@@ -22,6 +22,15 @@ Open image -> mark patches -> create trim layout -> generate maps -> add treatme
 The MVP release target is Windows 10/11 x64. Core Rust contracts remain portable for later platform
 qualification.
 
+## Current Capability
+
+Phase 1 provides the native seven-step shell and the complete project/image lifecycle: versioned SQLite
+projects, New/Open/Save/Save As/Close, recent projects, dirty-state handling, locks, autosave and recovery,
+single-instance routing, and bounded PNG/JPEG/TIFF import. Base Color and explicitly assigned registered PBR
+channels can be inspected through a mipmapped pan/zoom viewport without modifying source bytes.
+
+See `docs/phase-reports/phase-1.md` for the gate evidence and `docs/support/recovery.md` for recovery behavior.
+
 ## Local Commands
 
 ```powershell

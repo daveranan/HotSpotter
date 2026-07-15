@@ -1,16 +1,22 @@
-# Recovery Foundations
+# Project Recovery
 
-Phase 0 reserves an operating-system-managed recovery directory and defines the persistence boundary. It does
-not yet write project data.
+Hot Trimmer treats the project file as authoritative and recovery data as a separate safety net.
 
-Phase 1 must implement the following before projects are considered durable:
+- Every open project holds a one-writer lock. An active owner blocks a second writer; a lock whose process no
+  longer exists is reported and replaced.
+- Source registration commits through SQLite transactions and is also recorded in the autosave journal.
+- Explicit Save establishes the last known-good baseline. Discard restores that baseline rather than accepting
+  autosaved edits as an explicit save.
+- Up to five integrity-checked recovery snapshots are retained in the operating-system recovery directory.
+- After an unclean shutdown, the Recovery dialog lists only snapshots that open read-only and pass SQLite
+  integrity and schema checks.
+- **Recover As** requires a new destination. It validates and flushes a temporary copy before atomically
+  publishing it and refuses to overwrite any existing project.
 
-- Transactional SQLite migrations tested against versioned fixtures.
-- One-writer project locks and stale-lock recovery.
-- Autosave journals and rotating recovery snapshots.
-- Integrity checks before replacing the last known-good project.
-- An explicit recovery choice that never silently overwrites the user's project.
+If Hot Trimmer exits unexpectedly, restart it, choose a snapshot from Recovery, and save the recovered copy to
+a new name. Keep the original until the recovered project has been inspected. A normal project can also be
+opened directly; its integrity is checked before the session is adopted.
 
-Deleting the render cache must never delete or invalidate authoritative project data. Uninstall behavior must
-leave projects and user-owned source images intact.
-
+Owned source bytes are immutable inside the project. External sources are revalidated against their stored
+SHA-256 identity. Recovery, cache deletion, and uninstall behavior do not delete user-owned projects or source
+images.

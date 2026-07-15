@@ -13,6 +13,7 @@
     "@hot-trimmer/ipc-contracts": "0.1.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@tauri-apps/plugin-opener": "^2.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
@@ -25,4 +26,3 @@
     "vite": "^6.0.0"
   }
 }
-

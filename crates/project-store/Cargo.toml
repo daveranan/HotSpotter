@@ -7,7 +7,11 @@ license.workspace = true
 
 [dependencies]
 hot-trimmer-domain.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+sysinfo.workspace = true
 
 [lints]
 workspace = true
-

@@ -7,7 +7,12 @@ license.workspace = true
 
 [dependencies]
 hot-trimmer-domain.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+moxcms.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
-

@@ -7,6 +7,14 @@ pub enum ErrorCode {
     InvalidCoordinate,
     ProtocolMismatch,
     InvalidInput,
+    ProjectLocked,
+    ProjectInvalid,
+    ImageImportFailed,
+    NoOpenProject,
+    DirtyProject,
+    RecoveryFailed,
+    SourceRegistrationFailed,
+    OperationCancelled,
     Internal,
 }
 

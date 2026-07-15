@@ -15,6 +15,7 @@ const required = [
   "docs/adr/0004-color-and-channel-policy.md",
   "docs/adr/0005-source-file-ownership.md",
   "docs/phase-reports/phase-0.md",
+  "docs/phase-reports/phase-1.md",
   "docs/support/diagnostics.md",
   "docs/support/recovery.md",
   "apps/desktop/index.html",
@@ -26,6 +27,9 @@ const required = [
   "crates/domain/src/lib.rs",
   "packages/ipc-contracts/src/index.ts",
   "fixtures/contracts/foundation-status.json",
+  "fixtures/projects/schema-v1.sql",
+  "fixtures/projects/migrate-v1-to-v2.sql",
+  "fixtures/projects/data-v1.sql",
 ];
 
 const missing = required.filter((file) => !existsSync(join(root, file)));
@@ -56,4 +60,23 @@ for (const member of ["crates/domain", "crates/project-store", "apps/desktop/src
   }
 }
 
-console.log(`checked ${required.length} Hot Trimmer Phase 0 foundation files`);
+const desktop = readFileSync(join(root, "apps", "desktop", "src", "main.tsx"), "utf8");
+const styles = readFileSync(join(root, "apps", "desktop", "styles.css"), "utf8");
+for (const marker of [
+  'aria-label="MVP workflow"',
+  'role="alertdialog"',
+  'aria-modal="true"',
+  'aria-live="polite"',
+  'aria-label="Image import progress"',
+]) {
+  if (!desktop.includes(marker)) {
+    console.error(`desktop shell missing accessibility contract: ${marker}`);
+    process.exit(1);
+  }
+}
+if (!styles.includes("prefers-reduced-motion: reduce")) {
+  console.error("desktop shell must honor reduced motion");
+  process.exit(1);
+}
+
+console.log(`checked ${required.length} Hot Trimmer foundation and Phase 1 gate files`);
