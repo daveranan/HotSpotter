@@ -23,7 +23,8 @@
 - Project schema reservation: 1; Phase 0 writes no project records.
 - Render operation version: 1.
 - Export preset version: 1.
-- Cross-language fixture: `fixtures/contracts/foundation-status.json`.
+- Cross-language fixtures: `fixtures/contracts/foundation-status.json` and the Phase 1 lifecycle fixture now
+  prove the foundation contract continues to scale beyond the first command.
 
 ## Verification Evidence
 
@@ -41,6 +42,8 @@
   - Roaming app data, local cache, local logs, and recovery directories were created in the expected OS-managed
     locations.
 - `npm install` audit: 0 known vulnerabilities at the installed audit level.
+- RustSec advisory review now runs in CI. The resolved Rust license graph and parser threat model are recorded in
+  `docs/support/security-review.md`; no GPL-only, AGPL-only, or LGPL-only dependency is present.
 
 ## Manual Verification Item
 

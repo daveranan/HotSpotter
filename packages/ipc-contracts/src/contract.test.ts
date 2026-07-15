@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fixture from "../../../fixtures/contracts/foundation-status.json" with { type: "json" };
+import lifecycle from "../../../fixtures/contracts/phase-1-lifecycle.json" with { type: "json" };
+import patchAuthoring from "../../../fixtures/contracts/phase-2-patch-authoring.json" with { type: "json" };
 import {
   IPC_PROTOCOL_VERSION,
   type CloseProjectRequest,
   type CreateProjectRequest,
   type ImportSourceRequest,
+  type PatchCommandRequest,
+  type PatchPreviewRequest,
+  type PatchStateSnapshot,
+  type PolygonAssistRequest,
   type ProjectSnapshot,
   type RecoverProjectRequest,
+  type SourceSlotRequest,
 } from "./index.ts";
 
 const requiredCapabilities = [
@@ -58,14 +65,19 @@ test("phase 1 lifecycle and snapshot contracts carry recovery and registration s
     id: "00000000-0000-0000-0000-000000000001",
     name: "Registered material",
     path: "<project>",
-    schemaVersion: 2,
+    schemaVersion: 5,
     dirty: true,
     staleLockRecovered: false,
+    warnings: [],
+    patches: [],
+    canUndoPatch: false,
+    canRedoPatch: false,
     sources: [{
       id: "00000000-0000-0000-0000-000000000002",
       channel: "roughness",
       ownership: "verified_external_reference",
       displayName: "roughness.tif",
+      sourcePath: "C:/textures/roughness.tif",
       width: 2048,
       height: 2048,
       format: "TIFF",
@@ -84,4 +96,36 @@ test("phase 1 lifecycle and snapshot contracts carry recovery and registration s
   assert.notEqual(recover.recoveryPath, recover.destinationPath);
   assert.equal(snapshot.sources[0]?.channel, "roughness");
   assert.equal(snapshot.dirty, true);
+  assert.equal(snapshot.warnings.length, 0);
+});
+
+test("phase 1 fixture covers native lifecycle shapes and expanded material slots", () => {
+  const clearSpecular: SourceSlotRequest = {
+    protocolVersion: IPC_PROTOCOL_VERSION,
+    channel: "specular",
+  };
+  assert.equal(lifecycle.createRequest.protocolVersion, IPC_PROTOCOL_VERSION);
+  assert.equal(lifecycle.importRequest.channel, "specular");
+  assert.equal(lifecycle.closeRequest.disposition, "discard");
+  assert.notEqual(lifecycle.recoverRequest.recoveryPath, lifecycle.recoverRequest.destinationPath);
+  assert.equal(lifecycle.projectSnapshot.schemaVersion, 5);
+  assert.equal(lifecycle.projectSnapshot.sources[0]?.channel, "specular");
+  assert.equal(lifecycle.projectSnapshot.warnings[0]?.code, "recovery_failed");
+  assert.equal(clearSpecular.channel, lifecycle.importRequest.channel);
+});
+
+test("phase 2 fixtures preserve camel-case patch commands, assistance, preview, and history state", () => {
+  const command = patchAuthoring.patchCommandRequest as PatchCommandRequest;
+  const assist = patchAuthoring.polygonAssistRequest as PolygonAssistRequest;
+  const preview = patchAuthoring.previewRequest as PatchPreviewRequest;
+  const state = patchAuthoring.patchState as PatchStateSnapshot;
+  assert.equal(command.protocolVersion, IPC_PROTOCOL_VERSION);
+  assert.equal(command.command.type, "create");
+  assert.equal(command.command.patch.properties.repeatMode, "repeat_x");
+  assert.equal(command.command.patch.geometry.corners.length, 4);
+  assert.equal(assist.points.length, 6);
+  assert.equal(assist.retainMask, true);
+  assert.equal(preview.maxEdge, 768);
+  assert.equal(state.canUndoPatch, true);
+  assert.equal(state.canRedoPatch, false);
 });

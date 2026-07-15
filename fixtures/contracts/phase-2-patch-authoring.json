@@ -1,0 +1,56 @@
+{
+  "patchCommandRequest": {
+    "protocolVersion": 1,
+    "coalescingGroup": 42,
+    "command": {
+      "type": "create",
+      "patch": {
+        "id": "00000000-0000-4000-8000-000000000010",
+        "sourceId": "00000000-0000-4000-8000-000000000002",
+        "name": "Brick course",
+        "enabled": true,
+        "geometry": {
+          "corners": [
+            { "x": 0.1, "y": 0.1 },
+            { "x": 0.9, "y": 0.1 },
+            { "x": 0.9, "y": 0.9 },
+            { "x": 0.1, "y": 0.9 }
+          ]
+        },
+        "properties": {
+          "repeatMode": "repeat_x",
+          "trimCap": false,
+          "paddingPx": 4,
+          "bleedPx": 8,
+          "materialId": 7,
+          "mapParticipation": "all"
+        },
+        "rectification": { "aspectRatio": 4, "scale": 1 }
+      }
+    }
+  },
+  "polygonAssistRequest": {
+    "protocolVersion": 1,
+    "retainMask": true,
+    "points": [
+      { "x": 0.1, "y": 0.2 },
+      { "x": 0.5, "y": 0.1 },
+      { "x": 0.9, "y": 0.2 },
+      { "x": 0.95, "y": 0.5 },
+      { "x": 0.8, "y": 0.9 },
+      { "x": 0.2, "y": 0.9 }
+    ]
+  },
+  "previewRequest": {
+    "protocolVersion": 1,
+    "patchId": "00000000-0000-4000-8000-000000000010",
+    "maxEdge": 768
+  },
+  "patchState": {
+    "patches": [],
+    "dirty": true,
+    "canUndoPatch": true,
+    "canRedoPatch": false,
+    "warnings": []
+  }
+}

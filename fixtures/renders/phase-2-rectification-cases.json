@@ -1,0 +1,57 @@
+[
+  {
+    "name": "frontal-color",
+    "sourceWidth": 16,
+    "sourceHeight": 16,
+    "outputWidth": 16,
+    "outputHeight": 16,
+    "corners": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    "sampleSpace": "srgb",
+    "alphaPattern": false,
+    "expectedSha256": "96cc4258d3d4ed19707d4946c986f2ee2e76e945895386713ac293b1baf3c875"
+  },
+  {
+    "name": "rotated-color",
+    "sourceWidth": 16,
+    "sourceHeight": 16,
+    "outputWidth": 12,
+    "outputHeight": 12,
+    "corners": [[0.50, 0.04], [0.96, 0.50], [0.50, 0.96], [0.04, 0.50]],
+    "sampleSpace": "srgb",
+    "alphaPattern": false,
+    "expectedSha256": "24fe5e790ff3b6803688943770d57bb1735e988639b5a647f35459be741414b3"
+  },
+  {
+    "name": "skewed-linear",
+    "sourceWidth": 16,
+    "sourceHeight": 16,
+    "outputWidth": 16,
+    "outputHeight": 10,
+    "corners": [[0.08, 0.12], [0.92, 0.03], [0.78, 0.95], [0.22, 0.84]],
+    "sampleSpace": "linear",
+    "alphaPattern": false,
+    "expectedSha256": "96d1f387ff0f10d40a69ada64a92d3e8e8fad427ae4ce8252891f1b5fbc5ebed"
+  },
+  {
+    "name": "near-boundary-alpha",
+    "sourceWidth": 16,
+    "sourceHeight": 16,
+    "outputWidth": 16,
+    "outputHeight": 16,
+    "corners": [[0.0001, 0.0001], [0.9999, 0.0001], [0.9999, 0.9999], [0.0001, 0.9999]],
+    "sampleSpace": "srgb",
+    "alphaPattern": true,
+    "expectedSha256": "cbccd07bf8b0ebe1b681e54a3be2025d4e6ae73ad7df8eddac6d5a5d23433f78"
+  },
+  {
+    "name": "high-resolution-8k",
+    "sourceWidth": 8192,
+    "sourceHeight": 1024,
+    "outputWidth": 512,
+    "outputHeight": 64,
+    "corners": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    "sampleSpace": "srgb",
+    "alphaPattern": false,
+    "expectedSha256": "1e715c35c6d0028be50b7570d10f3f9c350cbb05a093187f8d55e6f02bbbcb96"
+  }
+]

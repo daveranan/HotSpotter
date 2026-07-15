@@ -7,14 +7,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use hot_trimmer_domain::{ProjectId, SourceId};
+use hot_trimmer_domain::{
+    Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchSet, ProjectId, SourceId,
+};
+use hot_trimmer_geometry::Quadrilateral;
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 pub const MAX_RECOVERY_SNAPSHOTS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -26,16 +29,24 @@ pub enum SourceChannel {
     Roughness,
     Metallic,
     AmbientOcclusion,
+    Specular,
+    Opacity,
+    EdgeMask,
+    MaterialId,
 }
 
 impl SourceChannel {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::BaseColor,
         Self::Normal,
         Self::Height,
         Self::Roughness,
         Self::Metallic,
         Self::AmbientOcclusion,
+        Self::Specular,
+        Self::Opacity,
+        Self::EdgeMask,
+        Self::MaterialId,
     ];
 
     #[must_use]
@@ -47,6 +58,10 @@ impl SourceChannel {
             Self::Roughness => "roughness",
             Self::Metallic => "metallic",
             Self::AmbientOcclusion => "ambient_occlusion",
+            Self::Specular => "specular",
+            Self::Opacity => "opacity",
+            Self::EdgeMask => "edge_mask",
+            Self::MaterialId => "material_id",
         }
     }
 
@@ -89,6 +104,7 @@ pub struct SourceInput {
     pub id: SourceId,
     pub ownership: SourceOwnership,
     pub external_path: Option<PathBuf>,
+    pub origin_path: PathBuf,
     pub sha256: String,
     pub width: u32,
     pub height: u32,
@@ -107,12 +123,13 @@ pub struct StoredSource {
     pub input: SourceInput,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProjectSummary {
     pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
     pub sources: Vec<StoredSource>,
+    pub patches: Vec<Patch>,
     pub stale_lock_recovered: bool,
 }
 
@@ -146,6 +163,8 @@ pub enum StoreError {
     InvalidId(String),
     #[error("import Base Color before assigning related PBR sources")]
     BaseColorRequired,
+    #[error("remove companion material inputs before removing Base Color")]
+    BaseColorInUse,
     #[error(
         "the {channel} source is {actual_width}x{actual_height}; registered sources must be {expected_width}x{expected_height}"
     )]
@@ -156,6 +175,12 @@ pub enum StoreError {
         actual_width: u32,
         actual_height: u32,
     },
+    #[error("the source is used by one or more patches")]
+    SourceInUseByPatches,
+    #[error("the patch command is invalid: {0}")]
+    PatchCommand(#[from] PatchCommandError),
+    #[error("patch data could not be serialized: {0}")]
+    PatchSerialization(#[from] serde_json::Error),
 }
 
 pub struct ProjectStore {
@@ -163,6 +188,7 @@ pub struct ProjectStore {
     project_path: PathBuf,
     _lock: ProjectLock,
     stale_lock_recovered: bool,
+    patch_set: PatchSet,
 }
 
 impl ProjectStore {
@@ -202,6 +228,7 @@ impl ProjectStore {
             project_path: path.to_path_buf(),
             _lock: lock,
             stale_lock_recovered,
+            patch_set: PatchSet::default(),
         })
     }
 
@@ -217,11 +244,13 @@ impl ProjectStore {
         migrate(&mut connection)?;
         verify_integrity(&connection)?;
 
+        let patch_set = PatchSet::new(load_patches(&connection)?)?;
         let store = Self {
             connection,
             project_path: path.to_path_buf(),
             _lock: lock,
             stale_lock_recovered,
+            patch_set,
         };
         store.summary()?;
         Ok(store)
@@ -273,17 +302,42 @@ impl ProjectStore {
     ) -> Result<(), StoreError> {
         validate_source_ownership(source)?;
         self.validate_registration(channel, source.width, source.height)?;
+        let previous_source_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM sources WHERE channel = ?1",
+                [channel.as_db_value()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<SourceId>()
+                    .map_err(|_| StoreError::InvalidId(value))
+            })
+            .transpose()?;
+        let mut next_patch_set = self.patch_set.clone();
+        if let Some(previous_source_id) = previous_source_id {
+            next_patch_set.execute(
+                PatchCommand::ReassignSource {
+                    from_source_id: previous_source_id,
+                    to_source_id: source.id,
+                },
+                None,
+            )?;
+        }
         let now = unix_timestamp()?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "DELETE FROM sources WHERE channel = ?1",
             [channel.as_db_value()],
         )?;
+        persist_patch_rows(&transaction, next_patch_set.patches())?;
         transaction.execute(
             "INSERT INTO sources (
                 id, channel, ownership, external_path, sha256, width, height, format, color_type,
-                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 source.id.to_string(),
                 channel.as_db_value(),
@@ -306,6 +360,7 @@ impl ProjectStore {
                     )
                 })?,
                 source.owned_bytes,
+                source.origin_path.to_string_lossy(),
             ],
         )?;
         let payload = format!(
@@ -321,7 +376,165 @@ impl ProjectStore {
         )?;
         transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
         transaction.commit()?;
+        self.patch_set = next_patch_set;
         checkpoint(&self.connection)
+    }
+
+    /// Removes one material-input slot and journals the command transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when Base Color still anchors companion inputs or persistence fails.
+    pub fn remove_source(&mut self, channel: SourceChannel) -> Result<(), StoreError> {
+        if channel == SourceChannel::BaseColor {
+            let companions: u32 = self.connection.query_row(
+                "SELECT COUNT(*) FROM sources WHERE channel <> 'base_color'",
+                [],
+                |row| row.get(0),
+            )?;
+            if companions > 0 {
+                return Err(StoreError::BaseColorInUse);
+            }
+        }
+        let source_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM sources WHERE channel = ?1",
+                [channel.as_db_value()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<SourceId>()
+                    .map_err(|_| StoreError::InvalidId(value))
+            })
+            .transpose()?;
+        if source_id.is_some_and(|id| {
+            self.patch_set
+                .patches()
+                .iter()
+                .any(|patch| patch.source_id == id)
+        }) {
+            return Err(StoreError::SourceInUseByPatches);
+        }
+        let now = unix_timestamp()?;
+        let transaction = self.connection.transaction()?;
+        let removed = transaction.execute(
+            "DELETE FROM sources WHERE channel = ?1",
+            [channel.as_db_value()],
+        )?;
+        if removed == 0 {
+            return Err(StoreError::InvalidData(format!(
+                "empty material input slot: {}",
+                channel.as_db_value()
+            )));
+        }
+        let payload = format!("{{\"channel\":\"{}\"}}", channel.as_db_value());
+        transaction.execute(
+            "INSERT INTO autosave_journal (occurred_unix, operation, payload_json)
+             VALUES (?1, 'remove_source', ?2)",
+            params![now, payload],
+        )?;
+        transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+        transaction.commit()?;
+        checkpoint(&self.connection)
+    }
+
+    /// Renames the project and journals the edit transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the name is invalid or persistence cannot commit.
+    pub fn rename_project(&mut self, name: &str) -> Result<(), StoreError> {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 255 {
+            return Err(StoreError::InvalidData(
+                "project name must be 1 to 255 characters".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE project SET name = ?1, modified_unix = ?2",
+            params![name, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO autosave_journal (occurred_unix, operation, payload_json)
+             VALUES (?1, 'rename_project', json_object('name', ?2))",
+            params![now, name],
+        )?;
+        transaction.commit()?;
+        checkpoint(&self.connection)
+    }
+
+    #[must_use]
+    pub fn patches(&self) -> &[Patch] {
+        self.patch_set.patches()
+    }
+
+    #[must_use]
+    pub fn can_undo_patch_command(&self) -> bool {
+        self.patch_set.can_undo()
+    }
+
+    #[must_use]
+    pub fn can_redo_patch_command(&self) -> bool {
+        self.patch_set.can_redo()
+    }
+
+    /// Applies and durably journals one validated patch command in the same transaction as patch state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed command, serialization, or database failure without changing in-memory state.
+    pub fn execute_patch_command(
+        &mut self,
+        command: &PatchCommand,
+        coalescing_group: Option<u64>,
+    ) -> Result<PatchEditOutcome, StoreError> {
+        let mut next = self.patch_set.clone();
+        let outcome = next.execute(command.clone(), coalescing_group)?;
+        let payload = serde_json::to_string(command)?;
+        persist_patch_state(
+            &mut self.connection,
+            next.patches(),
+            "patch_command",
+            &payload,
+        )?;
+        self.patch_set = next;
+        checkpoint(&self.connection)?;
+        Ok(outcome)
+    }
+
+    /// Undoes the latest coalesced patch command and persists the restored state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure without changing state when history is empty or persistence fails.
+    pub fn undo_patch_command(&mut self) -> Result<PatchEditOutcome, StoreError> {
+        let mut next = self.patch_set.clone();
+        let outcome = next.undo()?;
+        let payload = serde_json::to_string(&outcome.invalidated_patch_ids)?;
+        persist_patch_state(&mut self.connection, next.patches(), "patch_undo", &payload)?;
+        self.patch_set = next;
+        checkpoint(&self.connection)?;
+        Ok(outcome)
+    }
+
+    /// Redoes the next patch command and persists the restored state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure without changing state when redo history is empty or persistence fails.
+    pub fn redo_patch_command(&mut self) -> Result<PatchEditOutcome, StoreError> {
+        let mut next = self.patch_set.clone();
+        let outcome = next.redo()?;
+        let payload = serde_json::to_string(&outcome.invalidated_patch_ids)?;
+        persist_patch_state(&mut self.connection, next.patches(), "patch_redo", &payload)?;
+        self.patch_set = next;
+        checkpoint(&self.connection)?;
+        Ok(outcome)
     }
 
     /// Returns the durable autosave command journal in commit order.
@@ -354,7 +567,7 @@ impl ProjectStore {
         checkpoint(&self.connection)
     }
 
-    /// Writes an integrity-checked standalone copy without replacing a previous valid snapshot on failure.
+    /// Publishes an integrity-checked standalone copy at a previously unused generation path.
     ///
     /// # Errors
     ///
@@ -371,7 +584,8 @@ impl ProjectStore {
             .backup(DatabaseName::Main, &temporary, None)?;
         validate_standalone_database(&temporary)?;
         sync_file(&temporary)?;
-        atomic_replace(&temporary, destination)
+        pause_at_backup_publication_failpoint()?;
+        atomic_publish_new(&temporary, destination)
     }
 
     /// Restores a validated snapshot into the open database using `SQLite`'s online backup API.
@@ -387,7 +601,9 @@ impl ProjectStore {
             None::<fn(rusqlite::backup::Progress)>,
         )?;
         checkpoint(&self.connection)?;
-        verify_integrity(&self.connection)
+        verify_integrity(&self.connection)?;
+        self.patch_set = PatchSet::new(load_patches(&self.connection)?)?;
+        Ok(())
     }
 
     /// Creates and locks a verified project copy at a new path.
@@ -418,6 +634,7 @@ impl ProjectStore {
             project_path: destination.to_path_buf(),
             _lock: lock,
             stale_lock_recovered,
+            patch_set: self.patch_set.clone(),
         })
     }
 
@@ -439,13 +656,16 @@ impl ProjectStore {
         Ok(path)
     }
 
-    /// Returns the stable baseline path used to implement discard without touching unrelated recovery files.
+    /// Returns a unique immutable baseline path used to implement discard.
     #[must_use]
     pub fn baseline_path(&self, recovery_dir: &Path) -> PathBuf {
         let id = self
             .summary()
             .map_or_else(|_| "unknown".to_owned(), |summary| summary.id.to_string());
-        recovery_dir.join(format!("{id}.baseline.hottrimmer-recovery"))
+        recovery_dir.join(format!(
+            "{id}.baseline.{}.hottrimmer-recovery",
+            Uuid::new_v4()
+        ))
     }
 
     fn validate_registration(
@@ -520,17 +740,51 @@ fn summary_from_connection(
         name,
         path: path.to_path_buf(),
         sources: load_sources(connection)?,
+        patches: load_patches(connection)?,
         stale_lock_recovered,
     })
+}
+
+fn load_patches(connection: &Connection) -> Result<Vec<Patch>, StoreError> {
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 5 {
+        return Ok(Vec::new());
+    }
+    let mut statement =
+        connection.prepare("SELECT id, source_id, patch_json FROM patches ORDER BY ordinal")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut patches = Vec::new();
+    for row in rows {
+        let (id, source_id, json) = row?;
+        let patch: Patch = serde_json::from_str(&json)?;
+        if patch.id.to_string() != id || patch.source_id.to_string() != source_id {
+            return Err(StoreError::InvalidData(
+                "patch identifiers disagree with the indexed project data".into(),
+            ));
+        }
+        Quadrilateral::new(patch.geometry.corners).map_err(|error| {
+            StoreError::InvalidData(format!("invalid patch {} geometry: {error}", patch.id))
+        })?;
+        patches.push(patch);
+    }
+    PatchSet::new(patches.clone())?;
+    Ok(patches)
 }
 
 fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError> {
     let mut statement = connection.prepare(
         "SELECT id, channel, ownership, external_path, sha256, width, height, format, color_type,
-                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes
+                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
          FROM sources ORDER BY CASE channel
             WHEN 'base_color' THEN 0 WHEN 'normal' THEN 1 WHEN 'height' THEN 2
-            WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 ELSE 5 END",
+            WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 WHEN 'ambient_occlusion' THEN 5
+            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -548,6 +802,7 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
             row.get::<_, bool>(11)?,
             row.get::<_, u64>(12)?,
             row.get::<_, Option<Vec<u8>>>(13)?,
+            row.get::<_, String>(14)?,
         ))
     })?;
     let mut sources = Vec::new();
@@ -567,6 +822,7 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
             has_embedded_icc_profile,
             encoded_bytes,
             owned_bytes,
+            origin_path,
         ) = row?;
         let input = SourceInput {
             id: id_text
@@ -574,6 +830,7 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
                 .map_err(|_| StoreError::InvalidId(id_text))?,
             ownership: SourceOwnership::from_db_value(&ownership_text)?,
             external_path: external_path.map(PathBuf::from),
+            origin_path: PathBuf::from(origin_path),
             sha256,
             width,
             height,
@@ -602,6 +859,43 @@ fn configure(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn persist_patch_rows(transaction: &Transaction<'_>, patches: &[Patch]) -> Result<(), StoreError> {
+    transaction.execute("DELETE FROM patches", [])?;
+    for (ordinal, patch) in patches.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| StoreError::InvalidData("patch count exceeds SQLite limits".into()))?;
+        let json = serde_json::to_string(patch)?;
+        transaction.execute(
+            "INSERT INTO patches (id, source_id, ordinal, patch_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                patch.id.to_string(),
+                patch.source_id.to_string(),
+                ordinal,
+                json
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_patch_state(
+    connection: &mut Connection,
+    patches: &[Patch],
+    operation: &str,
+    payload_json: &str,
+) -> Result<(), StoreError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction()?;
+    persist_patch_rows(&transaction, patches)?;
+    transaction.execute(
+        "INSERT INTO autosave_journal (occurred_unix, operation, payload_json) VALUES (?1, ?2, ?3)",
+        params![now, operation, payload_json],
+    )?;
+    transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     let mut version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > CURRENT_SCHEMA_VERSION {
@@ -622,6 +916,27 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         migrate_to_v2(&transaction)?;
         transaction.pragma_update(None, "user_version", 2_u32)?;
         transaction.commit()?;
+        version = 2;
+    }
+    if version == 2 {
+        let transaction = connection.transaction()?;
+        migrate_to_v3(&transaction)?;
+        transaction.pragma_update(None, "user_version", 3_u32)?;
+        transaction.commit()?;
+        version = 3;
+    }
+    if version == 3 {
+        let transaction = connection.transaction()?;
+        migrate_to_v4(&transaction)?;
+        transaction.pragma_update(None, "user_version", 4_u32)?;
+        transaction.commit()?;
+        version = 4;
+    }
+    if version == 4 {
+        let transaction = connection.transaction()?;
+        migrate_to_v5(&transaction)?;
+        transaction.pragma_update(None, "user_version", 5_u32)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -634,6 +949,27 @@ fn migrate_to_v1(transaction: &Transaction<'_>) -> Result<(), StoreError> {
 fn migrate_to_v2(transaction: &Transaction<'_>) -> Result<(), StoreError> {
     transaction.execute_batch(include_str!(
         "../../../fixtures/projects/migrate-v1-to-v2.sql"
+    ))?;
+    Ok(())
+}
+
+fn migrate_to_v3(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(include_str!(
+        "../../../fixtures/projects/migrate-v2-to-v3.sql"
+    ))?;
+    Ok(())
+}
+
+fn migrate_to_v4(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(include_str!(
+        "../../../fixtures/projects/migrate-v3-to-v4.sql"
+    ))?;
+    Ok(())
+}
+
+fn migrate_to_v5(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(include_str!(
+        "../../../fixtures/projects/migrate-v4-to-v5.sql"
     ))?;
     Ok(())
 }
@@ -713,18 +1049,32 @@ fn sync_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn atomic_replace(temporary: &Path, destination: &Path) -> Result<(), StoreError> {
-    if !destination.exists() {
-        fs::rename(temporary, destination)?;
+#[cfg(debug_assertions)]
+fn pause_at_backup_publication_failpoint() -> Result<(), StoreError> {
+    let Some(signal) = std::env::var_os("HOT_TRIMMER_BACKUP_PUBLICATION_SIGNAL") else {
         return Ok(());
+    };
+    fs::write(signal, b"ready-to-publish")?;
+    std::thread::sleep(Duration::from_secs(60));
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+const fn pause_at_backup_publication_failpoint() -> Result<(), StoreError> {
+    Ok(())
+}
+
+fn atomic_publish_new(temporary: &Path, destination: &Path) -> Result<(), StoreError> {
+    if destination.exists() {
+        return Err(StoreError::AlreadyExists);
     }
-    let previous = sibling_temporary_path(destination);
-    fs::rename(destination, &previous)?;
-    if let Err(error) = fs::rename(temporary, destination) {
-        let _ = fs::rename(&previous, destination);
-        return Err(error.into());
+    #[cfg(windows)]
+    fs::rename(temporary, destination)?;
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(temporary, destination)?;
+        fs::remove_file(temporary)?;
     }
-    fs::remove_file(previous)?;
     Ok(())
 }
 
@@ -810,7 +1160,10 @@ fn lock_path(project_path: &Path) -> PathBuf {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use hot_trimmer_domain::SourceId;
+    use hot_trimmer_domain::{
+        NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId, PatchProperties,
+        RectificationSettings, SourceId,
+    };
     use rusqlite::Connection;
     use uuid::Uuid;
 
@@ -840,6 +1193,7 @@ mod tests {
             id: SourceId::new(),
             ownership: SourceOwnership::OwnedCopy,
             external_path: None,
+            origin_path: PathBuf::from("fixture.png"),
             sha256: "a".repeat(64),
             width,
             height,
@@ -850,6 +1204,27 @@ mod tests {
             has_embedded_icc_profile: false,
             encoded_bytes: 3,
             owned_bytes: Some(vec![1, 2, 3]),
+        }
+    }
+
+    fn patch(source_id: SourceId, name: &str) -> Patch {
+        let point = |x, y| NormalizedPoint::new(x, y).expect("test point");
+        Patch {
+            id: PatchId::new(),
+            source_id,
+            name: name.into(),
+            enabled: true,
+            geometry: PatchGeometry {
+                corners: [
+                    point(0.1, 0.1),
+                    point(0.9, 0.1),
+                    point(0.9, 0.9),
+                    point(0.1, 0.9),
+                ],
+                assistance_mask: None,
+            },
+            properties: PatchProperties::default(),
+            rectification: RectificationSettings::default(),
         }
     }
 
@@ -897,6 +1272,165 @@ mod tests {
                 .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
                 .expect("schema version"),
             CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn version_two_fixture_migrates_to_material_input_slots() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-two.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v2.sql"))
+            .expect("v2 schema");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/data-v1.sql"))
+            .expect("v2 data");
+        connection
+            .pragma_update(None, "user_version", 2_u32)
+            .expect("mark v2");
+        migrate(&mut connection).expect("migrate v2");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        drop(connection);
+
+        let store = ProjectStore::open(&path).expect("open migrated project");
+        assert_eq!(store.summary().expect("summary").sources.len(), 1);
+        let mut channels = SourceChannel::ALL.into_iter();
+        assert_eq!(channels.next(), Some(SourceChannel::BaseColor));
+        assert_eq!(channels.count(), 9);
+    }
+
+    #[test]
+    fn version_three_fixture_adds_source_provenance() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-three.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v3.sql"))
+            .expect("v3 schema");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/data-v1.sql"))
+            .expect("v3 data");
+        connection
+            .pragma_update(None, "user_version", 3_u32)
+            .expect("mark v3");
+        migrate(&mut connection).expect("migrate v3");
+        let origin_path: String = connection
+            .query_row("SELECT origin_path FROM sources LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("origin path");
+        assert!(origin_path.is_empty());
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn version_four_fixture_adds_empty_patch_storage_transactionally() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-four.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v4.sql"))
+            .expect("v4 schema");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/data-v1.sql"))
+            .expect("v4 data");
+        connection
+            .pragma_update(None, "user_version", 4_u32)
+            .expect("mark v4");
+        migrate(&mut connection).expect("migrate v4");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        let patch_count: u32 = connection
+            .query_row("SELECT count(*) FROM patches", [], |row| row.get(0))
+            .expect("patch count");
+        assert_eq!(patch_count, 0);
+    }
+
+    #[test]
+    fn patch_commands_undo_redo_and_reopen_without_geometry_loss() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("patches.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Patches").expect("create project");
+        let base = source(1024, 512);
+        let authored = patch(base.id, "Brick course");
+        store
+            .replace_source(SourceChannel::BaseColor, &base)
+            .expect("base source");
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: authored.clone(),
+                    index: None,
+                },
+                None,
+            )
+            .expect("create patch");
+        assert_eq!(store.patches(), std::slice::from_ref(&authored));
+        store.undo_patch_command().expect("undo patch");
+        assert!(store.patches().is_empty());
+        store.redo_patch_command().expect("redo patch");
+        assert_eq!(store.patches(), std::slice::from_ref(&authored));
+        assert_eq!(
+            store
+                .autosave_journal()
+                .expect("journal")
+                .last()
+                .expect("entry")
+                .operation,
+            "patch_redo"
+        );
+        drop(store);
+
+        let reopened = ProjectStore::open(&path).expect("reopen project");
+        assert_eq!(reopened.summary().expect("summary").patches, vec![authored]);
+    }
+
+    #[test]
+    fn replacing_a_source_reassociates_patches_and_removal_is_blocked() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("patch-source.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Patch source").expect("create project");
+        let original = source(64, 64);
+        store
+            .replace_source(SourceChannel::BaseColor, &original)
+            .expect("base source");
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: patch(original.id, "Patch"),
+                    index: None,
+                },
+                None,
+            )
+            .expect("create patch");
+        assert!(matches!(
+            store.remove_source(SourceChannel::BaseColor),
+            Err(StoreError::SourceInUseByPatches)
+        ));
+        let replacement = source(64, 64);
+        store
+            .replace_source(SourceChannel::BaseColor, &replacement)
+            .expect("replace source");
+        assert_eq!(store.patches()[0].source_id, replacement.id);
+        drop(store);
+        assert_eq!(
+            ProjectStore::open(&path).expect("reopen").patches()[0].source_id,
+            replacement.id
         );
     }
 
@@ -950,8 +1484,43 @@ mod tests {
         store
             .replace_source(SourceChannel::Normal, &source(4, 6))
             .expect("registered normal");
-        assert_eq!(store.summary().expect("summary").sources.len(), 2);
-        assert_eq!(store.autosave_journal().expect("journal").len(), 2);
+        for channel in SourceChannel::ALL
+            .into_iter()
+            .filter(|channel| !matches!(channel, SourceChannel::BaseColor | SourceChannel::Normal))
+        {
+            store
+                .replace_source(channel, &source(4, 6))
+                .expect("registered material input");
+        }
+        assert_eq!(store.summary().expect("summary").sources.len(), 10);
+        assert_eq!(store.autosave_journal().expect("journal").len(), 10);
+        assert!(matches!(
+            store.remove_source(SourceChannel::BaseColor),
+            Err(StoreError::BaseColorInUse)
+        ));
+        store
+            .remove_source(SourceChannel::Specular)
+            .expect("remove companion input");
+        assert_eq!(store.summary().expect("summary").sources.len(), 9);
+        let journal = store.autosave_journal().expect("journal");
+        assert_eq!(journal.len(), 11);
+        assert_eq!(
+            journal.last().expect("removal entry").operation,
+            "remove_source"
+        );
+        store
+            .rename_project("Renamed Material")
+            .expect("rename project");
+        assert_eq!(store.summary().expect("summary").name, "Renamed Material");
+        assert_eq!(
+            store
+                .autosave_journal()
+                .expect("journal")
+                .last()
+                .expect("rename entry")
+                .operation,
+            "rename_project"
+        );
     }
 
     #[test]
@@ -1000,5 +1569,37 @@ mod tests {
             .count();
         assert_eq!(snapshot_count, MAX_RECOVERY_SNAPSHOTS + 1);
         assert!(baseline.exists());
+    }
+
+    #[test]
+    fn recovery_snapshot_contains_committed_patch_geometry() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("patch-recovery.hottrimmer");
+        let recovery = fixture.0.join("recovery");
+        let mut store = ProjectStore::create(&path, "Patch recovery").expect("create project");
+        let base = source(1024, 1024);
+        let authored = patch(base.id, "Recoverable patch");
+        store
+            .replace_source(SourceChannel::BaseColor, &base)
+            .expect("base source");
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: authored.clone(),
+                    index: None,
+                },
+                None,
+            )
+            .expect("create patch");
+        let snapshot = store
+            .create_recovery_snapshot(&recovery)
+            .expect("recovery snapshot");
+        drop(store);
+
+        let recovered = ProjectStore::open(&snapshot).expect("open recovery snapshot");
+        assert_eq!(
+            recovered.summary().expect("summary").patches,
+            vec![authored]
+        );
     }
 }

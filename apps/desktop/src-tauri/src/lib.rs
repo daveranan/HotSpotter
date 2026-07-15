@@ -5,7 +5,8 @@ mod paths;
 use std::sync::{Arc, Mutex};
 
 use commands::{
-    PendingProjectPath, ProjectSession, SharedImportJob, SharedProjectSession, StartupState,
+    PendingProjectPath, ProjectSession, SharedImportJob, SharedPatchPreviewJob,
+    SharedProjectSession, StartupState,
 };
 use paths::AppPaths;
 use tauri::{
@@ -60,6 +61,7 @@ pub fn run() {
             );
             app.manage(Arc::new(Mutex::new(ProjectSession::new(&paths))) as SharedProjectSession);
             app.manage(Arc::new(Mutex::new(None)) as SharedImportJob);
+            app.manage(Arc::new(Mutex::new(None)) as SharedPatchPreviewJob);
             app.manage(StartupState {
                 previous_shutdown_clean: !previous_unclean,
             });
@@ -79,6 +81,15 @@ pub fn run() {
             commands::open_project,
             commands::import_source,
             commands::cancel_import,
+            commands::remove_source,
+            commands::rename_project,
+            commands::apply_patch_command,
+            commands::undo_patch_command,
+            commands::redo_patch_command,
+            commands::fit_patch_polygon,
+            commands::generate_patch_preview,
+            commands::generate_draft_patch_preview,
+            commands::cancel_patch_preview,
             commands::save_project,
             commands::save_project_as,
             commands::close_project,
@@ -105,6 +116,9 @@ fn install_native_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let open_project = MenuItemBuilder::with_id("open_project", "&Open Project…")
         .accelerator("Ctrl+O")
         .build(app)?;
+    let open_image = MenuItemBuilder::with_id("open_image", "Open &Image…")
+        .accelerator("Ctrl+I")
+        .build(app)?;
     let save_project = MenuItemBuilder::with_id("save_project", "&Save")
         .accelerator("Ctrl+S")
         .build(app)?;
@@ -120,6 +134,7 @@ fn install_native_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let file = SubmenuBuilder::new(app, "&File")
         .item(&new_project)
         .item(&open_project)
+        .item(&open_image)
         .separator()
         .item(&save_project)
         .item(&save_project_as)

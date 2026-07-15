@@ -6,14 +6,20 @@ It is not a full DCC, a general material-library manager, or a Blender/Substance
 product pass is intentionally narrow:
 
 ```text
-Open image -> mark patches -> create trim layout -> generate maps -> add treatments -> preview -> export
+Sources -> Patches & Layout (with embedded preview) -> Maps & Polish -> Export / Send to Blender
 ```
+
+Current delivery: Phase 0 through the revised Phase 2 implementation and automated gates are complete. Durable
+projects, multi-image auto-assignment, provenance display, the integrated source/patch workplace, real-time
+perspective correction, and the hotspot workpiece are working. Multiple material-source sets and authoritative
+layout remain Phase 3; later output capabilities stay disabled or absent until their phases are implemented.
 
 ## Project Shape
 
 - `docs/mvp-plan.md` is the product and implementation plan.
 - `docs/phases.md` is the production implementation program.
 - `docs/ux-workflow.md` describes the intended user workflow and screen model.
+- `docs/technical-spec.md` defines interaction, slot, patch, layout, persistence, and accessibility contracts.
 - `apps/desktop` contains the Tauri 2 native shell and React presentation layer.
 - `crates` contains the Rust domain, persistence, geometry, image, render, preview, and export boundaries.
 - `packages` contains shared TypeScript UI, editor, and versioned IPC contracts.
@@ -24,12 +30,15 @@ qualification.
 
 ## Current Capability
 
-Phase 1 provides the native seven-step shell and the complete project/image lifecycle: versioned SQLite
+Phases 1 and 2 provide the native workspace shell, complete project/image lifecycle, and editable patch
+authoring: versioned SQLite
 projects, New/Open/Save/Save As/Close, recent projects, dirty-state handling, locks, autosave and recovery,
-single-instance routing, and bounded PNG/JPEG/TIFF import. Base Color and explicitly assigned registered PBR
-channels can be inspected through a mipmapped pan/zoom viewport without modifying source bytes.
+single-instance routing, and bounded PNG/JPEG/TIFF import. Ten explicit registered material-input slots can be
+managed and inspected through a mipmapped pan/zoom viewport without modifying source bytes. Patches can be
+captured with rectangle, four-point, or assisted polygon tools, corrected numerically or directly, assigned
+repeat/material behavior, and previewed through deterministic background rectification.
 
-See `docs/phase-reports/phase-1.md` for the gate evidence and `docs/support/recovery.md` for recovery behavior.
+See `docs/phase-reports/phase-2.md` for the current gate evidence and `docs/support/recovery.md` for recovery behavior.
 
 ## Local Commands
 

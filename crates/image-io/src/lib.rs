@@ -96,6 +96,13 @@ pub struct InspectedImage {
     pub thumbnail_mipmaps: Vec<ThumbnailMipmap>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedRgba8 {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ThumbnailMipmap {
     pub max_edge: u32,
@@ -328,6 +335,69 @@ pub fn inspect_bytes_cancellable(
     })
 }
 
+/// Decodes oriented, color-policy-aware RGBA pixels for authoritative patch rectification.
+///
+/// # Errors
+///
+/// Returns a typed failure before unbounded allocation when encoded bytes, dimensions, decoded memory, color
+/// profile, or cancellation violate the declared import limits.
+pub fn decode_rgba8_bytes_cancellable(
+    source_bytes: &[u8],
+    limits: DecodeLimits,
+    color_policy: ColorPolicy,
+    cancellation: &CancellationToken,
+) -> Result<DecodedRgba8, ImageIoError> {
+    ensure_not_cancelled(cancellation)?;
+    let encoded_bytes = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
+    if encoded_bytes > limits.max_encoded_bytes {
+        return Err(ImageIoError::EncodedSizeLimit {
+            actual: encoded_bytes,
+            limit: limits.max_encoded_bytes,
+        });
+    }
+    let reader = ImageReader::new(Cursor::new(source_bytes)).with_guessed_format()?;
+    let format = reader.format().ok_or(ImageIoError::UnsupportedFormat)?;
+    if !matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Tiff
+    ) {
+        return Err(ImageIoError::UnsupportedFormat);
+    }
+    let (width, height) = reader.into_dimensions()?;
+    if width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension {
+        return Err(ImageIoError::DimensionLimit {
+            limit: limits.max_dimension,
+        });
+    }
+    let decoded_estimate = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(16);
+    if decoded_estimate > limits.max_decoded_bytes {
+        return Err(ImageIoError::DecodedSizeLimit {
+            limit: limits.max_decoded_bytes,
+        });
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(source_bytes), format);
+    let mut image_limits = Limits::default();
+    image_limits.max_image_width = Some(limits.max_dimension);
+    image_limits.max_image_height = Some(limits.max_dimension);
+    image_limits.max_alloc = Some(limits.max_decoded_bytes);
+    reader.limits(image_limits);
+    let decoded = reader.decode()?;
+    ensure_not_cancelled(cancellation)?;
+    let orientation = read_orientation(Cursor::new(source_bytes));
+    let oriented = apply_orientation(decoded, orientation);
+    let icc_profile = extract_icc_profile(source_bytes, format)?;
+    let managed = apply_color_policy(oriented, icc_profile.as_deref(), color_policy)?;
+    ensure_not_cancelled(cancellation)?;
+    let rgba = managed.into_rgba8();
+    Ok(DecodedRgba8 {
+        width: rgba.width(),
+        height: rgba.height(),
+        pixels: rgba.into_raw(),
+    })
+}
+
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), ImageIoError> {
     if cancellation.is_cancelled() {
         Err(ImageIoError::Cancelled)
@@ -429,7 +499,8 @@ mod tests {
 
     use super::{
         CancellationToken, ColorPolicy, DecodeLimits, ImageIoError, apply_orientation,
-        inspect_bytes, inspect_bytes_cancellable, inspect_bytes_with_policy,
+        decode_rgba8_bytes_cancellable, inspect_bytes, inspect_bytes_cancellable,
+        inspect_bytes_with_policy,
     };
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -551,6 +622,33 @@ mod tests {
                 DecodeLimits::default(),
                 ColorPolicy::ConvertToSrgb,
                 &cancellation,
+            ),
+            Err(ImageIoError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn authoritative_rgba_decode_preserves_oriented_pixels_and_cancellation() {
+        let bytes = png_bytes(12, 8);
+        let decoded = decode_rgba8_bytes_cancellable(
+            &bytes,
+            DecodeLimits::default(),
+            ColorPolicy::ConvertToSrgb,
+            &CancellationToken::new(),
+        )
+        .expect("decode RGBA source");
+        assert_eq!((decoded.width, decoded.height), (12, 8));
+        assert_eq!(decoded.pixels.len(), 12 * 8 * 4);
+        assert_eq!(&decoded.pixels[..4], &[20, 40, 60, 128]);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            decode_rgba8_bytes_cancellable(
+                &bytes,
+                DecodeLimits::default(),
+                ColorPolicy::ConvertToSrgb,
+                &cancelled,
             ),
             Err(ImageIoError::Cancelled)
         ));

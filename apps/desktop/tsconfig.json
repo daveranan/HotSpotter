@@ -17,6 +17,6 @@
     "jsx": "react-jsx",
     "noUncheckedIndexedAccess": true
   },
-  "include": ["src", "vite.config.ts"]
+  "include": ["src", "vite.config.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }
-

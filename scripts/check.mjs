@@ -16,8 +16,11 @@ const required = [
   "docs/adr/0005-source-file-ownership.md",
   "docs/phase-reports/phase-0.md",
   "docs/phase-reports/phase-1.md",
+  "docs/phase-reports/phase-2.md",
   "docs/support/diagnostics.md",
   "docs/support/recovery.md",
+  "docs/support/security-review.md",
+  "docs/technical-spec.md",
   "apps/desktop/index.html",
   "apps/desktop/package.json",
   "apps/desktop/src/main.tsx",
@@ -27,8 +30,17 @@ const required = [
   "crates/domain/src/lib.rs",
   "packages/ipc-contracts/src/index.ts",
   "fixtures/contracts/foundation-status.json",
+  "fixtures/contracts/phase-1-lifecycle.json",
+  "fixtures/contracts/phase-2-patch-authoring.json",
   "fixtures/projects/schema-v1.sql",
   "fixtures/projects/migrate-v1-to-v2.sql",
+  "fixtures/projects/schema-v2.sql",
+  "fixtures/projects/migrate-v2-to-v3.sql",
+  "fixtures/projects/schema-v3.sql",
+  "fixtures/projects/migrate-v3-to-v4.sql",
+  "fixtures/projects/schema-v4.sql",
+  "fixtures/projects/migrate-v4-to-v5.sql",
+  "fixtures/renders/phase-2-rectification-cases.json",
   "fixtures/projects/data-v1.sql",
 ];
 
@@ -39,7 +51,7 @@ if (missing.length > 0) {
 }
 
 const plan = readFileSync(join(root, "docs", "mvp-plan.md"), "utf8");
-for (const term of ["Open image", "mark patches", "Create Trim Sheet", "ID Map", "Normal", "Roughness"]) {
+for (const term of ["Open Image", "Patches and Layout", "Create Trim Sheet", "ID Map", "Normal", "Roughness"]) {
   if (!plan.toLowerCase().includes(term.toLowerCase())) {
     console.error(`docs/mvp-plan.md missing required term: ${term}`);
     process.exit(1);
@@ -63,7 +75,7 @@ for (const member of ["crates/domain", "crates/project-store", "apps/desktop/src
 const desktop = readFileSync(join(root, "apps", "desktop", "src", "main.tsx"), "utf8");
 const styles = readFileSync(join(root, "apps", "desktop", "styles.css"), "utf8");
 for (const marker of [
-  'aria-label="MVP workflow"',
+  'aria-label="Work modes"',
   'role="alertdialog"',
   'aria-modal="true"',
   'aria-live="polite"',
@@ -79,4 +91,4 @@ if (!styles.includes("prefers-reduced-motion: reduce")) {
   process.exit(1);
 }
 
-console.log(`checked ${required.length} Hot Trimmer foundation and Phase 1 gate files`);
+console.log(`checked ${required.length} Hot Trimmer foundation through Phase 2 gate files`);

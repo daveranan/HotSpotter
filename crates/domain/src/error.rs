@@ -14,6 +14,7 @@ pub enum ErrorCode {
     DirtyProject,
     RecoveryFailed,
     SourceRegistrationFailed,
+    PatchGeometryInvalid,
     OperationCancelled,
     Internal,
 }

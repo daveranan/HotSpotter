@@ -15,6 +15,7 @@ fn owned_source(bytes: usize) -> SourceInput {
         id: SourceId::new(),
         ownership: SourceOwnership::OwnedCopy,
         external_path: None,
+        origin_path: PathBuf::from("kill-fixture.png"),
         sha256: "b".repeat(64),
         width: 64,
         height: 64,
@@ -58,7 +59,6 @@ fn crash_child() {
             fs::write(&signal, b"committed").expect("signal autosave commit");
         }
         "save" => {
-            fs::write(&signal, b"starting").expect("signal save start");
             store
                 .backup_atomic(&project.with_extension("saving"))
                 .expect("child save backup");
@@ -74,6 +74,7 @@ fn spawn_child(mode: &str, project: &Path, signal: &Path) -> std::process::Child
         .env("HOT_TRIMMER_CRASH_MODE", mode)
         .env("HOT_TRIMMER_PROJECT", project)
         .env("HOT_TRIMMER_SIGNAL", signal)
+        .env("HOT_TRIMMER_BACKUP_PUBLICATION_SIGNAL", signal)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -106,6 +107,10 @@ fn kill_during_save_never_damages_the_previous_project() {
     store
         .replace_source(SourceChannel::BaseColor, &owned_source(32 * 1024 * 1024))
         .expect("seed large project");
+    let baseline = project.with_extension("saving");
+    store
+        .backup_atomic(&baseline)
+        .expect("seed previous baseline");
     drop(store);
     let mut child = spawn_child("save", &project, &signal);
     wait_for(&signal);
@@ -114,5 +119,12 @@ fn kill_during_save_never_damages_the_previous_project() {
     let reopened = ProjectStore::open(&project).expect("previous project remains valid");
     assert_eq!(reopened.summary().expect("summary").sources.len(), 1);
     drop(reopened);
+    assert_eq!(
+        ProjectStore::inspect(&baseline)
+            .expect("previous baseline remains valid")
+            .sources
+            .len(),
+        1
+    );
     fs::remove_dir_all(fixture).expect("remove fixture");
 }

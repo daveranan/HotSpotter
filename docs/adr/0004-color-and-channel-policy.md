@@ -5,7 +5,8 @@
 
 ## Decision
 
-Base Color is color-managed. Height, Normal, Roughness, Metallic, AO/Cavity, masks, and IDs are linear data.
+Base Color/Diffuse is color-managed. Height/Bump, Normal, Roughness, Metallic, AO/Cavity, Specular, Opacity,
+Edge Mask, masks, and IDs are linear data.
 Normal operations decode, filter or blend, and renormalize vectors; orientation is explicit. ID maps use stable
 flat colors with no filtering at region boundaries.
 
@@ -16,4 +17,3 @@ assigned.
 
 Every decoder, renderer, preview, and export preset must declare channel semantics. Accidental color transforms
 or per-channel coordinate drift are release blockers.
-

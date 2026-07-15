@@ -1,0 +1,62 @@
+{
+  "createRequest": {
+    "protocolVersion": 1,
+    "path": "<project>",
+    "name": "Brick"
+  },
+  "importRequest": {
+    "protocolVersion": 1,
+    "path": "<source>",
+    "ownership": "owned_copy",
+    "channel": "specular"
+  },
+  "closeRequest": {
+    "protocolVersion": 1,
+    "disposition": "discard"
+  },
+  "recoverRequest": {
+    "protocolVersion": 1,
+    "recoveryPath": "<recovery>",
+    "destinationPath": "<recovered-project>"
+  },
+  "projectSnapshot": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "name": "Brick",
+    "path": "<project>",
+    "schemaVersion": 5,
+    "dirty": true,
+    "staleLockRecovered": false,
+    "sources": [
+      {
+        "id": "00000000-0000-4000-8000-000000000002",
+        "channel": "specular",
+        "ownership": "owned_copy",
+        "displayName": "Owned Specular",
+        "sourcePath": "",
+        "width": 2048,
+        "height": 2048,
+        "format": "PNG",
+        "colorType": "L8",
+        "hasAlpha": false,
+        "exifOrientation": 1,
+        "hasEmbeddedIccProfile": false,
+        "iccConvertedToSrgb": false,
+        "encodedBytes": 4096,
+        "thumbnailDataUrl": "data:image/png;base64,AA==",
+        "thumbnailMipmaps": [
+          { "maxEdge": 320, "dataUrl": "data:image/png;base64,AA==" }
+        ]
+      }
+    ],
+    "patches": [],
+    "canUndoPatch": false,
+    "canRedoPatch": false,
+    "warnings": [
+      {
+        "code": "recovery_failed",
+        "message": "Recovery snapshot could not be refreshed.",
+        "recovery": "Save explicitly to retry recovery publication."
+      }
+    ]
+  }
+}

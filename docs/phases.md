@@ -126,6 +126,13 @@ performance measurements, or a recorded manual verification checklist.
 Establish the production repository, native shell, durable contracts, and verification pipeline before
 feature implementation spreads.
 
+### Status
+
+- [x] Repository, native shell, contracts, CI, diagnostics, security review, and production build implemented.
+- [x] Automated Phase 0 gate passed.
+- [x] Native release executable builds and launches as a targetable Windows application.
+- [ ] Record the remaining packaged-app manual UI observation listed in the Phase 0 completion report.
+
 ### Implementation
 
 - Create the Tauri 2 desktop application, Rust workspace, TypeScript packages, and ownership boundaries
@@ -158,40 +165,78 @@ feature implementation spreads.
 
 ### Objective
 
-Deliver the first workflow step inside a durable native project that can safely survive close, crash, and
-upgrade.
+Deliver Sources mode inside a durable native project that can safely survive close, crash, and upgrade.
+
+### Status
+
+- [x] Phase 1 implementation complete.
+- [x] Full automated gate, strict lint/type checks, crash tests, web build, and native release build passed.
+- [x] Rebuilt release executable launched successfully on Windows.
+- [ ] Record keyboard-only and 100%/300% packaged-app checks; this is verification work, not missing code.
 
 ### Implementation
 
-- Implement the seven-step workflow bar, minimal left tool strip, central viewport, right inspector, and
-  compact bottom tray from `ux-workflow.md`.
-- Keep later steps visibly unavailable until their prerequisites exist; do not expose nonfunctional controls.
-- Add New, Open, Save, Save As, Close, Recent Projects, native file/folder dialogs, drag-and-drop, reveal in
+- [x] Implement three persistent authoring modes, central viewport, contextual right panel, compact source tray,
+  and separate Export/Send to Blender actions from `ux-workflow.md`. The roadmap remains sequential; the product
+  is not a wizard.
+- [x] Keep later modes visibly unavailable until their capabilities exist; enabled controls perform an action.
+- [x] Add New, Open, Save, Save As, Close, Recent Projects, native file/folder dialogs, drag-and-drop, reveal in
   folder, dirty-state prompts, persistent window geometry, and single-instance project routing.
-- Implement the project database, migrations, transactions, lock ownership, autosave journal, recovery
+- [x] Implement the project database, migrations, transactions, lock ownership, autosave journal, recovery
   snapshots, integrity check, and recovery UI.
-- Import PNG, JPEG, and TIFF source images with EXIF orientation, ICC handling, alpha policy, dimension and
+- [x] Import PNG, JPEG, and TIFF source images with EXIF orientation, ICC handling, alpha policy, dimension and
   memory limits, and useful errors. Add only the extra formats needed by the initial PBR-map fixtures.
-- Support one Base Color source by default and a small, explicitly assigned PBR set with dimension and
-  registration validation.
-- Build a mipmapped viewport with pan, zoom, fit, pixel inspection, checkerboard transparency, and responsive
-  loading that never decodes a large source on the UI thread.
+- [x] Make Open images the direct first-run action, creating the durable project after image selection. Add Open all
+  for multi-file filename-based assignment that imports Base Color first and never silently replaces filled slots.
+- [x] Support ten explicit material-input slots—Base Color/Diffuse, Normal, Height/Bump, Roughness, Metallic, AO,
+  Specular, Opacity, Edge Mask, and Material ID—with dimension and registration validation.
+- [x] Retain and display actual filename, original import path, and dimensions; keep ownership/color/alpha/ICC policy
+  out of routine Sources UI. Make the project name directly editable in the top bar.
+- [x] Build a mipmapped viewport with pan, zoom, fit, pixel inspection, checkerboard transparency, and responsive
+  loading that never decodes a large source on the UI thread. Put pan/zoom/fit in a compact lower-left HUD.
+
+### Implemented Behavior
+
+- [x] **Direct start:** Open images accepts one or many source files before project creation, then asks for the
+  durable `.hottrimmer` destination and imports the selected set.
+- [x] **Open all:** deterministic filename-token matching recognizes common long and short PBR names, establishes
+  Base Color first, fills only empty slots, and uses visible slot order for ambiguous leftovers.
+- [x] **Safe batch imports:** each image is a separate authoritative transaction. Successful earlier files remain
+  durable and visible if a later file fails validation or is cancelled.
+- [x] **Registered material set:** Base Color anchors oriented dimensions; companion maps are rejected when Base
+  Color is absent or dimensions do not match. Individual Add/Replace corrects automatic assignment.
+- [x] **Source provenance:** schema v4 stores original import path independently from storage ownership. Filled
+  slots and the source tray show role, filename, and dimensions; selected details show the full original path.
+- [x] **Inline project rename:** top-bar editing validates and journals the name, marks the session dirty, refreshes
+  recovery, and updates Recent Projects best-effort. Enter commits text; Escape restores the previous name.
+- [x] **Viewport HUD:** drag pans, wheel and small controls zoom, Fit resets the transform, the lower-left HUD shows
+  zoom, and the lower-right readout samples pixel coordinates/RGBA.
+- [x] **Crash-safe edit semantics:** source and rename transactions become authoritative before recovery refresh;
+  recovery publication failure is reported as a warning without hiding the committed edit or clearing dirty state.
+- [x] **Future-boundary enforcement:** Patches & Layout, Maps & Polish, embedded preview, Export, and Send to Blender
+  remain disabled or absent until their implementation phases. No placeholder is presented as working behavior.
 
 ### Required Evidence
 
-- Migration fixtures cover every schema version and failed/interrupted migration recovery.
-- Kill-process tests during save and autosave preserve the previous valid project.
-- Malformed, truncated, decompression-bomb, oversized, rotated, color-profiled, and alpha-bearing images fail
+- [x] Migration fixtures cover every schema version and failed/interrupted migration recovery.
+- [x] Kill-process tests during save and autosave preserve the previous valid project.
+- [x] Malformed, truncated, decompression-bomb, oversized, rotated, color-profiled, and alpha-bearing images fail
   safely or import correctly.
-- Keyboard-only and 100%-300% DPI checks cover the shell, dialogs, focus order, and viewport commands.
+- [x] Strict TypeScript, Rust formatting, Clippy with warnings denied, all workspace tests, production web build,
+  optimized native build, and Windows launch passed on 2026-07-15.
+- [ ] Keyboard-only and 100%-300% DPI checks cover the shell, dialogs, focus order, and viewport commands.
 
 ### Exit Criteria
 
-- A user can create a project, open an image, save, close, reopen, and recover after an unclean shutdown.
-- The source is never destructively modified and its ownership status is explicit.
-- Image loading, project saving, and recovery cannot block the UI indefinitely or silently lose data.
+- [x] A user can open one or many images directly, create its project, auto-fill material-input slots, rename, save,
+  close, reopen, and recover after an unclean shutdown.
+- [x] The source is never destructively modified; its filename, original path, and dimensions are visible.
+- [x] Image loading, project saving, and recovery use bounded/cancellable work and cannot silently lose committed
+  data under the tested failure modes.
 
 ## 7. Phase 2 - Patch Authoring and Perspective Correction
+
+**Status:** Reworked on 2026-07-15 after hands-on UX review. See `phase-reports/phase-2.md` for the gate record.
 
 ### Objective
 
@@ -199,14 +244,24 @@ Implement fast, precise patch marking and rectification while preserving editabi
 
 ### Implementation
 
-- Add the `Add Patch`, Select, Move, Pan, and Zoom tools with direct manipulation and numeric alternatives.
-- Support four-point placement, rectangle placement, live corner adjustment, accept/cancel, duplicate, rename,
-  reorder, enable/disable, and delete.
+- Use one integrated left/right workspace: a material-source/patch workplace on the left and the evolving hotspot
+  workpiece on the right. Source management is part of the workplace, not a separate primary mode.
+- Make selection directly movable, resizable, and rotatable. Double-click enters point editing; middle mouse pans
+  and the wheel zooms without selecting a dedicated tool.
+- Support arbitrary-order four-point placement and rectangle placement with automatic completion, live corner
+  adjustment, duplicate, rename, reorder, enable/disable, and delete. The capture order is canonicalized internally;
+  users never need to know renderer winding rules.
+- Add clearly named outline-fit assistance: eight boundary clicks automatically derive an editable best-fit
+  quadrilateral, while Enter may fit an earlier four-to-seven-point trace. It is an assisted quad capture tool,
+  not a separate polygon patch type.
 - Validate convexity, winding, minimum area, source bounds, degeneracy, and self-intersection before accepting
   a patch.
 - Implement homography estimation and inverse-mapped rectification with appropriate color/data sampling,
   transparent out-of-bounds behavior, and selectable output aspect/scale.
-- Show a live rectified preview and make repeated patch creation the default post-accept action.
+- Show the source outline and real-time rectification together in the fixed left/right workspace. During a drag,
+  a cached GPU preview updates without waiting for native PNG refinement.
+- Use one patch list. Rename by double-click, reorder by drag, and place duplicate/delete/enable actions in the
+  patch context menu; do not duplicate patch navigation in a bottom asset tray.
 - Add patch properties for Repeat X, Repeat Y, Tile XY, Stretch, Unique, Trim Cap, padding/bleed, material ID,
   and map-generation participation.
 - Route all edits through domain commands with coalesced drag undo, redo, dirty-state tracking, autosave, and
@@ -235,8 +290,24 @@ the source patch definitions.
 
 ### Implementation
 
+- Add ordered material-source sets. Each set represents one material idea, owns one registered collection of
+  Base Color and optional PBR/mask maps, and can own zero or many captured patches. Projects may contain many sets.
+- Add a persistent material-source library rail at the far left. Selecting a set exposes its explicit Base Color,
+  Normal, Height, Roughness, and other map slots above the source canvas; map import never creates a new set or
+  silently assigns an unrelated image to a data channel.
+- Keep material source sets and their patch workplace on the left while the authoritative hotspot sheet stays on
+  the right. Switching source sets never replaces or hides the assembled sheet.
+- Introduce layout regions independently of patches. A region may be filled by a whole material source, a captured
+  rectified patch, or a simple color/data input; patch capture is optional for producing a useful layout.
+- Represent every enabled patch used by the layout as its own placeable region/tile. Selecting a patch may inspect
+  it, but must not replace the entire layout canvas with a full-frame patch preview.
 - Implement layout settings for output resolution, padding, bleed, patch order, auto-pack, horizontal-strip
   priority, vertical-strip priority, fixed selected-patch size, repeat behavior, and trim-cap handling.
+- Add explained Balanced, Horizontal Trims, Vertical Trims, Modular Kit, and Atlas presets during New Project or
+  first layout entry. Persist preset intent and allow later changes without deleting patches or locked regions.
+- Keep patch authoring and layout views available within the same Patches & Layout mode.
+- Treat Horizontal Loop, Vertical Loop, Tile, Stretch, Unique Detail, and Trim Cap as visible region/fill behavior,
+  so users can build conventional trim sheets and hotspot atlases without reasoning about renderer internals.
 - Build a deterministic layout solver with stable tie-breaking and explicit failure diagnostics.
 - Preserve normalized cross-channel coordinates and integer output bounds for every region.
 - Let users drag boundaries, resize and reorder regions, lock dimensions, set exact numeric values, and rerun
@@ -255,7 +326,9 @@ the source patch definitions.
 
 ### Exit Criteria
 
-- `Create Trim Sheet` produces a credible first layout from marked patches.
+- `Create Trim Sheet` produces a credible first layout from selected material sources and optional patches.
+- A user can create and refine a hotspot sheet from whole material sources without capturing any patch.
+- A project can combine several material-source sets, each with its own registered maps and optional patches.
 - Users can refine and regenerate the layout without losing source work or cross-channel registration.
 - Impossible constraints are reported before export and never produce an apparently valid overlapping sheet.
 
@@ -313,7 +386,12 @@ Add focused material polish without introducing a node graph or destructive edit
 - Implement a versioned ordered layer model with visibility, opacity, blend mode, channel targets, mask input,
   seed, strength, scale, and invert.
 - Add Grunge, Edge Wear, Dirt, Color Adjust, Roughness Adjust, Height Boost, Decal, and Mask operations.
-- Allow layers to target the full layout or selected patches/regions while preserving shared coordinates.
+- Allow layers to target the full layout, a material-source set, or selected patches/regions while preserving
+  shared coordinates. Layer inputs may come from any imported source set and do not require a captured patch.
+- Make source images usable as paint/fill/mask inputs: for example, use a grunge source as the mask for rust or
+  weathering over a different metallic material source, with independent transform, scale, and intensity.
+- Add nondestructive procedural mask shapes such as circles, rectangles, gradients, and editable polygons.
+  These shapes control layer and treatment coverage; source patches remain rectifiable quadrilaterals.
 - Implement deterministic procedural noise and edge/cavity masks with explicit seeds.
 - Add layer create, duplicate, rename, reorder, group selection, enable/disable, delete, and inspector editing.
 - Make drag and slider interaction preview quickly, coalesce undo entries, and schedule authoritative refinement
@@ -331,11 +409,12 @@ Add focused material polish without introducing a node graph or destructive edit
 ### Exit Criteria
 
 - A user can add grunge or edge wear, mask it, target channels, reorder it, and reopen the project unchanged.
+- A user can combine multiple material sources through masks and treatments without destructively merging them.
 - Treatments remain nondestructive, deterministic, registered, undoable, and consistent between preview and
   export.
 - No treatment requires node-graph concepts to complete the MVP workflow.
 
-## 11. Phase 6 - 3D Preview and Authoritative Export
+## 11. Phase 6 - Embedded 3D Preview and Authoritative Output
 
 ### Objective
 
@@ -344,6 +423,7 @@ Prove the trim sheet on relevant geometry and export a complete, validated map s
 ### Implementation
 
 - Build a wgpu PBR preview using the same generated map handles and channel conventions as export.
+- Integrate preview as the resizable Patches & Layout card specified in Phase 2; it is not a separate mode.
 - Provide Plane, Cube, Sphere, Cylinder, Beveled Block, Crate, Wall Module, and Archway fixtures as capacity
   permits; at least one MVP mesh must have authored hotspot UVs that demonstrate actual trim usage.
 - Add orbit, pan, zoom, reset, mesh selection, light rotation, environment/exposure controls, and channel/debug
@@ -351,6 +431,7 @@ Prove the trim sheet on relevant geometry and export a complete, validated map s
 - Document preview approximations and compare preview shading and channel orientation against Blender fixtures.
 - Implement export presets for Blender PBR and generic PBR with output folder, naming template, resolution, bit
   depth, image format, OpenGL/DirectX normal orientation, overwrite policy, and selected maps.
+- Expose Export and Send to Blender as separate persistent top-level commands that preserve authoring context.
 - Export Base Color, Normal, Roughness, Metallic, Height, AO, and ID maps by default. Offer Region Guide and
   preview render only as explicit diagnostics.
 - Snapshot project state at job start; render to a staging directory; validate dimensions, channels, bit depth,

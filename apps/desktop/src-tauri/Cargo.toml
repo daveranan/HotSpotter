@@ -15,8 +15,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64.workspace = true
 hot-trimmer-domain.workspace = true
+hot-trimmer-geometry = { path = "../../../crates/geometry" }
 hot-trimmer-image-io = { path = "../../../crates/image-io" }
 hot-trimmer-project-store = { path = "../../../crates/project-store" }
+hot-trimmer-render-core = { path = "../../../crates/render-core" }
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }

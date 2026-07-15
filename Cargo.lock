@@ -1531,8 +1531,11 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hot-trimmer-domain",
+ "hot-trimmer-geometry",
  "hot-trimmer-image-io",
  "hot-trimmer-project-store",
+ "hot-trimmer-render-core",
+ "image",
  "serde",
  "serde_json",
  "tauri",
@@ -1551,6 +1554,7 @@ name = "hot-trimmer-domain"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -1567,6 +1571,7 @@ name = "hot-trimmer-geometry"
 version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1594,8 +1599,10 @@ name = "hot-trimmer-project-store"
 version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
+ "hot-trimmer-geometry",
  "rusqlite",
  "serde",
+ "serde_json",
  "sysinfo",
  "thiserror 2.0.18",
  "uuid",
@@ -1606,6 +1613,11 @@ name = "hot-trimmer-render-core"
 version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
+ "hot-trimmer-geometry",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
