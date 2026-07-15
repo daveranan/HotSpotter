@@ -1,0 +1,5 @@
+{
+  "extends": "../../apps/desktop/tsconfig.json",
+  "include": ["src"]
+}
+

@@ -4,8 +4,17 @@
   "private": true,
   "license": "UNLICENSED",
   "type": "module",
+  "workspaces": [
+    "apps/desktop",
+    "packages/*"
+  ],
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "check": "node scripts/check.mjs"
+    "build": "npm run build:web && cargo build --workspace",
+    "build:native": "npm run tauri --workspace @hot-trimmer/desktop -- build --no-bundle",
+    "build:web": "npm run build --workspace @hot-trimmer/desktop",
+    "check": "node scripts/check.mjs && npm run typecheck --workspaces --if-present && npm run test --workspaces --if-present && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace",
+    "dev": "npm run tauri --workspace @hot-trimmer/desktop -- dev",
+    "format": "cargo fmt --all",
+    "test": "npm run test --workspaces --if-present && cargo test --workspace"
   }
 }

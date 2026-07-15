@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Hot Trimmer">
+  <defs>
+    <linearGradient id="heat" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffbf4b" />
+      <stop offset="0.52" stop-color="#f2633a" />
+      <stop offset="1" stop-color="#c62f55" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#111315" />
+  <path d="M108 112h74v108h148V112h74v288h-74V292H182v108h-74z" fill="url(#heat)" />
+  <path d="M206 154h100v204H206z" fill="#111315" />
+  <path d="M224 172h64v168h-64z" fill="#e8ecef" />
+</svg>

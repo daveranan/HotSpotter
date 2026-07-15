@@ -1,0 +1,22 @@
+{
+  "request": {
+    "protocolVersion": 1
+  },
+  "response": {
+    "protocolVersion": 1,
+    "appVersion": "0.1.0",
+    "platform": "windows",
+    "directories": {
+      "appData": "<app-data>",
+      "cache": "<cache>",
+      "logs": "<logs>",
+      "recovery": "<recovery>"
+    },
+    "capabilities": [
+      "native_paths",
+      "typed_ipc",
+      "structured_diagnostics",
+      "native_dialog"
+    ]
+  }
+}
