@@ -9,16 +9,20 @@
 - Hands-on review replaced the separate Sources destination and overlay-heavy patch canvas with one fixed split:
   the material-source/patch workplace is on the left and the evolving hotspot workpiece is on the right.
 - Four-point capture accepts any click order, canonicalizes it internally, and commits after the fourth point.
-  Rectangle capture commits on release. Polygon assistance retains an explicit finish because its point count is
-  intentionally variable. Escape cancels incomplete capture or restores an interrupted manipulation.
-- A selected patch moves by dragging its interior and exposes resize/rotate handles. Double-click switches to
-  labeled TL/TR/BR/BL point editing. Middle mouse pans and the wheel zooms without dedicated Move/Pan/Zoom tools.
+  Rectangle capture commits on release. Outline Fit commits automatically at eight points, with Enter allowing
+  an intentional early four-to-seven-point fit. Escape cancels incomplete capture or restores a manipulation.
+- A selected patch moves by dragging its interior and exposes scale handles on its actual corners. Rotation uses
+  cursor-only hit zones outside those corners without an extra bounding box or visible gizmos. Double-click switches
+  to labeled TL/TR/BR/BL point editing. Stable viewport-level pointer capture and drag-generation guards prevent
+  rerenders or earlier native command completions from resetting an active edit.
 - One sidebar patch list supports double-click rename and drag reorder. Duplicate, enable/disable, rename, and
   confirmed delete live in a right-click context menu. The duplicate bottom tray and floating preview were removed.
 - Cached WebGL rectification updates directly in the right workpiece throughout pointer movement. The bounded,
   deterministic native preview refines after interaction settles and never blocks direct manipulation.
-- Region behavior uses user-facing Horizontal Loop, Vertical Loop, Tile, Stretch, Unique Detail, and Trim Cap
+- Region behavior uses icon-backed Single, Horizontal Loop, Vertical Loop, Tile, Stretch, and Trim Cap
   language while preserving repeat, padding, bleed, material ID, map participation, aspect, and scale contracts.
+- The selected material exposes explicit channel slots with Base Color, Normal, Height, Roughness, and other
+  swatches. Bulk import only fills matching empty roles; it never guesses an unrelated image into a data-map slot.
 - All accepted edits use typed domain commands. Geometry drags coalesce into one history operation; undo/redo,
   dirty state, autosave journaling, recovery refresh, and patch-scoped cache invalidation are deterministic.
 
