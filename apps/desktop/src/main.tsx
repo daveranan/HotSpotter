@@ -10,7 +10,6 @@ import {
   IPC_PROTOCOL_VERSION,
   type CloseProjectRequest,
   type CommandFailure,
-  type CreateProjectRequest,
   type FoundationStatusRequest,
   type ImportSourceRequest,
   type ProjectNameRequest,
@@ -84,12 +83,19 @@ function nextEmptyChannel(sources: SourceSnapshot[]): SourceChannel {
   return channelOptions.find((option) => !sources.some((source) => source.channel === option.value))?.value ?? "base_color";
 }
 
+function activeSourceSetId(project: ProjectSnapshot): string {
+  // Schema v5 has one registered material set. The project ID is its stable compatibility identity until
+  // Phase 3 persists explicit ordered source sets and native snapshots return their IDs.
+  return project.sources[0]?.sourceSetId ?? project.id;
+}
+
 function App(): React.JSX.Element {
   const [project, setProject] = useState<ProjectSnapshot | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [recoveries, setRecoveries] = useState<RecoveryCandidate[]>([]);
   const [showRecents, setShowRecents] = useState(false);
   const [showRecovery, setShowRecovery] = useState(false);
+  const [crashRecoveryAvailable, setCrashRecoveryAvailable] = useState(false);
   const [showDirtyPrompt, setShowDirtyPrompt] = useState(false);
   const [failure, setFailure] = useState<CommandFailure | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -117,8 +123,8 @@ function App(): React.JSX.Element {
   useEffect(() => {
     if (!native) return;
     void invoke<StartupStatus>("startup_status", { request }).then(async (status) => {
-      await refreshLists();
-      if (!status.previousShutdownClean) setShowRecovery(true);
+      const lists = await refreshLists();
+      setCrashRecoveryAvailable(!status.previousShutdownClean && lists.recovery.length > 0);
     });
     void invoke<string | null>("take_pending_project_path", { request }).then((path) => {
       if (path) void requestReplacement(() => openProjectAt(path));
@@ -129,7 +135,6 @@ function App(): React.JSX.Element {
     if (!native) return;
     let removeDrop: (() => void) | undefined;
     let removeRoute: (() => void) | undefined;
-    let removeMenu: (() => void) | undefined;
     let removeProgress: (() => void) | undefined;
     void getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type !== "drop") return;
@@ -147,22 +152,10 @@ function App(): React.JSX.Element {
     void listen<string>("open-project-requested", (event) => {
       void requestReplacement(() => openProjectAt(event.payload));
     }).then((unlisten) => { removeRoute = unlisten; });
-    void listen<string>("menu-action", (event) => {
-      switch (event.payload) {
-        case "new_project": void requestReplacement(() => createProject()); break;
-        case "open_project": void requestReplacement(chooseProject); break;
-        case "open_image": if (project) void chooseImages(); else void startFromImages(); break;
-        case "save_project": void saveProject(); break;
-        case "save_project_as": void saveProjectAs(); break;
-        case "close_project": void requestCloseProject(); break;
-        case "reveal_project": if (project) void revealItemInDir(project.path); break;
-        case "show_recovery": if (!showDirtyPrompt) setShowRecovery(true); break;
-      }
-    }).then((unlisten) => { removeMenu = unlisten; });
     void listen<ImportProgress>("import-progress", (event) => {
       setImportProgress(event.payload);
     }).then((unlisten) => { removeProgress = unlisten; });
-    return () => { removeDrop?.(); removeRoute?.(); removeMenu?.(); removeProgress?.(); };
+    return () => { removeDrop?.(); removeRoute?.(); removeProgress?.(); };
   }, [native, importChannel, project, showDirtyPrompt]);
 
   useEffect(() => {
@@ -252,13 +245,14 @@ function App(): React.JSX.Element {
     finally { setBusy(null); }
   }
 
-  async function refreshLists(): Promise<void> {
-    if (!native) return;
+  async function refreshLists(): Promise<{ recent: RecentProject[]; recovery: RecoveryCandidate[] }> {
+    if (!native) return { recent: [], recovery: [] };
     const [recent, recovery] = await Promise.all([
       invoke<RecentProject[]>("list_recent_projects", { request }).catch(() => []),
       invoke<RecoveryCandidate[]>("list_recovery_candidates", { request }).catch(() => []),
     ]);
     setRecentProjects(recent); setRecoveries(recovery);
+    return { recent, recovery };
   }
 
   async function requestReplacement(action: () => Promise<void>): Promise<void> {
@@ -279,22 +273,19 @@ function App(): React.JSX.Element {
     setShowDirtyPrompt(false);
     const next = pendingAfterClose.current;
     pendingAfterClose.current = null;
+    if (disposition === "save" && project?.isDraft) {
+      const saved = await saveProjectAs();
+      if (!saved) return;
+      const closed = await closeCurrent("discard");
+      if (closed && next) await next();
+      return;
+    }
     const closed = await closeCurrent(disposition);
     if (closed && next) await next();
   }
 
   async function createProject(initialImagePaths?: string[]): Promise<void> {
-    const chosen = await run("New project dialog", () => save({
-      title: "New Hot Trimmer project", defaultPath: "Untitled.hottrimmer",
-      filters: [{ name: "Hot Trimmer Project", extensions: ["hottrimmer"] }],
-    }));
-    if (!chosen.ok || !chosen.value) return;
-    const path = chosen.value;
-    const fileName = path.split(/[\\/]/).at(-1) ?? "Untitled";
-    const createRequest: CreateProjectRequest = {
-      protocolVersion: IPC_PROTOCOL_VERSION, path, name: fileName.replace(/\.hottrimmer$/i, ""),
-    };
-    const result = await run("Create project", () => invoke<ProjectSnapshot>("create_project", { request: createRequest }));
+    const result = await run("Create draft", () => invoke<ProjectSnapshot>("create_draft_project", { request }));
     if (result.ok && result.value) {
       acceptProject(result.value);
       if (initialImagePaths?.length) await importImages(initialImagePaths, result.value);
@@ -336,22 +327,22 @@ function App(): React.JSX.Element {
     } : current);
   }
 
-  async function chooseImage(channelOverride?: SourceChannel): Promise<void> {
+  async function chooseImage(channelOverride?: SourceChannel, sourceSetIdOverride?: string): Promise<void> {
     const channel = channelOverride ?? importChannel;
     const chosen = await run("Image dialog", () => open({
       title: `Import ${channelLabel(channel)} source`, multiple: false, directory: false,
       filters: [{ name: "Source image", extensions: ["png", "jpg", "jpeg", "tif", "tiff"] }],
     }));
-    if (chosen.ok && chosen.value) await importImage(chosen.value, undefined, channel);
+    if (chosen.ok && chosen.value) await importImage(chosen.value, undefined, channel, sourceSetIdOverride);
   }
 
-  async function chooseImages(): Promise<void> {
+  async function chooseImages(sourceSetIdOverride?: string): Promise<void> {
     if (!project) return;
     const chosen = await run("Open source set", () => open({
       title: "Open and auto-assign source images", multiple: true, directory: false,
       filters: [{ name: "Source images", extensions: ["png", "jpg", "jpeg", "tif", "tiff"] }],
     }));
-    if (chosen.ok && chosen.value) await importImages(Array.isArray(chosen.value) ? chosen.value : [chosen.value]);
+    if (chosen.ok && chosen.value) await importImages(Array.isArray(chosen.value) ? chosen.value : [chosen.value], undefined, sourceSetIdOverride);
   }
 
   async function startFromImages(): Promise<void> {
@@ -365,10 +356,12 @@ function App(): React.JSX.Element {
     }
   }
 
-  async function importImages(paths: string[], projectOverride?: ProjectSnapshot): Promise<void> {
+  async function importImages(paths: string[], projectOverride?: ProjectSnapshot, sourceSetIdOverride?: string): Promise<void> {
     const targetProject = projectOverride ?? project;
     if (!targetProject) return;
-    const assignments = assignSourceFiles(paths, targetProject.sources.map((source) => source.channel));
+    const sourceSetId = sourceSetIdOverride ?? activeSourceSetId(targetProject);
+    const setSources = targetProject.sources.filter((source) => source.sourceSetId === sourceSetId);
+    const assignments = assignSourceFiles(paths, setSources.map((source) => source.channel));
     if (!assignments.length) {
       setFailure({ code: "source_map_not_identified", message: "No selected file matched an empty map slot in Material 1.", recovery: "Click an empty Base Color, Normal, Height, or other map slot to import that channel explicitly. Independent material sources arrive in Phase 3." });
       return;
@@ -381,6 +374,7 @@ function App(): React.JSX.Element {
       setImportProgress({ stage: `Auto-assigning ${index + 1} of ${assignments.length}: ${channelLabel(assignment.channel)}`, fraction: index / assignments.length });
       const importRequest: ImportSourceRequest = {
         protocolVersion: IPC_PROTOCOL_VERSION, path: assignment.path, ownership: "owned_copy", channel: assignment.channel,
+        sourceSetId,
       };
       const result = await run("Import image", () => invoke<ProjectSnapshot>("import_source", { request: importRequest }));
       if (!result.ok || !result.value) break;
@@ -390,7 +384,7 @@ function App(): React.JSX.Element {
     setImportProgress(null);
     if (completed > 0) {
       setSelectedChannel(assignments[completed - 1]?.channel ?? "base_color");
-      setImportChannel(nextEmptyChannel(snapshot.sources));
+      setImportChannel(nextEmptyChannel(snapshot.sources.filter((source) => source.sourceSetId === sourceSetId)));
       fitView(); void refreshLists();
       if (completed === assignments.length && assignments.length < paths.length) {
         setFailure({ code: "source_maps_skipped", message: `${paths.length - assignments.length} file(s) did not match an empty map slot and were not imported.`, recovery: "Use an empty channel slot for an explicit map. Phase 3 adds multiple independent material sources." });
@@ -398,7 +392,7 @@ function App(): React.JSX.Element {
     }
   }
 
-  async function importImage(path: string, projectOverride?: ProjectSnapshot, channelOverride?: SourceChannel): Promise<void> {
+  async function importImage(path: string, projectOverride?: ProjectSnapshot, channelOverride?: SourceChannel, sourceSetIdOverride?: string): Promise<void> {
     const targetProject = projectOverride ?? project;
     const targetChannel = channelOverride ?? importChannel;
     if (!targetProject) {
@@ -407,12 +401,14 @@ function App(): React.JSX.Element {
     }
     const importRequest: ImportSourceRequest = {
       protocolVersion: IPC_PROTOCOL_VERSION, path, ownership: "owned_copy", channel: targetChannel,
+      sourceSetId: sourceSetIdOverride ?? activeSourceSetId(targetProject),
     };
     setImportProgress({ stage: "Preparing", fraction: 0 });
     const result = await run("Import image", () => invoke<ProjectSnapshot>("import_source", { request: importRequest }));
     setImportProgress(null);
     if (result.ok && result.value) {
-      setProject(result.value); setSelectedChannel(targetChannel); setImportChannel(nextEmptyChannel(result.value.sources)); fitView(); void refreshLists();
+      const importedSetId = sourceSetIdOverride ?? activeSourceSetId(targetProject);
+      setProject(result.value); setSelectedChannel(targetChannel); setImportChannel(nextEmptyChannel(result.value.sources.filter((source) => source.sourceSetId === importedSetId))); fitView(); void refreshLists();
     }
   }
 
@@ -436,7 +432,7 @@ function App(): React.JSX.Element {
   }
 
   async function removeSelectedSource(): Promise<void> {
-    if (!slotSource) return;
+    if (!slotSource || !project) return;
     const accepted = await confirm(
       `Clear ${channelLabel(slotSource.channel)} from this project? The original image is never deleted.`,
       { title: "Clear material input", kind: "warning" },
@@ -445,6 +441,7 @@ function App(): React.JSX.Element {
     const removeRequest: SourceSlotRequest = {
       protocolVersion: IPC_PROTOCOL_VERSION,
       channel: slotSource.channel,
+      sourceSetId: activeSourceSetId(project),
     };
     const result = await run("Clear material input", () => invoke<ProjectSnapshot>("remove_source", { request: removeRequest }));
     if (result.ok && result.value) {
@@ -465,22 +462,33 @@ function App(): React.JSX.Element {
     else setNameDraft(project.name);
   }
 
-  async function saveProject(): Promise<void> {
-    if (!project) return;
+  async function saveProject(): Promise<boolean> {
+    if (!project) return false;
+    if (project.isDraft) return saveProjectAs();
     const result = await run("Save project", () => invoke<ProjectSnapshot>("save_project", { request }));
     if (result.ok && result.value) { setProject(result.value); void refreshLists(); }
+    return result.ok;
   }
 
-  async function saveProjectAs(): Promise<void> {
-    if (!project) return;
+  async function saveProjectAs(): Promise<boolean> {
+    if (!project) return false;
     const chosen = await run("Save As dialog", () => save({
-      title: "Save Hot Trimmer project as", defaultPath: `${project.name} Copy.hottrimmer`,
+      title: "Save Hot Trimmer project as", defaultPath: `${project.name}${project.isDraft ? "" : " Copy"}.hottrimmer`,
       filters: [{ name: "Hot Trimmer Project", extensions: ["hottrimmer"] }],
     }));
-    if (!chosen.ok || !chosen.value) return;
+    if (!chosen.ok || !chosen.value) return false;
     const saveRequest: ProjectPathRequest = { protocolVersion: IPC_PROTOCOL_VERSION, path: chosen.value };
     const result = await run("Save project as", () => invoke<ProjectSnapshot>("save_project_as", { request: saveRequest }));
     if (result.ok && result.value) acceptProject(result.value);
+    return result.ok;
+  }
+
+  async function clearRecovery(): Promise<void> {
+    const result = await run("Clear recovery", () => invoke<void>("clear_recovery_candidates", { request }));
+    if (!result.ok) return;
+    setRecoveries([]);
+    setCrashRecoveryAvailable(false);
+    setShowRecovery(false);
   }
 
   async function closeCurrent(disposition: "save" | "discard"): Promise<boolean> {
@@ -563,31 +571,55 @@ function App(): React.JSX.Element {
 
   return (
     <main className="app-shell" aria-label="Hot Trimmer desktop workspace">
-      <header className="topbar">
-        <strong className="brand">Hot Trimmer</strong>
+      <header className="topbar" data-tauri-drag-region>
+        <strong className="brand" data-tauri-drag-region>Hot Trimmer</strong>
         <div className="project-actions" aria-label="Project actions">
           <button onClick={() => void requestReplacement(() => createProject())} disabled={!native || busy !== null} title="New project (Ctrl+N)">New</button>
           <button onClick={() => void requestReplacement(chooseProject)} disabled={!native || busy !== null} title="Open project (Ctrl+O)">Open</button>
           <div className="menu-anchor">
             <button onClick={() => setShowRecents((shown) => !shown)} disabled={!native || busy !== null} aria-expanded={showRecents}>Recent</button>
-            {showRecents ? <div className="popup-menu" role="menu">{recentProjects.length ? recentProjects.map((recent) => <button key={recent.path} role="menuitem" disabled={!recent.available} onClick={() => void requestReplacement(() => openProjectAt(recent.path))}><strong>{recent.name}</strong><small>{recent.available ? recent.path : "Unavailable"}</small></button>) : <span>No recent projects</span>}</div> : null}
+            {showRecents ? <div className="popup-menu" role="menu">{recentProjects.some((recent) => recent.available) ? recentProjects.filter((recent) => recent.available).map((recent) => <button key={recent.path} role="menuitem" onClick={() => void requestReplacement(() => openProjectAt(recent.path))}><strong>{recent.name}</strong><small>{recent.path}</small></button>) : <span>No recent projects</span>}</div> : null}
           </div>
-          <button onClick={() => void saveProject()} disabled={!project || !project.dirty || busy !== null} title="Save (Ctrl+S)">Save</button>
+          <button onClick={() => void saveProject()} disabled={!project || (!project.dirty && !project.isDraft) || busy !== null} title="Save (Ctrl+S)">Save</button>
           <button onClick={() => void saveProjectAs()} disabled={!project || busy !== null} title="Save As (Ctrl+Shift+S)">Save As</button>
           <button onClick={() => void requestCloseProject()} disabled={!project || busy !== null} title="Close project (Ctrl+W)">Close</button>
-          <button onClick={() => void revealItemInDir(project?.path ?? "").catch((reason) => setFailure(failureFrom(reason, "Reveal in folder failed.")))} disabled={!project || busy !== null}>Reveal</button>
+          <button onClick={() => void revealItemInDir(project?.path ?? "").catch((reason) => setFailure(failureFrom(reason, "Reveal in folder failed.")))} disabled={!project || project.isDraft || busy !== null}>Reveal</button>
         </div>
-        {project ? <div className="project-context" title={`${project.path}\nClick the name to edit`}><input aria-label="Project name" value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} onBlur={() => void renameProject()} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); else if (event.key === "Escape") { setNameDraft(project.name); event.currentTarget.blur(); } }} /><span className={project.dirty ? "pending" : "saved"}>{project.dirty ? "Save pending" : "Saved"}</span></div> : null}
-        <nav className="workflow" aria-label="Work modes">
+        {project ? <div className="project-context" title={project.isDraft ? "Unsaved working document" : `${project.path}\nClick the name to edit`}><input aria-label="Project name" value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} onBlur={() => void renameProject()} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); else if (event.key === "Escape") { setNameDraft(project.name); event.currentTarget.blur(); } }} /><span className={project.isDraft || project.dirty ? "pending" : "saved"}>{project.isDraft ? "Draft" : project.dirty ? "Unsaved changes" : "Saved"}</span></div> : null}
+        {project ? <nav className="workflow" aria-label="Work modes">
           {workspaceModes.map((mode) => {
             const unavailable = !mode.available || !project;
             return <button key={mode.id} className={`mode ${mode.id === workspaceMode ? "active" : ""}`} aria-current={mode.id === workspaceMode ? "page" : undefined} disabled={unavailable} onClick={() => { if (mode.id !== "maps") setWorkspaceMode(mode.id); }} title={mode.detail}>{mode.label}{!mode.available ? <small>Later</small> : null}</button>;
           })}
-        </nav>
-        <div className="publish-actions" aria-label="Output actions"><button disabled title="Export arrives in a later phase">Export <small>Later</small></button><button disabled title="Send directly to Blender arrives after export integration">Send to Blender <small>Later</small></button></div>
+        </nav> : null}
+        {project ? <div className="publish-actions" aria-label="Output actions"><button disabled title="Export arrives in a later phase">Export <small>Later</small></button><button disabled title="Send directly to Blender arrives after export integration">Send to Blender <small>Later</small></button></div> : <span className="window-drag-space" data-tauri-drag-region />}
+        {native ? <div className="window-controls" aria-label="Window controls">
+          <button aria-label="Minimize" title="Minimize" onClick={() => void getCurrentWindow().minimize()}>−</button>
+          <button aria-label="Maximize or restore" title="Maximize or restore" onClick={() => void getCurrentWindow().toggleMaximize()}>□</button>
+          <button className="window-close" aria-label="Close" title="Close" onClick={() => void getCurrentWindow().close()}>×</button>
+        </div> : null}
       </header>
 
-      <section className="workspace" aria-labelledby="workspace-title" hidden={workspaceMode !== "sources" && project !== null}>
+      {!project ? <section className="start-screen" aria-labelledby="start-title">
+        <div className="start-content">
+          <div className="start-hero">
+            <span className="start-mark" aria-hidden="true">HT</span>
+            <div><span className="eyebrow">Hot Trimmer</span><h1 id="start-title">Start a material workbench</h1><p>Open source images immediately, or return to a saved project. You choose a filename only when you save.</p></div>
+          </div>
+          <div className="start-actions">
+            <button className="primary" onClick={() => void startFromImages()} disabled={!native || busy !== null}>Open images</button>
+            <button onClick={() => void requestReplacement(() => createProject())} disabled={!native || busy !== null}>New blank</button>
+            <button onClick={() => void requestReplacement(chooseProject)} disabled={!native || busy !== null}>Open project</button>
+          </div>
+          {crashRecoveryAvailable ? <section className="crash-recovery-card"><div><strong>Work from an interrupted session is available</strong><span>Recovery stays optional and always creates a separate project.</span></div><button onClick={() => setShowRecovery(true)}>Review</button><button onClick={() => void clearRecovery()}>Dismiss</button></section> : null}
+          <section className="recent-section" aria-labelledby="recent-title"><div className="section-heading"><h2 id="recent-title">Recent projects</h2>{recentProjects.some((recent) => recent.available) ? <button onClick={() => void requestReplacement(chooseProject)}>Browse…</button> : null}</div>
+            <div className="recent-grid">{recentProjects.some((recent) => recent.available) ? recentProjects.filter((recent) => recent.available).slice(0, 8).map((recent) => <button key={recent.path} className="recent-card" onClick={() => void requestReplacement(() => openProjectAt(recent.path))}><span className="recent-icon" aria-hidden="true">HT</span><span><strong>{recent.name}</strong><small>{recent.path}</small></span></button>) : <div className="recent-empty"><strong>No recent projects yet</strong><span>Saved projects will appear here.</span></div>}</div>
+          </section>
+        </div>
+        {busy ? <div className="busy" role="status"><span /><strong>{importProgress?.stage ?? busy}…</strong></div> : null}
+      </section> : null}
+
+      <section className="workspace" aria-labelledby="workspace-title" hidden={!project || workspaceMode !== "sources"}>
         <header className="panel-title"><div><span className="eyebrow">{selectedSource ? channelLabel(selectedSource.channel) : "Source workspace"}</span><strong id="workspace-title">{selectedSource?.displayName ?? "No source image"}</strong></div></header>
         <div className={`viewport ${selectedSource ? "has-source" : ""}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onPointerLeave={() => setPixel(null)} onWheel={(event) => { if (!selectedSource) return; event.preventDefault(); zoomBy(event.deltaY < 0 ? 1.1 : 0.9); }}>
           {selectedSource && imageUrl ? <img ref={imageRef} src={imageUrl} alt={`${channelLabel(selectedSource.channel)} source ${selectedSource.displayName}`} draggable={false} onLoad={prepareSampler} style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }} /> : <div className="empty-state"><span className="empty-icon" aria-hidden="true">▧</span><h1>{project ? "Open your material sources" : "Open images and start"}</h1><p>{project ? "Select a texture set and Hot Trimmer will auto-assign its named maps." : "Choose one or more images first; Hot Trimmer will then ask where to save the project."}</p><div className="empty-actions">{project ? <><button className="primary" onClick={() => void chooseImages()} disabled={busy !== null}>Open all</button><button onClick={() => { setImportChannel("base_color"); void chooseImage("base_color"); }} disabled={busy !== null}>Add Base Color only</button></> : <><button className="primary" onClick={() => void startFromImages()} disabled={!native || busy !== null}>Open images</button><button onClick={() => void requestReplacement(() => createProject())} disabled={!native || busy !== null}>New Empty Project</button><button onClick={() => void requestReplacement(chooseProject)} disabled={!native || busy !== null}>Open Project</button></>}</div><small>{native ? "Drop an image set here to auto-assign it, or add maps individually." : "Native actions are available in the desktop build."}</small></div>}
@@ -597,7 +629,7 @@ function App(): React.JSX.Element {
         </div>
       </section>
 
-      <aside className="inspector" aria-label="Material input manager" hidden={workspaceMode !== "sources"}>
+      <aside className="inspector" aria-label="Material input manager" hidden={!project || workspaceMode !== "sources"}>
         <header className="panel-title source-panel-title"><div><span className="eyebrow">Sources mode</span><strong>Material inputs</strong></div><div className="source-header-actions"><span className="slot-count">{project?.sources.length ?? 0} / {channelOptions.length}</span><button className="primary" onClick={() => void chooseImages()} disabled={!project || project.sources.length >= channelOptions.length || busy !== null}>+ Open all</button></div></header>
         <section className="source-slots" aria-label="Material input slots">
           {channelOptions.map((option) => { const source = project?.sources.find((candidate) => candidate.channel === option.value); const unavailable = option.value !== "base_color" && !baseColor; return <button key={option.value} className={`source-slot ${importChannel === option.value ? "active" : ""} ${source ? "filled" : ""}`} onClick={() => chooseSlot(option.value)} disabled={!project || unavailable} title={unavailable ? "Add Base Color first" : option.description}><span className={`channel-swatch ${option.tone}`}>{option.short}</span><span><strong>{option.label}</strong><small>{source ? source.displayName : unavailable ? "Needs Base Color" : "Empty slot"}</small></span><b aria-label={source ? "Assigned" : "Not assigned"}>{source ? "●" : "+"}</b></button>; })}
@@ -610,12 +642,12 @@ function App(): React.JSX.Element {
         {failure ? <section className="error-card" role="alert"><strong>{failure.message}</strong><span>{failure.recovery}</span>{failure.detail ? <details><summary>Technical detail</summary><code>{failure.detail}</code></details> : null}</section> : null}
       </aside>
 
-      <section className="bottom-tray" aria-label="Imported source library" hidden={workspaceMode !== "sources"}><span className="tray-label">Sources</span>{project?.sources.map((source) => { const option = channelOptions.find((candidate) => candidate.value === source.channel)!; return <button key={source.id} title={source.sourcePath || source.displayName} className={`tray tray-source ${source.channel === selectedSource?.channel ? "active" : ""}`} onClick={() => { setSelectedChannel(source.channel); setImportChannel(source.channel); fitView(); }}><span className={`channel-swatch ${option.tone}`}>{option.short}</span><span><strong>{source.displayName}</strong><small>{source.width} × {source.height}</small></span></button>; })}{project && project.sources.length < channelOptions.length ? <button className="tray add-tray" onClick={() => void chooseImages()}>+ Open all</button> : null}{warningCount ? <span className="tray warning" role="status">Warnings <b>{warningCount}</b></span> : null}</section>
-      {project ? <PatchWorkspace hidden={workspaceMode !== "patches"} project={project} onPatchState={acceptPatchState} onFailure={setFailure} onOpenSources={() => void chooseImages()} onOpenSourceChannel={(channel) => void chooseImage(channel)} /> : null}
-      <footer className="statusbar"><span>{project ? `${project.name}${project.dirty ? " *" : ""}` : "No project"}</span><span>{project?.dirty ? "Recovery updated · explicit Save pending" : project ? "Saved" : "Choose Open Image to begin"}</span><span>{selectedSource ? `${channelLabel(selectedSource.channel)} · ${selectedSource.width} × ${selectedSource.height} ${selectedSource.format}` : "No material input selected"}</span><span>Schema v{project?.schemaVersion ?? "–"} · Offline</span></footer>
+      <section className="bottom-tray" aria-label="Imported source library" hidden={!project || workspaceMode !== "sources"}><span className="tray-label">Sources</span>{project?.sources.map((source) => { const option = channelOptions.find((candidate) => candidate.value === source.channel)!; return <button key={source.id} title={source.sourcePath || source.displayName} className={`tray tray-source ${source.channel === selectedSource?.channel ? "active" : ""}`} onClick={() => { setSelectedChannel(source.channel); setImportChannel(source.channel); fitView(); }}><span className={`channel-swatch ${option.tone}`}>{option.short}</span><span><strong>{source.displayName}</strong><small>{source.width} × {source.height}</small></span></button>; })}{project && project.sources.length < channelOptions.length ? <button className="tray add-tray" onClick={() => void chooseImages()}>+ Open all</button> : null}{warningCount ? <span className="tray warning" role="status">Warnings <b>{warningCount}</b></span> : null}</section>
+      {project ? <PatchWorkspace hidden={workspaceMode !== "patches"} project={project} onPatchState={acceptPatchState} onFailure={setFailure} onAddSource={() => void chooseImage("base_color", crypto.randomUUID())} onOpenSources={(sourceSetId) => void chooseImages(sourceSetId)} onOpenSourceChannel={(channel, sourceSetId) => void chooseImage(channel, sourceSetId)} /> : null}
+      {project ? <footer className="statusbar"><span>{project.name}</span><span>{project.isDraft ? "Draft · choose Save when ready" : project.dirty ? "Unsaved changes" : "Saved"}</span><span>{selectedSource ? `${channelLabel(selectedSource.channel)} · ${selectedSource.width} × ${selectedSource.height}` : "No source selected"}</span></footer> : null}
 
       {showDirtyPrompt ? <div className="modal-backdrop" role="presentation"><section ref={modalRef} className="modal" role="alertdialog" aria-modal="true" aria-labelledby="dirty-title" aria-describedby="dirty-description"><span className="modal-kicker">Unsaved changes</span><h2 id="dirty-title">Save changes to {project?.name}?</h2><p id="dirty-description">Autosave recovery exists, but closing with Discard restores the last explicit save.</p><div className="modal-actions"><button className="primary" onClick={() => void resolveDirty("save")}>Save</button><button className="danger" onClick={() => void resolveDirty("discard")}>Discard</button><button onClick={() => { pendingAfterClose.current = null; setShowDirtyPrompt(false); }}>Cancel</button></div></section></div> : null}
-      {showRecovery ? <div className="modal-backdrop" role="presentation"><section ref={modalRef} className="modal recovery-modal" role="dialog" aria-modal="true" aria-labelledby="recovery-title"><span className="modal-kicker">Crash-safe snapshots</span><h2 id="recovery-title">Recovery</h2><p>Recovery always creates a new project and never overwrites the original.</p><div className="recovery-list">{recoveries.length ? recoveries.map((candidate) => <div key={candidate.path}><div><strong>{candidate.projectName}</strong><small>{new Date(candidate.modifiedUnix * 1000).toLocaleString()} · {candidate.sourceCount} inputs</small></div><button onClick={() => beginRecovery(candidate)}>Recover As…</button></div>) : <span>No valid recovery snapshots were found.</span>}</div><div className="modal-actions"><button onClick={() => setShowRecovery(false)}>Close</button></div></section></div> : null}
+      {showRecovery ? <div className="modal-backdrop" role="presentation"><section ref={modalRef} className="modal recovery-modal" role="dialog" aria-modal="true" aria-labelledby="recovery-title"><span className="modal-kicker">Interrupted session</span><h2 id="recovery-title">Recovery</h2><p>Choose this only when you want to restore work after a crash. Recovery never overwrites a project.</p><div className="recovery-list">{recoveries.length ? recoveries.map((candidate) => <div key={candidate.path}><div><strong>{candidate.projectName}</strong><small>{new Date(candidate.modifiedUnix * 1000).toLocaleString()} · {candidate.sourceCount} inputs</small></div><button onClick={() => beginRecovery(candidate)}>Recover As…</button></div>) : <span>No valid recovery snapshots were found.</span>}</div><div className="modal-actions"><button className="danger" onClick={() => void clearRecovery()} disabled={!recoveries.length}>Clear recovery data</button><button onClick={() => setShowRecovery(false)}>Close</button></div></section></div> : null}
     </main>
   );
 }

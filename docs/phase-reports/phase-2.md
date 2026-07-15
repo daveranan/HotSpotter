@@ -15,14 +15,27 @@
   cursor-only hit zones outside those corners without an extra bounding box or visible gizmos. Double-click switches
   to labeled TL/TR/BR/BL point editing. Stable viewport-level pointer capture and drag-generation guards prevent
   rerenders or earlier native command completions from resetting an active edit.
-- One sidebar patch list supports double-click rename and drag reorder. Duplicate, enable/disable, rename, and
-  confirmed delete live in a right-click context menu. The duplicate bottom tray and floating preview were removed.
-- Cached WebGL rectification updates directly in the right workpiece throughout pointer movement. The bounded,
-  deterministic native preview refines after interaction settles and never blocks direct manipulation.
+- The vertical rail gives roughly one third of its height to scrollable sources and two thirds to the selected
+  source's compact patch list. Pointer and keyboard reorder are deterministic. Switching sources cancels incomplete
+  geometry and cannot expose or select another source's patches. Duplicate, enable/disable, rename, and immediate
+  delete live in a right-click context menu.
+- Cached WebGL rectification updates directly in the right workpiece throughout pointer movement. Bounded native
+  refinement verifies dimensions in the background but never replaces the live surface, preventing delayed aspect
+  or skew jumps after interaction settles.
 - Region behavior uses icon-backed Single, Horizontal Loop, Vertical Loop, Tile, Stretch, and Trim Cap
   language while preserving repeat, padding, bleed, material ID, map participation, aspect, and scale contracts.
 - The selected material exposes explicit channel slots with Base Color, Normal, Height, Roughness, and other
   swatches. Bulk import only fills matching empty roles; it never guesses an unrelated image into a data-map slot.
+- A persistent vertical source rail supports any number of independent material sources. Each source owns its own
+  registered channel slots and optional patches; New Source imports a fresh Base Color instead of replacing one.
+- Wheel zoom is cursor-anchored. Transparent crosshair points preserve the boundary under the pointer, with generous
+  invisible hit targets and a bottom-left 2×/3×/4× precision loupe that magnifies the current viewport scale.
+- The source rail and workbench/preview boundary are directly resizable. A compact neutral visual system uses color
+  primarily for selection and action hierarchy, with denser typography, spacing, controls, and scrollbars.
+- Native window chrome and the native File menu are replaced by one draggable application bar with integrated
+  Windows controls. Redundant workspace title and Undo/Redo rows are removed while keyboard history remains.
+- Capture mode disables existing patch hit targets, and double-clicking empty source-image space begins four-point
+  capture without an extra mode-selection step.
 - All accepted edits use typed domain commands. Geometry drags coalesce into one history operation; undo/redo,
   dirty state, autosave journaling, recovery refresh, and patch-scoped cache invalidation are deterministic.
 
@@ -41,10 +54,14 @@
 
 ## Contracts, Schema, and Recovery
 
-- Project schema version 5 adds ordered `patches` rows containing validated versioned patch JSON and a deferred
-  source foreign key. The v4-to-v5 migration is transactional.
+- Project schema version 6 adds ordered `source_sets` and scopes channel uniqueness and registration to each set.
+  It preserves the schema-v5 ordered `patches` rows and deferred source foreign key through a transactional
+  v5-to-v6 migration.
 - Save As, reopen, baseline, rotating recovery snapshots, and source replacement preserve patch identity and
   geometry. Removing a source in use is rejected; replacing it reassigns dependent patches transactionally.
+- New work starts as an application-owned draft and enters Recent Projects only after Save. User project folders
+  retain one `.hottrimmer` file; locks live in the temporary application area and SQLite uses rollback journaling
+  without persistent WAL/SHM siblings. Recovery is shown only as an explicit response to an interrupted session.
 - IPC protocol version 1 now types patch commands, polygon assistance, committed and draft preview requests,
   progress events, history availability, project patches, and cancellation. The cross-language Phase 2 fixture
   verifies camel-case wire names.
@@ -57,11 +74,12 @@
   trips, coordinate transforms, degeneracy/winding/crossing rejection, polygon assistance, and output bounds.
 - The SHA-256 golden matrix covers frontal, rotated, skewed, near-boundary, alpha, sRGB/color, linear-data, and
   representative 8K inputs. Cancellation tests prove monotonic progress and no partial publication.
-- Persistence tests cover schema-v4 migration, patch command transactions, undo/redo, reopen, source reassignment,
-  removal protection, and recovery snapshots containing committed patch geometry.
+- Persistence tests cover schema-v4 through schema-v6 migration, independent source-set channel registration,
+  patch command transactions, undo/redo, reopen, source reassignment, removal protection, and recovery snapshots.
 - Interaction tests cover arbitrary and counter-clockwise capture order, automatic completion geometry, direct
   move/resize/rotate transforms, projective live-preview mapping, repeated drafts, selection changes, pointer-drag
-  cancellation, undo/redo/reopen through the native state path, and coordinate invariance at 100%/300% scale.
+  cancellation, cursor-anchored zoom, undo/redo/reopen through the native state path, and coordinate invariance at
+  100%/300% scale.
 - The full `npm run check` gate includes strict TypeScript, Rust formatting, Clippy with warnings denied, all
   workspace tests, fixtures, parser limits, and kill-process durability tests. `npm run build:native` produces
   the optimized Tauri executable, which launched as a targetable `Hot Trimmer` window. Deeper automated window
@@ -84,14 +102,29 @@
 ## Known MVP Boundaries
 
 - Phase 2's right workpiece shows rectification and temporary region intent, not the deterministic packing solver
-  owned by Phase 3. Phase 3 also owns the schema migration from one registered input set to multiple ordered
-  material sources and patch-independent layout regions.
+  owned by Phase 3. Phase 3 consumes the ordered material sources delivered here and adds patch-independent layout
+  regions without changing source-local map registration or patch definitions.
 - Preview IPC returns a bounded PNG data URL; full-resolution render tiles remain native and are Phase 4 work.
 - An individual image-codec call cannot be interrupted mid-call, but dimensions and conservative decoded memory
   are bounded before it begins and cancellation is observed at every surrounding stage.
+
+## Deferred Hands-on Bugs
+
+These regressions were captured during the final July 15 hands-on review and are intentionally not fixed in this
+commit:
+
+1. **A second four-point capture stops accepting points.** Create a four-point patch by double-clicking empty source
+   workspace and placing its four points. Then double-click empty workspace again to start another four-point patch.
+   The capture UI starts, but clicks no longer place points. Expected: every new capture accepts four points and
+   auto-finishes independently.
+2. **The material-map strip can no longer scroll horizontally.** With enough Base Color, Normal, Height, Roughness,
+   and other map slots to exceed the available width, attempt to scroll the compact map strip horizontally.
+   Vertical sizing is correct, but no mouse, trackpad, or visible scrollbar path exposes the off-screen slots.
+   Expected: the compact strip remains horizontally scrollable without restoring the unwanted vertical scrollbar.
 
 ## Gate Decision
 
 Phase 2 is complete. Users can author multiple precisely editable patches, assign behavior, preview deterministic
 rectification, undo/redo, save, recover, and reopen without geometry loss. Invalid data is rejected locally and
-cannot enter persistence or the renderer. No Phase 2 acceptance item is deferred.
+cannot enter persistence or the renderer. The two hands-on interaction regressions above are explicitly deferred
+for a later stabilization pass.

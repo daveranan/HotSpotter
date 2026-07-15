@@ -22,6 +22,25 @@ export function normalizedFromRect(
   return point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1 ? point : null;
 }
 
+export function zoomViewAtPoint(
+  view: { x: number; y: number; scale: number },
+  nextScale: number,
+  cursor: { x: number; y: number },
+  renderedRect: { left: number; top: number; width: number; height: number },
+): { x: number; y: number; scale: number } {
+  if (view.scale <= 0 || renderedRect.width <= 0 || renderedRect.height <= 0) {
+    return { ...view, scale: nextScale };
+  }
+  const ratio = nextScale / view.scale;
+  const centerX = renderedRect.left + renderedRect.width / 2;
+  const centerY = renderedRect.top + renderedRect.height / 2;
+  return {
+    x: view.x + (cursor.x - centerX) * (1 - ratio),
+    y: view.y + (cursor.y - centerY) * (1 - ratio),
+    scale: nextScale,
+  };
+}
+
 export function rectangleGeometry(start: NormalizedPoint, end: NormalizedPoint): PatchGeometry {
   const left = Math.min(start.x, end.x);
   const right = Math.max(start.x, end.x);

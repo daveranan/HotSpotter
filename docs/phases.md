@@ -186,7 +186,8 @@ Deliver Sources mode inside a durable native project that can safely survive clo
   snapshots, integrity check, and recovery UI.
 - [x] Import PNG, JPEG, and TIFF source images with EXIF orientation, ICC handling, alpha policy, dimension and
   memory limits, and useful errors. Add only the extra formats needed by the initial PBR-map fixtures.
-- [x] Make Open images the direct first-run action, creating the durable project after image selection. Add Open all
+- [x] Make Open images the direct first-run action, creating an unsaved draft after image selection and asking for
+  a durable filename only on explicit Save. Add Open all
   for multi-file filename-based assignment that imports Base Color first and never silently replaces filled slots.
 - [x] Support ten explicit material-input slots—Base Color/Diffuse, Normal, Height/Bump, Roughness, Metallic, AO,
   Specular, Opacity, Edge Mask, and Material ID—with dimension and registration validation.
@@ -197,10 +198,11 @@ Deliver Sources mode inside a durable native project that can safely survive clo
 
 ### Implemented Behavior
 
-- [x] **Direct start:** Open images accepts one or many source files before project creation, then asks for the
-  durable `.hottrimmer` destination and imports the selected set.
+- [x] **Direct start:** Open images accepts one or many source files into an unsaved draft immediately. The first
+  explicit Save publishes one bundled `.hottrimmer` file; transient locks, drafts, and crash recovery remain in
+  application-owned locations rather than cluttering the project folder.
 - [x] **Open all:** deterministic filename-token matching recognizes common long and short PBR names, establishes
-  Base Color first, fills only empty slots, and uses visible slot order for ambiguous leftovers.
+  Base Color first, fills only matching empty slots, and leaves ambiguous leftovers unassigned for explicit import.
 - [x] **Safe batch imports:** each image is a separate authoritative transaction. Successful earlier files remain
   durable and visible if a later file fails validation or is cancelled.
 - [x] **Registered material set:** Base Color anchors oriented dimensions; companion maps are rejected when Base
@@ -246,8 +248,10 @@ Implement fast, precise patch marking and rectification while preserving editabi
 
 - Use one integrated left/right workspace: a material-source/patch workplace on the left and the evolving hotspot
   workpiece on the right. Source management is part of the workplace, not a separate primary mode.
+- Persist ordered material-source sets in the project. Each source owns its own registered Base Color and optional
+  PBR/mask maps plus zero or many patches; a vertical library rail switches sources without overwriting channels.
 - Make selection directly movable, resizable, and rotatable. Double-click enters point editing; middle mouse pans
-  and the wheel zooms without selecting a dedicated tool.
+  and the wheel zooms around the cursor without selecting a dedicated tool.
 - Support arbitrary-order four-point placement and rectangle placement with automatic completion, live corner
   adjustment, duplicate, rename, reorder, enable/disable, and delete. The capture order is canonicalized internally;
   users never need to know renderer winding rules.
@@ -260,7 +264,9 @@ Implement fast, precise patch marking and rectification while preserving editabi
   transparent out-of-bounds behavior, and selectable output aspect/scale.
 - Show the source outline and real-time rectification together in the fixed left/right workspace. During a drag,
   a cached GPU preview updates without waiting for native PNG refinement.
-- Use one patch list. Rename by double-click, reorder by drag, and place duplicate/delete/enable actions in the
+- Use transparent crosshair point handles with generous invisible hit targets and a bottom-left 2×/3×/4× loupe
+  that multiplies the current viewport zoom during capture and point editing, so boundaries remain visible.
+- Use one source-local patch list. Rename by double-click, reorder by drag, and place duplicate/delete/enable actions in the
   patch context menu; do not duplicate patch navigation in a bottom asset tray.
 - Add patch properties for Repeat X, Repeat Y, Tile XY, Stretch, Unique, Trim Cap, padding/bleed, material ID,
   and map-generation participation.
@@ -290,11 +296,8 @@ the source patch definitions.
 
 ### Implementation
 
-- Add ordered material-source sets. Each set represents one material idea, owns one registered collection of
-  Base Color and optional PBR/mask maps, and can own zero or many captured patches. Projects may contain many sets.
-- Add a persistent material-source library rail at the far left. Selecting a set exposes its explicit Base Color,
-  Normal, Height, Roughness, and other map slots above the source canvas; map import never creates a new set or
-  silently assigns an unrelated image to a data channel.
+- Build on the ordered material-source sets and persistent source rail delivered in Phase 2. Layout commands consume
+  whole sources and their optional patches without changing their registered maps or source-local patch definitions.
 - Keep material source sets and their patch workplace on the left while the authoritative hotspot sheet stays on
   the right. Switching source sets never replaces or hides the assembled sheet.
 - Introduce layout regions independently of patches. A region may be filled by a whole material source, a captured
@@ -349,6 +352,8 @@ using the math and honesty rules in `mvp-plan.md`.
   highlight recovery, and preserve-color controls.
 - Generate Height from Rec. 709 luminance using large-shape blur, high-pass detail, midpoint/gain/clamp, invert,
   edge preservation, and per-patch controls.
+- Expose estimated-map creation directly from each empty or replaceable map slot (including its context menu),
+  with `Generate from Base Color` opening channel-appropriate controls instead of silently replacing an imported map.
 - Generate tangent-space Normal from Sobel or Scharr height gradients with strength, detail scale, pre-blur,
   normalization, and OpenGL/DirectX orientation.
 - Generate Roughness as an explicitly controllable heuristic using base value, luminance, local contrast,

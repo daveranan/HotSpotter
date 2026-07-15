@@ -96,6 +96,7 @@ pub struct ImportSourceRequest {
     path: String,
     ownership: SourceOwnership,
     channel: SourceChannel,
+    source_set_id: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +104,7 @@ pub struct ImportSourceRequest {
 pub struct SourceSlotRequest {
     protocol_version: u16,
     channel: SourceChannel,
+    source_set_id: Uuid,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -173,6 +175,7 @@ pub struct ThumbnailMipmapSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct SourceSnapshot {
     id: String,
+    source_set_id: String,
     channel: SourceChannel,
     ownership: SourceOwnership,
     display_name: String,
@@ -200,6 +203,7 @@ pub struct ProjectSnapshot {
     schema_version: u32,
     dirty: bool,
     stale_lock_recovered: bool,
+    is_draft: bool,
     sources: Vec<SourceSnapshot>,
     patches: Vec<Patch>,
     can_undo_patch: bool,
@@ -274,6 +278,8 @@ pub struct ProjectSession {
     baseline: Option<PathBuf>,
     recovery_dir: PathBuf,
     app_data_dir: PathBuf,
+    draft_dir: PathBuf,
+    is_draft: bool,
 }
 
 impl ProjectSession {
@@ -284,6 +290,8 @@ impl ProjectSession {
             baseline: None,
             recovery_dir: paths.recovery.clone(),
             app_data_dir: paths.app_data.clone(),
+            draft_dir: paths.drafts.clone(),
+            is_draft: false,
         }
     }
 
@@ -296,6 +304,26 @@ impl ProjectSession {
     }
 
     fn adopt(&mut self, store: ProjectStore) -> Result<(), UserFacingError> {
+        self.adopt_with_mode(store, false)
+    }
+
+    fn adopt_draft(&mut self, store: ProjectStore) -> Result<(), UserFacingError> {
+        self.adopt_with_mode(store, true)
+    }
+
+    fn adopt_with_mode(
+        &mut self,
+        store: ProjectStore,
+        is_draft: bool,
+    ) -> Result<(), UserFacingError> {
+        let previous_draft = self
+            .is_draft
+            .then(|| {
+                self.store
+                    .as_ref()
+                    .map(|current| current.path().to_path_buf())
+            })
+            .flatten();
         let baseline = store.baseline_path(&self.recovery_dir);
         store.backup_atomic(&baseline).map_err(store_error)?;
         if let Some(previous) = self.baseline.replace(baseline.clone()) {
@@ -303,12 +331,32 @@ impl ProjectSession {
         }
         cleanup_stale_baselines(&self.recovery_dir, &baseline);
         self.store = Some(store);
+        self.is_draft = is_draft;
         self.dirty = false;
+        if let Some(path) = previous_draft {
+            if !is_draft
+                || self
+                    .store
+                    .as_ref()
+                    .is_none_or(|current| current.path() != path)
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
         Ok(())
     }
 
     fn save(&mut self) -> Result<(), UserFacingError> {
+        if self.is_draft {
+            return Err(user_error(
+                ErrorCode::InvalidInput,
+                "Choose a filename for this draft first.",
+                "Use Save As to create one bundled .hottrimmer project file.",
+                None,
+            ));
+        }
         let store = self.store.as_ref().ok_or_else(no_open_project)?;
+        let project_id = store.summary().map_err(store_error)?.id;
         store.save().map_err(store_error)?;
         let baseline = store.baseline_path(&self.recovery_dir);
         store.backup_atomic(&baseline).map_err(store_error)?;
@@ -321,18 +369,20 @@ impl ProjectSession {
             }
         }
         self.dirty = false;
+        cleanup_project_recovery(&self.recovery_dir, project_id);
         Ok(())
     }
 
     fn replace_source_and_refresh_recovery(
         &mut self,
+        source_set_id: Uuid,
         channel: SourceChannel,
         source: &SourceInput,
     ) -> Result<Option<UserFacingError>, UserFacingError> {
         self.store
             .as_mut()
             .ok_or_else(no_open_project)?
-            .replace_source(channel, source)
+            .replace_source_in_set(source_set_id, channel, source)
             .map_err(store_error)?;
         self.dirty = true;
         Ok(self
@@ -346,12 +396,13 @@ impl ProjectSession {
 
     fn remove_source_and_refresh_recovery(
         &mut self,
+        source_set_id: Uuid,
         channel: SourceChannel,
     ) -> Result<Option<UserFacingError>, UserFacingError> {
         self.store
             .as_mut()
             .ok_or_else(no_open_project)?
-            .remove_source(channel)
+            .remove_source_in_set(source_set_id, channel)
             .map_err(store_error)?;
         self.dirty = true;
         Ok(self
@@ -448,11 +499,23 @@ impl ProjectSession {
                 }
             }
         }
+        let closed = self.store.as_ref().and_then(|store| store.summary().ok());
+        let draft_path = self
+            .is_draft
+            .then(|| self.store.as_ref().map(|store| store.path().to_path_buf()))
+            .flatten();
         self.store = None;
         if let Some(baseline) = self.baseline.take() {
             let _ = fs::remove_file(baseline);
         }
         self.dirty = false;
+        self.is_draft = false;
+        if let Some(summary) = closed {
+            cleanup_project_recovery(&self.recovery_dir, summary.id);
+        }
+        if let Some(path) = draft_path {
+            let _ = fs::remove_file(path);
+        }
         Ok(())
     }
 }
@@ -551,6 +614,27 @@ pub async fn create_project(
 }
 
 #[tauri::command]
+pub async fn create_draft_project(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectSnapshot, UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let shared = Arc::clone(&session);
+    run_blocking(move || {
+        let mut guard = shared.lock().map_err(|_| session_poisoned())?;
+        guard.ensure_replaceable()?;
+        fs::create_dir_all(&guard.draft_dir).map_err(recovery_error)?;
+        let path = guard
+            .draft_dir
+            .join(format!("Untitled-{}.hottrimmer", Uuid::new_v4()));
+        let store = ProjectStore::create(&path, "Untitled").map_err(store_error)?;
+        guard.adopt_draft(store)?;
+        snapshot_adopted_session(&mut guard)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn open_project(
     request: ProjectPathRequest,
     session: State<'_, SharedProjectSession>,
@@ -579,6 +663,7 @@ pub async fn import_source(
     let path = validate_ipc_path(&request.path)?;
     let ownership = request.ownership;
     let channel = request.channel;
+    let source_set_id = request.source_set_id;
     let shared = Arc::clone(&session);
     let jobs = Arc::clone(&import_job);
     let cancellation = CancellationToken::new();
@@ -602,7 +687,8 @@ pub async fn import_source(
         let source_id = source.id;
         let mut guard = shared.lock().map_err(|_| session_poisoned())?;
         emit_import_progress(&app, "Writing recovery snapshot", 0.92);
-        let recovery_warning = guard.replace_source_and_refresh_recovery(channel, &source)?;
+        let recovery_warning =
+            guard.replace_source_and_refresh_recovery(source_set_id, channel, &source)?;
         emit_import_progress(&app, "Complete", 1.0);
         let mut snapshot = snapshot_session(&guard, Some((source_id, inspected)))?;
         if let Some(warning) = recovery_warning {
@@ -719,7 +805,8 @@ pub async fn remove_source(
     let shared = Arc::clone(&session);
     run_blocking(move || {
         let mut guard = shared.lock().map_err(|_| session_poisoned())?;
-        let recovery_warning = guard.remove_source_and_refresh_recovery(request.channel)?;
+        let recovery_warning =
+            guard.remove_source_and_refresh_recovery(request.source_set_id, request.channel)?;
         let mut snapshot = snapshot_session(&guard, None)?;
         if let Some(warning) = recovery_warning {
             snapshot.warnings.push(ProjectWarning {
@@ -976,6 +1063,20 @@ pub async fn list_recovery_candidates(
 }
 
 #[tauri::command]
+pub async fn clear_recovery_candidates(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<(), UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let shared = Arc::clone(&session);
+    run_blocking(move || {
+        let guard = shared.lock().map_err(|_| session_poisoned())?;
+        clear_recovery_directory(&guard.recovery_dir)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn recover_project(
     request: RecoverProjectRequest,
     session: State<'_, SharedProjectSession>,
@@ -1053,6 +1154,7 @@ fn snapshot_session(
         schema_version: hot_trimmer_project_store::CURRENT_SCHEMA_VERSION,
         dirty: session.dirty,
         stale_lock_recovered: summary.stale_lock_recovered,
+        is_draft: session.is_draft,
         sources,
         patches: summary.patches,
         can_undo_patch: store.can_undo_patch_command(),
@@ -1291,6 +1393,7 @@ fn source_snapshot(source: &StoredSource, inspected: InspectedImage) -> SourceSn
         .collect();
     SourceSnapshot {
         id: source.input.id.to_string(),
+        source_set_id: source.source_set_id.to_string(),
         channel: source.channel,
         ownership: source.input.ownership,
         display_name,
@@ -1328,6 +1431,9 @@ const fn channel_label(channel: SourceChannel) -> &'static str {
 }
 
 fn remember_open_project(session: &ProjectSession) -> Result<(), UserFacingError> {
+    if session.is_draft {
+        return Ok(());
+    }
     let summary = session
         .store
         .as_ref()
@@ -1457,6 +1563,35 @@ fn scan_recovery_candidates(
     }
     candidates.sort_by_key(|candidate| Reverse(candidate.modified_unix));
     Ok(candidates)
+}
+
+fn cleanup_project_recovery(recovery_dir: &Path, project_id: hot_trimmer_domain::ProjectId) {
+    let prefix = format!("{project_id}.");
+    let Ok(entries) = fs::read_dir(recovery_dir) else {
+        return;
+    };
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        if path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && !name.contains(".baseline.")
+        }) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn clear_recovery_directory(recovery_dir: &Path) -> Result<(), UserFacingError> {
+    let entries = fs::read_dir(recovery_dir).map_err(recovery_error)?;
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        if path.is_file()
+            && path
+                .file_name()
+                .is_some_and(|name| !name.to_string_lossy().contains(".baseline."))
+        {
+            fs::remove_file(path).map_err(recovery_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn publish_recovery_copy(source: &Path, destination: &Path) -> Result<(), UserFacingError> {
@@ -1713,7 +1848,8 @@ mod tests {
         CloseProjectRequest, CreateProjectRequest, FoundationStatus, ImportSourceRequest,
         MAX_IPC_PATH_UTF16, NativeDirectories, PatchCommandRequest, PatchPreviewRequest,
         PolygonAssistRequest, ProjectSession, ProjectSnapshot, ProjectWarning,
-        RecoverProjectRequest, SourceSnapshot, ThumbnailMipmapSnapshot, validate_ipc_path,
+        RecoverProjectRequest, SourceSnapshot, ThumbnailMipmapSnapshot, clear_recovery_directory,
+        validate_ipc_path,
     };
 
     #[test]
@@ -1775,11 +1911,13 @@ mod tests {
             id: "00000000-0000-4000-8000-000000000001".into(),
             name: "Brick".into(),
             path: "<project>".into(),
-            schema_version: 5,
+            schema_version: 6,
             dirty: true,
             stale_lock_recovered: false,
+            is_draft: false,
             sources: vec![SourceSnapshot {
                 id: "00000000-0000-4000-8000-000000000002".into(),
+                source_set_id: "00000000-0000-4000-8000-000000000001".into(),
                 channel: SourceChannel::Specular,
                 ownership: SourceOwnership::OwnedCopy,
                 display_name: "Owned Specular".into(),
@@ -1863,6 +2001,8 @@ mod tests {
             baseline: None,
             recovery_dir: blocked_recovery,
             app_data_dir: root.clone(),
+            draft_dir: root.join("drafts"),
+            is_draft: false,
         };
         let source = SourceInput {
             id: SourceId::new(),
@@ -1881,7 +2021,11 @@ mod tests {
             owned_bytes: Some(vec![0; 4]),
         };
         let warning = session
-            .replace_source_and_refresh_recovery(SourceChannel::BaseColor, &source)
+            .replace_source_and_refresh_recovery(
+                uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").expect("set id"),
+                SourceChannel::BaseColor,
+                &source,
+            )
             .expect("authoritative import succeeds")
             .expect("recovery warning");
         assert!(session.dirty);
@@ -1899,5 +2043,25 @@ mod tests {
         );
         drop(session);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn clearing_recovery_keeps_the_open_project_baseline() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-clear-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let baseline = root.join(format!("{id}.baseline.keep.hottrimmer-recovery"));
+        let snapshot = root.join(format!("{id}.123.snapshot.hottrimmer-recovery"));
+        fs::write(&baseline, b"baseline").expect("baseline");
+        fs::write(&snapshot, b"snapshot").expect("snapshot");
+
+        clear_recovery_directory(&root).expect("clear recovery snapshots");
+
+        assert!(baseline.exists());
+        assert!(!snapshot.exists());
+        fs::remove_dir_all(root).expect("remove fixture root");
     }
 }

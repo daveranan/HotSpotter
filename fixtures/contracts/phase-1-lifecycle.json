@@ -8,7 +8,8 @@
     "protocolVersion": 1,
     "path": "<source>",
     "ownership": "owned_copy",
-    "channel": "specular"
+    "channel": "specular",
+    "sourceSetId": "00000000-0000-4000-8000-000000000001"
   },
   "closeRequest": {
     "protocolVersion": 1,
@@ -23,12 +24,14 @@
     "id": "00000000-0000-4000-8000-000000000001",
     "name": "Brick",
     "path": "<project>",
-    "schemaVersion": 5,
+    "schemaVersion": 6,
     "dirty": true,
     "staleLockRecovered": false,
+    "isDraft": false,
     "sources": [
       {
         "id": "00000000-0000-4000-8000-000000000002",
+        "sourceSetId": "00000000-0000-4000-8000-000000000001",
         "channel": "specular",
         "ownership": "owned_copy",
         "displayName": "Owned Specular",

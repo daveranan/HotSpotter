@@ -19,6 +19,7 @@
         "minWidth": 960,
         "minHeight": 640,
         "resizable": true,
+        "decorations": false,
         "fullscreen": false,
         "center": true
       }
@@ -35,4 +36,3 @@
     "longDescription": "A focused native desktop application for extracting patches, creating trim layouts, generating maps, previewing, and exporting."
   }
 }
-

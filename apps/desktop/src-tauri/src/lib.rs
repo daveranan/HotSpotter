@@ -9,10 +9,7 @@ use commands::{
     SharedProjectSession, StartupState,
 };
 use paths::AppPaths;
-use tauri::{
-    Emitter, Manager,
-    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
-};
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Starts the native desktop runtime.
@@ -44,12 +41,12 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .on_menu_event(|app, event| {
-            let _ = app.emit("menu-action", event.id().as_ref());
-        })
         .setup(|app| {
             let paths = AppPaths::resolve(app.handle()).map_err(std::io::Error::other)?;
             let previous_unclean = paths.begin_session().map_err(std::io::Error::other)?;
+            if !previous_unclean {
+                paths.clear_recovery_after_clean_start();
+            }
             let home = app.path().home_dir().ok();
             tracing::info!(
                 protocol = hot_trimmer_domain::IPC_PROTOCOL_VERSION,
@@ -66,7 +63,6 @@ pub fn run() {
                 previous_shutdown_clean: !previous_unclean,
             });
             app.manage(paths);
-            install_native_menu(app)?;
             if let Some(path) = project_argument(&std::env::args().collect::<Vec<_>>())
                 && let Ok(mut pending) = app.state::<PendingProjectPath>().lock()
             {
@@ -78,6 +74,7 @@ pub fn run() {
             commands::foundation_status,
             commands::startup_status,
             commands::create_project,
+            commands::create_draft_project,
             commands::open_project,
             commands::import_source,
             commands::cancel_import,
@@ -95,6 +92,7 @@ pub fn run() {
             commands::close_project,
             commands::list_recent_projects,
             commands::list_recovery_candidates,
+            commands::clear_recovery_candidates,
             commands::recover_project,
             commands::take_pending_project_path
         ])
@@ -107,47 +105,6 @@ pub fn run() {
             paths.end_session();
         }
     });
-}
-
-fn install_native_menu(app: &mut tauri::App) -> tauri::Result<()> {
-    let new_project = MenuItemBuilder::with_id("new_project", "&New Project…")
-        .accelerator("Ctrl+N")
-        .build(app)?;
-    let open_project = MenuItemBuilder::with_id("open_project", "&Open Project…")
-        .accelerator("Ctrl+O")
-        .build(app)?;
-    let open_image = MenuItemBuilder::with_id("open_image", "Open &Image…")
-        .accelerator("Ctrl+I")
-        .build(app)?;
-    let save_project = MenuItemBuilder::with_id("save_project", "&Save")
-        .accelerator("Ctrl+S")
-        .build(app)?;
-    let save_project_as = MenuItemBuilder::with_id("save_project_as", "Save &As…")
-        .accelerator("Ctrl+Shift+S")
-        .build(app)?;
-    let close_project = MenuItemBuilder::with_id("close_project", "&Close Project")
-        .accelerator("Ctrl+W")
-        .build(app)?;
-    let reveal_project =
-        MenuItemBuilder::with_id("reveal_project", "Reveal Project in Folder").build(app)?;
-    let recovery = MenuItemBuilder::with_id("show_recovery", "Recovery…").build(app)?;
-    let file = SubmenuBuilder::new(app, "&File")
-        .item(&new_project)
-        .item(&open_project)
-        .item(&open_image)
-        .separator()
-        .item(&save_project)
-        .item(&save_project_as)
-        .item(&close_project)
-        .separator()
-        .item(&reveal_project)
-        .item(&recovery)
-        .separator()
-        .quit()
-        .build()?;
-    let menu = MenuBuilder::new(app).item(&file).build()?;
-    app.set_menu(menu)?;
-    Ok(())
 }
 
 fn project_argument(arguments: &[String]) -> Option<String> {

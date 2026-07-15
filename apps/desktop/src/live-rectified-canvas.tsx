@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PatchGeometry } from "@hot-trimmer/ipc-contracts";
 import { quadProjection } from "./patch-authoring";
 
@@ -6,6 +6,30 @@ interface LiveRectifiedCanvasProps {
   geometry: PatchGeometry;
   imageUrl: string;
   label: string;
+  aspectRatio?: number;
+}
+
+interface SurfaceSize { width: number; height: number }
+
+function automaticAspect(geometry: PatchGeometry, image: HTMLImageElement): number {
+  const distance = (first: { x: number; y: number }, second: { x: number; y: number }): number => Math.hypot(
+    (second.x - first.x) * image.naturalWidth,
+    (second.y - first.y) * image.naturalHeight,
+  );
+  const [topLeft, topRight, bottomRight, bottomLeft] = geometry.corners;
+  if (!topLeft || !topRight || !bottomRight || !bottomLeft) return 1;
+  const width = (distance(topLeft, topRight) + distance(bottomLeft, bottomRight)) / 2;
+  const height = (distance(topLeft, bottomLeft) + distance(topRight, bottomRight)) / 2;
+  return Math.max(0.01, width / Math.max(0.01, height));
+}
+
+function fittedSize(container: HTMLDivElement, aspectRatio: number): SurfaceSize {
+  const availableWidth = Math.max(1, container.clientWidth);
+  const availableHeight = Math.max(1, container.clientHeight);
+  if (availableWidth / availableHeight > aspectRatio) {
+    return { width: availableHeight * aspectRatio, height: availableHeight };
+  }
+  return { width: availableWidth, height: availableWidth / aspectRatio };
 }
 
 function shader(context: WebGLRenderingContext, kind: number, source: string): WebGLShader {
@@ -88,35 +112,62 @@ function draw(canvas: HTMLCanvasElement, image: HTMLImageElement, geometry: Patc
   context.deleteShader(fragment);
 }
 
-export function LiveRectifiedCanvas({ geometry, imageUrl, label }: LiveRectifiedCanvasProps): React.JSX.Element {
+function drawSafely(canvas: HTMLCanvasElement, image: HTMLImageElement, geometry: PatchGeometry): void {
+  try {
+    draw(canvas, image, geometry);
+  } catch {
+    // The authoritative native preview remains available when WebGL compilation or context allocation fails.
+  }
+}
+
+export function LiveRectifiedCanvas({ geometry, imageUrl, label, aspectRatio }: LiveRectifiedCanvasProps): React.JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const [surfaceSize, setSurfaceSize] = useState<SurfaceSize>({ width: 1, height: 1 });
+
+  function resizeSurface(image = imageRef.current): void {
+    const surface = surfaceRef.current;
+    if (!surface || !image) return;
+    const ratio = aspectRatio && Number.isFinite(aspectRatio) ? aspectRatio : automaticAspect(geometry, image);
+    setSurfaceSize(fittedSize(surface, ratio));
+  }
 
   useEffect(() => {
     const image = new Image();
     image.onload = () => {
       imageRef.current = image;
-      if (canvasRef.current) draw(canvasRef.current, image, geometry);
+      resizeSurface(image);
+      if (canvasRef.current) drawSafely(canvasRef.current, image, geometry);
     };
     image.src = imageUrl;
     return () => { image.onload = null; };
-  }, [imageUrl]);
+  }, [imageUrl, aspectRatio]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const image = imageRef.current;
-    if (canvas && image) draw(canvas, image, geometry);
-  }, [geometry]);
+    if (canvas && image) {
+      resizeSurface(image);
+      drawSafely(canvas, image, geometry);
+    }
+  }, [geometry, aspectRatio]);
+
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) return;
+    const resize = new ResizeObserver(() => {
+      resizeSurface();
+    });
+    resize.observe(surface);
+    return () => resize.disconnect();
+  }, [geometry, aspectRatio]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const resize = new ResizeObserver(() => {
-      if (imageRef.current) draw(canvas, imageRef.current, geometry);
-    });
-    resize.observe(canvas);
-    return () => resize.disconnect();
-  }, [geometry]);
+    const image = imageRef.current;
+    if (canvas && image) drawSafely(canvas, image, geometry);
+  }, [geometry, surfaceSize]);
 
-  return <canvas ref={canvasRef} className="live-rectified-canvas" role="img" aria-label={label} />;
+  return <div ref={surfaceRef} className="rectified-preview-surface"><canvas ref={canvasRef} className="live-rectified-canvas" role="img" aria-label={label} style={surfaceSize} /></div>;
 }

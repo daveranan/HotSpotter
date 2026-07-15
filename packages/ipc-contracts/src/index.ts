@@ -59,10 +59,12 @@ export interface ProjectNameRequest extends FoundationStatusRequest {
 export interface ImportSourceRequest extends ProjectPathRequest {
   ownership: SourceOwnership;
   channel: SourceChannel;
+  sourceSetId: string;
 }
 
 export interface SourceSlotRequest extends FoundationStatusRequest {
   channel: SourceChannel;
+  sourceSetId: string;
 }
 
 export interface CloseProjectRequest extends FoundationStatusRequest {
@@ -81,6 +83,7 @@ export interface ThumbnailMipmap {
 
 export interface SourceSnapshot {
   id: string;
+  sourceSetId: string;
   channel: SourceChannel;
   ownership: SourceOwnership;
   displayName: string;
@@ -198,6 +201,7 @@ export interface ProjectSnapshot {
   schemaVersion: number;
   dirty: boolean;
   staleLockRecovered: boolean;
+  isDraft: boolean;
   sources: SourceSnapshot[];
   patches: PatchSnapshot[];
   canUndoPatch: boolean;

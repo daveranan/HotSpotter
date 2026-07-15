@@ -103,12 +103,13 @@ test("phase 1 fixture covers native lifecycle shapes and expanded material slots
   const clearSpecular: SourceSlotRequest = {
     protocolVersion: IPC_PROTOCOL_VERSION,
     channel: "specular",
+    sourceSetId: "00000000-0000-4000-8000-000000000001",
   };
   assert.equal(lifecycle.createRequest.protocolVersion, IPC_PROTOCOL_VERSION);
   assert.equal(lifecycle.importRequest.channel, "specular");
   assert.equal(lifecycle.closeRequest.disposition, "discard");
   assert.notEqual(lifecycle.recoverRequest.recoveryPath, lifecycle.recoverRequest.destinationPath);
-  assert.equal(lifecycle.projectSnapshot.schemaVersion, 5);
+  assert.equal(lifecycle.projectSnapshot.schemaVersion, 6);
   assert.equal(lifecycle.projectSnapshot.sources[0]?.channel, "specular");
   assert.equal(lifecycle.projectSnapshot.warnings[0]?.code, "recovery_failed");
   assert.equal(clearSpecular.channel, lifecycle.importRequest.channel);

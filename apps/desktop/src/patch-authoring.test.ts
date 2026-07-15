@@ -15,6 +15,7 @@ import {
   scaleGeometryFromCorner,
   translateGeometry,
   validatePatchGeometry,
+  zoomViewAtPoint,
 } from "./patch-authoring.ts";
 
 test("rectangle placement produces canonical valid corners", () => {
@@ -106,6 +107,20 @@ test("viewport coordinates are invariant at 100 and 300 percent display scale", 
   const at100 = normalizedFromRect(300, 150, { left: 100, top: 50, width: 400, height: 200 });
   const at300 = normalizedFromRect(900, 450, { left: 300, top: 150, width: 1200, height: 600 });
   assert.deepEqual(at300, at100);
+});
+
+test("wheel zoom keeps the image coordinate under the cursor stationary", () => {
+  const before = { left: 100, top: 50, width: 400, height: 200 };
+  const cursor = { x: 420, y: 90 };
+  const view = { x: 0, y: 0, scale: 1 };
+  const next = zoomViewAtPoint(view, 2, cursor, before);
+  const after = {
+    left: before.left + before.width / 2 + next.x - before.width,
+    top: before.top + before.height / 2 + next.y - before.height,
+    width: before.width * 2,
+    height: before.height * 2,
+  };
+  assert.deepEqual(normalizedFromRect(cursor.x, cursor.y, after), normalizedFromRect(cursor.x, cursor.y, before));
 });
 
 test("rapid patch drafts remain independent and a cancelled drag restores its original geometry", () => {

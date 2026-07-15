@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub cache: PathBuf,
     pub logs: PathBuf,
     pub recovery: PathBuf,
+    pub drafts: PathBuf,
     session_marker: PathBuf,
 }
 
@@ -30,9 +31,10 @@ impl AppPaths {
             .app_log_dir()
             .map_err(|error| error.to_string())?;
         let recovery = app_data.join("recovery");
+        let drafts = app_data.join("drafts");
         let session_marker = app_data.join("running.session");
 
-        for directory in [&app_data, &cache, &logs, &recovery] {
+        for directory in [&app_data, &cache, &logs, &recovery, &drafts] {
             fs::create_dir_all(directory)
                 .map_err(|error| format!("failed to initialize application directory: {error}"))?;
         }
@@ -42,6 +44,7 @@ impl AppPaths {
             cache,
             logs,
             recovery,
+            drafts,
             session_marker,
         })
     }
@@ -64,6 +67,17 @@ impl AppPaths {
     pub fn end_session(&self) {
         let _ = fs::remove_file(&self.session_marker);
     }
+
+    pub fn clear_recovery_after_clean_start(&self) {
+        let Ok(entries) = fs::read_dir(&self.recovery) else {
+            return;
+        };
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.is_file() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +97,7 @@ mod tests {
             cache: root.join("cache"),
             logs: root.join("logs"),
             recovery: root.join("recovery"),
+            drafts: root.join("drafts"),
             session_marker: root.join("running.session"),
         };
         assert!(!paths.begin_session().expect("first clean startup"));

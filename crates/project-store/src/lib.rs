@@ -17,7 +17,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 pub const MAX_RECOVERY_SNAPSHOTS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -119,6 +119,7 @@ pub struct SourceInput {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredSource {
+    pub source_set_id: Uuid,
     pub channel: SourceChannel,
     pub input: SourceInput,
 }
@@ -220,6 +221,10 @@ impl ProjectStore {
             "INSERT INTO project (id, name, created_unix, modified_unix) VALUES (?1, ?2, ?3, ?3)",
             params![project_id.to_string(), name, now],
         )?;
+        transaction.execute(
+            "INSERT INTO source_sets (id, name, ordinal) VALUES (?1, 'Material 1', 0)",
+            [project_id.to_string()],
+        )?;
         transaction.commit()?;
         checkpoint(&connection)?;
 
@@ -290,6 +295,11 @@ impl ProjectStore {
         )
     }
 
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.project_path
+    }
+
     /// Replaces one explicitly assigned source and journals the command in one transaction.
     ///
     /// # Errors
@@ -300,13 +310,28 @@ impl ProjectStore {
         channel: SourceChannel,
         source: &SourceInput,
     ) -> Result<(), StoreError> {
+        let source_set_id = self.default_source_set_id()?;
+        self.replace_source_in_set(source_set_id, channel, source)
+    }
+
+    /// Replaces a map in one independently registered material source set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when ownership, registration, or persistence fails.
+    pub fn replace_source_in_set(
+        &mut self,
+        source_set_id: Uuid,
+        channel: SourceChannel,
+        source: &SourceInput,
+    ) -> Result<(), StoreError> {
         validate_source_ownership(source)?;
-        self.validate_registration(channel, source.width, source.height)?;
+        self.validate_registration(source_set_id, channel, source.width, source.height)?;
         let previous_source_id = self
             .connection
             .query_row(
-                "SELECT id FROM sources WHERE channel = ?1",
-                [channel.as_db_value()],
+                "SELECT id FROM sources WHERE source_set_id = ?1 AND channel = ?2",
+                params![source_set_id.to_string(), channel.as_db_value()],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
@@ -328,18 +353,36 @@ impl ProjectStore {
         }
         let now = unix_timestamp()?;
         let transaction = self.connection.transaction()?;
+        let next_ordinal: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM source_sets",
+            [],
+            |row| row.get(0),
+        )?;
         transaction.execute(
-            "DELETE FROM sources WHERE channel = ?1",
-            [channel.as_db_value()],
+            "INSERT INTO source_sets (id, name, ordinal) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                source_set_id.to_string(),
+                source.origin_path.file_stem().map_or_else(
+                    || "Material".into(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+                next_ordinal
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM sources WHERE source_set_id = ?1 AND channel = ?2",
+            params![source_set_id.to_string(), channel.as_db_value()],
         )?;
         persist_patch_rows(&transaction, next_patch_set.patches())?;
         transaction.execute(
             "INSERT INTO sources (
-                id, channel, ownership, external_path, sha256, width, height, format, color_type,
+                id, source_set_id, channel, ownership, external_path, sha256, width, height, format, color_type,
                 has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 source.id.to_string(),
+                source_set_id.to_string(),
                 channel.as_db_value(),
                 source.ownership.as_db_value(),
                 source
@@ -364,7 +407,8 @@ impl ProjectStore {
             ],
         )?;
         let payload = format!(
-            "{{\"channel\":\"{}\",\"sourceId\":\"{}\",\"sha256\":\"{}\"}}",
+            "{{\"sourceSetId\":\"{}\",\"channel\":\"{}\",\"sourceId\":\"{}\",\"sha256\":\"{}\"}}",
+            source_set_id,
             channel.as_db_value(),
             source.id,
             source.sha256
@@ -386,10 +430,24 @@ impl ProjectStore {
     ///
     /// Returns a typed error when Base Color still anchors companion inputs or persistence fails.
     pub fn remove_source(&mut self, channel: SourceChannel) -> Result<(), StoreError> {
+        let source_set_id = self.default_source_set_id()?;
+        self.remove_source_in_set(source_set_id, channel)
+    }
+
+    /// Removes one map from one material source set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the source is required or persistence fails.
+    pub fn remove_source_in_set(
+        &mut self,
+        source_set_id: Uuid,
+        channel: SourceChannel,
+    ) -> Result<(), StoreError> {
         if channel == SourceChannel::BaseColor {
             let companions: u32 = self.connection.query_row(
-                "SELECT COUNT(*) FROM sources WHERE channel <> 'base_color'",
-                [],
+                "SELECT COUNT(*) FROM sources WHERE source_set_id = ?1 AND channel <> 'base_color'",
+                [source_set_id.to_string()],
                 |row| row.get(0),
             )?;
             if companions > 0 {
@@ -399,8 +457,8 @@ impl ProjectStore {
         let source_id = self
             .connection
             .query_row(
-                "SELECT id FROM sources WHERE channel = ?1",
-                [channel.as_db_value()],
+                "SELECT id FROM sources WHERE source_set_id = ?1 AND channel = ?2",
+                params![source_set_id.to_string(), channel.as_db_value()],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
@@ -421,8 +479,8 @@ impl ProjectStore {
         let now = unix_timestamp()?;
         let transaction = self.connection.transaction()?;
         let removed = transaction.execute(
-            "DELETE FROM sources WHERE channel = ?1",
-            [channel.as_db_value()],
+            "DELETE FROM sources WHERE source_set_id = ?1 AND channel = ?2",
+            params![source_set_id.to_string(), channel.as_db_value()],
         )?;
         if removed == 0 {
             return Err(StoreError::InvalidData(format!(
@@ -430,7 +488,11 @@ impl ProjectStore {
                 channel.as_db_value()
             )));
         }
-        let payload = format!("{{\"channel\":\"{}\"}}", channel.as_db_value());
+        let payload = format!(
+            "{{\"sourceSetId\":\"{}\",\"channel\":\"{}\"}}",
+            source_set_id,
+            channel.as_db_value()
+        );
         transaction.execute(
             "INSERT INTO autosave_journal (occurred_unix, operation, payload_json)
              VALUES (?1, 'remove_source', ?2)",
@@ -495,6 +557,7 @@ impl ProjectStore {
     ) -> Result<PatchEditOutcome, StoreError> {
         let mut next = self.patch_set.clone();
         let outcome = next.execute(command.clone(), coalescing_group)?;
+        validate_patch_geometries(next.patches())?;
         let payload = serde_json::to_string(command)?;
         persist_patch_state(
             &mut self.connection,
@@ -668,8 +731,18 @@ impl ProjectStore {
         ))
     }
 
+    fn default_source_set_id(&self) -> Result<Uuid, StoreError> {
+        let value: String = self.connection.query_row(
+            "SELECT id FROM source_sets ORDER BY ordinal LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Uuid::parse_str(&value).map_err(|_| StoreError::InvalidId(value))
+    }
+
     fn validate_registration(
         &self,
+        source_set_id: Uuid,
         channel: SourceChannel,
         width: u32,
         height: u32,
@@ -677,8 +750,9 @@ impl ProjectStore {
         let base_dimensions = self
             .connection
             .query_row(
-                "SELECT width, height FROM sources WHERE channel = 'base_color'",
-                [],
+                "SELECT width, height FROM sources
+                 WHERE source_set_id = ?1 AND channel = 'base_color'",
+                [source_set_id.to_string()],
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
             )
             .optional()?;
@@ -687,8 +761,9 @@ impl ProjectStore {
                 .connection
                 .query_row(
                     "SELECT channel FROM sources
-                     WHERE channel <> 'base_color' AND (width <> ?1 OR height <> ?2) LIMIT 1",
-                    params![width, height],
+                     WHERE source_set_id = ?1 AND channel <> 'base_color'
+                       AND (width <> ?2 OR height <> ?3) LIMIT 1",
+                    params![source_set_id.to_string(), width, height],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -768,47 +843,68 @@ fn load_patches(connection: &Connection) -> Result<Vec<Patch>, StoreError> {
                 "patch identifiers disagree with the indexed project data".into(),
             ));
         }
-        Quadrilateral::new(patch.geometry.corners).map_err(|error| {
-            StoreError::InvalidData(format!("invalid patch {} geometry: {error}", patch.id))
-        })?;
         patches.push(patch);
     }
+    validate_patch_geometries(&patches)?;
     PatchSet::new(patches.clone())?;
     Ok(patches)
 }
 
+fn validate_patch_geometries(patches: &[Patch]) -> Result<(), StoreError> {
+    for patch in patches {
+        Quadrilateral::new(patch.geometry.corners).map_err(|error| {
+            StoreError::InvalidData(format!("invalid patch {} geometry: {error}", patch.id))
+        })?;
+    }
+    Ok(())
+}
+
 fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT id, channel, ownership, external_path, sha256, width, height, format, color_type,
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let sql = if version >= 6 {
+        "SELECT sources.id, sources.source_set_id, sources.channel, sources.ownership,
+                sources.external_path, sources.sha256, sources.width, sources.height, sources.format, sources.color_type,
+                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
+         FROM sources JOIN source_sets ON source_sets.id = sources.source_set_id
+         ORDER BY source_sets.ordinal, CASE channel
+            WHEN 'base_color' THEN 0 WHEN 'normal' THEN 1 WHEN 'height' THEN 2
+            WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 WHEN 'ambient_occlusion' THEN 5
+            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END"
+    } else {
+        "SELECT sources.id, (SELECT id FROM project LIMIT 1), sources.channel, sources.ownership,
+                sources.external_path, sources.sha256, sources.width, sources.height, sources.format, sources.color_type,
                 has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
          FROM sources ORDER BY CASE channel
             WHEN 'base_color' THEN 0 WHEN 'normal' THEN 1 WHEN 'height' THEN 2
             WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 WHEN 'ambient_occlusion' THEN 5
-            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END",
-    )?;
+            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END"
+    };
+    let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, u32>(5)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
             row.get::<_, u32>(6)?,
-            row.get::<_, String>(7)?,
+            row.get::<_, u32>(7)?,
             row.get::<_, String>(8)?,
-            row.get::<_, bool>(9)?,
-            row.get::<_, u16>(10)?,
-            row.get::<_, bool>(11)?,
-            row.get::<_, u64>(12)?,
-            row.get::<_, Option<Vec<u8>>>(13)?,
-            row.get::<_, String>(14)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, bool>(10)?,
+            row.get::<_, u16>(11)?,
+            row.get::<_, bool>(12)?,
+            row.get::<_, u64>(13)?,
+            row.get::<_, Option<Vec<u8>>>(14)?,
+            row.get::<_, String>(15)?,
         ))
     })?;
     let mut sources = Vec::new();
     for row in rows {
         let (
             id_text,
+            source_set_id_text,
             channel_text,
             ownership_text,
             external_path,
@@ -844,6 +940,8 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
         };
         validate_source_ownership(&input)?;
         sources.push(StoredSource {
+            source_set_id: Uuid::parse_str(&source_set_id_text)
+                .map_err(|_| StoreError::InvalidId(source_set_id_text))?,
             channel: SourceChannel::from_db_value(&channel_text)?,
             input,
         });
@@ -853,7 +951,7 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
 
 fn configure(connection: &Connection) -> Result<(), StoreError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.busy_timeout(Duration::from_secs(2))?;
     Ok(())
@@ -937,6 +1035,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         migrate_to_v5(&transaction)?;
         transaction.pragma_update(None, "user_version", 5_u32)?;
         transaction.commit()?;
+        version = 5;
+    }
+    if version == 5 {
+        let transaction = connection.transaction()?;
+        migrate_to_v6(&transaction)?;
+        transaction.pragma_update(None, "user_version", 6_u32)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -970,6 +1075,13 @@ fn migrate_to_v4(transaction: &Transaction<'_>) -> Result<(), StoreError> {
 fn migrate_to_v5(transaction: &Transaction<'_>) -> Result<(), StoreError> {
     transaction.execute_batch(include_str!(
         "../../../fixtures/projects/migrate-v4-to-v5.sql"
+    ))?;
+    Ok(())
+}
+
+fn migrate_to_v6(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(include_str!(
+        "../../../fixtures/projects/migrate-v5-to-v6.sql"
     ))?;
     Ok(())
 }
@@ -1108,6 +1220,9 @@ struct ProjectLock {
 impl ProjectLock {
     fn acquire(project_path: &Path) -> Result<(Self, bool), StoreError> {
         let path = lock_path(project_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut stale_lock_recovered = false;
         if path.exists() {
             let active = fs::read_to_string(&path)
@@ -1151,9 +1266,19 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 fn lock_path(project_path: &Path) -> PathBuf {
-    let mut value = project_path.as_os_str().to_owned();
-    value.push(".lock");
-    PathBuf::from(value)
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+    let mut hasher = DefaultHasher::new();
+    project_path
+        .to_string_lossy()
+        .to_lowercase()
+        .hash(&mut hasher);
+    std::env::temp_dir()
+        .join("HotTrimmer")
+        .join("locks")
+        .join(format!("{:016x}.lock", hasher.finish()))
 }
 
 #[cfg(test)]
@@ -1362,6 +1487,42 @@ mod tests {
     }
 
     #[test]
+    fn version_five_fixture_groups_existing_maps_into_the_first_source_set() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-five.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v4.sql"))
+            .expect("v4 schema");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/data-v1.sql"))
+            .expect("v4 data");
+        connection
+            .execute_batch(include_str!(
+                "../../../fixtures/projects/migrate-v4-to-v5.sql"
+            ))
+            .expect("v5 schema");
+        connection
+            .pragma_update(None, "user_version", 5_u32)
+            .expect("mark v5");
+        migrate(&mut connection).expect("migrate v5");
+        let (project_id, source_set_id): (String, String) = connection
+            .query_row(
+                "SELECT project.id, sources.source_set_id FROM project JOIN sources LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("migrated source set");
+        assert_eq!(source_set_id, project_id);
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn patch_commands_undo_redo_and_reopen_without_geometry_loss() {
         let fixture = FixtureDir::new();
         let path = fixture.0.join("patches.hottrimmer");
@@ -1398,6 +1559,36 @@ mod tests {
 
         let reopened = ProjectStore::open(&path).expect("reopen project");
         assert_eq!(reopened.summary().expect("summary").patches, vec![authored]);
+    }
+
+    #[test]
+    fn invalid_patch_geometry_is_rejected_before_persistence() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("invalid-patch.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Invalid patch").expect("create project");
+        let base = source(1024, 512);
+        store
+            .replace_source(SourceChannel::BaseColor, &base)
+            .expect("base source");
+        let mut invalid = patch(base.id, "Crossed patch");
+        invalid.geometry.corners.swap(1, 2);
+        let journal_before = store.autosave_journal().expect("journal before").len();
+
+        assert!(matches!(
+            store.execute_patch_command(
+                &PatchCommand::Create {
+                    patch: invalid,
+                    index: None,
+                },
+                None,
+            ),
+            Err(StoreError::InvalidData(_))
+        ));
+        assert!(store.patches().is_empty());
+        assert_eq!(
+            store.autosave_journal().expect("journal after").len(),
+            journal_before
+        );
     }
 
     #[test]
@@ -1466,6 +1657,20 @@ mod tests {
     }
 
     #[test]
+    fn project_folder_has_no_persistent_database_or_lock_sidecars() {
+        let fixture = FixtureDir::new();
+        let project = fixture.0.join("bundle.hottrimmer");
+        let store = ProjectStore::create(&project, "Bundle").expect("create project");
+        store.save().expect("save project");
+
+        assert!(project.exists());
+        assert!(!project.with_extension("hottrimmer-wal").exists());
+        assert!(!project.with_extension("hottrimmer-shm").exists());
+        assert!(!project.with_extension("hottrimmer.lock").exists());
+        assert_ne!(lock_path(&project).parent(), project.parent());
+    }
+
+    #[test]
     fn pbr_sources_require_base_color_registration() {
         let fixture = FixtureDir::new();
         let path = fixture.0.join("registration.hottrimmer");
@@ -1521,6 +1726,49 @@ mod tests {
                 .operation,
             "rename_project"
         );
+    }
+
+    #[test]
+    fn material_source_sets_keep_channels_and_registration_independent() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("multiple-sources.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Multiple sources").expect("create project");
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        store
+            .replace_source_in_set(first, SourceChannel::BaseColor, &source(4, 6))
+            .expect("first base color");
+        store
+            .replace_source_in_set(first, SourceChannel::Normal, &source(4, 6))
+            .expect("first normal");
+        store
+            .replace_source_in_set(second, SourceChannel::BaseColor, &source(8, 10))
+            .expect("second base color may use independent dimensions");
+        store
+            .replace_source_in_set(second, SourceChannel::Normal, &source(8, 10))
+            .expect("second normal");
+        let summary = store.summary().expect("summary");
+        assert_eq!(summary.sources.len(), 4);
+        assert_eq!(
+            summary
+                .sources
+                .iter()
+                .filter(|source| source.source_set_id == first)
+                .count(),
+            2
+        );
+        assert_eq!(
+            summary
+                .sources
+                .iter()
+                .filter(|source| source.source_set_id == second)
+                .count(),
+            2
+        );
+        assert!(matches!(
+            store.remove_source_in_set(first, SourceChannel::BaseColor),
+            Err(StoreError::BaseColorInUse)
+        ));
     }
 
     #[test]
