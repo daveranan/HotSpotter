@@ -1,3 +1,6 @@
+import "./source-first-app";
+
+/* Legacy layout shell removed from the build during the document cutover.
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
@@ -674,3 +677,4 @@ function App(): React.JSX.Element {
 }
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
+*/

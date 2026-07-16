@@ -435,7 +435,7 @@ impl RegionSourceLayer {
             return Err(SourceLayerError::TooManyWarps);
         }
         for (index, warp) in self.warps.iter().enumerate() {
-            if !warp_is_valid(warp) {
+            if !source_warp_is_valid(warp) {
                 return Err(SourceLayerError::InvalidWarp { index });
             }
         }
@@ -468,7 +468,7 @@ fn segments_intersect(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)
     (ab_c * ab_d) < 0.0 && (cd_a * cd_b) < 0.0
 }
 
-fn warp_is_valid(warp: &SourceWarp) -> bool {
+pub(crate) fn source_warp_is_valid(warp: &SourceWarp) -> bool {
     let bounded = |value: f64, maximum: f64| value.is_finite() && value.abs() <= maximum;
     match *warp {
         SourceWarp::Planar {

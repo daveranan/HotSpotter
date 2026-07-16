@@ -91,6 +91,15 @@
             "width": 12.6,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.007813,
+              "width": 0.984375,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -119,6 +128,15 @@
             "width": 12.6,
             "height": 0.3,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.046875,
+              "width": 0.984375,
+              "height": 0.023438
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -147,6 +165,15 @@
             "width": 12.6,
             "height": 0.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.078125,
+              "width": 0.984375,
+              "height": 0.015625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -175,6 +202,15 @@
             "width": 6.2,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.101563,
+              "width": 0.484375,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -203,6 +239,15 @@
             "width": 6.3,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.5,
+              "y": 0.101563,
+              "width": 0.492188,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -231,6 +276,15 @@
             "width": 3,
             "height": 0.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.140625,
+              "width": 0.234375,
+              "height": 0.015625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -259,6 +313,15 @@
             "width": 3,
             "height": 0.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.25,
+              "y": 0.140625,
+              "width": 0.234375,
+              "height": 0.015625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -287,6 +350,15 @@
             "width": 3,
             "height": 0.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.492188,
+              "y": 0.140625,
+              "width": 0.234375,
+              "height": 0.015625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -315,6 +387,15 @@
             "width": 3.3,
             "height": 0.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.734375,
+              "y": 0.140625,
+              "width": 0.257813,
+              "height": 0.015625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -343,6 +424,15 @@
             "width": 2.8,
             "height": 3.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.164063,
+              "width": 0.21875,
+              "height": 0.25
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -371,6 +461,15 @@
             "width": 2.8,
             "height": 3.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.234375,
+              "y": 0.164063,
+              "width": 0.21875,
+              "height": 0.25
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -399,6 +498,15 @@
             "width": 2.8,
             "height": 3.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.460938,
+              "y": 0.164063,
+              "width": 0.21875,
+              "height": 0.25
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -427,6 +535,15 @@
             "width": 2.8,
             "height": 3.2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.6875,
+              "y": 0.164063,
+              "width": 0.21875,
+              "height": 0.25
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -455,6 +572,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -483,6 +609,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.130859,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -511,6 +646,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.253906,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -539,6 +683,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.376953,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -567,6 +720,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.5,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -595,6 +757,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.623047,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -623,6 +794,15 @@
             "width": 1.475,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.746094,
+              "y": 0.421875,
+              "width": 0.115234,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -651,6 +831,15 @@
             "width": 1.575,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.869141,
+              "y": 0.421875,
+              "width": 0.123047,
+              "height": 0.039063
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -685,6 +874,15 @@
             "centerY": 0.5,
             "innerRadius": 0,
             "outerRadius": 0.48
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.46875,
+              "width": 0.109375,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -719,6 +917,15 @@
             "centerY": 0.5,
             "innerRadius": 0.08,
             "outerRadius": 0.48
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.125,
+              "y": 0.46875,
+              "width": 0.109375,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -753,6 +960,15 @@
             "centerY": 0.5,
             "innerRadius": 0.16,
             "outerRadius": 0.48
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.242188,
+              "y": 0.46875,
+              "width": 0.109375,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -787,6 +1003,15 @@
             "centerY": 0.5,
             "innerRadius": 0.24,
             "outerRadius": 0.48
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.359375,
+              "y": 0.46875,
+              "width": 0.109375,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -815,6 +1040,15 @@
             "width": 1.6,
             "height": 1.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.476563,
+              "y": 0.46875,
+              "width": 0.125,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -843,6 +1077,15 @@
             "width": 1.6,
             "height": 1.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.609375,
+              "y": 0.46875,
+              "width": 0.125,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -871,6 +1114,15 @@
             "width": 1.6,
             "height": 1.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.742188,
+              "y": 0.46875,
+              "width": 0.125,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -899,6 +1151,15 @@
             "width": 1.5,
             "height": 1.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.875,
+              "y": 0.46875,
+              "width": 0.117188,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -927,6 +1188,15 @@
             "width": 4.1,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.585938,
+              "width": 0.320313,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -955,6 +1225,15 @@
             "width": 4.1,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.335938,
+              "y": 0.585938,
+              "width": 0.320313,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -983,6 +1262,15 @@
             "width": 4.2,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.664063,
+              "y": 0.585938,
+              "width": 0.328125,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1011,6 +1299,15 @@
             "width": 3,
             "height": 0.3,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.625,
+              "width": 0.234375,
+              "height": 0.023438
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1039,6 +1336,15 @@
             "width": 3,
             "height": 0.3,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.25,
+              "y": 0.625,
+              "width": 0.234375,
+              "height": 0.023438
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1067,6 +1373,15 @@
             "width": 3,
             "height": 0.3,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.492188,
+              "y": 0.625,
+              "width": 0.234375,
+              "height": 0.023438
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1095,6 +1410,15 @@
             "width": 3.3,
             "height": 0.3,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.734375,
+              "y": 0.625,
+              "width": 0.257813,
+              "height": 0.023438
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1123,6 +1447,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1151,6 +1484,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.130859,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1179,6 +1521,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.253906,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1207,6 +1558,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.376953,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1235,6 +1595,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.5,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1263,6 +1632,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.623047,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1291,6 +1669,15 @@
             "width": 1.475,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.746094,
+              "y": 0.65625,
+              "width": 0.115234,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1319,6 +1706,15 @@
             "width": 1.575,
             "height": 1.1,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.869141,
+              "y": 0.65625,
+              "width": 0.123047,
+              "height": 0.085938
+            },
+            "addressMode": "clamp"
           }
         },
         {
@@ -1347,6 +1743,15 @@
             "width": 4.1,
             "height": 2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.75,
+              "width": 0.320313,
+              "height": 0.15625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1375,6 +1780,15 @@
             "width": 4.1,
             "height": 2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.335938,
+              "y": 0.75,
+              "width": 0.320313,
+              "height": 0.15625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1403,6 +1817,15 @@
             "width": 4.2,
             "height": 2,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.664063,
+              "y": 0.75,
+              "width": 0.328125,
+              "height": 0.15625
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1431,6 +1854,15 @@
             "width": 4.1,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.914063,
+              "width": 0.320313,
+              "height": 0.039063
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1459,6 +1891,15 @@
             "width": 4.1,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.335938,
+              "y": 0.914063,
+              "width": 0.320313,
+              "height": 0.039063
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1487,6 +1928,15 @@
             "width": 4.2,
             "height": 0.5,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.664063,
+              "y": 0.914063,
+              "width": 0.328125,
+              "height": 0.039063
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1515,6 +1965,15 @@
             "width": 4.1,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.960938,
+              "width": 0.320313,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1543,6 +2002,15 @@
             "width": 4.1,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.335938,
+              "y": 0.960938,
+              "width": 0.320313,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         },
         {
@@ -1571,6 +2039,15 @@
             "width": 4.2,
             "height": 0.4,
             "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.664063,
+              "y": 0.960938,
+              "width": 0.328125,
+              "height": 0.03125
+            },
+            "addressMode": "repeat"
           }
         }
       ]

@@ -5,8 +5,8 @@ mod paths;
 use std::sync::{Arc, Mutex};
 
 use commands::{
-    PendingProjectPath, ProjectSession, SharedImportJob, SharedLayoutSolveJob,
-    SharedPatchPreviewJob, SharedProjectSession, StartupState,
+    PendingProjectPath, PreviewService, ProjectSession, SharedImportJob, SharedPreviewService,
+    SharedProjectSession, StartupState,
 };
 use paths::AppPaths;
 use tauri::{Emitter, Manager};
@@ -58,8 +58,7 @@ pub fn run() {
             );
             app.manage(Arc::new(Mutex::new(ProjectSession::new(&paths))) as SharedProjectSession);
             app.manage(Arc::new(Mutex::new(None)) as SharedImportJob);
-            app.manage(Arc::new(Mutex::new(None)) as SharedPatchPreviewJob);
-            app.manage(Arc::new(Mutex::new(None)) as SharedLayoutSolveJob);
+            app.manage(Arc::new(PreviewService::default()) as SharedPreviewService);
             app.manage(StartupState {
                 previous_shutdown_clean: !previous_unclean,
             });
@@ -81,25 +80,19 @@ pub fn run() {
             commands::cancel_import,
             commands::remove_source,
             commands::rename_project,
+            commands::create_trim_sheet_document,
+            commands::apply_document_command,
             commands::apply_patch_command,
             commands::undo_patch_command,
             commands::redo_patch_command,
-            commands::undo_project_command,
-            commands::redo_project_command,
-            commands::generate_layout,
-            commands::apply_layout_command,
-            commands::cancel_layout_solve,
-            commands::fit_patch_polygon,
-            commands::generate_patch_preview,
-            commands::generate_draft_patch_preview,
-            commands::cancel_patch_preview,
+            commands::undo_document_command,
+            commands::redo_document_command,
+            commands::compile_trim_sheet_document,
+            commands::preview_trim_sheet_document,
             commands::save_project,
             commands::save_project_as,
             commands::close_project,
             commands::list_recent_projects,
-            commands::list_recovery_candidates,
-            commands::clear_recovery_candidates,
-            commands::recover_project,
             commands::take_pending_project_path
         ])
         .build(tauri::generate_context!())

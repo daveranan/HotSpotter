@@ -7,7 +7,7 @@
     "build": "vite build",
     "dev": "vite --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
-    "test": "node --test src/source-assignment.test.ts src/patch-authoring.test.ts src/serial-task-queue.test.ts src/layout-authoring.test.ts",
+    "test": "node --test src/document-workbench.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -1,17 +1,322 @@
 {
-  "templates": [{
-    "identity":{"templateId":"ht.vertical_trim","templateVersion":"1.0.0","compatibilityKey":"ht.vertical_trim.topology.v1"},
-    "schemaVersion":1,"canonicalWidth":4096,"canonicalHeight":4096,
-    "stableOrder":["jamb_wide","jamb_medium","jamb_narrow","reveal","stile_left","stile_center","stile_right","end_cap"],
-    "slots":[
-      {"slotKey":"jamb_wide","compatibilityKey":"ht.vertical_trim.jamb_wide.v1","materialGroup":"trim","variationGroup":"wide","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":32,"y":32,"width":704,"height":4032},"hotspot":{"x":384,"y":2048},"idColor":[64,89,115],"worldPlacement":{"width":2.2,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"jamb_medium","compatibilityKey":"ht.vertical_trim.jamb_medium.v1","materialGroup":"trim","variationGroup":"medium","role":"repeatingStrip","structuralProfile":"bevel","allocation":{"x":768,"y":32,"width":448,"height":4032},"hotspot":{"x":992,"y":2048},"idColor":[86,122,158],"worldPlacement":{"width":1.4,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"jamb_narrow","compatibilityKey":"ht.vertical_trim.jamb_narrow.v1","materialGroup":"trim","variationGroup":"narrow","role":"repeatingStrip","structuralProfile":"groove","allocation":{"x":1248,"y":32,"width":192,"height":4032},"hotspot":{"x":1344,"y":2048},"idColor":[109,155,201],"worldPlacement":{"width":0.6,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"reveal","compatibilityKey":"ht.vertical_trim.reveal.v1","materialGroup":"trim","variationGroup":"groove","role":"repeatingStrip","structuralProfile":"groove","allocation":{"x":1472,"y":32,"width":96,"height":4032},"hotspot":{"x":1520,"y":2048},"idColor":[132,188,244],"worldPlacement":{"width":0.3,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"stile_left","compatibilityKey":"ht.vertical_trim.stile_left.v1","materialGroup":"trim","variationGroup":"stile","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":1600,"y":32,"width":768,"height":4032},"hotspot":{"x":1984,"y":2048},"idColor":[155,221,77],"worldPlacement":{"width":2.4,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"stile_center","compatibilityKey":"ht.vertical_trim.stile_center.v1","materialGroup":"trim","variationGroup":"stile","role":"repeatingStrip","structuralProfile":"bevel","allocation":{"x":2400,"y":32,"width":704,"height":4032},"hotspot":{"x":2752,"y":2048},"idColor":[178,74,120],"worldPlacement":{"width":2.2,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"stile_right","compatibilityKey":"ht.vertical_trim.stile_right.v1","materialGroup":"trim","variationGroup":"stile","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":3136,"y":32,"width":576,"height":4032},"hotspot":{"x":3424,"y":2048},"idColor":[201,107,163],"worldPlacement":{"width":1.8,"height":12.6,"rotationDegrees":90}},
-      {"slotKey":"end_cap","compatibilityKey":"ht.vertical_trim.end_cap.v1","materialGroup":"trim","variationGroup":"cap","role":"trimCap","structuralProfile":"panelFrame","allocation":{"x":3744,"y":32,"width":320,"height":4032},"hotspot":{"x":3904,"y":2048},"idColor":[224,140,206],"worldPlacement":{"width":1.0,"height":12.6,"rotationDegrees":90}}
-    ]
-  }]
+  "templates": [
+    {
+      "identity": {
+        "templateId": "ht.vertical_trim",
+        "templateVersion": "1.0.0",
+        "compatibilityKey": "ht.vertical_trim.topology.v1"
+      },
+      "schemaVersion": 1,
+      "canonicalWidth": 4096,
+      "canonicalHeight": 4096,
+      "stableOrder": [
+        "jamb_wide",
+        "jamb_medium",
+        "jamb_narrow",
+        "reveal",
+        "stile_left",
+        "stile_center",
+        "stile_right",
+        "end_cap"
+      ],
+      "slots": [
+        {
+          "slotKey": "jamb_wide",
+          "compatibilityKey": "ht.vertical_trim.jamb_wide.v1",
+          "materialGroup": "trim",
+          "variationGroup": "wide",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 32,
+            "y": 32,
+            "width": 704,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 384,
+            "y": 2048
+          },
+          "idColor": [
+            64,
+            89,
+            115
+          ],
+          "worldPlacement": {
+            "width": 2.2,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.007813,
+              "width": 0.171875,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "jamb_medium",
+          "compatibilityKey": "ht.vertical_trim.jamb_medium.v1",
+          "materialGroup": "trim",
+          "variationGroup": "medium",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 768,
+            "y": 32,
+            "width": 448,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 992,
+            "y": 2048
+          },
+          "idColor": [
+            86,
+            122,
+            158
+          ],
+          "worldPlacement": {
+            "width": 1.4,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.1875,
+              "y": 0.007813,
+              "width": 0.109375,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "jamb_narrow",
+          "compatibilityKey": "ht.vertical_trim.jamb_narrow.v1",
+          "materialGroup": "trim",
+          "variationGroup": "narrow",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 1248,
+            "y": 32,
+            "width": 192,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 1344,
+            "y": 2048
+          },
+          "idColor": [
+            109,
+            155,
+            201
+          ],
+          "worldPlacement": {
+            "width": 0.6,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.304688,
+              "y": 0.007813,
+              "width": 0.046875,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "reveal",
+          "compatibilityKey": "ht.vertical_trim.reveal.v1",
+          "materialGroup": "trim",
+          "variationGroup": "groove",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 1472,
+            "y": 32,
+            "width": 96,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 1520,
+            "y": 2048
+          },
+          "idColor": [
+            132,
+            188,
+            244
+          ],
+          "worldPlacement": {
+            "width": 0.3,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.359375,
+              "y": 0.007813,
+              "width": 0.023438,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "stile_left",
+          "compatibilityKey": "ht.vertical_trim.stile_left.v1",
+          "materialGroup": "trim",
+          "variationGroup": "stile",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 1600,
+            "y": 32,
+            "width": 768,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 1984,
+            "y": 2048
+          },
+          "idColor": [
+            155,
+            221,
+            77
+          ],
+          "worldPlacement": {
+            "width": 2.4,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.390625,
+              "y": 0.007813,
+              "width": 0.1875,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "stile_center",
+          "compatibilityKey": "ht.vertical_trim.stile_center.v1",
+          "materialGroup": "trim",
+          "variationGroup": "stile",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 2400,
+            "y": 32,
+            "width": 704,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 2752,
+            "y": 2048
+          },
+          "idColor": [
+            178,
+            74,
+            120
+          ],
+          "worldPlacement": {
+            "width": 2.2,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.585938,
+              "y": 0.007813,
+              "width": 0.171875,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "stile_right",
+          "compatibilityKey": "ht.vertical_trim.stile_right.v1",
+          "materialGroup": "trim",
+          "variationGroup": "stile",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 3136,
+            "y": 32,
+            "width": 576,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 3424,
+            "y": 2048
+          },
+          "idColor": [
+            201,
+            107,
+            163
+          ],
+          "worldPlacement": {
+            "width": 1.8,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.765625,
+              "y": 0.007813,
+              "width": 0.140625,
+              "height": 0.984375
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "end_cap",
+          "compatibilityKey": "ht.vertical_trim.end_cap.v1",
+          "materialGroup": "trim",
+          "variationGroup": "cap",
+          "role": "trimCap",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 3744,
+            "y": 32,
+            "width": 320,
+            "height": 4032
+          },
+          "hotspot": {
+            "x": 3904,
+            "y": 2048
+          },
+          "idColor": [
+            224,
+            140,
+            206
+          ],
+          "worldPlacement": {
+            "width": 1,
+            "height": 12.6,
+            "rotationDegrees": 90
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.914063,
+              "y": 0.007813,
+              "width": 0.078125,
+              "height": 0.984375
+            },
+            "addressMode": "clamp"
+          }
+        }
+      ]
+    }
+  ]
 }

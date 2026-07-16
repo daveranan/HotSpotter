@@ -9,8 +9,6 @@ use tauri::{AppHandle, Manager};
 #[derive(Clone, Debug)]
 pub struct AppPaths {
     pub app_data: PathBuf,
-    pub cache: PathBuf,
-    pub logs: PathBuf,
     pub recovery: PathBuf,
     pub drafts: PathBuf,
     session_marker: PathBuf,
@@ -22,27 +20,17 @@ impl AppPaths {
             .path()
             .app_data_dir()
             .map_err(|error| error.to_string())?;
-        let cache = app
-            .path()
-            .app_cache_dir()
-            .map_err(|error| error.to_string())?;
-        let logs = app
-            .path()
-            .app_log_dir()
-            .map_err(|error| error.to_string())?;
         let recovery = app_data.join("recovery");
         let drafts = app_data.join("drafts");
         let session_marker = app_data.join("running.session");
 
-        for directory in [&app_data, &cache, &logs, &recovery, &drafts] {
+        for directory in [&app_data, &recovery, &drafts] {
             fs::create_dir_all(directory)
                 .map_err(|error| format!("failed to initialize application directory: {error}"))?;
         }
 
         Ok(Self {
             app_data,
-            cache,
-            logs,
             recovery,
             drafts,
             session_marker,
@@ -94,8 +82,6 @@ mod tests {
         fs::create_dir_all(&root).expect("create fixture root");
         let paths = AppPaths {
             app_data: root.clone(),
-            cache: root.join("cache"),
-            logs: root.join("logs"),
             recovery: root.join("recovery"),
             drafts: root.join("drafts"),
             session_marker: root.join("running.session"),

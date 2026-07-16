@@ -7,6 +7,6 @@
     "noEmit": true,
     "isolatedModules": true
   },
-  "include": ["src/index.ts"],
+  "include": ["src/document-contracts.ts"],
   "exclude": ["src/**/*.test.ts"]
 }

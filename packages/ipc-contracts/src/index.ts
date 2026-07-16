@@ -1,3 +1,6 @@
+export * from "./document-contracts";
+
+export namespace RemovedLegacy {
 export const IPC_PROTOCOL_VERSION = 1 as const;
 
 export interface FoundationStatusRequest {
@@ -464,4 +467,5 @@ export interface RecoveryCandidate {
   path: string;
   modifiedUnix: number;
   sourceCount: number;
+}
 }

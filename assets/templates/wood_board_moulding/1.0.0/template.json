@@ -1,17 +1,334 @@
 {
-  "templates":[{
-    "identity":{"templateId":"ht.wood_board_moulding","templateVersion":"1.0.0","compatibilityKey":"ht.wood_board_moulding.topology.v1"},
-    "schemaVersion":1,"canonicalWidth":4096,"canonicalHeight":4096,
-    "stableOrder":["board_wide","board_medium","board_narrow","board_detail","groove_a","groove_b","endgrain_disc","endgrain_ring"],
-    "slots":[
-      {"slotKey":"board_wide","compatibilityKey":"ht.wood_board_moulding.board_wide.v1","materialGroup":"wood","variationGroup":"board","role":"planar","structuralProfile":"flat","allocation":{"x":32,"y":32,"width":4032,"height":896},"hotspot":{"x":2048,"y":480},"idColor":[66,92,118],"worldPlacement":{"width":12.6,"height":2.8,"rotationDegrees":0}},
-      {"slotKey":"board_medium","compatibilityKey":"ht.wood_board_moulding.board_medium.v1","materialGroup":"wood","variationGroup":"board","role":"planar","structuralProfile":"flat","allocation":{"x":32,"y":960,"width":4032,"height":704},"hotspot":{"x":2048,"y":1312},"idColor":[89,125,161],"worldPlacement":{"width":12.6,"height":2.2,"rotationDegrees":0}},
-      {"slotKey":"board_narrow","compatibilityKey":"ht.wood_board_moulding.board_narrow.v1","materialGroup":"wood","variationGroup":"board","role":"planar","structuralProfile":"flat","allocation":{"x":32,"y":1696,"width":4032,"height":448},"hotspot":{"x":2048,"y":1920},"idColor":[112,158,204],"worldPlacement":{"width":12.6,"height":1.4,"rotationDegrees":0}},
-      {"slotKey":"board_detail","compatibilityKey":"ht.wood_board_moulding.board_detail.v1","materialGroup":"wood","variationGroup":"board","role":"planar","structuralProfile":"flat","allocation":{"x":32,"y":2176,"width":4032,"height":320},"hotspot":{"x":2048,"y":2336},"idColor":[135,191,247],"worldPlacement":{"width":12.6,"height":1.0,"rotationDegrees":0}},
-      {"slotKey":"groove_a","compatibilityKey":"ht.wood_board_moulding.groove_a.v1","materialGroup":"wood","variationGroup":"moulding","role":"repeatingStrip","structuralProfile":"groove","allocation":{"x":32,"y":2528,"width":4032,"height":160},"hotspot":{"x":2048,"y":2608},"idColor":[158,224,80],"worldPlacement":{"width":12.6,"height":0.5,"rotationDegrees":0}},
-      {"slotKey":"groove_b","compatibilityKey":"ht.wood_board_moulding.groove_b.v1","materialGroup":"wood","variationGroup":"moulding","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":32,"y":2720,"width":4032,"height":256},"hotspot":{"x":2048,"y":2848},"idColor":[181,77,123],"worldPlacement":{"width":12.6,"height":0.8,"rotationDegrees":0}},
-      {"slotKey":"endgrain_disc","compatibilityKey":"ht.wood_board_moulding.endgrain_disc.v1","materialGroup":"wood","variationGroup":"endgrain","role":"radial","structuralProfile":"radialDisc","allocation":{"x":32,"y":3008,"width":1024,"height":1024},"hotspot":{"x":544,"y":3520},"idColor":[204,110,166],"worldPlacement":{"width":3.2,"height":3.2,"rotationDegrees":0},"radialParameters":{"centerX":0.5,"centerY":0.5,"innerRadius":0.0,"outerRadius":0.48}},
-      {"slotKey":"endgrain_ring","compatibilityKey":"ht.wood_board_moulding.endgrain_ring.v1","materialGroup":"wood","variationGroup":"endgrain","role":"radial","structuralProfile":"annulus","allocation":{"x":1088,"y":3008,"width":1024,"height":1024},"hotspot":{"x":1600,"y":3520},"idColor":[227,143,209],"worldPlacement":{"width":3.2,"height":3.2,"rotationDegrees":0},"radialParameters":{"centerX":0.5,"centerY":0.5,"innerRadius":0.12,"outerRadius":0.48}}
-    ]
-  }]
+  "templates": [
+    {
+      "identity": {
+        "templateId": "ht.wood_board_moulding",
+        "templateVersion": "1.0.0",
+        "compatibilityKey": "ht.wood_board_moulding.topology.v1"
+      },
+      "schemaVersion": 1,
+      "canonicalWidth": 4096,
+      "canonicalHeight": 4096,
+      "stableOrder": [
+        "board_wide",
+        "board_medium",
+        "board_narrow",
+        "board_detail",
+        "groove_a",
+        "groove_b",
+        "endgrain_disc",
+        "endgrain_ring"
+      ],
+      "slots": [
+        {
+          "slotKey": "board_wide",
+          "compatibilityKey": "ht.wood_board_moulding.board_wide.v1",
+          "materialGroup": "wood",
+          "variationGroup": "board",
+          "role": "planar",
+          "structuralProfile": "flat",
+          "allocation": {
+            "x": 32,
+            "y": 32,
+            "width": 4032,
+            "height": 896
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 480
+          },
+          "idColor": [
+            66,
+            92,
+            118
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 2.8,
+            "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.007813,
+              "width": 0.984375,
+              "height": 0.21875
+            },
+            "addressMode": "clamp"
+          }
+        },
+        {
+          "slotKey": "board_medium",
+          "compatibilityKey": "ht.wood_board_moulding.board_medium.v1",
+          "materialGroup": "wood",
+          "variationGroup": "board",
+          "role": "planar",
+          "structuralProfile": "flat",
+          "allocation": {
+            "x": 32,
+            "y": 960,
+            "width": 4032,
+            "height": 704
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 1312
+          },
+          "idColor": [
+            89,
+            125,
+            161
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 2.2,
+            "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.234375,
+              "width": 0.984375,
+              "height": 0.171875
+            },
+            "addressMode": "clamp"
+          }
+        },
+        {
+          "slotKey": "board_narrow",
+          "compatibilityKey": "ht.wood_board_moulding.board_narrow.v1",
+          "materialGroup": "wood",
+          "variationGroup": "board",
+          "role": "planar",
+          "structuralProfile": "flat",
+          "allocation": {
+            "x": 32,
+            "y": 1696,
+            "width": 4032,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 1920
+          },
+          "idColor": [
+            112,
+            158,
+            204
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 1.4,
+            "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.414063,
+              "width": 0.984375,
+              "height": 0.109375
+            },
+            "addressMode": "clamp"
+          }
+        },
+        {
+          "slotKey": "board_detail",
+          "compatibilityKey": "ht.wood_board_moulding.board_detail.v1",
+          "materialGroup": "wood",
+          "variationGroup": "board",
+          "role": "planar",
+          "structuralProfile": "flat",
+          "allocation": {
+            "x": 32,
+            "y": 2176,
+            "width": 4032,
+            "height": 320
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 2336
+          },
+          "idColor": [
+            135,
+            191,
+            247
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 1,
+            "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.53125,
+              "width": 0.984375,
+              "height": 0.078125
+            },
+            "addressMode": "clamp"
+          }
+        },
+        {
+          "slotKey": "groove_a",
+          "compatibilityKey": "ht.wood_board_moulding.groove_a.v1",
+          "materialGroup": "wood",
+          "variationGroup": "moulding",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 32,
+            "y": 2528,
+            "width": 4032,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 2608
+          },
+          "idColor": [
+            158,
+            224,
+            80
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 0.5,
+            "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.617188,
+              "width": 0.984375,
+              "height": 0.039063
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "groove_b",
+          "compatibilityKey": "ht.wood_board_moulding.groove_b.v1",
+          "materialGroup": "wood",
+          "variationGroup": "moulding",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 32,
+            "y": 2720,
+            "width": 4032,
+            "height": 256
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 2848
+          },
+          "idColor": [
+            181,
+            77,
+            123
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 0.8,
+            "rotationDegrees": 0
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.664063,
+              "width": 0.984375,
+              "height": 0.0625
+            },
+            "addressMode": "repeat"
+          }
+        },
+        {
+          "slotKey": "endgrain_disc",
+          "compatibilityKey": "ht.wood_board_moulding.endgrain_disc.v1",
+          "materialGroup": "wood",
+          "variationGroup": "endgrain",
+          "role": "radial",
+          "structuralProfile": "radialDisc",
+          "allocation": {
+            "x": 32,
+            "y": 3008,
+            "width": 1024,
+            "height": 1024
+          },
+          "hotspot": {
+            "x": 544,
+            "y": 3520
+          },
+          "idColor": [
+            204,
+            110,
+            166
+          ],
+          "worldPlacement": {
+            "width": 3.2,
+            "height": 3.2,
+            "rotationDegrees": 0
+          },
+          "radialParameters": {
+            "centerX": 0.5,
+            "centerY": 0.5,
+            "innerRadius": 0,
+            "outerRadius": 0.48
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.007813,
+              "y": 0.734375,
+              "width": 0.25,
+              "height": 0.25
+            },
+            "addressMode": "clamp"
+          }
+        },
+        {
+          "slotKey": "endgrain_ring",
+          "compatibilityKey": "ht.wood_board_moulding.endgrain_ring.v1",
+          "materialGroup": "wood",
+          "variationGroup": "endgrain",
+          "role": "radial",
+          "structuralProfile": "annulus",
+          "allocation": {
+            "x": 1088,
+            "y": 3008,
+            "width": 1024,
+            "height": 1024
+          },
+          "hotspot": {
+            "x": 1600,
+            "y": 3520
+          },
+          "idColor": [
+            227,
+            143,
+            209
+          ],
+          "worldPlacement": {
+            "width": 3.2,
+            "height": 3.2,
+            "rotationDegrees": 0
+          },
+          "radialParameters": {
+            "centerX": 0.5,
+            "centerY": 0.5,
+            "innerRadius": 0.12,
+            "outerRadius": 0.48
+          },
+          "sourceMapping": {
+            "crop": {
+              "x": 0.265625,
+              "y": 0.734375,
+              "width": 0.25,
+              "height": 0.25
+            },
+            "addressMode": "clamp"
+          }
+        }
+      ]
+    }
+  ]
 }

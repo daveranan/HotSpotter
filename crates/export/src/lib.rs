@@ -265,14 +265,20 @@ mod tests {
             .find(|slot| slot.slot_id == "wall_primary")
             .expect("rectangular fixture");
         assert_eq!(rectangular.uv_fit.kind, UvFitKind::Rectangular);
-        assert_eq!(rectangular.region_id_color, [72, 104, 136]);
+        assert_eq!(
+            rectangular.region_id_color,
+            template.slots.iter().find(|slot| slot.slot_key == "wall_primary").unwrap().id_color.0,
+        );
         let radial = first
             .slots
             .iter()
             .find(|slot| slot.slot_id == "radial_fixture_a")
             .expect("radial fixture");
         assert_eq!(radial.uv_fit.kind, UvFitKind::Radial);
-        assert_eq!(radial.region_id_color, [144, 136, 72]);
+        assert_eq!(
+            radial.region_id_color,
+            template.slots.iter().find(|slot| slot.slot_key == "radial_fixture_a").unwrap().id_color.0,
+        );
         assert!(radial.radial_parameters.is_some());
     }
 }

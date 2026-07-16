@@ -1633,7 +1633,9 @@ name = "hot-trimmer-sheet-compiler"
 version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
+ "hot-trimmer-geometry",
  "hot-trimmer-render-core",
+ "serde",
  "thiserror 2.0.18",
 ]
 

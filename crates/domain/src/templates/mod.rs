@@ -45,6 +45,31 @@ pub struct RadialParameters {
     pub outer_radius: f64,
 }
 
+/// Template-authored source-space crop used to instantiate a region's first material mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateSourceRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateSourceAddressMode {
+    Clamp,
+    Repeat,
+    MirroredRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateSourceMapping {
+    pub crop: TemplateSourceRect,
+    pub address_mode: TemplateSourceAddressMode,
+}
+
 /// Manifest-owned intended usage of a fixed template allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +94,17 @@ pub enum StructuralProfile {
     Annulus,
 }
 
+/// Optional destination-packing guidance. Source mapping remains a separate, immutable concern.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplatePackingIntent {
+    pub preferred_aspect: f64,
+    pub area_weight: f64,
+    pub minimum_size: [u32; 2],
+    pub allow_rotation: bool,
+    pub padding: u32,
+}
+
 /// One fixed slot in a versioned layout template.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +120,9 @@ pub struct TemplateSlot {
     pub hotspot: Option<Hotspot>,
     pub id_color: IdColor,
     pub world_placement: WorldPlacement,
+    pub source_mapping: TemplateSourceMapping,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packing_intent: Option<TemplatePackingIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radial_parameters: Option<RadialParameters>,
 }
@@ -234,6 +273,20 @@ impl TemplateDefinition {
                     slot.slot_key.clone(),
                 ));
             }
+            if !valid_source_mapping(slot.source_mapping) {
+                return Err(TemplateRegistryError::InvalidSourceMapping(
+                    slot.slot_key.clone(),
+                ));
+            }
+            if let Some(intent) = slot.packing_intent
+                && (!intent.preferred_aspect.is_finite()
+                    || intent.preferred_aspect <= 0.0
+                    || !intent.area_weight.is_finite()
+                    || intent.area_weight <= 0.0
+                    || intent.minimum_size.contains(&0))
+            {
+                return Err(TemplateRegistryError::InvalidPackingIntent(slot.slot_key.clone()));
+            }
             match (slot.role, slot.radial_parameters) {
                 (TemplateSlotRole::Radial, Some(radial)) => {
                     let valid_parameters = radial.center_x.is_finite()
@@ -377,6 +430,10 @@ pub enum TemplateRegistryError {
     InvalidHotspot(String),
     #[error("template world placement is invalid: {0}")]
     InvalidWorldPlacement(String),
+    #[error("template source mapping is invalid: {0}")]
+    InvalidSourceMapping(String),
+    #[error("template slot packing intent is invalid: {0}")]
+    InvalidPackingIntent(String),
     #[error("template radial parameters are invalid: {0}")]
     InvalidRadialParameters(String),
     #[error("template is duplicated: {template_id}@{template_version}")]
@@ -384,6 +441,20 @@ pub enum TemplateRegistryError {
         template_id: String,
         template_version: String,
     },
+}
+
+fn valid_source_mapping(mapping: TemplateSourceMapping) -> bool {
+    let crop = mapping.crop;
+    crop.x.is_finite()
+        && crop.y.is_finite()
+        && crop.width.is_finite()
+        && crop.height.is_finite()
+        && crop.width > 0.0
+        && crop.height > 0.0
+        && crop.x >= 0.0
+        && crop.y >= 0.0
+        && crop.x + crop.width <= 1.0 + f64::EPSILON
+        && crop.y + crop.height <= 1.0 + f64::EPSILON
 }
 
 #[cfg(test)]
@@ -404,7 +475,8 @@ mod tests {
             "allocation": {"x": 0, "y": 0, "width": 2048, "height": 4096},
             "hotspot": {"x": 1024, "y": 2048},
             "idColor": [64, 65, 66],
-            "worldPlacement": {"width": 4.0, "height": 3.0, "rotationDegrees": 0.0}
+            "worldPlacement": {"width": 4.0, "height": 3.0, "rotationDegrees": 0.0},
+            "sourceMapping": {"crop": {"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0}, "addressMode": "clamp"}
           },
           {
             "slotKey": "floor",
@@ -412,6 +484,7 @@ mod tests {
             "allocation": {"x": 2048, "y": 0, "width": 2048, "height": 2048},
             "idColor": [67, 68, 69],
             "worldPlacement": {"width": 4.0, "height": 4.0, "rotationDegrees": 90.0},
+            "sourceMapping": {"crop": {"x": 0.5, "y": 0.0, "width": 0.5, "height": 0.5}, "addressMode": "clamp"},
             "radialParameters": {"centerX": 0.5, "centerY": 0.5, "innerRadius": 0.0, "outerRadius": 1.0}
           }
         ]
