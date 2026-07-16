@@ -11,7 +11,7 @@ use crate::{
     TemplateSnapshot,
     layout::source_warp_is_valid,
     templates::{
-        CanonicalRect, TemplateSlot, TemplateSourceAddressMode, TemplateSourceMapping,
+        CanonicalRect, RadialParameters, TemplateSlot, TemplateSourceAddressMode, TemplateSourceMapping,
         TemplateSourceRect,
     },
 };
@@ -172,11 +172,35 @@ pub struct WarpOperation {
     pub operation: SourceWarp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RadialMappingSettings {
+    pub center_x: f64,
+    pub center_y: f64,
+    pub inner_radius: f64,
+    pub outer_radius: f64,
+    pub falloff: f64,
+}
+
+impl From<RadialParameters> for RadialMappingSettings {
+    fn from(value: RadialParameters) -> Self {
+        Self {
+            center_x: value.center_x,
+            center_y: value.center_y,
+            inner_radius: value.inner_radius,
+            outer_radius: value.outer_radius,
+            falloff: 0.5,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionMapping {
     pub projection: Projection,
     pub warps: Vec<WarpOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radial: Option<RadialMappingSettings>,
     pub transform: MappingTransform,
     pub address_mode: AddressMode,
     pub sampling: SamplingPolicy,
@@ -204,6 +228,7 @@ impl Default for RegionMapping {
         Self {
             projection: Projection::default(),
             warps: Vec::new(),
+            radial: None,
             transform: MappingTransform::default(),
             address_mode: AddressMode::Clamp,
             sampling: SamplingPolicy::default(),
@@ -951,7 +976,10 @@ impl TrimSheetDocument {
                 RegionBinding {
                     region_id,
                     content: ContentReference::InheritPrimaryMaterial,
-                    mapping: template_region_mapping(slot.source_mapping),
+                    mapping: RegionMapping {
+                        radial: slot.radial_parameters.map(Into::into),
+                        ..template_region_mapping(slot.source_mapping)
+                    },
                     variation: VariationSettings::default(),
                     blend: BlendPolicy::default(),
                 },
@@ -1022,6 +1050,18 @@ impl TrimSheetDocument {
                     .mapping
                     .projection = projection.clone();
             }
+            TrimSheetDocumentCommand::SetRegionRadial { region_id, radial } => {
+                let region = next.topology.regions.iter().find(|region| region.id == *region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
+                if region.role != TemplateSlotRole::Radial {
+                    return Err(TrimSheetDocumentError::InvalidRadialMapping(*region_id));
+                }
+                next.region_bindings
+                    .get_mut(region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
+                    .mapping
+                    .radial = Some(*radial);
+            }
             TrimSheetDocumentCommand::SetOutputResolution { output_size } => {
                 next.render_settings.output_size = *output_size;
             }
@@ -1039,7 +1079,8 @@ impl TrimSheetDocument {
                         let slot = template.slots.iter().find(|slot| &slot.slot_key == key)?;
                         (deterministic_region_id(&template.identity.compatibility_key, &slot.compatibility_key) == region.id).then_some(slot)
                     }).ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-                    let rect = packed[&slot.slot_key];
+                    let rect = packed.get(&slot.slot_key).copied()
+                        .ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
                     let padding = settings.padding.min(rect.width.saturating_sub(1) / 2)
                         .min(rect.height.saturating_sub(1) / 2);
                     region.allocation_rect = rect;
@@ -1052,6 +1093,9 @@ impl TrimSheetDocument {
             TrimSheetDocumentCommand::SetRegionDestination { region_id, allocation_rect, padding } => {
                 let region = next.topology.regions.iter_mut().find(|region| region.id == *region_id)
                     .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
+                if region.role == TemplateSlotRole::Radial && allocation_rect.width != allocation_rect.height {
+                    return Err(TrimSheetDocumentError::AspectLockedRegion(*region_id));
+                }
                 region.allocation_rect = *allocation_rect;
                 region.hotspot_rect = inset_rect(*allocation_rect, *padding);
                 next.topology.topology_hash = hash_serializable(&next.topology.topology_hash_inputs())?;
@@ -1094,6 +1138,7 @@ fn template_region_mapping(mapping: TemplateSourceMapping) -> RegionMapping {
             .expect("template crop focus is normalized"),
         },
         warps: Vec::new(),
+        radial: None,
         transform: MappingTransform::default(),
         address_mode: template_address_mode(mapping.address_mode),
         sampling: SamplingPolicy::default(),
@@ -1142,6 +1187,10 @@ pub enum TrimSheetDocumentCommand {
         region_id: RegionId,
         projection: Projection,
     },
+    SetRegionRadial {
+        region_id: RegionId,
+        radial: RadialMappingSettings,
+    },
     SetOutputResolution {
         output_size: PixelSize,
     },
@@ -1174,8 +1223,22 @@ struct SemanticPackItem<'a> {
     weight: f64,
 }
 
-/// Semantic bands first, followed by a deterministic weighted rectangle partition. The authored
-/// allocation contributes only preferred area/aspect; source crops never participate in packing.
+#[derive(Clone, Copy, Debug)]
+struct GridPackRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl GridPackRect {
+    fn area(self) -> u32 {
+        self.width.saturating_mul(self.height)
+    }
+}
+
+/// Builds a coverage-guaranteed semantic mosaic. The grid controls snapping precision only; the
+/// recipe is driven by role, preferred aspect, and area weight. Source crops never participate.
 fn semantic_pack_template(template: &TemplateDefinition, settings: LayoutGridSettings) -> BTreeMap<String, CanonicalRect> {
     let columns = u32::from(settings.columns);
     let rows = u32::from(settings.rows);
@@ -1189,81 +1252,153 @@ fn semantic_pack_template(template: &TemplateDefinition, settings: LayoutGridSet
             ),
         })
     }).collect();
-    items.sort_by(|left, right| {
-        semantic_priority(left.slot.role).cmp(&semantic_priority(right.slot.role))
-            .then_with(|| right.weight.total_cmp(&left.weight))
-            .then_with(|| left.stable_index.cmp(&right.stable_index))
-    });
+    items.sort_by(semantic_item_order);
 
-    let mut occupied = vec![false; (columns * rows) as usize];
-    let mut result = BTreeMap::new();
-    for item in items {
-        let (mut width, mut height) = semantic_footprint(item.slot, columns, rows);
-        let allow_rotation = item.slot.packing_intent.is_some_and(|intent| intent.allow_rotation);
-        let placed = loop {
-            let mut candidate = find_grid_space(&occupied, columns, rows, width, height)
-                .map(|(x, y)| (x, y, width, height));
-            if candidate.is_none() && allow_rotation && width != height {
-                candidate = find_grid_space(&occupied, columns, rows, height, width)
-                    .map(|(x, y)| (x, y, height, width));
-            }
-            if candidate.is_some() || (width == 1 && height == 1) { break candidate; }
-            if width >= height && width > 1 { width = width.div_ceil(2); }
-            else if height > 1 { height = height.div_ceil(2); }
-        };
-        let Some((x, y, width, height)) = placed else { continue };
-        mark_grid(&mut occupied, columns, x, y, width, height);
-        result.insert(item.slot.slot_key.clone(), grid_rect(
-            x, y, width, height, columns, rows, template.canonical_width, template.canonical_height,
-        ));
+    let mut radial: Vec<_> = items.iter().copied()
+        .filter(|item| item.slot.role == TemplateSlotRole::Radial).collect();
+    let mut strips: Vec<_> = items.iter().copied()
+        .filter(|item| item.slot.role == TemplateSlotRole::RepeatingStrip).collect();
+    let mut panels: Vec<_> = items.iter().copied()
+        .filter(|item| !matches!(item.slot.role, TemplateSlotRole::Radial | TemplateSlotRole::RepeatingStrip)).collect();
+    radial.sort_by(semantic_item_order);
+    strips.sort_by(semantic_item_order);
+    panels.sort_by(semantic_item_order);
+
+    let mut placements = BTreeMap::new();
+    let full = GridPackRect { x: 0, y: 0, width: columns, height: rows };
+    let radial_edge = (rows / 8).max(1).min(columns / radial.len().max(1) as u32);
+    let radial_width = radial_edge.saturating_mul(radial.len() as u32);
+    let radial_y = rows.saturating_mul(3) / 8;
+    let top = GridPackRect { x: 0, y: 0, width: columns, height: radial_y };
+    let side = GridPackRect {
+        x: radial_width,
+        y: radial_y,
+        width: columns.saturating_sub(radial_width),
+        height: radial_edge,
+    };
+    let bottom = GridPackRect {
+        x: 0,
+        y: radial_y.saturating_add(radial_edge),
+        width: columns,
+        height: rows.saturating_sub(radial_y.saturating_add(radial_edge)),
+    };
+    let special_zones_fit = !radial.is_empty()
+        && !panels.is_empty()
+        && !strips.is_empty()
+        && radial_width <= columns
+        && top.area() >= panels.len() as u32
+        && bottom.area() >= strips.len() as u32;
+
+    if special_zones_fit {
+        for (index, item) in radial.iter().enumerate() {
+            placements.insert(item.slot.slot_key.clone(), GridPackRect {
+                x: index as u32 * radial_edge,
+                y: radial_y,
+                width: radial_edge,
+                height: radial_edge,
+            });
+        }
+        if side.area() > 0 {
+            let hero = panels.remove(0);
+            placements.insert(hero.slot.slot_key.clone(), side);
+        }
+        partition_semantic(&panels, top, &mut placements);
+        partition_semantic(&strips, bottom, &mut placements);
+    } else if radial.is_empty() && !panels.is_empty() && !strips.is_empty() {
+        let strip_share = (total_weight(&strips) / total_weight(&items)).clamp(0.25, 0.75);
+        let mut strip_rows = (f64::from(rows) * strip_share).round() as u32;
+        strip_rows = strip_rows.clamp(strips.len().div_ceil(columns as usize) as u32, rows.saturating_sub(1));
+        let panel_rect = GridPackRect { x: 0, y: 0, width: columns, height: rows - strip_rows };
+        let strip_rect = GridPackRect { x: 0, y: rows - strip_rows, width: columns, height: strip_rows };
+        if panel_rect.area() >= panels.len() as u32 && strip_rect.area() >= strips.len() as u32 {
+            partition_semantic(&panels, panel_rect, &mut placements);
+            partition_semantic(&strips, strip_rect, &mut placements);
+        } else {
+            partition_semantic(&items, full, &mut placements);
+        }
+    } else {
+        partition_semantic(&items, full, &mut placements);
     }
-    result
+
+    placements.into_iter().map(|(key, rect)| (key, grid_rect(
+        rect.x, rect.y, rect.width, rect.height, columns, rows,
+        template.canonical_width, template.canonical_height,
+    ))).collect()
 }
 
-fn semantic_priority(role: TemplateSlotRole) -> u8 {
-    match role {
-        TemplateSlotRole::Planar => 0,
-        TemplateSlotRole::TrimCap => 1,
-        TemplateSlotRole::UniqueDetail => 2,
-        TemplateSlotRole::Radial => 3,
-        TemplateSlotRole::RepeatingStrip => 4,
-    }
+fn semantic_item_order(left: &SemanticPackItem<'_>, right: &SemanticPackItem<'_>) -> std::cmp::Ordering {
+    right.weight.total_cmp(&left.weight)
+        .then_with(|| preferred_aspect(right.slot).total_cmp(&preferred_aspect(left.slot)))
+        .then_with(|| left.stable_index.cmp(&right.stable_index))
 }
 
-fn semantic_footprint(slot: &TemplateSlot, columns: u32, rows: u32) -> (u32, u32) {
-    let scale_x = |units: u32| (units * columns).div_ceil(32).clamp(1, columns);
-    let scale_y = |units: u32| (units * rows).div_ceil(32).clamp(1, rows);
-    let aspect = slot.packing_intent.map_or(
+fn preferred_aspect(slot: &TemplateSlot) -> f64 {
+    slot.packing_intent.map_or(
         f64::from(slot.allocation.width) / f64::from(slot.allocation.height),
         |intent| intent.preferred_aspect,
-    );
-    match slot.role {
-        TemplateSlotRole::Planar => if aspect >= 1.5 { (scale_x(12), scale_y(6)) } else { (scale_x(8), scale_y(8)) },
-        TemplateSlotRole::RepeatingStrip => if aspect >= 1.0 { (scale_x(16), scale_y(1)) } else { (scale_x(1), scale_y(16)) },
-        TemplateSlotRole::Radial => (scale_x(4).min(scale_y(4)), scale_x(4).min(scale_y(4))),
-        TemplateSlotRole::TrimCap => (scale_x(4), scale_y(4)),
-        TemplateSlotRole::UniqueDetail => if aspect >= 1.5 { (scale_x(4), scale_y(2)) } else { (scale_x(4), scale_y(4)) },
-    }
+    ).clamp(1.0 / 64.0, 64.0)
 }
 
-fn find_grid_space(occupied: &[bool], columns: u32, rows: u32, width: u32, height: u32) -> Option<(u32, u32)> {
-    if width > columns || height > rows { return None; }
-    for y in 0..=rows - height {
-        for x in 0..=columns - width {
-            if (y..y + height).all(|row| (x..x + width).all(|column| !occupied[(row * columns + column) as usize])) {
-                return Some((x, y));
+fn total_weight(items: &[SemanticPackItem<'_>]) -> f64 {
+    items.iter().map(|item| item.weight.max(1.0)).sum::<f64>().max(1.0)
+}
+
+fn aggregate_aspect(items: &[SemanticPackItem<'_>]) -> f64 {
+    let weight = total_weight(items);
+    (items.iter().map(|item| item.weight.max(1.0) * preferred_aspect(item.slot).ln()).sum::<f64>() / weight).exp()
+}
+
+fn partition_semantic(items: &[SemanticPackItem<'_>], rect: GridPackRect, output: &mut BTreeMap<String, GridPackRect>) {
+    if items.is_empty() || rect.area() < items.len() as u32 {
+        return;
+    }
+    if items.len() == 1 {
+        output.insert(items[0].slot.slot_key.clone(), rect);
+        return;
+    }
+    let total = total_weight(items);
+    let mut best: Option<(f64, usize, bool, u32)> = None;
+    for split in 1..items.len() {
+        let left = &items[..split];
+        let right = &items[split..];
+        let ratio = total_weight(left) / total;
+        for vertical in [true, false] {
+            let (edge, cross) = if vertical { (rect.width, rect.height) } else { (rect.height, rect.width) };
+            if edge < 2 || cross == 0 { continue; }
+            let minimum = (left.len() as u32).div_ceil(cross).max(1);
+            let maximum = edge.saturating_sub((right.len() as u32).div_ceil(cross).max(1));
+            if minimum > maximum { continue; }
+            let cut = ((f64::from(edge) * ratio).round() as u32).clamp(minimum, maximum);
+            let (left_aspect, right_aspect) = if vertical {
+                (f64::from(cut) / f64::from(rect.height), f64::from(rect.width - cut) / f64::from(rect.height))
+            } else {
+                (f64::from(rect.width) / f64::from(cut), f64::from(rect.width) / f64::from(rect.height - cut))
+            };
+            let left_weight = total_weight(left);
+            let right_weight = total_weight(right);
+            let aspect_cost = left_weight * (left_aspect / aggregate_aspect(left)).ln().abs()
+                + right_weight * (right_aspect / aggregate_aspect(right)).ln().abs();
+            let area_ratio = f64::from(cut) / f64::from(edge);
+            let score = aspect_cost / total + (area_ratio - ratio).abs() * 0.35;
+            if best.is_none_or(|candidate| score < candidate.0) {
+                best = Some((score, split, vertical, cut));
             }
         }
     }
-    None
-}
-
-fn mark_grid(occupied: &mut [bool], columns: u32, x: u32, y: u32, width: u32, height: u32) {
-    for row in y..y + height {
-        for column in x..x + width {
-            occupied[(row * columns + column) as usize] = true;
-        }
-    }
+    let Some((_, split, vertical, cut)) = best else { return };
+    let (first, second) = if vertical {
+        (
+            GridPackRect { width: cut, ..rect },
+            GridPackRect { x: rect.x + cut, width: rect.width - cut, ..rect },
+        )
+    } else {
+        (
+            GridPackRect { height: cut, ..rect },
+            GridPackRect { y: rect.y + cut, height: rect.height - cut, ..rect },
+        )
+    };
+    partition_semantic(&items[..split], first, output);
+    partition_semantic(&items[split..], second, output);
 }
 
 fn rects_overlap(left: CanonicalRect, right: CanonicalRect) -> bool {
@@ -1399,6 +1534,21 @@ fn validate_mapping(
             }
         }
     }
+    if let Some(radial) = mapping.radial
+        && (!radial.center_x.is_finite()
+            || !radial.center_y.is_finite()
+            || !radial.inner_radius.is_finite()
+            || !radial.outer_radius.is_finite()
+            || !radial.falloff.is_finite()
+            || !(0.0..=1.0).contains(&radial.center_x)
+            || !(0.0..=1.0).contains(&radial.center_y)
+            || radial.inner_radius < 0.0
+            || radial.outer_radius <= radial.inner_radius
+            || radial.outer_radius > 2.0
+            || !(0.1..=4.0).contains(&radial.falloff))
+    {
+        return Err(TrimSheetDocumentError::InvalidRadialMapping(region_id));
+    }
     if mapping.transform.scale.iter().any(|value| {
         !value.is_finite() || value.abs() <= 1e-6 || value.abs() > MAX_MAPPING_MAGNITUDE
     }) || mapping
@@ -1459,6 +1609,8 @@ pub enum TrimSheetDocumentError {
     InvalidAllocationRect(RegionId),
     #[error("region allocation rectangle overlaps another region: {0}")]
     OverlappingAllocationRect(RegionId),
+    #[error("region destination aspect is locked and cannot be skewed: {0}")]
+    AspectLockedRegion(RegionId),
     #[error("region hotspot rectangle is invalid: {0}")]
     InvalidHotspotRect(RegionId),
     #[error("region UV-fit metadata is invalid: {0}")]
@@ -1504,6 +1656,8 @@ pub enum TrimSheetDocumentError {
     MissingSolidContent(RegionId),
     #[error("region source geometry is empty, out of bounds, or singular: {0}")]
     InvalidSourceGeometry(RegionId),
+    #[error("region radial mapping is invalid or unsupported for this region: {0}")]
+    InvalidRadialMapping(RegionId),
     #[error("region mapping contains a non-finite or out-of-range numeric value: {0}")]
     InvalidNumericValue(RegionId),
     #[error("region has too many warp operations: {0}")]
@@ -1536,7 +1690,7 @@ pub enum TrimSheetDocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PatchGeometry, PatchProperties, RectificationSettings, SourceId};
+    use crate::{PatchGeometry, PatchProperties, RectificationSettings, SourceId, TemplateRegistry};
 
     fn material(id: SourceSetId) -> MaterialSourceSet {
         MaterialSourceSet {
@@ -1659,6 +1813,36 @@ mod tests {
             .expect("binding")
             .content = ContentReference::Patch(patch_id);
         document.validate().expect("patch binding");
+    }
+
+    #[test]
+    fn semantic_grid_packing_is_total_stable_and_safe_at_every_supported_size() {
+        let registry = TemplateRegistry::built_in().expect("templates");
+        let template = registry.get("ht.generic_architecture", "1.0.0").expect("generic template");
+        let material_id = SourceSetId::from_bytes([7; 16]);
+        let original = TrimSheetDocument::from_template(
+            LayoutId::from_bytes([8; 16]),
+            template,
+            vec![material(material_id)],
+            Vec::new(),
+        ).expect("generated document");
+        let mappings = original.region_bindings.clone();
+
+        for size in [16, 24, 32, 48, 64] {
+            let packed = original.apply_command(&TrimSheetDocumentCommand::SetLayoutGrid {
+                settings: LayoutGridSettings { columns: size, rows: size, padding: 8 },
+            }).expect("supported grid packs every slot");
+            packed.validate().expect("packed document validates");
+            assert_eq!(packed.region_bindings, mappings, "destination packing must not edit source mappings");
+            assert_eq!(packed.topology.regions.len(), template.slots.len());
+            let allocated_area: u64 = packed.topology.regions.iter()
+                .map(|region| u64::from(region.allocation_rect.width) * u64::from(region.allocation_rect.height))
+                .sum();
+            assert_eq!(allocated_area, 4_096_u64 * 4_096_u64, "the atlas must have no unowned cells");
+            for region in packed.topology.regions.iter().filter(|region| region.role == TemplateSlotRole::Radial) {
+                assert_eq!(region.allocation_rect.width, region.allocation_rect.height, "radial destinations stay square");
+            }
+        }
     }
 
     #[test]

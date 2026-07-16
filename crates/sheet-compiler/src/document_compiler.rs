@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use hot_trimmer_domain::{
     AddressMode, CanonicalRect, ContentReference, DocumentHash, IdColor, MaterialMapKind,
-    PatchId, PixelBounds, PixelSize, Projection, RegionDefinition, RegionId, RegionMapping,
+    PatchId, PixelBounds, PixelSize, Projection, RadialMappingSettings, RegionDefinition, RegionId, RegionMapping,
     SourceId, SourceSetId,
     StructuralProfile, TemplateSlotRole, TrimSheetDocument, TrimSheetDocumentError,
 };
@@ -348,6 +348,9 @@ pub fn compile_preview_map_incremental<F>(
 where
     F: Fn() -> bool,
 {
+    // A region-only render is meaningful only as a composite over a complete sheet. Fall back to
+    // a full bounded preview whenever no base exists; never manufacture a partial black surface.
+    let dirty_region = dirty_region.filter(|_| base_pixels.is_some());
     let mut preview_document = document.clone();
     let source_size = preview_document.render_settings.output_size;
     let edge = source_size.width.max(source_size.height);
@@ -530,7 +533,15 @@ fn render_region_map(
             let v = (f64::from(y) + 0.5) / f64::from(bounds.height);
             // Role warping happens in allocation-local coordinates. The declared crop is
             // applied afterwards, so changing destination packing can never move source bounds.
-            let (u, v) = role_local_uv(region.role, u, v);
+            let (u, v) = role_local_uv(region.role, binding.mapping.radial.as_ref(), u, v);
+            let (u, v) = preserve_crop_aspect(
+                u,
+                v,
+                &binding.mapping.projection,
+                bounds,
+                source.width,
+                source.height,
+            );
             let (u, v) = mapped_uv(
                 u,
                 v,
@@ -555,15 +566,46 @@ fn render_region_map(
     Ok(())
 }
 
-fn role_local_uv(role: TemplateSlotRole, u: f64, v: f64) -> (f64, f64) {
-    if role != TemplateSlotRole::Radial {
+fn role_local_uv(
+    role: TemplateSlotRole,
+    radial: Option<&RadialMappingSettings>,
+    u: f64,
+    v: f64,
+) -> (f64, f64) {
+    let Some(radial) = radial.filter(|_| role == TemplateSlotRole::Radial) else {
+        return (u, v);
+    };
+    let dx = u - radial.center_x;
+    let dy = v - radial.center_y;
+    let normalized = ((dx * dx + dy * dy).sqrt() * 2.0).clamp(0.0, 1.0);
+    let radius = radial.inner_radius
+        + (radial.outer_radius - radial.inner_radius) * normalized.powf(radial.falloff);
+    let angle = dy.atan2(dx) / std::f64::consts::TAU + 0.5;
+    (radius, angle)
+}
+
+/// Center-crops a source rectangle to the destination aspect. This is UV-space `cover`: no
+/// source texel is stretched merely because packing produced a differently shaped destination.
+fn preserve_crop_aspect(
+    u: f64,
+    v: f64,
+    projection: &Projection,
+    destination: PixelBounds,
+    source_width: u32,
+    source_height: u32,
+) -> (f64, f64) {
+    let Projection::Crop { bounds, .. } = projection else { return (u, v) };
+    if destination.width == 0 || destination.height == 0 || source_width == 0 || source_height == 0 {
         return (u, v);
     }
-    let dx = u - 0.5;
-    let dy = v - 0.5;
-    let radius = ((dx * dx + dy * dy).sqrt() * 2.0).clamp(0.0, 1.0);
-    let angle = dy.atan2(dx) / std::f64::consts::TAU + 0.5;
-    (radius.sqrt(), angle)
+    let source_aspect = bounds.width.get() * f64::from(source_width)
+        / (bounds.height.get() * f64::from(source_height));
+    let destination_aspect = f64::from(destination.width) / f64::from(destination.height);
+    if destination_aspect > source_aspect {
+        (u, 0.5 + (v - 0.5) * source_aspect / destination_aspect)
+    } else {
+        (0.5 + (u - 0.5) * destination_aspect / source_aspect, v)
+    }
 }
 
 fn mapped_uv(u: f64, v: f64, projection: &Projection, mode: AddressMode) -> (f64, f64) {
@@ -833,6 +875,20 @@ mod tests {
         );
         assert_eq!(compiled.regions.len(), document.topology.regions.len());
         assert!(compiled.maps.base_color.iter().any(|value| *value != 0));
+        for region in &compiled.regions {
+            for y in region.allocation_bounds.y..region.allocation_bounds.y + region.allocation_bounds.height {
+                for x in region.allocation_bounds.x..region.allocation_bounds.x + region.allocation_bounds.width {
+                    let offset = ((y * compiled.dimensions.width + x) * 4) as usize;
+                    let pixel = &compiled.maps.base_color[offset..offset + 4];
+                    assert_eq!(pixel[3], 255, "region {} contains transparent output", region.display_name);
+                    assert!(
+                        pixel[..3].iter().any(|component| *component != 0),
+                        "region {} contains black output at ({x}, {y})",
+                        region.display_name
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -904,7 +960,8 @@ mod tests {
             height: 16,
             rgba8: coordinate_grid(16, 16, 128).into(),
         };
-        let compiled = compile_document(&document, &[base, specular, edge]).unwrap();
+        let registered_maps = [base, specular, edge];
+        let compiled = compile_document(&document, &registered_maps).unwrap();
         let specular_map = compiled
             .maps
             .additional
@@ -957,6 +1014,28 @@ mod tests {
             sampled_slots.len(),
             "sampled template regions must declare distinct source-space crops"
         );
+
+        let full_preview = compile_preview_map(
+            &document,
+            &registered_maps,
+            PreviewMapKind::BaseColor,
+            64,
+        )
+        .unwrap();
+        let preview_without_a_complete_base = compile_preview_map_incremental(
+            &document,
+            &registered_maps,
+            PreviewMapKind::BaseColor,
+            64,
+            None,
+            Some(compiled.regions[0].region_id),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            preview_without_a_complete_base.pixels, full_preview.pixels,
+            "a dirty preview without a complete base must render the complete sheet"
+        );
     }
 
     fn coordinate_grid(width: u32, height: u32, marker: u8) -> Vec<u8> {
@@ -995,7 +1074,15 @@ mod tests {
             / f64::from(region.allocation_bounds.width);
         let local_v = (f64::from(point.1 - region.allocation_bounds.y) + 0.5)
             / f64::from(region.allocation_bounds.height);
-        let (local_u, local_v) = role_local_uv(region.role, local_u, local_v);
+        let (local_u, local_v) = role_local_uv(region.role, region.mapping.radial.as_ref(), local_u, local_v);
+        let (local_u, local_v) = preserve_crop_aspect(
+            local_u,
+            local_v,
+            &region.mapping.projection,
+            region.allocation_bounds,
+            width,
+            height,
+        );
         let (u, v) = mapped_uv(
             local_u,
             local_v,

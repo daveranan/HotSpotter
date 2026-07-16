@@ -652,6 +652,10 @@ fn preview_trim_sheet_document_impl(
     } else {
         None
     };
+    // A dirty preview is valid only when it composites onto a known-complete surface. If this
+    // topology/map has no settled base yet, render the whole low-resolution sheet once instead
+    // of promoting a one-region image with a black background into the settled cache.
+    let effective_dirty_region = request.region_id.filter(|_| base_pixels.is_some());
     if let (Some(region_id), Some(projection)) = (request.region_id, request.projection) {
         let binding = document.region_bindings.get_mut(&region_id)
             .ok_or_else(|| error(ErrorCode::InvalidInput, "The preview region no longer exists."))?;
@@ -666,7 +670,7 @@ fn preview_trim_sheet_document_impl(
         request.map_view,
         max_edge,
         base_pixels,
-        request.region_id,
+        effective_dirty_region,
         || preview_service.latest_draft_id.load(Ordering::Acquire) != request.draft_id,
     ).map_err(|compile| match compile {
         hot_trimmer_sheet_compiler::SheetCompileError::Cancelled => {
@@ -1053,6 +1057,7 @@ fn write_recent_projects(
     }
     fs::rename(temporary, path).map_err(recent_error)
 }
+
 
 fn now_unix() -> i64 {
     SystemTime::now()

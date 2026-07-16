@@ -14,7 +14,7 @@ pub use document::{
     ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, FitAxis,
     GeneratorProvenance, LayoutGridSettings, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, ProceduralMaterial, Projection, QuarterTurn,
-    RegionAppearanceHashInput, RegionBinding, RegionDefinition, RegionMapping, RegionOrientation,
+    RadialMappingSettings, RegionAppearanceHashInput, RegionBinding, RegionDefinition, RegionMapping, RegionOrientation,
     RegionTopologyHashInput, RenderSettings, SamplingPolicy, SheetFraming, SolidChannelValues,
     TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, TopologyHashInputs, TopologyKind, TopologySnapshot,
     TreatmentLayer, TreatmentParameter, TrimSheetChange, TrimSheetDocument,

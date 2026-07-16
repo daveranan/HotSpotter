@@ -65,6 +65,43 @@ const mapViews: readonly [CompiledMapView, string][] = [
 
 type Activity = "starting" | "idle" | "importing" | "compiling" | "saving" | "opening";
 type CropProjection = Extract<RegionMapping["projection"], { type: "crop" }>;
+type PaneLayoutMode = "full" | "without-inspector" | "without-library" | "sheet-only";
+
+function paneLayoutMode(width: number): PaneLayoutMode {
+  if (width >= 998) return "full";
+  if (width >= 712) return "without-inspector";
+  if (width >= 506) return "without-library";
+  return "sheet-only";
+}
+
+function reconcilePanes(current: PaneState, width: number): PaneState {
+  let library = Math.min(420, Math.max(160, current.library));
+  let source = Math.min(650, Math.max(260, current.source));
+  let inspector = Math.min(420, Math.max(230, current.inspector));
+  const mode = paneLayoutMode(width);
+  const available = mode === "full" ? width - 338 : mode === "without-inspector" ? width - 292 : width - 266;
+  if (mode === "full") {
+    let overflow = Math.max(0, library + source + inspector - available);
+    const shrink = (value: number, minimum: number) => {
+      const amount = Math.min(overflow, value - minimum);
+      overflow -= amount;
+      return value - amount;
+    };
+    source = shrink(source, 260);
+    inspector = shrink(inspector, 230);
+    library = shrink(library, 160);
+  } else if (mode === "without-inspector") {
+    let overflow = Math.max(0, library + source - available);
+    const amount = Math.min(overflow, source - 260);
+    source -= amount;
+    overflow -= amount;
+    library -= Math.min(overflow, library - 160);
+  } else if (mode === "without-library") {
+    source = Math.min(source, Math.max(240, available));
+  }
+  if (library === current.library && source === current.source && inspector === current.inspector) return current;
+  return { library, source, inspector };
+}
 
 function isNativeRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -98,6 +135,7 @@ function App() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [showRecents, setShowRecents] = useState(false);
   const [panes, setPanes] = useState<PaneState>({ library: 220, source: 470, inspector: 278 });
+  const [workbenchWidth, setWorkbenchWidth] = useState(1280);
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [activePatchId, setActivePatchId] = useState<string | null>(null);
@@ -123,8 +161,23 @@ function App() {
   const selectedRegion = artifact?.regions.find((region) => region.regionId === selectedRegionId) ?? null;
   const selectedBinding = selectedRegionId ? project?.document?.regionBindings[selectedRegionId] ?? null : null;
   const selectedCrop = selectedBinding?.mapping.projection.type === "crop" ? selectedBinding.mapping.projection : null;
+  const currentTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
   const stale = !!project?.document && !!artifact && artifact.documentRevision !== project.document.documentRevision;
   const buildState = buildStatus(project, artifact, activity, problem, stale);
+  const paneMode = paneLayoutMode(workbenchWidth);
+  const workbenchColumns = paneMode === "full"
+    ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr) 6px ${panes.inspector}px`
+    : paneMode === "without-inspector"
+      ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr)`
+      : paneMode === "without-library"
+        ? `${panes.source}px 6px minmax(0, 1fr)`
+        : "minmax(0, 1fr)";
+
+  useEffect(() => {
+    previewDraftId.current += 1;
+    dirtyPreviewRegion.current = null;
+    setPreview(null);
+  }, [currentTopologyHash]);
 
   useEffect(() => {
     if (!native || !project?.document) return;
@@ -132,6 +185,20 @@ function App() {
     dirtyPreviewRegion.current = null;
     void requestPreview(dirtyRegion ?? undefined);
   }, [native, mapView, project?.document?.documentRevision]);
+
+  useEffect(() => {
+    const element = workbenchRef.current;
+    if (!element) return;
+    const update = () => {
+      const width = element.clientWidth;
+      setWorkbenchWidth(width);
+      setPanes((current) => reconcilePanes(current, width));
+    };
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    update();
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (started.current) return;
@@ -375,6 +442,8 @@ function App() {
         setProject(current);
       }
       const compiled = await invoke<CompiledSheetProjection>("compile_trim_sheet_document", { request: protocol });
+      previewDraftId.current += 1;
+      setPreview(null);
       setArtifact(compiled);
       setSelectedRegionId((selected) => compiled.regions.some((region) => region.regionId === selected) ? selected : null);
     } catch (reason) {
@@ -398,6 +467,8 @@ function App() {
         current = await applyCommand({ type: "set_primary_material", materialId });
       }
       const compiled = await invoke<CompiledSheetProjection>("compile_trim_sheet_document", { request: protocol });
+      previewDraftId.current += 1;
+      setPreview(null);
       setProject(current);
       setArtifact(compiled);
       setSelectedRegionId((selected) => compiled.regions.some((region) => region.regionId === selected) ? selected : null);
@@ -582,6 +653,33 @@ function App() {
     } catch (reason) { setProblem(failure(reason)); }
   }
 
+  async function setLayoutPadding(padding: number) {
+    if (!project?.document) return;
+    try {
+      await command({ type: "set_layout_grid", settings: { columns: project.document.layoutGrid.columns, rows: project.document.layoutGrid.rows, padding } });
+    } catch (reason) { setProblem(failure(reason)); }
+  }
+
+  async function setRegionCrop(regionId: string, bounds: NormalizedBounds) {
+    dirtyPreviewRegion.current = regionId;
+    try {
+      await command({
+        type: "set_region_projection",
+        regionId,
+        projection: { type: "crop", bounds, focus: { x: bounds.x + bounds.width * 0.5, y: bounds.y + bounds.height * 0.5 } },
+      });
+    } catch (reason) {
+      dirtyPreviewRegion.current = null;
+      setProblem(failure(reason));
+    }
+  }
+
+  async function setRegionRadial(regionId: string, radial: NonNullable<RegionMapping["radial"]>) {
+    dirtyPreviewRegion.current = regionId;
+    try { await command({ type: "set_region_radial", regionId, radial }); }
+    catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
+  }
+
   async function setRegionDestination(regionId: string, allocationRect: { x: number; y: number; width: number; height: number }, padding: number) {
     try { await command({ type: "set_region_destination", regionId, allocationRect, padding }); }
     catch (reason) { setProblem(failure(reason)); }
@@ -635,16 +733,16 @@ function App() {
         </div> : null}
       </header>
 
-      <section ref={workbenchRef} className="workbench" style={{ gridTemplateColumns: `${panes.library}px 6px ${panes.source}px 6px minmax(320px, 1fr) 6px ${panes.inspector}px` }}>
-        <SourceLibrary
+      <section ref={workbenchRef} className={`workbench pane-layout-${paneMode}`} style={{ gridTemplateColumns: workbenchColumns }}>
+        {paneMode === "full" || paneMode === "without-inspector" ? <SourceLibrary
           project={project}
           activeSourceSetId={activeSourceSetId}
           selectedSource={selectedSource}
           onSelect={chooseSource}
           onAddSourceSet={() => void addSourceSet()}
-        />
-        <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} />
-        <section className="source-workspace">
+        /> : null}
+        {paneMode === "full" || paneMode === "without-inspector" ? <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {paneMode !== "sheet-only" ? <section className="source-workspace">
           <MapSlots
             sources={activeSources}
             selectedChannel={selectedChannel}
@@ -674,8 +772,8 @@ function App() {
             onCreatePatch={(geometry, fourPoint) => void createPatch(geometry, fourPoint)}
             onCancelTool={() => setPatchTool(null)}
           />
-        </section>
-        <PaneSplitter kind="source-sheet" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} />
+        </section> : null}
+        {paneMode !== "sheet-only" ? <PaneSplitter kind="source-sheet" sourceOnly={paneMode === "without-library"} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         <SheetWorkbench
           project={project}
           artifact={artifact}
@@ -692,9 +790,10 @@ function App() {
           activity={activity}
           setResolution={setResolution}
           setLayoutGrid={setLayoutGrid}
+          setLayoutPadding={setLayoutPadding}
         />
-        <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} />
-        <Inspector
+        {paneMode === "full" ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {paneMode === "full" ? <Inspector
           project={project}
           artifact={artifact}
           selectedRegion={selectedRegion}
@@ -703,7 +802,9 @@ function App() {
           onUndo={() => void history(false)}
           onRedo={() => void history(true)}
           onSetDestination={(regionId, rect, padding) => void setRegionDestination(regionId, rect, padding)}
-        />
+          onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
+          onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
+        /> : null}
       </section>
       <footer className="statusbar">
         <span>{project?.name ?? "Untitled"}</span>
@@ -990,7 +1091,7 @@ function SourceCanvas(props: {
       />
       {effectiveCrop ? <button
         className="source-crop"
-        style={cropStyle(effectiveCrop)}
+        style={cropStyle(effectiveCrop, viewport.view.scale)}
         onPointerDown={(event) => beginCrop(event, "move")}
         aria-label={`Move source crop for ${props.selectedRegion?.displayName ?? "selected region"}`}
       >
@@ -1061,6 +1162,7 @@ function rectangleArea(geometry: PatchGeometry): number {
 
 function PaneSplitter(props: {
   kind: PaneDragKind;
+  sourceOnly?: boolean;
   paneDrag: React.MutableRefObject<{ kind: PaneDragKind; start: PaneState } | null>;
   setPanes: (next: PaneState | ((current: PaneState) => PaneState)) => void;
   workbenchRef: React.RefObject<HTMLElement | null>;
@@ -1076,7 +1178,14 @@ function PaneSplitter(props: {
     const active = props.paneDrag.current;
     if (!active || active.kind !== props.kind) return;
     const rect = props.workbenchRef.current?.getBoundingClientRect();
-    if (rect) props.setPanes(() => resizePanes(props.kind, active.start, event.clientX, rect.left, rect.width));
+    if (!rect) return;
+    if (props.sourceOnly) {
+      const maximum = Math.max(240, rect.width - 266);
+      const source = Math.min(maximum, Math.max(240, event.clientX - rect.left));
+      props.setPanes((current) => current.source === source ? current : { ...current, source });
+      return;
+    }
+    props.setPanes(() => resizePanes(props.kind, active.start, event.clientX, rect.left, rect.width));
   }
   function up() {
     props.paneDrag.current = null;
@@ -1100,10 +1209,20 @@ function SheetWorkbench(props: {
   activity: Activity;
   setResolution: (size: number) => void;
   setLayoutGrid: (size: number) => void;
+  setLayoutPadding: (padding: number) => void;
 }) {
   const artifact = props.artifact;
-  const sheet = props.preview ?? artifact;
-  const imageUrl = props.preview?.mapView === props.mapView ? props.preview.dataUrl : artifact?.maps[props.mapView];
+  const topologyHash = props.project?.document ? hashBytes(props.project.document.topology.topologyHash) : null;
+  const validPreview = props.preview
+    && props.project?.document
+    && props.preview.documentRevision === props.project.document.documentRevision
+    && props.preview.topologyHash === topologyHash
+    && props.preview.mapView === props.mapView
+      ? props.preview
+      : null;
+  const sheet = validPreview ?? artifact;
+  const imageUrl = validPreview?.dataUrl ?? artifact?.maps[props.mapView];
+  const sheetMatchesDocument = !!sheet && sheet.topologyHash === topologyHash;
   const viewport = useViewportController(sheet ? { width: sheet.width, height: sheet.height } : null);
   return <section className="sheet-workbench">
     <header className="sheet-header">
@@ -1121,8 +1240,11 @@ function SheetWorkbench(props: {
         <option value={2048}>2048</option>
         <option value={4096}>4096</option>
       </select>
-      <select aria-label="Layout grid" value={props.project?.document?.layoutGrid.columns ?? 32} onChange={(event) => void props.setLayoutGrid(Number(event.target.value))} disabled={!props.project?.document}>
-        {[16, 24, 32, 48, 64].map((size) => <option key={size} value={size}>{size} x {size} grid</option>)}
+      <select aria-label="Snap grid" title="Snapping precision; the semantic layout recipe controls the arrangement" value={props.project?.document?.layoutGrid.columns ?? 32} onChange={(event) => void props.setLayoutGrid(Number(event.target.value))} disabled={!props.project?.document}>
+        {[16, 24, 32, 48, 64].map((size) => <option key={size} value={size}>{size} x {size} snap</option>)}
+      </select>
+      <select aria-label="Region padding" title="Mip-safe padding between usable trim regions" value={props.project?.document?.layoutGrid.padding ?? 8} onChange={(event) => void props.setLayoutPadding(Number(event.target.value))} disabled={!props.project?.document}>
+        {[0, 2, 4, 8, 16, 32].map((padding) => <option key={padding} value={padding}>{padding}px padding</option>)}
       </select>
       <button className="primary" onClick={props.build} disabled={!props.primaryMaterial || props.activity !== "idle"}>
         {props.activity === "compiling" ? "Compiling..." : props.project?.document ? "Update sheet" : "Build trim sheet"}
@@ -1151,16 +1273,16 @@ function SheetWorkbench(props: {
         }}
       >
         <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} />
-        <div
+        {sheetMatchesDocument ? <div
           className="sheet-grid"
           style={{
             backgroundSize: `${100 / (props.project?.document?.layoutGrid.columns ?? 32)}% ${100 / (props.project?.document?.layoutGrid.rows ?? 32)}%`,
           }}
-        />
+        /> : null}
         <div className="overlays">{sheet.regions.map((region) => <button
           key={region.regionId}
           className={`region ${region.regionId === props.selectedRegionId ? "selected" : ""}`}
-          style={overlayStyle(region, sheet)}
+          style={overlayStyle(region, sheet, viewport.view.scale)}
           onClick={(event) => { event.stopPropagation(); props.setSelectedRegionId(region.regionId === props.selectedRegionId ? null : region.regionId); }}
         ><span>{region.displayName}</span></button>)}</div>
       </div>}
@@ -1190,6 +1312,8 @@ function Inspector(props: {
   onUndo: () => void;
   onRedo: () => void;
   onSetDestination: (regionId: string, rect: { x: number; y: number; width: number; height: number }, padding: number) => void;
+  onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
+  onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
 }) {
   const binding = props.selectedRegion && props.project?.document?.regionBindings[props.selectedRegion.regionId];
   return <aside className="context-inspector">
@@ -1216,9 +1340,20 @@ function Inspector(props: {
           padding={props.project?.document?.layoutGrid.padding ?? 8}
           onApply={props.onSetDestination}
         />
+        {binding?.mapping.projection.type === "crop" ? <CropEditor
+          key={`${props.selectedRegion.regionId}-crop`}
+          regionId={props.selectedRegion.regionId}
+          bounds={binding.mapping.projection.bounds}
+          onApply={props.onSetCrop}
+        /> : null}
+        {props.selectedRegion.role === "radial" && binding?.mapping.radial ? <RadialEditor
+          key={`${props.selectedRegion.regionId}-radial`}
+          regionId={props.selectedRegion.regionId}
+          radial={binding.mapping.radial}
+          onApply={props.onSetRadial}
+        /> : null}
       </> : <p>Select a patch or create one on the source workbench.</p>}
     </section>
-    <LockedSection title="Mapping & Warp" reason="No direct-manipulation document transaction is implemented yet." />
     <LockedSection title="Profiles & Weathering" reason="Generated-map recipes are not command-backed in this slice." />
     <LockedSection title="Decorations" reason="Decoration bindings require authored patch commands." />
   </aside>;
@@ -1231,10 +1366,38 @@ function DestinationEditor(props: {
 }) {
   const [rect, setRect] = useState(props.region?.allocationRect ?? { x: 0, y: 0, width: 512, height: 512 });
   if (!props.region) return null;
+  const squareLocked = props.region.role === "radial";
   return <div className="destination-editor">
     <strong>DESTINATION GRID BOUNDS</strong>
-    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={4096} value={rect[field]} onChange={(event) => setRect((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}
+    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={4096} value={rect[field]} disabled={squareLocked && field === "height"} onChange={(event) => {
+      const value = Number(event.target.value);
+      setRect((current) => squareLocked && field === "width" ? { ...current, width: value, height: value } : { ...current, [field]: value });
+    }} /></label>)}
+    {squareLocked ? <small>Square locked for radial mapping</small> : null}
     <button onClick={() => props.onApply(props.region!.id, rect, props.padding)}>Apply bounds</button>
+  </div>;
+}
+
+function CropEditor(props: { regionId: string; bounds: NormalizedBounds; onApply: (regionId: string, bounds: NormalizedBounds) => void }) {
+  const [bounds, setBounds] = useState(props.bounds);
+  return <div className="mapping-editor">
+    <strong>SOURCE CROP</strong>
+    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={1} step={0.01} value={Number(bounds[field].toFixed(4))} onChange={(event) => setBounds((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}
+    <button onClick={() => props.onApply(props.regionId, bounds)}>Apply crop</button>
+  </div>;
+}
+
+function RadialEditor(props: { regionId: string; radial: NonNullable<RegionMapping["radial"]>; onApply: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void }) {
+  const [radial, setRadial] = useState(props.radial);
+  const fields: ReadonlyArray<[keyof typeof radial, string, number, number, number]> = [
+    ["centerX", "Center X", 0, 1, 0.01], ["centerY", "Center Y", 0, 1, 0.01],
+    ["innerRadius", "Inner", 0, 1.99, 0.01], ["outerRadius", "Outer", 0.01, 2, 0.01],
+    ["falloff", "Falloff", 0.1, 4, 0.1],
+  ];
+  return <div className="mapping-editor radial-editor">
+    <strong>RADIAL PROJECTION</strong>
+    {fields.map(([field, label, min, max, step]) => <label key={field}>{label}<input type="number" min={min} max={max} step={step} value={Number(radial[field].toFixed(3))} onChange={(event) => setRadial((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}
+    <button onClick={() => props.onApply(props.regionId, radial)}>Apply radial</button>
   </div>;
 }
 
@@ -1256,6 +1419,10 @@ function channelLabel(channel: SourceChannel): string {
   return channelOptions.find((option) => option.value === channel)?.label ?? channel;
 }
 
+function hashBytes(bytes: readonly number[]): string {
+  return bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function contentLabel(type?: string) {
   return type === "inherit_primary_material" ? "Primary material" : type?.replaceAll("_", " ") ?? "-";
 }
@@ -1270,7 +1437,7 @@ function cropLabel(projection?: { type: string; bounds?: { x: number; y: number;
   return `${b.x.toFixed(2)}, ${b.y.toFixed(2)} / ${b.width.toFixed(2)} x ${b.height.toFixed(2)}`;
 }
 
-function overlayStyle(region: ResolvedRegion, artifact: Pick<CompiledSheetProjection, "width" | "height">): React.CSSProperties {
+function overlayStyle(region: ResolvedRegion, artifact: Pick<CompiledSheetProjection, "width" | "height">, scale = 1): React.CSSProperties {
   const bounds = region.allocationBounds;
   return {
     left: `${bounds.x / artifact.width * 100}%`,
@@ -1278,16 +1445,22 @@ function overlayStyle(region: ResolvedRegion, artifact: Pick<CompiledSheetProjec
     width: `${bounds.width / artifact.width * 100}%`,
     height: `${bounds.height / artifact.height * 100}%`,
     borderColor: `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]})`,
-  };
+    "--region-stroke": `${Math.min(3, Math.max(0.75, 1 / scale))}px`,
+    "--region-label-size": `${Math.min(16, Math.max(7, 10 / scale))}px`,
+  } as React.CSSProperties;
 }
 
-function cropStyle(bounds: NormalizedBounds): React.CSSProperties {
+function cropStyle(bounds: NormalizedBounds, scale = 1): React.CSSProperties {
   return {
     left: `${bounds.x * 100}%`,
     top: `${bounds.y * 100}%`,
     width: `${bounds.width * 100}%`,
     height: `${bounds.height * 100}%`,
-  };
+    borderWidth: `${Math.min(4, Math.max(0.75, 2 / scale))}px`,
+    "--source-handle-size": `${Math.min(20, Math.max(6, 10 / scale))}px`,
+    "--source-handle-offset": `${Math.min(12, Math.max(3, 6 / scale))}px`,
+    "--source-label-size": `${Math.min(16, Math.max(7, 10 / scale))}px`,
+  } as React.CSSProperties;
 }
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);

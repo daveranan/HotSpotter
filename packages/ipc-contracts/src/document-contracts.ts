@@ -20,6 +20,7 @@ export interface RegionMapping {
   projection: { type: "crop"; bounds: NormalizedBounds; focus: NormalizedPoint }
     | { type: "perspective"; quad: readonly NormalizedPoint[] };
   warps: readonly unknown[];
+  radial?: { centerX: number; centerY: number; innerRadius: number; outerRadius: number; falloff: number };
   transform: {
     scale: readonly [number, number]; rotationDegrees: number;
     mirrorX: boolean; mirrorY: boolean; offset: readonly [number, number];
@@ -31,7 +32,6 @@ export interface RegionBinding {
   regionId: string;
   content: ContentReference;
   mapping: RegionMapping;
-  role: string;
 }
 
 export interface RegionDefinition {
@@ -128,6 +128,7 @@ export interface ResolvedRegion {
   materialId: string;
   materialIdColor: readonly [number, number, number];
   mapping: RegionMapping;
+  role: string;
 }
 
 export type CompiledMapView =
@@ -162,6 +163,7 @@ export type TrimSheetDocumentCommand =
   | { type: "set_region_content"; regionId: string; content: ContentReference }
   | { type: "set_sheet_framing"; framing: unknown }
   | { type: "set_region_projection"; regionId: string; projection: RegionMapping["projection"] }
+  | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }
   | { type: "set_output_resolution"; outputSize: PixelSize }
   | { type: "set_layout_grid"; settings: { columns: number; rows: number; padding: number } }
   | { type: "set_region_destination"; regionId: string; allocationRect: PixelBounds; padding: number };
