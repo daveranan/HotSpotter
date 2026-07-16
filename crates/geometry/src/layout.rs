@@ -44,182 +44,185 @@ struct CustomAtlasLayoutEngine;
 
 impl CustomAtlasLayoutEngine {
     #[allow(clippy::too_many_lines)]
-    fn solve(request: &LayoutRequest, active: Vec<(usize, &LayoutItem)>) -> Result<Layout, LayoutSolveError> {
-    let mut used_ids = BTreeSet::new();
-    let mut prepared = Vec::with_capacity(active.len());
-    let grid = grid_dimensions(request.preset, active.len(), request.settings.output);
-    let maximum_clearance = active
-        .iter()
-        .map(|(_, item)| {
-            item.padding_px.unwrap_or(request.settings.padding_px)
-                + item.bleed_px.unwrap_or(request.settings.bleed_px)
-        })
-        .max()
-        .unwrap_or(0);
-    let cell = grid_cell(request.settings.output, grid, maximum_clearance).ok_or_else(|| {
-        LayoutSolveError::ImpossibleFit {
-            item_key: active[0].1.key.clone(),
-            requested: PixelSize {
-                width: 1,
-                height: 1,
-            },
-            output: request.settings.output,
-            reason: "padding and bleed consume the available output".into(),
-        }
-    })?;
+    fn solve(
+        request: &LayoutRequest,
+        active: Vec<(usize, &LayoutItem)>,
+    ) -> Result<Layout, LayoutSolveError> {
+        let mut used_ids = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(active.len());
+        let grid = grid_dimensions(request.preset, active.len(), request.settings.output);
+        let maximum_clearance = active
+            .iter()
+            .map(|(_, item)| {
+                item.padding_px.unwrap_or(request.settings.padding_px)
+                    + item.bleed_px.unwrap_or(request.settings.bleed_px)
+            })
+            .max()
+            .unwrap_or(0);
+        let cell =
+            grid_cell(request.settings.output, grid, maximum_clearance).ok_or_else(|| {
+                LayoutSolveError::ImpossibleFit {
+                    item_key: active[0].1.key.clone(),
+                    requested: PixelSize {
+                        width: 1,
+                        height: 1,
+                    },
+                    output: request.settings.output,
+                    reason: "padding and bleed consume the available output".into(),
+                }
+            })?;
 
-    for (input_index, item) in active {
-        let existing = compatible_existing(request, item);
-        let id = choose_region_id(
-            item,
-            existing,
-            request.settings.auto_pack.seed,
-            &mut used_ids,
-        );
-        let locks = existing.map_or_else(RegionLocks::default, |region| region.locks);
-        let mut size = target_size(request.preset, item, cell);
-        if let Some(region) = existing {
-            if locks.width {
-                size.width = region.bounds.width;
+        for (input_index, item) in active {
+            let existing = compatible_existing(request, item);
+            let id = choose_region_id(
+                item,
+                existing,
+                request.settings.auto_pack.seed,
+                &mut used_ids,
+            );
+            let locks = existing.map_or_else(RegionLocks::default, |region| region.locks);
+            let mut size = target_size(request.preset, item, cell);
+            if let Some(region) = existing {
+                if locks.width {
+                    size.width = region.bounds.width;
+                }
+                if locks.height {
+                    size.height = region.bounds.height;
+                }
             }
-            if locks.height {
-                size.height = region.bounds.height;
+            if let Some(width) = item.constraints.fixed_width_px {
+                size.width = width;
             }
-        }
-        if let Some(width) = item.constraints.fixed_width_px {
-            size.width = width;
-        }
-        if let Some(height) = item.constraints.fixed_height_px {
-            size.height = height;
-        }
-        if let Some(fixed) = request.settings.fixed_selected_size
-            && fixed.region_id == id
-        {
-            size = fixed.size;
-        }
-        if !size.is_nonzero() {
-            return Err(LayoutSolveError::ImpossibleFit {
-                item_key: item.key.clone(),
-                requested: size,
-                output: request.settings.output,
-                reason: "the requested content size is zero".into(),
-            });
-        }
-        let padding_px = item.padding_px.unwrap_or(request.settings.padding_px);
-        let bleed_px = item.bleed_px.unwrap_or(request.settings.bleed_px);
-        let clearance =
-            padding_px
-                .checked_add(bleed_px)
-                .ok_or_else(|| LayoutSolveError::ImpossibleFit {
+            if let Some(height) = item.constraints.fixed_height_px {
+                size.height = height;
+            }
+            if let Some(fixed) = request.settings.fixed_selected_size
+                && fixed.region_id == id
+            {
+                size = fixed.size;
+            }
+            if !size.is_nonzero() {
+                return Err(LayoutSolveError::ImpossibleFit {
+                    item_key: item.key.clone(),
+                    requested: size,
+                    output: request.settings.output,
+                    reason: "the requested content size is zero".into(),
+                });
+            }
+            let padding_px = item.padding_px.unwrap_or(request.settings.padding_px);
+            let bleed_px = item.bleed_px.unwrap_or(request.settings.bleed_px);
+            let clearance = padding_px.checked_add(bleed_px).ok_or_else(|| {
+                LayoutSolveError::ImpossibleFit {
                     item_key: item.key.clone(),
                     requested: size,
                     output: request.settings.output,
                     reason: "padding plus bleed overflows the supported integer range".into(),
-                })?;
-        let position = existing
-            .filter(|_| locks.position)
-            .map(|region| (region.bounds.x, region.bounds.y));
-        prepared.push(PreparedRegion {
-            input_index,
-            item,
-            existing,
-            id,
-            id_color: existing
-                .filter(|region| region.id == id)
-                .map_or_else(|| IdColor::for_region(id), |region| region.id_color),
-            locks,
-            size,
-            padding_px,
-            bleed_px,
-            clearance,
-            locked_position: position,
-        });
-    }
-
-    sort_prepared(&mut prepared, request.settings.order);
-    resolve_id_colors(&mut prepared);
-    let use_grid_fast_path = request.settings.auto_pack.enabled
-        && prepared.iter().all(|region| {
-            region.existing.is_none()
-                && region.locked_position.is_none()
-                && region.clearance == maximum_clearance
-                && region.size.width <= cell.width
-                && region.size.height <= cell.height
-        });
-    let mut occupied: Vec<Placed> = Vec::with_capacity(prepared.len());
-    let mut results = Vec::with_capacity(prepared.len());
-
-    // Position-locked regions are authoritative obstacles irrespective of display order.
-    for prepared_region in prepared
-        .iter()
-        .filter(|region| region.locked_position.is_some())
-    {
-        let Some((x, y)) = prepared_region.locked_position else {
-            continue;
-        };
-        let bounds = PixelBounds {
-            x,
-            y,
-            width: prepared_region.size.width,
-            height: prepared_region.size.height,
-        };
-        if !fits_output(bounds, prepared_region.clearance, request.settings.output) {
-            return Err(LayoutSolveError::LockedRegionOutOfBounds {
-                region_id: prepared_region.id,
+                }
+            })?;
+            let position = existing
+                .filter(|_| locks.position)
+                .map(|region| (region.bounds.x, region.bounds.y));
+            prepared.push(PreparedRegion {
+                input_index,
+                item,
+                existing,
+                id,
+                id_color: existing
+                    .filter(|region| region.id == id)
+                    .map_or_else(|| IdColor::for_region(id), |region| region.id_color),
+                locks,
+                size,
+                padding_px,
+                bleed_px,
+                clearance,
+                locked_position: position,
             });
         }
-        if let Some(other) = occupied.iter().find(|placed| {
-            !separated(
-                bounds,
-                prepared_region.clearance,
-                placed.bounds,
-                placed.clearance,
-            )
-        }) {
-            return Err(LayoutSolveError::LockedRegionsOverlap {
-                first: prepared_region.id,
-                second: other.id,
-            });
-        }
-        validate_caps_fit(prepared_region, bounds)?;
-        occupied.push(Placed {
-            id: prepared_region.id,
-            bounds,
-            clearance: prepared_region.clearance,
-        });
-    }
 
-    for (order_index, prepared_region) in prepared.iter().enumerate() {
-        let bounds = if let Some((x, y)) = prepared_region.locked_position {
-            PixelBounds {
+        sort_prepared(&mut prepared, request.settings.order);
+        resolve_id_colors(&mut prepared);
+        let use_grid_fast_path = request.settings.auto_pack.enabled
+            && prepared.iter().all(|region| {
+                region.existing.is_none()
+                    && region.locked_position.is_none()
+                    && region.clearance == maximum_clearance
+                    && region.size.width <= cell.width
+                    && region.size.height <= cell.height
+            });
+        let mut occupied: Vec<Placed> = Vec::with_capacity(prepared.len());
+        let mut results = Vec::with_capacity(prepared.len());
+
+        // Position-locked regions are authoritative obstacles irrespective of display order.
+        for prepared_region in prepared
+            .iter()
+            .filter(|region| region.locked_position.is_some())
+        {
+            let Some((x, y)) = prepared_region.locked_position else {
+                continue;
+            };
+            let bounds = PixelBounds {
                 x,
                 y,
                 width: prepared_region.size.width,
                 height: prepared_region.size.height,
-            }
-        } else if !request.settings.auto_pack.enabled {
-            let Some(existing) = prepared_region.existing else {
-                return Err(LayoutSolveError::AutoPackDisabledMissingPlacement {
-                    item_key: prepared_region.item.key.clone(),
+            };
+            if !fits_output(bounds, prepared_region.clearance, request.settings.output) {
+                return Err(LayoutSolveError::LockedRegionOutOfBounds {
+                    region_id: prepared_region.id,
                 });
-            };
-            let bounds = PixelBounds {
-                x: existing.bounds.x,
-                y: existing.bounds.y,
-                width: prepared_region.size.width,
-                height: prepared_region.size.height,
-            };
-            if !fits_output(bounds, prepared_region.clearance, request.settings.output)
-                || occupied.iter().any(|placed| {
-                    !separated(
-                        bounds,
-                        prepared_region.clearance,
-                        placed.bounds,
-                        placed.clearance,
-                    )
-                })
-            {
-                return Err(LayoutSolveError::ImpossibleFit {
+            }
+            if let Some(other) = occupied.iter().find(|placed| {
+                !separated(
+                    bounds,
+                    prepared_region.clearance,
+                    placed.bounds,
+                    placed.clearance,
+                )
+            }) {
+                return Err(LayoutSolveError::LockedRegionsOverlap {
+                    first: prepared_region.id,
+                    second: other.id,
+                });
+            }
+            validate_caps_fit(prepared_region, bounds)?;
+            occupied.push(Placed {
+                id: prepared_region.id,
+                bounds,
+                clearance: prepared_region.clearance,
+            });
+        }
+
+        for (order_index, prepared_region) in prepared.iter().enumerate() {
+            let bounds = if let Some((x, y)) = prepared_region.locked_position {
+                PixelBounds {
+                    x,
+                    y,
+                    width: prepared_region.size.width,
+                    height: prepared_region.size.height,
+                }
+            } else if !request.settings.auto_pack.enabled {
+                let Some(existing) = prepared_region.existing else {
+                    return Err(LayoutSolveError::AutoPackDisabledMissingPlacement {
+                        item_key: prepared_region.item.key.clone(),
+                    });
+                };
+                let bounds = PixelBounds {
+                    x: existing.bounds.x,
+                    y: existing.bounds.y,
+                    width: prepared_region.size.width,
+                    height: prepared_region.size.height,
+                };
+                if !fits_output(bounds, prepared_region.clearance, request.settings.output)
+                    || occupied.iter().any(|placed| {
+                        !separated(
+                            bounds,
+                            prepared_region.clearance,
+                            placed.bounds,
+                            placed.clearance,
+                        )
+                    })
+                {
+                    return Err(LayoutSolveError::ImpossibleFit {
                     item_key: prepared_region.item.key.clone(),
                     requested: prepared_region.size,
                     output: request.settings.output,
@@ -227,19 +230,19 @@ impl CustomAtlasLayoutEngine {
                         "the retained manual position is out of bounds or overlaps another region"
                             .into(),
                 });
-            }
-            bounds
-        } else if use_grid_fast_path {
-            grid_position(
-                order_index,
-                grid,
-                cell,
-                maximum_clearance,
-                prepared_region.size,
-                request.settings.auto_pack.priority,
-            )
-        } else {
-            find_position(
+                }
+                bounds
+            } else if use_grid_fast_path {
+                grid_position(
+                    order_index,
+                    grid,
+                    cell,
+                    maximum_clearance,
+                    prepared_region.size,
+                    request.settings.auto_pack.priority,
+                )
+            } else {
+                find_position(
                 prepared_region,
                 &occupied,
                 request.settings.output,
@@ -254,43 +257,43 @@ impl CustomAtlasLayoutEngine {
                     prepared_region.clearance
                 ),
             })?
-        };
-        validate_caps_fit(prepared_region, bounds)?;
-        if prepared_region.locked_position.is_none() {
-            occupied.push(Placed {
+            };
+            validate_caps_fit(prepared_region, bounds)?;
+            if prepared_region.locked_position.is_none() {
+                occupied.push(Placed {
+                    id: prepared_region.id,
+                    bounds,
+                    clearance: prepared_region.clearance,
+                });
+            }
+            results.push(LayoutRegion {
                 id: prepared_region.id,
+                item_key: prepared_region.item.key.clone(),
+                fill: prepared_region.item.fill.clone(),
+                behavior: prepared_region.item.behavior,
+                trim_caps: prepared_region.item.trim_caps,
                 bounds,
-                clearance: prepared_region.clearance,
+                padding_px: prepared_region.padding_px,
+                bleed_px: prepared_region.bleed_px,
+                order_index: u32::try_from(order_index).map_err(|_| {
+                    LayoutSolveError::Contract(LayoutContractError::TooManyRegions {
+                        found: prepared.len(),
+                        maximum: hot_trimmer_domain::MAX_LAYOUT_REGIONS,
+                    })
+                })?,
+                locks: prepared_region.locks,
+                id_color: prepared_region.id_color,
             });
         }
-        results.push(LayoutRegion {
-            id: prepared_region.id,
-            item_key: prepared_region.item.key.clone(),
-            fill: prepared_region.item.fill.clone(),
-            behavior: prepared_region.item.behavior,
-            trim_caps: prepared_region.item.trim_caps,
-            bounds,
-            padding_px: prepared_region.padding_px,
-            bleed_px: prepared_region.bleed_px,
-            order_index: u32::try_from(order_index).map_err(|_| {
-                LayoutSolveError::Contract(LayoutContractError::TooManyRegions {
-                    found: prepared.len(),
-                    maximum: hot_trimmer_domain::MAX_LAYOUT_REGIONS,
-                })
-            })?,
-            locks: prepared_region.locks,
-            id_color: prepared_region.id_color,
-        });
-    }
 
-    let layout = Layout {
-        id: request.layout_id,
-        preset: request.preset,
-        settings: request.settings.clone(),
-        regions: results,
-    };
-    validate_layout(&layout)?;
-    Ok(layout)
+        let layout = Layout {
+            id: request.layout_id,
+            preset: request.preset,
+            settings: request.settings.clone(),
+            regions: results,
+        };
+        validate_layout(&layout)?;
+        Ok(layout)
     }
 }
 

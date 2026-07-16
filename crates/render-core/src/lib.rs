@@ -5,7 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use hot_trimmer_geometry::{GeometryError, Point, Quadrilateral};
+use hot_trimmer_domain::{
+    RegionSourceLayer, SourceLayerError, SourceMapping, SourceSamplingMode, SourceWarp,
+};
+use hot_trimmer_geometry::{GeometryError, Homography, Point, Quadrilateral};
 use thiserror::Error;
 
 mod structural_profile;
@@ -18,6 +21,7 @@ pub use structural_profile::{
 
 pub const RENDER_OPERATION_VERSION: u16 = 1;
 pub const DEFAULT_TILE_EDGE: u32 = 256;
+const MAX_RENDER_OPERATIONS: u64 = 1_073_741_824;
 
 #[derive(Clone, Debug, Default)]
 pub struct RenderCancellationToken(Arc<AtomicBool>);
@@ -67,6 +71,295 @@ pub struct RectifiedImage {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
+}
+
+/// The executable source layer rendered into one already-sized sheet region.  The caller owns
+/// compositing, so an error or cancellation can never publish an incompletely updated sheet.
+#[derive(Clone, Copy, Debug)]
+pub struct RegionLayerRenderRequest<'a> {
+    pub source_rgba8: &'a [u8],
+    pub source_width: u32,
+    pub source_height: u32,
+    pub layer: &'a RegionSourceLayer,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub sample_space: SampleSpace,
+}
+
+/// Renders a persisted region source recipe through its ordered mapping stack.
+///
+/// The layer is evaluated as: base mapping, variation/scale, mirror, rotation, then ordered
+/// warps.  This is intentionally a standalone image: callers only composite it after the entire
+/// operation succeeds.
+pub fn render_region_layer_rgba8(
+    request: RegionLayerRenderRequest<'_>,
+    cancellation: &RenderCancellationToken,
+) -> Result<RectifiedImage, RenderError> {
+    if request.source_width == 0
+        || request.source_height == 0
+        || request.output_width == 0
+        || request.output_height == 0
+    {
+        return Err(RenderError::InvalidDimensions);
+    }
+    if request.source_rgba8.len() != pixel_bytes(request.source_width, request.source_height)? {
+        return Err(RenderError::InvalidSourceBuffer);
+    }
+    request.layer.validate()?;
+    let output_bytes = pixel_bytes(request.output_width, request.output_height)?;
+    let operation_count = u64::from(request.output_width)
+        .checked_mul(u64::from(request.output_height))
+        .and_then(|pixels| {
+            pixels.checked_mul(u64::try_from(request.layer.warps.len() + 2).unwrap_or(u64::MAX))
+        })
+        .ok_or(RenderError::OperationTooLarge)?;
+    if operation_count > MAX_RENDER_OPERATIONS {
+        return Err(RenderError::OperationTooLarge);
+    }
+    if cancellation.is_cancelled() {
+        return Err(RenderError::Cancelled);
+    }
+
+    let mapping = LayerMapping::new(request.layer)?;
+    let filter = match request.layer.sampling.mode {
+        SourceSamplingMode::Nearest => SamplingFilter::Nearest,
+        // Cubic is deliberately sampled through the deterministic bilinear CPU path until a
+        // cubic kernel is specified for both preview and final output.
+        SourceSamplingMode::Linear | SourceSamplingMode::Cubic => SamplingFilter::Bilinear,
+    };
+    let mut rgba8 = vec![0; output_bytes];
+    for y in 0..request.output_height {
+        if cancellation.is_cancelled() {
+            return Err(RenderError::Cancelled);
+        }
+        let v = (f64::from(y) + 0.5) / f64::from(request.output_height);
+        for x in 0..request.output_width {
+            let u = (f64::from(x) + 0.5) / f64::from(request.output_width);
+            let source = mapping.map(Point { x: u, y: v }, request.layer)?;
+            let sample = sample_rgba8(
+                request.source_rgba8,
+                request.source_width,
+                request.source_height,
+                source,
+                filter,
+                request.sample_space,
+            );
+            let offset = usize::try_from(
+                (u64::from(y) * u64::from(request.output_width) + u64::from(x)) * 4,
+            )
+            .map_err(|_| RenderError::OutputTooLarge)?;
+            rgba8[offset..offset + 4].copy_from_slice(&sample);
+        }
+    }
+    Ok(RectifiedImage {
+        width: request.output_width,
+        height: request.output_height,
+        rgba8,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LayerMapping {
+    WholeSource,
+    Bounds {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+    Perspective(Homography),
+}
+
+impl LayerMapping {
+    fn new(layer: &RegionSourceLayer) -> Result<Self, RenderError> {
+        match &layer.mapping {
+            SourceMapping::WholeSource => Ok(Self::WholeSource),
+            SourceMapping::Bounds { bounds } => Ok(Self::Bounds {
+                x: bounds.x.get(),
+                y: bounds.y.get(),
+                width: bounds.width.get(),
+                height: bounds.height.get(),
+            }),
+            SourceMapping::Perspective { quad } => Ok(Self::Perspective(
+                Quadrilateral::new(*quad)?.source_from_output()?,
+            )),
+        }
+    }
+
+    fn map(self, output: Point, layer: &RegionSourceLayer) -> Result<Point, RenderError> {
+        let mut point = match self {
+            Self::WholeSource => output,
+            Self::Bounds {
+                x,
+                y,
+                width,
+                height,
+            } => Point {
+                x: x + output.x * width,
+                y: y + output.y * height,
+            },
+            Self::Perspective(homography) => {
+                homography
+                    .transform(output)
+                    .ok_or(RenderError::NonInvertibleMapping {
+                        operation: "perspective mapping",
+                    })?
+            }
+        };
+        point.x = (point.x - 0.5) * layer.sampling.scale + 0.5 + layer.variation_offset[0];
+        point.y = (point.y - 0.5) * layer.sampling.scale + 0.5 + layer.variation_offset[1];
+        if layer.mirror_x {
+            point.x = 1.0 - point.x;
+        }
+        if layer.mirror_y {
+            point.y = 1.0 - point.y;
+        }
+        let angle = layer.rotation_degrees.to_radians();
+        let (sin, cos) = angle.sin_cos();
+        let dx = point.x - 0.5;
+        let dy = point.y - 0.5;
+        point = Point {
+            x: cos.mul_add(dx, -sin * dy) + 0.5,
+            y: sin.mul_add(dx, cos * dy) + 0.5,
+        };
+        for (index, warp) in layer.warps.iter().enumerate() {
+            point = apply_warp(point, warp, index)?;
+        }
+        (point.x.is_finite() && point.y.is_finite())
+            .then_some(point)
+            .ok_or(RenderError::NonInvertibleMapping {
+                operation: "source layer transform",
+            })
+    }
+}
+
+fn apply_warp(point: Point, warp: &SourceWarp, index: usize) -> Result<Point, RenderError> {
+    let fail = || RenderError::NonInvertibleWarp { index };
+    let mapped = match *warp {
+        SourceWarp::Planar {
+            scale_x,
+            scale_y,
+            offset_x,
+            offset_y,
+        } => Point {
+            x: point.x.mul_add(scale_x, offset_x),
+            y: point.y.mul_add(scale_y, offset_y),
+        },
+        SourceWarp::Perspective { strength } => {
+            let denominator = strength.mul_add(point.y - 0.5, 1.0);
+            if denominator.abs() <= f64::EPSILON {
+                return Err(fail());
+            }
+            Point {
+                x: (point.x - 0.5) / denominator + 0.5,
+                y: point.y / denominator,
+            }
+        }
+        SourceWarp::Polar {
+            center_x,
+            center_y,
+            radius,
+        } => {
+            let dx = point.x - center_x;
+            let dy = point.y - center_y;
+            Point {
+                x: dy.atan2(dx) / std::f64::consts::TAU + 0.5,
+                y: (dx * dx + dy * dy).sqrt() / radius,
+            }
+        }
+        SourceWarp::SpiralTwirl {
+            center_x,
+            center_y,
+            radius,
+            strength,
+            iterations,
+        } => {
+            let mut dx = point.x - center_x;
+            let mut dy = point.y - center_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance <= radius {
+                for _ in 0..iterations.max(1) {
+                    let angle = strength * (1.0 - distance / radius) / f64::from(iterations.max(1));
+                    let (sin, cos) = angle.sin_cos();
+                    (dx, dy) = (cos.mul_add(dx, -sin * dy), sin.mul_add(dx, cos * dy));
+                }
+            }
+            Point {
+                x: center_x + dx,
+                y: center_y + dy,
+            }
+        }
+        SourceWarp::RadialLens {
+            center_x,
+            center_y,
+            radius,
+            strength,
+        } => {
+            let dx = point.x - center_x;
+            let dy = point.y - center_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let factor = if distance <= radius {
+                1.0 + strength * (1.0 - distance / radius)
+            } else {
+                1.0
+            };
+            if factor.abs() <= f64::EPSILON {
+                return Err(fail());
+            }
+            Point {
+                x: center_x + dx * factor,
+                y: center_y + dy * factor,
+            }
+        }
+        SourceWarp::CylindricalArc {
+            radius,
+            arc_degrees,
+        } => {
+            let angle = (point.x - 0.5) * arc_degrees.to_radians();
+            Point {
+                x: 0.5 + radius * angle.sin(),
+                y: point.y,
+            }
+        }
+    };
+    (mapped.x.is_finite() && mapped.y.is_finite())
+        .then_some(mapped)
+        .ok_or_else(fail)
+}
+
+/// Reorients a sampled tangent-space normal through the local source mapping Jacobian.  A
+/// reflected mapping therefore flips the corresponding tangent component instead of leaving a
+/// visually inside-out normal map.
+pub fn correct_tangent_space_normal_rgba8(
+    normal: [u8; 4],
+    jacobian: [[f64; 2]; 2],
+) -> Result<[u8; 4], RenderError> {
+    if jacobian
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+    {
+        return Err(RenderError::NonInvertibleMapping {
+            operation: "normal mapping Jacobian",
+        });
+    }
+    let x = f64::from(normal[0]) / 127.5 - 1.0;
+    let y = f64::from(normal[1]) / 127.5 - 1.0;
+    let z = f64::from(normal[2]) / 127.5 - 1.0;
+    let mapped_x = jacobian[0][0].mul_add(x, jacobian[1][0] * y);
+    let mapped_y = jacobian[0][1].mul_add(x, jacobian[1][1] * y);
+    let length = (mapped_x * mapped_x + mapped_y * mapped_y + z * z).sqrt();
+    if length <= f64::EPSILON || !length.is_finite() {
+        return Err(RenderError::NonInvertibleMapping {
+            operation: "normal mapping Jacobian",
+        });
+    }
+    Ok([
+        quantize(mapped_x / length * 0.5 + 0.5),
+        quantize(mapped_y / length * 0.5 + 0.5),
+        quantize(z / length * 0.5 + 0.5),
+        normal[3],
+    ])
 }
 
 /// Rectifies a patch by inverse-mapping output pixel centers through its homography. The operation is
@@ -145,10 +438,18 @@ pub enum RenderError {
     InvalidSourceBuffer,
     #[error("rectified output exceeds the bounded allocation limit")]
     OutputTooLarge,
+    #[error("render operation count exceeds the bounded limit")]
+    OperationTooLarge,
     #[error("rectification was cancelled")]
     Cancelled,
     #[error("patch geometry cannot be rectified: {0}")]
     Geometry(#[from] GeometryError),
+    #[error("source layer is invalid: {0}")]
+    SourceLayer(#[from] SourceLayerError),
+    #[error("source mapping is non-invertible at {operation}")]
+    NonInvertibleMapping { operation: &'static str },
+    #[error("source warp {index} is non-invertible")]
+    NonInvertibleWarp { index: usize },
 }
 
 fn validate_request(request: RectificationRequest<'_>) -> Result<(), RenderError> {
@@ -306,14 +607,18 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use hot_trimmer_domain::NormalizedPoint;
+    use hot_trimmer_domain::{
+        NormalizedPoint, RegionSourceLayer, SourceMapping, SourceRectification,
+        SourceRectificationMode, SourceWarp,
+    };
     use hot_trimmer_geometry::{Point, Quadrilateral};
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     use super::{
-        RectificationRequest, RenderCancellationToken, RenderError, SampleSpace, SamplingFilter,
-        rectify_rgba8, rectify_rgba8_with_progress, sample_rgba8,
+        RectificationRequest, RegionLayerRenderRequest, RenderCancellationToken, RenderError,
+        SampleSpace, SamplingFilter, correct_tangent_space_normal_rgba8, rectify_rgba8,
+        rectify_rgba8_with_progress, render_region_layer_rgba8, sample_rgba8,
     };
 
     fn point(x: f64, y: f64) -> NormalizedPoint {
@@ -468,6 +773,88 @@ mod tests {
             &RenderCancellationToken::new(),
         );
         assert!(matches!(result, Err(RenderError::InvalidSourceBuffer)));
+    }
+
+    #[test]
+    fn region_layer_planar_perspective_and_mirror_are_deterministic() {
+        let source = [10, 0, 0, 255, 200, 0, 0, 255];
+        let mut mirrored = RegionSourceLayer {
+            mirror_x: true,
+            ..RegionSourceLayer::default()
+        };
+        let render = |layer: &RegionSourceLayer| {
+            render_region_layer_rgba8(
+                RegionLayerRenderRequest {
+                    source_rgba8: &source,
+                    source_width: 2,
+                    source_height: 1,
+                    layer,
+                    output_width: 2,
+                    output_height: 1,
+                    sample_space: SampleSpace::LinearData,
+                },
+                &RenderCancellationToken::new(),
+            )
+        };
+        let planar = render(&RegionSourceLayer::default()).expect("planar layer");
+        let reflected = render(&mirrored).expect("mirrored layer");
+        assert_eq!(&planar.rgba8[..4], &[10, 0, 0, 255]);
+        assert_eq!(&reflected.rgba8[..4], &[200, 0, 0, 255]);
+
+        mirrored.mirror_x = false;
+        mirrored.mapping = SourceMapping::Perspective {
+            quad: full_source_quad().corners(),
+        };
+        mirrored.rectification = SourceRectification {
+            mode: SourceRectificationMode::Perspective,
+            ..SourceRectification::default()
+        };
+        assert_eq!(render(&mirrored).expect("perspective layer"), planar);
+    }
+
+    #[test]
+    fn invalid_region_layer_and_cancellation_return_no_image() {
+        let mut layer = RegionSourceLayer::default();
+        layer.warps.push(SourceWarp::Polar {
+            center_x: 0.5,
+            center_y: 0.5,
+            radius: 0.0,
+        });
+        let request = RegionLayerRenderRequest {
+            source_rgba8: &[255, 255, 255, 255],
+            source_width: 1,
+            source_height: 1,
+            layer: &layer,
+            output_width: 1,
+            output_height: 1,
+            sample_space: SampleSpace::LinearData,
+        };
+        assert!(matches!(
+            render_region_layer_rgba8(request, &RenderCancellationToken::new()),
+            Err(RenderError::SourceLayer(_))
+        ));
+        let cancellation = RenderCancellationToken::new();
+        cancellation.cancel();
+        let valid_layer = RegionSourceLayer::default();
+        assert!(matches!(
+            render_region_layer_rgba8(
+                RegionLayerRenderRequest {
+                    layer: &valid_layer,
+                    ..request
+                },
+                &cancellation
+            ),
+            Err(RenderError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn mirrored_jacobian_flips_the_normal_tangent_handedness() {
+        let corrected =
+            correct_tangent_space_normal_rgba8([255, 128, 128, 255], [[-1.0, 0.0], [0.0, 1.0]])
+                .expect("mirrored normal");
+        assert!(corrected[0] < 128);
+        assert_eq!(corrected[3], 255);
     }
 
     #[test]

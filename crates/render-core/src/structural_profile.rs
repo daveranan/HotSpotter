@@ -34,28 +34,52 @@ impl StructuralProfile {
     pub const fn for_kind(kind: ProfileKind) -> Self {
         match kind {
             ProfileKind::Flat => Self {
-                kind, amplitude: 0.0, edge_width: 0.0, frame_width: 0.0,
-                inner_radius: 0.0, outer_radius: 0.0,
+                kind,
+                amplitude: 0.0,
+                edge_width: 0.0,
+                frame_width: 0.0,
+                inner_radius: 0.0,
+                outer_radius: 0.0,
             },
             ProfileKind::ConvexBevel45 | ProfileKind::ConcaveGroove45 => Self {
-                kind, amplitude: 0.125, edge_width: 0.125, frame_width: 0.0,
-                inner_radius: 0.0, outer_radius: 0.0,
+                kind,
+                amplitude: 0.125,
+                edge_width: 0.125,
+                frame_width: 0.0,
+                inner_radius: 0.0,
+                outer_radius: 0.0,
             },
             ProfileKind::RoundedBevel => Self {
-                kind, amplitude: 0.125, edge_width: 0.125, frame_width: 0.0,
-                inner_radius: 0.0, outer_radius: 0.0,
+                kind,
+                amplitude: 0.125,
+                edge_width: 0.125,
+                frame_width: 0.0,
+                inner_radius: 0.0,
+                outer_radius: 0.0,
             },
             ProfileKind::PanelFrame => Self {
-                kind, amplitude: 0.04, edge_width: 0.04, frame_width: 0.20,
-                inner_radius: 0.0, outer_radius: 0.0,
+                kind,
+                amplitude: 0.04,
+                edge_width: 0.04,
+                frame_width: 0.20,
+                inner_radius: 0.0,
+                outer_radius: 0.0,
             },
             ProfileKind::RadialDisc => Self {
-                kind, amplitude: 0.06, edge_width: 0.06, frame_width: 0.0,
-                inner_radius: 0.0, outer_radius: 0.42,
+                kind,
+                amplitude: 0.06,
+                edge_width: 0.06,
+                frame_width: 0.0,
+                inner_radius: 0.0,
+                outer_radius: 0.42,
             },
             ProfileKind::Annulus => Self {
-                kind, amplitude: 0.04, edge_width: 0.04, frame_width: 0.0,
-                inner_radius: 0.24, outer_radius: 0.44,
+                kind,
+                amplitude: 0.04,
+                edge_width: 0.04,
+                frame_width: 0.0,
+                inner_radius: 0.24,
+                outer_radius: 0.44,
             },
         }
     }
@@ -230,10 +254,7 @@ fn validate_hotspot(
     hotspot: PixelBounds,
     sheet_size: PixelSize,
 ) -> Result<(), StructuralProfileError> {
-    if sheet_size.width == 0
-        || sheet_size.height == 0
-        || hotspot.width == 0
-        || hotspot.height == 0
+    if sheet_size.width == 0 || sheet_size.height == 0 || hotspot.width == 0 || hotspot.height == 0
     {
         return Err(StructuralProfileError::InvalidDimensions);
     }
@@ -271,14 +292,17 @@ fn validate_profile(profile: StructuralProfile) -> Result<(), StructuralProfileE
         profile.inner_radius,
         profile.outer_radius,
     ];
-    if values.into_iter().any(|value| !value.is_finite() || value < 0.0) {
+    if values
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
         return Err(StructuralProfileError::InvalidProfileParameters);
     }
     let valid = match profile.kind {
         ProfileKind::Flat => true,
-        ProfileKind::ConvexBevel45
-        | ProfileKind::ConcaveGroove45
-        | ProfileKind::RoundedBevel => profile.amplitude > 0.0 && profile.edge_width > 0.0,
+        ProfileKind::ConvexBevel45 | ProfileKind::ConcaveGroove45 | ProfileKind::RoundedBevel => {
+            profile.amplitude > 0.0 && profile.edge_width > 0.0
+        }
         ProfileKind::PanelFrame => {
             profile.amplitude > 0.0
                 && profile.edge_width > 0.0
@@ -306,13 +330,7 @@ fn validate_profile(profile: StructuralProfile) -> Result<(), StructuralProfileE
     }
 }
 
-fn profile_height(
-    profile: StructuralProfile,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-) -> f64 {
+fn profile_height(profile: StructuralProfile, x: u32, y: u32, width: u32, height: u32) -> f64 {
     let scale = f64::from(width.min(height));
     let pixel_x = f64::from(x) + 0.5;
     let pixel_y = f64::from(y) + 0.5;
@@ -333,8 +351,8 @@ fn profile_height(
             -profile.amplitude * (1.0 - linear_ramp(edge_distance / profile.edge_width))
         }
         ProfileKind::RoundedBevel => {
-            let phase = linear_ramp(edge_distance / profile.edge_width)
-                * std::f64::consts::FRAC_PI_2;
+            let phase =
+                linear_ramp(edge_distance / profile.edge_width) * std::f64::consts::FRAC_PI_2;
             profile.amplitude * phase.sin()
         }
         ProfileKind::PanelFrame => {
@@ -347,8 +365,7 @@ fn profile_height(
             profile.amplitude * smooth_ramp(inside)
         }
         ProfileKind::Annulus => {
-            let inside = (radius - profile.inner_radius)
-                .min(profile.outer_radius - radius)
+            let inside = (radius - profile.inner_radius).min(profile.outer_radius - radius)
                 / profile.edge_width;
             profile.amplitude * smooth_ramp(inside)
         }
@@ -443,7 +460,12 @@ mod tests {
     ) -> StructuralProfileMaps {
         compile_structural_profile(StructuralProfileRequest {
             profile: StructuralProfile::for_kind(kind),
-            hotspot: PixelBounds { x, y, width, height },
+            hotspot: PixelBounds {
+                x,
+                y,
+                width,
+                height,
+            },
             sheet_size: PixelSize {
                 width: x + width + 5,
                 height: y + height + 5,
@@ -549,27 +571,47 @@ mod tests {
     fn normal_conventions_invert_only_the_green_channel() {
         let open_gl = compile(ProfileKind::RadialDisc, NormalConvention::OpenGl);
         let direct_x = compile(ProfileKind::RadialDisc, NormalConvention::DirectX);
-        assert!(open_gl
-            .normal_rgba8
-            .chunks_exact(4)
-            .zip(direct_x.normal_rgba8.chunks_exact(4))
-            .any(|(open_gl, direct_x)| {
-                open_gl[0] == direct_x[0]
-                    && open_gl[1] != direct_x[1]
-                    && open_gl[2] == direct_x[2]
-                    && open_gl[3] == direct_x[3]
-            }));
+        assert!(
+            open_gl
+                .normal_rgba8
+                .chunks_exact(4)
+                .zip(direct_x.normal_rgba8.chunks_exact(4))
+                .any(|(open_gl, direct_x)| {
+                    open_gl[0] == direct_x[0]
+                        && open_gl[1] != direct_x[1]
+                        && open_gl[2] == direct_x[2]
+                        && open_gl[3] == direct_x[3]
+                })
+        );
     }
 
     #[test]
     fn slot_key_profile_defaults_are_stable() {
         assert_eq!(profile_kind_for_slot_key("surface_01"), ProfileKind::Flat);
-        assert_eq!(profile_kind_for_slot_key("trim_bevel"), ProfileKind::ConvexBevel45);
-        assert_eq!(profile_kind_for_slot_key("recessed_seam"), ProfileKind::ConcaveGroove45);
-        assert_eq!(profile_kind_for_slot_key("rounded_cap"), ProfileKind::RoundedBevel);
-        assert_eq!(profile_kind_for_slot_key("panel_frame"), ProfileKind::PanelFrame);
-        assert_eq!(profile_kind_for_slot_key("radial_fixture"), ProfileKind::RadialDisc);
-        assert_eq!(profile_kind_for_slot_key("ring_detail"), ProfileKind::Annulus);
+        assert_eq!(
+            profile_kind_for_slot_key("trim_bevel"),
+            ProfileKind::ConvexBevel45
+        );
+        assert_eq!(
+            profile_kind_for_slot_key("recessed_seam"),
+            ProfileKind::ConcaveGroove45
+        );
+        assert_eq!(
+            profile_kind_for_slot_key("rounded_cap"),
+            ProfileKind::RoundedBevel
+        );
+        assert_eq!(
+            profile_kind_for_slot_key("panel_frame"),
+            ProfileKind::PanelFrame
+        );
+        assert_eq!(
+            profile_kind_for_slot_key("radial_fixture"),
+            ProfileKind::RadialDisc
+        );
+        assert_eq!(
+            profile_kind_for_slot_key("ring_detail"),
+            ProfileKind::Annulus
+        );
     }
 
     #[test]
@@ -591,6 +633,9 @@ mod tests {
             },
             normal_convention: NormalConvention::OpenGl,
         });
-        assert_eq!(result, Err(StructuralProfileError::InvalidProfileParameters));
+        assert_eq!(
+            result,
+            Err(StructuralProfileError::InvalidProfileParameters)
+        );
     }
 }

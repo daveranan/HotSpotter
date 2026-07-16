@@ -9,10 +9,13 @@ import type {
   LayoutRegion,
   LayoutRequest,
   LayoutSettings,
+  NormalizedPoint,
   PackPriority,
+  PatchGeometry,
   PatchSnapshot,
   PixelBounds,
   ProjectSnapshot,
+  RegionSourceLayer,
   SourceFramingMode,
   SourceSnapshot,
   TemplateIdentity,
@@ -106,10 +109,142 @@ export function layoutPreviewDataUrl(preview: CompiledLayoutPreview | null, map:
 export const defaultTemplateSourceTransform: TemplateSourceTransform = {
   mode: "cover",
   cropFocus: { x: 0.5, y: 0.5 },
+  cropBounds: { x: 0, y: 0, width: 1, height: 1 },
 };
 
-export function templateSourceTransform(mode: SourceFramingMode, cropFocus = defaultTemplateSourceTransform.cropFocus): TemplateSourceTransform {
-  return { mode, cropFocus: { x: cropFocus.x, y: cropFocus.y } };
+export function defaultRegionSourceLayer(): RegionSourceLayer {
+  return {
+    version: 1,
+    mapping: { type: "whole_source" },
+    rectification: { mode: "none", maxIntermediateEdge: 2048 },
+    sampling: { mode: "linear", scale: 1 },
+    rotationDegrees: 0,
+    mirrorX: false,
+    mirrorY: false,
+    blend: "replace",
+    opacity: 1,
+    variationOffset: [0, 0],
+    warps: [],
+  };
+}
+
+/** The editable source quadrilateral is independent from the trim-sheet region bounds. */
+export function sourceLayerGeometry(sourceLayer: RegionSourceLayer): PatchGeometry {
+  if (sourceLayer.mapping.type === "perspective") return { corners: sourceLayer.mapping.quad.map((point) => ({ ...point })) as PatchGeometry["corners"] };
+  const bounds = sourceLayer.mapping.type === "bounds" ? sourceLayer.mapping.bounds : { x: 0, y: 0, width: 1, height: 1 };
+  return { corners: [
+    { x: bounds.x, y: bounds.y },
+    { x: bounds.x + bounds.width, y: bounds.y },
+    { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+    { x: bounds.x, y: bounds.y + bounds.height },
+  ] };
+}
+
+export function sourceLayerWithGeometry(sourceLayer: RegionSourceLayer, geometry: PatchGeometry): RegionSourceLayer {
+  const [topLeft, topRight, bottomRight, bottomLeft] = geometry.corners;
+  const epsilon = 1e-9;
+  const rectangular = Math.abs(topLeft.y - topRight.y) < epsilon
+    && Math.abs(bottomLeft.y - bottomRight.y) < epsilon
+    && Math.abs(topLeft.x - bottomLeft.x) < epsilon
+    && Math.abs(topRight.x - bottomRight.x) < epsilon;
+  return {
+    ...sourceLayer,
+    mapping: rectangular
+      ? { type: "bounds", bounds: { x: topLeft.x, y: topLeft.y, width: topRight.x - topLeft.x, height: bottomLeft.y - topLeft.y } }
+      : { type: "perspective", quad: geometry.corners.map((point) => ({ ...point })) as [NormalizedPoint, NormalizedPoint, NormalizedPoint, NormalizedPoint] },
+  };
+}
+
+export interface SourceFootprint {
+  bounds: { x: number; y: number; width: number; height: number };
+  wrapped: boolean;
+}
+
+/**
+ * Maps a stable sheet region to the source area currently sampled by template framing.
+ * Repeat framing deliberately returns every visible source segment so the authoring view
+ * never represents a wrapped sample as one false rectangle.
+ */
+export function sourceFootprintsForRegion(
+  bounds: PixelBounds,
+  output: { width: number; height: number },
+  framing: TemplateSourceTransform,
+  source: { width: number; height: number },
+): SourceFootprint[] {
+  const crop = framing.cropBounds ?? { x: 0, y: 0, width: 1, height: 1 };
+  const left = bounds.x / Math.max(1, output.width);
+  const top = bounds.y / Math.max(1, output.height);
+  const right = (bounds.x + bounds.width) / Math.max(1, output.width);
+  const bottom = (bounds.y + bounds.height) / Math.max(1, output.height);
+  const clamp = (value: number): number => Math.max(0, Math.min(1, value));
+  const canonical = (value: number): number => Math.round(value * 1_000_000_000) / 1_000_000_000;
+  const canonicalBounds = (value: SourceFootprint["bounds"]): SourceFootprint["bounds"] => ({
+    x: canonical(value.x), y: canonical(value.y), width: canonical(value.width), height: canonical(value.height),
+  });
+  const framed = (u: number, v: number): { x: number; y: number } => {
+    if (framing.mode === "stretch") return { x: crop.x + u * crop.width, y: crop.y + v * crop.height };
+    const sourceAspect = (source.width * crop.width) / Math.max(1, source.height * crop.height);
+    const sheetAspect = output.width / Math.max(1, output.height);
+    if (sourceAspect > sheetAspect) {
+      const visibleWidth = sheetAspect / sourceAspect;
+      const offset = clamp(framing.cropFocus.x) * (1 - visibleWidth);
+      return { x: crop.x + (offset + u * visibleWidth) * crop.width, y: crop.y + v * crop.height };
+    }
+    const visibleHeight = sourceAspect / sheetAspect;
+    const offset = clamp(framing.cropFocus.y) * (1 - visibleHeight);
+    return { x: crop.x + u * crop.width, y: crop.y + (offset + v * visibleHeight) * crop.height };
+  };
+  if (framing.mode !== "repeat") {
+    const start = framed(left, top);
+    const end = framed(right, bottom);
+    return [{ bounds: canonicalBounds({ x: start.x, y: start.y, width: Math.max(0.001, end.x - start.x), height: Math.max(0.001, end.y - start.y) }), wrapped: false }];
+  }
+
+  const repeat = 2;
+  const xStart = left * repeat;
+  const xEnd = right * repeat;
+  const yStart = top * repeat;
+  const yEnd = bottom * repeat;
+  const segments = (start: number, end: number): Array<{ start: number; end: number; wrapped: boolean }> => {
+    if (end - start >= 1 - Number.EPSILON) return [{ start: 0, end: 1, wrapped: false }];
+    const firstTile = Math.floor(start);
+    const lastTile = Math.floor(Math.max(start, end - Number.EPSILON));
+    const result = [];
+    for (let tile = firstTile; tile <= lastTile; tile += 1) {
+      result.push({
+        start: Math.max(start, tile) - tile,
+        end: Math.min(end, tile + 1) - tile,
+        wrapped: tile !== firstTile,
+      });
+    }
+    return result;
+  };
+  const footprints: SourceFootprint[] = [];
+  for (const x of segments(xStart, xEnd)) {
+    for (const y of segments(yStart, yEnd)) {
+      const bounds = canonicalBounds({ x: crop.x + x.start * crop.width, y: crop.y + y.start * crop.height, width: Math.max(0.001, (x.end - x.start) * crop.width), height: Math.max(0.001, (y.end - y.start) * crop.height) });
+      footprints.push({ bounds, wrapped: x.wrapped || y.wrapped });
+    }
+  }
+  return footprints;
+}
+
+export function templateRegionName(region: LayoutRegion): string {
+  const key = region.itemKey.replace(/^(template|slot|region)[:._-]*/i, "");
+  if (key && !/^source[:._-]/i.test(key) && !/^item[:._-]?\d*$/i.test(key)) {
+    return key.split(/[_:.\-]+/).filter(Boolean).map((word) => `${word.slice(0, 1).toUpperCase()}${word.slice(1)}`).join(" ");
+  }
+  if (region.bounds.width === region.bounds.height) return "Radial detail";
+  return region.bounds.width > region.bounds.height ? "Horizontal trim" : "Vertical trim";
+}
+
+export function regionLabelDetail(zoom: number, selected: boolean, hovered: boolean): "hidden" | "compact" | "expanded" {
+  if (selected || hovered) return zoom >= 1.35 ? "expanded" : "compact";
+  return zoom >= 2.1 ? "compact" : "hidden";
+}
+
+export function templateSourceTransform(mode: SourceFramingMode, cropFocus = defaultTemplateSourceTransform.cropFocus, cropBounds = defaultTemplateSourceTransform.cropBounds): TemplateSourceTransform {
+  return { mode, cropFocus: { x: cropFocus.x, y: cropFocus.y }, cropBounds: cropBounds ? { ...cropBounds } : undefined };
 }
 
 export function buildTemplateGenerateLayoutRequest(sourceSetId: string, layoutId: string, settings: LayoutSettings, sourceTransform: TemplateSourceTransform = defaultTemplateSourceTransform, coalescingGroup?: number, template: TemplateIdentity = genericArchitectureTemplate): GenerateLayoutRequest {
@@ -120,7 +255,7 @@ export function buildTemplateGenerateLayoutRequest(sourceSetId: string, layoutId
     sourceSetId,
     layoutId,
     settings,
-    sourceTransform: templateSourceTransform(sourceTransform.mode, sourceTransform.cropFocus),
+    sourceTransform: templateSourceTransform(sourceTransform.mode, sourceTransform.cropFocus, sourceTransform.cropBounds),
     coalescingGroup,
   };
 }

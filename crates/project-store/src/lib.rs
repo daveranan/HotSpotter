@@ -1,6 +1,7 @@
 #![doc = "Transactional `SQLite` project persistence, migration, locking, autosave, and recovery."]
 
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -10,8 +11,8 @@ use std::{
 use hot_trimmer_domain::{
     Layout, LayoutId, LayoutItem, LayoutKind, LayoutPreset, LayoutRegion, LayoutRequest,
     LayoutSettings, Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchSet,
-    PixelBounds, ProjectId, RegionFill, RegionId, RegionLocks, SourceId, SourceSetId,
-    TemplateLayoutContract,
+    PixelBounds, ProjectId, RegionFill, RegionId, RegionLocks, RegionSourceLayer, SourceId,
+    SourceLayerError, SourceSetId, TemplateLayoutContract,
 };
 use hot_trimmer_geometry::{LayoutSolveError, Quadrilateral, solve_layout, validate_layout};
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, Transaction, params};
@@ -20,7 +21,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 pub const MAX_RECOVERY_SNAPSHOTS: usize = 5;
 const MAX_PROJECT_HISTORY: usize = 256;
 
@@ -145,6 +146,9 @@ pub struct StoredLayout {
     pub layout_kind: LayoutKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<TemplateLayoutContract>,
+    /// Explicit region source overrides. Missing keys intentionally use `RegionSourceLayer::default`.
+    #[serde(default)]
+    pub source_layers: BTreeMap<RegionId, RegionSourceLayer>,
 }
 
 impl StoredLayout {
@@ -158,6 +162,14 @@ impl StoredLayout {
             existing_regions: self.layout.regions.clone(),
         }
     }
+
+    #[must_use]
+    pub fn source_layer(&self, region_id: RegionId) -> RegionSourceLayer {
+        self.source_layers
+            .get(&region_id)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -170,6 +182,14 @@ pub enum LayoutCommand {
     SetBounds {
         region_id: RegionId,
         bounds: PixelBounds,
+    },
+    SetFill {
+        region_id: RegionId,
+        fill: RegionFill,
+    },
+    SetSourceLayer {
+        region_id: RegionId,
+        source_layer: RegionSourceLayer,
     },
     SetLocks {
         region_id: RegionId,
@@ -244,6 +264,12 @@ pub enum StoreError {
     LayoutReference(String),
     #[error("the layout command is invalid: {0}")]
     LayoutCommand(String),
+    #[error("region {region_id} source mapping is invalid: {source}")]
+    InvalidRegionSourceLayer {
+        region_id: RegionId,
+        #[source]
+        source: SourceLayerError,
+    },
     #[error("the layout could not be solved: {0}")]
     LayoutSolve(#[from] LayoutSolveError),
     #[error("the patch command is invalid: {0}")]
@@ -847,6 +873,7 @@ impl ProjectStore {
             items: request.items.clone(),
             layout_kind: LayoutKind::CustomAtlas,
             template: None,
+            source_layers: BTreeMap::new(),
         };
         self.commit_layout(next, "layout_solve", coalescing_group)?;
         self.layout.as_ref().ok_or_else(|| {
@@ -895,11 +922,50 @@ impl ProjectStore {
             }
         }
         validate_layout(&solved)?;
+        let source_layers = self
+            .layout
+            .as_ref()
+            .filter(|layout| {
+                layout.layout_kind == LayoutKind::Template
+                    && layout
+                        .template
+                        .as_ref()
+                        .and_then(|previous| previous.snapshot.as_ref())
+                        .zip(template.snapshot.as_ref())
+                        .is_some_and(|(previous, next)| {
+                            previous.identity.compatibility_key
+                                == next.identity.compatibility_key
+                        })
+            })
+            .map(|layout| {
+                layout
+                    .source_layers
+                    .iter()
+                    .filter_map(|(region_id, layer)| {
+                        let slot_key = layout
+                            .template
+                            .as_ref()?
+                            .slot_bindings
+                            .iter()
+                            .find(|binding| binding.region_id == *region_id)?
+                            .slot_key
+                            .as_str();
+                        let next_region_id = template
+                            .slot_bindings
+                            .iter()
+                            .find(|binding| binding.slot_key == slot_key)?
+                            .region_id;
+                        Some((next_region_id, layer.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let next = StoredLayout {
             layout: solved,
             items: request.items.clone(),
             layout_kind: LayoutKind::Template,
             template: Some(template),
+            source_layers,
         };
         self.commit_layout(next, "template_layout_solve", coalescing_group)?;
         self.layout.as_ref().ok_or_else(|| {
@@ -1467,7 +1533,7 @@ fn load_layout(connection: &Connection) -> Result<Option<StoredLayout>, StoreErr
     }
     let row = connection
         .query_row(
-            "SELECT id, preset, settings_json, items_json, layout_kind, template_json FROM layouts WHERE singleton = 1",
+            "SELECT id, preset, settings_json, items_json, layout_kind, template_json, source_layers_json FROM layouts WHERE singleton = 1",
             [],
             |row| {
                 Ok((
@@ -1477,11 +1543,21 @@ fn load_layout(connection: &Connection) -> Result<Option<StoredLayout>, StoreErr
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id_text, preset_text, settings_json, items_json, layout_kind_json, template_json)) = row else {
+    let Some((
+        id_text,
+        preset_text,
+        settings_json,
+        items_json,
+        layout_kind_json,
+        template_json,
+        source_layers_json,
+    )) = row
+    else {
         return Ok(None);
     };
     let id: LayoutId = id_text
@@ -1495,6 +1571,8 @@ fn load_layout(connection: &Connection) -> Result<Option<StoredLayout>, StoreErr
         .as_deref()
         .map(serde_json::from_str)
         .transpose()?;
+    let source_layers: BTreeMap<RegionId, RegionSourceLayer> =
+        serde_json::from_str(&source_layers_json)?;
     let mut statement = connection.prepare(
         "SELECT id, item_key, region_json FROM layout_regions WHERE layout_id = ?1 ORDER BY ordinal",
     )?;
@@ -1528,6 +1606,7 @@ fn load_layout(connection: &Connection) -> Result<Option<StoredLayout>, StoreErr
         items,
         layout_kind,
         template,
+        source_layers,
     };
     // Pure contract checks run here; catalog ownership is checked by `ProjectStore::open` through summary.
     stored
@@ -1543,6 +1622,7 @@ fn validate_layout_catalog_snapshot(
     sources: &[StoredSource],
     patches: &[Patch],
 ) -> Result<(), StoreError> {
+    validate_region_source_layers(stored)?;
     for item in &stored.items {
         match item.fill {
             RegionFill::WholeSourceSet { source_set_id } => {
@@ -1586,6 +1666,25 @@ fn validate_layout_catalog_snapshot(
     Ok(())
 }
 
+fn validate_region_source_layers(stored: &StoredLayout) -> Result<(), StoreError> {
+    for (&region_id, source_layer) in &stored.source_layers {
+        if !stored
+            .layout
+            .regions
+            .iter()
+            .any(|region| region.id == region_id)
+        {
+            return Err(StoreError::LayoutCommand(format!(
+                "source mapping references missing region {region_id}"
+            )));
+        }
+        source_layer
+            .validate()
+            .map_err(|source| StoreError::InvalidRegionSourceLayer { region_id, source })?;
+    }
+    Ok(())
+}
+
 fn apply_layout_command(
     stored: &mut StoredLayout,
     command: &LayoutCommand,
@@ -1595,10 +1694,30 @@ fn apply_layout_command(
             find_region_mut(stored, *region_id)?.bounds = *bounds;
         }
         LayoutCommand::SetFill { region_id, fill } => {
+            let item_key = find_region_mut(stored, *region_id)?.item_key.clone();
             let region = find_region_mut(stored, *region_id)?;
             region.fill = fill.clone();
-            if let Some(item) = stored.items.iter_mut().find(|item| item.key == region.item_key) {
+            if let Some(item) = stored.items.iter_mut().find(|item| item.key == item_key) {
                 item.fill = fill.clone();
+            }
+        }
+        LayoutCommand::SetSourceLayer {
+            region_id,
+            source_layer,
+        } => {
+            find_region_mut(stored, *region_id)?;
+            source_layer
+                .validate()
+                .map_err(|source| StoreError::InvalidRegionSourceLayer {
+                    region_id: *region_id,
+                    source,
+                })?;
+            if *source_layer == RegionSourceLayer::default() {
+                stored.source_layers.remove(region_id);
+            } else {
+                stored
+                    .source_layers
+                    .insert(*region_id, source_layer.clone());
             }
         }
         LayoutCommand::SetLocks { region_id, locks } => {
@@ -1854,15 +1973,16 @@ fn persist_authoring_state(
         let settings_json = serde_json::to_string(&stored.layout.settings)?;
         let items_json = serde_json::to_string(&stored.items)?;
         transaction.execute(
-            "INSERT INTO layouts (singleton, id, preset, settings_json, items_json, layout_kind, template_json)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO layouts (singleton, id, preset, settings_json, items_json, layout_kind, template_json, source_layers_json)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 stored.layout.id.to_string(),
                 preset,
                 settings_json,
                 items_json,
                 serde_json::to_string(&stored.layout_kind)?.trim_matches('"').to_owned(),
-                stored.template.as_ref().map(serde_json::to_string).transpose()?
+                stored.template.as_ref().map(serde_json::to_string).transpose()?,
+                serde_json::to_string(&stored.source_layers)?
             ],
         )?;
         for (ordinal, region) in stored.layout.regions.iter().enumerate() {
@@ -1906,15 +2026,16 @@ fn persist_layout_state(
         let settings_json = serde_json::to_string(&stored.layout.settings)?;
         let items_json = serde_json::to_string(&stored.items)?;
         transaction.execute(
-            "INSERT INTO layouts (singleton, id, preset, settings_json, items_json, layout_kind, template_json)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO layouts (singleton, id, preset, settings_json, items_json, layout_kind, template_json, source_layers_json)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 stored.layout.id.to_string(),
                 preset,
                 settings_json,
                 items_json,
                 serde_json::to_string(&stored.layout_kind)?.trim_matches('"').to_owned(),
-                stored.template.as_ref().map(serde_json::to_string).transpose()?
+                stored.template.as_ref().map(serde_json::to_string).transpose()?,
+                serde_json::to_string(&stored.source_layers)?
             ],
         )?;
         for (ordinal, region) in stored.layout.regions.iter().enumerate() {
@@ -2009,6 +2130,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         migrate_to_v8(&transaction)?;
         transaction.pragma_update(None, "user_version", 8_u32)?;
         transaction.commit()?;
+        version = 8;
+    }
+    if version == 8 {
+        let transaction = connection.transaction()?;
+        migrate_to_v9(&transaction)?;
+        transaction.pragma_update(None, "user_version", 9_u32)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -2064,6 +2192,13 @@ fn migrate_to_v8(transaction: &Transaction<'_>) -> Result<(), StoreError> {
     transaction.execute_batch(include_str!(
         "../../../fixtures/projects/migrate-v7-to-v8.sql"
     ))?;
+    Ok(())
+}
+
+fn migrate_to_v9(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "ALTER TABLE layouts ADD COLUMN source_layers_json TEXT NOT NULL DEFAULT '{}';",
+    )?;
     Ok(())
 }
 
@@ -2270,9 +2405,11 @@ mod tests {
         AutoPackSettings, FillBehavior, LayoutId, LayoutItem, LayoutOrder, LayoutPreset,
         LayoutRequest, LayoutSettings, NormalizedPoint, PackPriority, Patch, PatchCommand,
         PatchGeometry, PatchId, PatchProperties, PixelBounds, PixelSize, RectificationSettings,
-        RegionConstraints, RegionFill, RegionLocks, SourceId, SourceSetId,
+        RegionConstraints, RegionFill, RegionLocks, RegionSourceLayer, SourceId, SourceLayerError,
+        SourceMapping, SourceRectification, SourceRectificationMode, SourceSampling, SourceSetId,
+        SourceWarp,
     };
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
     use uuid::Uuid;
 
     use super::{
@@ -2615,7 +2752,15 @@ mod tests {
             .query_row(
                 "SELECT id, preset, settings_json, items_json, template_json FROM layouts",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("migrated layout");
         let kind: String = connection
@@ -2633,6 +2778,155 @@ mod tests {
                 .expect("schema version"),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn version_eight_layout_storage_migrates_source_layers_transactionally() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-eight.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v7.sql"))
+            .expect("v7 schema");
+        connection
+            .execute_batch(include_str!(
+                "../../../fixtures/projects/migrate-v7-to-v8.sql"
+            ))
+            .expect("v8 schema");
+        connection
+            .pragma_update(None, "user_version", 8_u32)
+            .expect("mark v8");
+
+        migrate(&mut connection).expect("migrate v8");
+
+        let source_layers: String = connection
+            .query_row(
+                "SELECT source_layers_json FROM layouts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("source-layer column")
+            .unwrap_or_else(|| "{}".into());
+        assert_eq!(source_layers, "{}");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn source_layer_edits_round_trip_without_changing_region_topology_and_reject_singular_quads() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("source-layer.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Source layer").expect("create project");
+        let source_set = store.summary().expect("summary").source_sets[0].id;
+        store
+            .replace_source(SourceChannel::BaseColor, &source(64, 64))
+            .expect("base source");
+        store
+            .solve_and_commit_layout(
+                &layout_request(vec![source_item(source_set, "source:brick")]),
+                None,
+            )
+            .expect("layout");
+        let original = store.layout().expect("layout").layout.regions[0].clone();
+        let point = |x, y| NormalizedPoint::new(x, y).expect("point");
+        let source_layer = RegionSourceLayer {
+            mapping: SourceMapping::Perspective {
+                quad: [
+                    point(0.1, 0.1),
+                    point(0.9, 0.15),
+                    point(0.85, 0.9),
+                    point(0.15, 0.85),
+                ],
+            },
+            rectification: SourceRectification {
+                mode: SourceRectificationMode::Perspective,
+                ..SourceRectification::default()
+            },
+            warps: vec![
+                SourceWarp::Planar {
+                    scale_x: 1.5,
+                    scale_y: 0.75,
+                    offset_x: 0.1,
+                    offset_y: -0.1,
+                },
+                SourceWarp::SpiralTwirl {
+                    center_x: 0.5,
+                    center_y: 0.5,
+                    radius: 0.8,
+                    strength: 0.25,
+                    iterations: 4,
+                },
+            ],
+            ..RegionSourceLayer::default()
+        };
+        store
+            .execute_layout_command(
+                &LayoutCommand::SetSourceLayer {
+                    region_id: original.id,
+                    source_layer: source_layer.clone(),
+                },
+                None,
+            )
+            .expect("set source layer");
+        let edited = store.layout().expect("edited layout");
+        assert_eq!(edited.layout.regions[0], original);
+        assert_eq!(edited.source_layer(original.id), source_layer);
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&path).expect("reopen project");
+        assert_eq!(
+            reopened
+                .layout()
+                .expect("reopened layout")
+                .source_layer(original.id),
+            source_layer
+        );
+        let singular = RegionSourceLayer {
+            mapping: SourceMapping::Perspective {
+                quad: [
+                    point(0.2, 0.2),
+                    point(0.4, 0.4),
+                    point(0.6, 0.6),
+                    point(0.8, 0.8),
+                ],
+            },
+            rectification: SourceRectification {
+                mode: SourceRectificationMode::Perspective,
+                ..SourceRectification::default()
+            },
+            ..RegionSourceLayer::default()
+        };
+        assert!(matches!(
+            reopened.execute_layout_command(
+                &LayoutCommand::SetSourceLayer { region_id: original.id, source_layer: singular },
+                None,
+            ),
+            Err(StoreError::InvalidRegionSourceLayer {
+                region_id,
+                source: SourceLayerError::SingularPerspective,
+            }) if region_id == original.id
+        ));
+        assert!(matches!(
+            reopened.execute_layout_command(
+                &LayoutCommand::SetSourceLayer {
+                    region_id: original.id,
+                    source_layer: RegionSourceLayer {
+                        sampling: SourceSampling { scale: f64::NAN, ..SourceSampling::default() },
+                        ..RegionSourceLayer::default()
+                    },
+                },
+                None,
+            ),
+            Err(StoreError::InvalidRegionSourceLayer {
+                region_id,
+                source: SourceLayerError::SamplingScaleOutOfRange,
+            }) if region_id == original.id
+        ));
     }
     #[test]
     fn source_only_two_set_layout_reopens_with_explicit_set_names() {

@@ -11,12 +11,11 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hot_trimmer_domain::{
-    ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, Layout, LayoutItem,
-    LayoutRequest, LayoutSettings, NormalizedBounds, NormalizedPoint, NormalizedScalar, Patch,
-    PatchCommand, PatchGeometry, PatchId, PixelSize, RegionConstraints, RegionFill, RegionId,
-    SlotBinding, SourceFraming, SourceId, SourceSetId, StyleRecipe, TemplateIdentity,
-    TemplateLayoutContract, TemplateRegistry, TemplateSlotRole, TrimAxis, TrimCaps,
-    UserFacingError,
+    ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, Layout, LayoutItem, LayoutRequest,
+    LayoutSettings, NormalizedBounds, NormalizedPoint, NormalizedScalar, Patch, PatchCommand,
+    PatchGeometry, PatchId, PixelSize, RegionConstraints, RegionFill, RegionId, SlotBinding,
+    SourceFraming, SourceId, SourceSetId, StyleRecipe, TemplateIdentity, TemplateLayoutContract,
+    TemplateRegistry, TemplateSlotRole, TrimAxis, TrimCaps, UserFacingError,
 };
 use hot_trimmer_geometry::{
     Quadrilateral, RectificationLimits, assist_polygon, rectified_dimensions, solve_layout,
@@ -34,7 +33,10 @@ use hot_trimmer_render_core::{
     NormalConvention, RectificationRequest, RenderCancellationToken, RenderError, SampleSpace,
     SamplingFilter, rectify_rgba8_with_progress,
 };
-use hot_trimmer_sheet_compiler::{SheetCompileOutput, SheetCompileRequest, compile_template_sheet};
+use hot_trimmer_sheet_compiler::{
+    RegionSourceLayerBinding, SheetCompileOutput, SheetCompileRequest,
+    compile_template_sheet_with_source_layers,
+};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1211,11 +1213,13 @@ fn generate_template_layout(
     coalescing_group: Option<u64>,
 ) -> Result<SheetPreview, UserFacingError> {
     let definition = TemplateRegistry::built_in()
-    .map_err(|error| template_error(error.to_string()))?
-    .get(&identity.template_id, &identity.template_version)
-    .filter(|definition| definition.identity.compatibility_key == identity.compatibility_key)
-    .cloned()
-    .ok_or_else(|| template_error("The requested template identity is not available.".into()))?;
+        .map_err(|error| template_error(error.to_string()))?
+        .get(&identity.template_id, &identity.template_version)
+        .filter(|definition| definition.identity.compatibility_key == identity.compatibility_key)
+        .cloned()
+        .ok_or_else(|| {
+            template_error("The requested template identity is not available.".into())
+        })?;
 
     let compiled = {
         let store = session.store.as_mut().ok_or_else(no_open_project)?;
@@ -1244,17 +1248,71 @@ fn generate_template_layout(
             &CancellationToken::new(),
         )
         .map_err(image_error)?;
-        let output = compile_template_sheet(SheetCompileRequest {
-            source_rgba8: &decoded.pixels,
-            source_width: decoded.width,
-            source_height: decoded.height,
-            template: &definition,
-            sheet_size: settings.output,
-            normal_convention: NormalConvention::OpenGl,
-            source_framing,
-        })
+        let previous_layout = store.layout().cloned();
+        let source_layer_data = previous_layout
+            .as_ref()
+            .filter(|layout| {
+                layout
+                    .template
+                    .as_ref()
+                    .and_then(|template| template.snapshot.as_ref())
+                    .is_some_and(|snapshot| {
+                        snapshot.identity.compatibility_key == identity.compatibility_key
+                    })
+            })
+            .and_then(|layout| layout.template.as_ref().map(|template| (layout, template)))
+            .into_iter()
+            .flat_map(|(layout, template)| {
+                template.slot_bindings.iter().filter_map(|binding| {
+                    definition
+                        .slots
+                        .iter()
+                        .any(|slot| slot.slot_key == binding.slot_key)
+                        .then(|| {
+                            layout
+                                .source_layers
+                                .get(&binding.region_id)
+                                .map(|layer| (binding.slot_key.clone(), layer.clone()))
+                        })
+                        .flatten()
+                })
+            })
+            .collect::<Vec<_>>();
+        let source_layer_bindings = source_layer_data
+            .iter()
+            .map(|(slot_key, layer)| RegionSourceLayerBinding { slot_key, layer })
+            .collect::<Vec<_>>();
+        let output = compile_template_sheet_with_source_layers(
+            SheetCompileRequest {
+                source_rgba8: &decoded.pixels,
+                source_width: decoded.width,
+                source_height: decoded.height,
+                template: &definition,
+                sheet_size: settings.output,
+                normal_convention: NormalConvention::OpenGl,
+                source_framing,
+            },
+            &source_layer_bindings,
+            &RenderCancellationToken::new(),
+        )
         .map_err(|error| template_error(error.to_string()))?;
-        let layout_request = template_layout_request(layout_id, settings, source_set_id, &definition);
+        let mut layout_request =
+            template_layout_request(layout_id, settings, source_set_id, &definition);
+        if let Some(previous) = previous_layout.as_ref() {
+            for item in &mut layout_request.items {
+                if let Some(previous_item) = previous
+                    .items
+                    .iter()
+                    .find(|candidate| candidate.key == item.key)
+                {
+                    if matches!(previous_item.fill, RegionFill::RectifiedPatch { .. }) {
+                        item.fill = previous_item.fill.clone();
+                    }
+                    item.behavior = previous_item.behavior;
+                    item.trim_caps = previous_item.trim_caps;
+                }
+            }
+        }
         let mut solved = solve_layout(&layout_request).map_err(UserFacingError::from)?;
         for region in &mut solved.regions {
             let slot = definition
@@ -1263,9 +1321,28 @@ fn generate_template_layout(
                 .find(|slot| slot.slot_key == region.item_key)
                 .expect("template item has a manifest slot");
             region.id_color = slot.id_color;
+            if let Some(previous_region) = previous_layout.as_ref().and_then(|previous| {
+                previous
+                    .layout
+                    .regions
+                    .iter()
+                    .find(|candidate| candidate.id == region.id)
+            }) {
+                region.bounds = previous_region.bounds;
+                region.locks = previous_region.locks;
+                region.behavior = previous_region.behavior;
+                region.trim_caps = previous_region.trim_caps;
+                if matches!(previous_region.fill, RegionFill::RectifiedPatch { .. }) {
+                    region.fill = previous_region.fill.clone();
+                }
+            }
         }
         let template = TemplateLayoutContract {
-            snapshot: Some(definition.snapshot().map_err(|error| template_error(error.to_string()))?),
+            snapshot: Some(
+                definition
+                    .snapshot()
+                    .map_err(|error| template_error(error.to_string()))?,
+            ),
             slot_bindings: solved
                 .regions
                 .iter()
@@ -1274,7 +1351,7 @@ fn generate_template_layout(
                     item_key: region.item_key.clone(),
                     region_id: region.id,
                     id_color: region.id_color,
-            })
+                })
                 .collect(),
             style_recipe: StyleRecipe::default(),
             source_framing,
@@ -1342,18 +1419,24 @@ fn template_layout_request(
                         )
                         .expect("canonical template bounds"),
                         width: NormalizedScalar::new(
-                            f64::from(slot.allocation.width) / f64::from(definition.canonical_width),
+                            f64::from(slot.allocation.width)
+                                / f64::from(definition.canonical_width),
                         )
                         .expect("canonical template bounds"),
                         height: NormalizedScalar::new(
-                            f64::from(slot.allocation.height) / f64::from(definition.canonical_height),
+                            f64::from(slot.allocation.height)
+                                / f64::from(definition.canonical_height),
                         )
                         .expect("canonical template bounds"),
                     }),
                 },
                 padding_px: Some(0),
                 bleed_px: Some(0),
-                region_id: Some(template_region_id(&definition.identity, &slot.slot_key, index)),
+                region_id: Some(template_region_id(
+                    &definition.identity,
+                    &slot.slot_key,
+                    index,
+                )),
             }
         })
         .collect();
@@ -1392,11 +1475,12 @@ fn template_slot_behavior(
             } else {
                 TrimAxis::Vertical
             };
-            let (allocation_span, output_span, canonical_span) = if matches!(axis, TrimAxis::Horizontal) {
-                (slot.allocation.width, output.width, canonical.width)
-            } else {
-                (slot.allocation.height, output.height, canonical.height)
-            };
+            let (allocation_span, output_span, canonical_span) =
+                if matches!(axis, TrimAxis::Horizontal) {
+                    (slot.allocation.width, output.width, canonical.width)
+                } else {
+                    (slot.allocation.height, output.height, canonical.height)
+                };
             let span = u32::try_from(
                 u64::from(allocation_span) * u64::from(output_span) / u64::from(canonical_span),
             )
@@ -1432,13 +1516,21 @@ fn template_region_id(identity: &TemplateIdentity, slot_key: &str, index: usize)
 
 fn png_data_url(width: u32, height: u32, rgba8: Vec<u8>) -> Result<String, UserFacingError> {
     let image = RgbaImage::from_raw(width, height, rgba8).ok_or_else(|| {
-        user_error(ErrorCode::Internal, "The sheet pixels could not be encoded.", "Retry the sheet update.", None)
+        user_error(
+            ErrorCode::Internal,
+            "The sheet pixels could not be encoded.",
+            "Retry the sheet update.",
+            None,
+        )
     })?;
     let mut encoded = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(image)
         .write_to(&mut encoded, ImageFormat::Png)
         .map_err(|error| template_error(error.to_string()))?;
-    Ok(format!("data:image/png;base64,{}", STANDARD.encode(encoded.into_inner())))
+    Ok(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(encoded.into_inner())
+    ))
 }
 
 fn png_preview(output: SheetCompileOutput) -> Result<SheetPreview, UserFacingError> {
@@ -2368,10 +2460,11 @@ fn store_error(error: StoreError) -> UserFacingError {
         ),
         StoreError::LayoutReference(_)
         | StoreError::LayoutCommand(_)
+        | StoreError::InvalidRegionSourceLayer { .. }
         | StoreError::LayoutSolve(_) => (
             ErrorCode::LayoutInvalid,
             "The trim-sheet edit could not be applied.",
-            "Review source participation, locks, bounds, padding, and bleed, then retry.",
+            "Review the selected region's source mapping, then retry.",
         ),
         StoreError::PatchCommand(_) => (
             ErrorCode::InvalidInput,
@@ -2561,11 +2654,12 @@ mod tests {
 
     use super::{
         AuthoringHistorySnapshot, CloseProjectRequest, CreateProjectRequest, FoundationStatus,
-        GenerateLayoutMode, GenerateLayoutRequest, ImportSourceRequest, LayoutCommandRequest, LayoutSolveJob,
-        LayoutStateSnapshot, MAX_IPC_PATH_UTF16, NativeDirectories, PatchCommandRequest,
-        PatchPreviewRequest, PolygonAssistRequest, ProjectSession, ProjectSnapshot, ProjectWarning,
-        RecoverProjectRequest, SourceSnapshot, ThumbnailMipmapSnapshot, authoring_history_snapshot,
-        clear_recovery_directory, validate_ipc_path, validate_layout_publish,
+        GenerateLayoutMode, GenerateLayoutRequest, ImportSourceRequest, LayoutCommandRequest,
+        LayoutSolveJob, LayoutStateSnapshot, MAX_IPC_PATH_UTF16, NativeDirectories,
+        PatchCommandRequest, PatchPreviewRequest, PolygonAssistRequest, ProjectSession,
+        ProjectSnapshot, ProjectWarning, RecoverProjectRequest, SourceSnapshot,
+        ThumbnailMipmapSnapshot, authoring_history_snapshot, clear_recovery_directory,
+        validate_ipc_path, validate_layout_publish,
     };
 
     #[test]
@@ -2716,7 +2810,10 @@ mod tests {
             serde_json::from_value(fixture["layoutCommandRequest"].clone())
                 .expect("layout command request");
         assert_eq!(generate.protocol_version, IPC_PROTOCOL_VERSION);
-        assert!(matches!(generate.mode, GenerateLayoutMode::CustomAtlas { .. }));
+        assert!(matches!(
+            generate.mode,
+            GenerateLayoutMode::CustomAtlas { .. }
+        ));
         assert_eq!(generate.coalescing_group, Some(71));
         assert_eq!(command.coalescing_group, Some(72));
         let state = LayoutStateSnapshot {
@@ -2814,8 +2911,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&root).expect("fixture directory");
-        let mut store = ProjectStore::create(&root.join("template.hottrimmer"), "Template")
-            .expect("project");
+        let mut store =
+            ProjectStore::create(&root.join("template.hottrimmer"), "Template").expect("project");
         let source_set_id = store.summary().expect("summary").source_sets[0].id;
         let image = image::RgbaImage::from_pixel(16, 16, image::Rgba([130, 98, 74, 255]));
         let mut bytes = Cursor::new(Vec::new());
@@ -2880,11 +2977,21 @@ mod tests {
         let decoded = image::load_from_memory(&png).expect("valid PNG");
         assert_eq!(decoded.width(), 512);
         assert_eq!(decoded.height(), 512);
-        let layout = session.store.as_ref().expect("store").layout().expect("layout");
+        let layout = session
+            .store
+            .as_ref()
+            .expect("store")
+            .layout()
+            .expect("layout");
         assert_eq!(layout.layout.regions.len(), 53);
         assert_eq!(layout.layout_kind, hot_trimmer_domain::LayoutKind::Template);
         assert_eq!(
-            layout.template.as_ref().expect("template contract").slot_bindings.len(),
+            layout
+                .template
+                .as_ref()
+                .expect("template contract")
+                .slot_bindings
+                .len(),
             53
         );
         assert!(preview.maps.normal.starts_with("data:image/png;base64,"));

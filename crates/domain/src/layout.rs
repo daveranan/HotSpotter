@@ -13,6 +13,12 @@ pub const MAX_LAYOUT_PIXELS: u64 = 268_435_456;
 pub const MAX_LAYOUT_REGIONS: usize = 4_096;
 pub const MAX_REGION_KEY_BYTES: usize = 255;
 pub const MAX_REGION_INSET: u32 = 4_096;
+/// A source layer is intentionally bounded so an adversarial persisted recipe cannot create
+/// unbounded preview or compiler work.
+pub const MAX_SOURCE_LAYER_WARPS: usize = 16;
+pub const MAX_SOURCE_LAYER_SAMPLING_SCALE: f64 = 16.0;
+pub const MAX_SOURCE_LAYER_ITERATIONS: u16 = 64;
+pub const MAX_SOURCE_LAYER_INTERMEDIATE_EDGE: u32 = 8_192;
 const ID_COLOR_COMPONENT_VALUES: u64 = 192;
 const ID_COLOR_VALUES: u64 =
     ID_COLOR_COMPONENT_VALUES * ID_COLOR_COMPONENT_VALUES * ID_COLOR_COMPONENT_VALUES;
@@ -158,6 +164,370 @@ pub enum SourceFramingMode {
 pub struct SourceFraming {
     pub mode: SourceFramingMode,
     pub crop_focus: NormalizedPoint,
+    #[serde(default = "full_source_bounds")]
+    pub crop_bounds: NormalizedBounds,
+}
+
+fn full_source_bounds() -> NormalizedBounds {
+    NormalizedBounds {
+        x: NormalizedScalar::new(0.0).expect("zero is normalized"),
+        y: NormalizedScalar::new(0.0).expect("zero is normalized"),
+        width: NormalizedScalar::new(1.0).expect("one is normalized"),
+        height: NormalizedScalar::new(1.0).expect("one is normalized"),
+    }
+}
+
+/// Versioned executable source mapping owned by one stable trim-sheet region.
+///
+/// The default deliberately retains the legacy whole-source behavior.  Bounds, perspective
+/// mapping, and every warp are in source UV space; none alter the region's sheet topology.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionSourceLayer {
+    #[serde(default = "default_source_layer_version")]
+    pub version: u16,
+    #[serde(default)]
+    pub mapping: SourceMapping,
+    #[serde(default)]
+    pub rectification: SourceRectification,
+    #[serde(default)]
+    pub sampling: SourceSampling,
+    #[serde(default)]
+    pub rotation_degrees: f64,
+    #[serde(default)]
+    pub mirror_x: bool,
+    #[serde(default)]
+    pub mirror_y: bool,
+    #[serde(default)]
+    pub blend: SourceBlend,
+    #[serde(default = "default_source_opacity")]
+    pub opacity: f64,
+    #[serde(default)]
+    pub variation_offset: [f64; 2],
+    #[serde(default)]
+    pub warps: Vec<SourceWarp>,
+}
+
+const fn default_source_layer_version() -> u16 {
+    1
+}
+
+const fn default_source_opacity() -> f64 {
+    1.0
+}
+
+impl Default for RegionSourceLayer {
+    fn default() -> Self {
+        Self {
+            version: default_source_layer_version(),
+            mapping: SourceMapping::WholeSource,
+            rectification: SourceRectification::default(),
+            sampling: SourceSampling::default(),
+            rotation_degrees: 0.0,
+            mirror_x: false,
+            mirror_y: false,
+            blend: SourceBlend::Replace,
+            opacity: default_source_opacity(),
+            variation_offset: [0.0, 0.0],
+            warps: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SourceMapping {
+    #[default]
+    WholeSource,
+    Bounds {
+        bounds: NormalizedBounds,
+    },
+    Perspective {
+        quad: [NormalizedPoint; 4],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRectificationMode {
+    #[default]
+    None,
+    Perspective,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRectification {
+    pub mode: SourceRectificationMode,
+    pub max_intermediate_edge: u32,
+}
+
+impl Default for SourceRectification {
+    fn default() -> Self {
+        Self {
+            mode: SourceRectificationMode::None,
+            max_intermediate_edge: 4_096,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSamplingMode {
+    Nearest,
+    #[default]
+    Linear,
+    Cubic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSampling {
+    pub mode: SourceSamplingMode,
+    pub scale: f64,
+}
+
+impl Default for SourceSampling {
+    fn default() -> Self {
+        Self {
+            mode: SourceSamplingMode::Linear,
+            scale: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceBlend {
+    #[default]
+    Replace,
+    Normal,
+    Multiply,
+    Overlay,
+}
+
+/// Ordered UV operations applied after the base mapping and before sampling.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SourceWarp {
+    Planar {
+        scale_x: f64,
+        scale_y: f64,
+        offset_x: f64,
+        offset_y: f64,
+    },
+    Perspective {
+        strength: f64,
+    },
+    Polar {
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    },
+    SpiralTwirl {
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+        strength: f64,
+        iterations: u16,
+    },
+    RadialLens {
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+        strength: f64,
+    },
+    CylindricalArc {
+        radius: f64,
+        arc_degrees: f64,
+    },
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SourceLayerError {
+    #[error("source layer version {0} is unsupported")]
+    UnsupportedVersion(u16),
+    #[error("source bounds must have positive width and height")]
+    EmptyBounds,
+    #[error("perspective quad is singular or self-intersecting")]
+    SingularPerspective,
+    #[error("source rectification mode must match its mapping")]
+    RectificationMismatch,
+    #[error(
+        "source rectification intermediate edge must be between 1 and {MAX_SOURCE_LAYER_INTERMEDIATE_EDGE}"
+    )]
+    IntermediateEdgeOutOfRange,
+    #[error(
+        "source sampling scale must be finite and between 0 and {MAX_SOURCE_LAYER_SAMPLING_SCALE}"
+    )]
+    SamplingScaleOutOfRange,
+    #[error("source opacity, rotation, or variation contains a non-finite or out-of-range value")]
+    InvalidTransformValue,
+    #[error("source layer has more than {MAX_SOURCE_LAYER_WARPS} warp operations")]
+    TooManyWarps,
+    #[error("warp {index} has invalid or unbounded parameters")]
+    InvalidWarp { index: usize },
+}
+
+impl RegionSourceLayer {
+    /// Validates finite, invertible, and bounded executable source-mapping parameters.
+    pub fn validate(&self) -> Result<(), SourceLayerError> {
+        if self.version != 1 {
+            return Err(SourceLayerError::UnsupportedVersion(self.version));
+        }
+        match &self.mapping {
+            SourceMapping::WholeSource => {
+                if self.rectification.mode != SourceRectificationMode::None {
+                    return Err(SourceLayerError::RectificationMismatch);
+                }
+            }
+            SourceMapping::Bounds { bounds } => {
+                if self.rectification.mode != SourceRectificationMode::None {
+                    return Err(SourceLayerError::RectificationMismatch);
+                }
+                if bounds.width.get() <= 0.0 || bounds.height.get() <= 0.0 {
+                    return Err(SourceLayerError::EmptyBounds);
+                }
+            }
+            SourceMapping::Perspective { quad } => {
+                if self.rectification.mode != SourceRectificationMode::Perspective
+                    || !is_non_singular_quad(*quad)
+                {
+                    return Err(
+                        if self.rectification.mode != SourceRectificationMode::Perspective {
+                            SourceLayerError::RectificationMismatch
+                        } else {
+                            SourceLayerError::SingularPerspective
+                        },
+                    );
+                }
+            }
+        }
+        if self.rectification.max_intermediate_edge == 0
+            || self.rectification.max_intermediate_edge > MAX_SOURCE_LAYER_INTERMEDIATE_EDGE
+        {
+            return Err(SourceLayerError::IntermediateEdgeOutOfRange);
+        }
+        if !self.sampling.scale.is_finite()
+            || !(0.0..=MAX_SOURCE_LAYER_SAMPLING_SCALE).contains(&self.sampling.scale)
+        {
+            return Err(SourceLayerError::SamplingScaleOutOfRange);
+        }
+        if !self.rotation_degrees.is_finite()
+            || !self.opacity.is_finite()
+            || !(0.0..=1.0).contains(&self.opacity)
+            || self
+                .variation_offset
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > 16.0)
+        {
+            return Err(SourceLayerError::InvalidTransformValue);
+        }
+        if self.warps.len() > MAX_SOURCE_LAYER_WARPS {
+            return Err(SourceLayerError::TooManyWarps);
+        }
+        for (index, warp) in self.warps.iter().enumerate() {
+            if !warp_is_valid(warp) {
+                return Err(SourceLayerError::InvalidWarp { index });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_non_singular_quad(quad: [NormalizedPoint; 4]) -> bool {
+    let points = quad.map(|point| (point.x.get(), point.y.get()));
+    let area = points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(4)
+        .map(|(&(x1, y1), &(x2, y2))| x1 * y2 - x2 * y1)
+        .sum::<f64>()
+        .abs();
+    area > 1e-8
+        && !segments_intersect(points[0], points[1], points[2], points[3])
+        && !segments_intersect(points[1], points[2], points[3], points[0])
+}
+
+fn segments_intersect(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    fn cross(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    }
+    let ab_c = cross(a, b, c);
+    let ab_d = cross(a, b, d);
+    let cd_a = cross(c, d, a);
+    let cd_b = cross(c, d, b);
+    (ab_c * ab_d) < 0.0 && (cd_a * cd_b) < 0.0
+}
+
+fn warp_is_valid(warp: &SourceWarp) -> bool {
+    let bounded = |value: f64, maximum: f64| value.is_finite() && value.abs() <= maximum;
+    match *warp {
+        SourceWarp::Planar {
+            scale_x,
+            scale_y,
+            offset_x,
+            offset_y,
+        } => {
+            scale_x.is_finite()
+                && scale_y.is_finite()
+                && scale_x.abs() > 1e-6
+                && scale_y.abs() > 1e-6
+                && scale_x.abs() <= MAX_SOURCE_LAYER_SAMPLING_SCALE
+                && scale_y.abs() <= MAX_SOURCE_LAYER_SAMPLING_SCALE
+                && bounded(offset_x, 16.0)
+                && bounded(offset_y, 16.0)
+        }
+        SourceWarp::Perspective { strength } => bounded(strength, 8.0),
+        SourceWarp::Polar {
+            center_x,
+            center_y,
+            radius,
+        } => {
+            bounded(center_x, 16.0)
+                && bounded(center_y, 16.0)
+                && radius.is_finite()
+                && (1e-6..=16.0).contains(&radius)
+        }
+        SourceWarp::SpiralTwirl {
+            center_x,
+            center_y,
+            radius,
+            strength,
+            iterations,
+        } => {
+            bounded(center_x, 16.0)
+                && bounded(center_y, 16.0)
+                && radius.is_finite()
+                && (1e-6..=16.0).contains(&radius)
+                && bounded(strength, 32.0)
+                && iterations <= MAX_SOURCE_LAYER_ITERATIONS
+        }
+        SourceWarp::RadialLens {
+            center_x,
+            center_y,
+            radius,
+            strength,
+        } => {
+            bounded(center_x, 16.0)
+                && bounded(center_y, 16.0)
+                && radius.is_finite()
+                && (1e-6..=16.0).contains(&radius)
+                && bounded(strength, 32.0)
+        }
+        SourceWarp::CylindricalArc {
+            radius,
+            arc_degrees,
+        } => radius.is_finite() && (1e-6..=16.0).contains(&radius) && bounded(arc_degrees, 360.0),
+    }
 }
 
 impl Eq for SourceFraming {}
@@ -167,6 +537,7 @@ impl Default for SourceFraming {
         Self {
             mode: SourceFramingMode::Cover,
             crop_focus: NormalizedPoint::new(0.5, 0.5).expect("default crop focus is normalized"),
+            crop_bounds: full_source_bounds(),
         }
     }
 }

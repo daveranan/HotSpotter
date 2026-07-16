@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   IPC_PROTOCOL_VERSION,
@@ -15,8 +15,11 @@ import {
   type PatchStateSnapshot,
   type ProjectSnapshot,
   type RectificationSettings,
+  type RegionSourceLayer,
+  type RegionFill,
   type SourceChannel,
   type SourceSnapshot,
+  type TemplateSourceTransform,
 } from "@hot-trimmer/ipc-contracts";
 import {
   canonicalizeFourPoints,
@@ -32,10 +35,15 @@ import {
   zoomViewAtPoint,
 } from "./patch-authoring";
 import { LiveRectifiedCanvas } from "./live-rectified-canvas";
-import { LayoutWorkspace } from "./layout-workspace";
+import { defaultRegionSourceLayer, defaultTemplateSourceTransform, sourceFootprintsForRegion, sourceLayerGeometry, sourceLayerWithGeometry } from "./layout-authoring";
+import { LayoutWorkspace, type WorkbenchRegionSelection } from "./layout-workspace";
 import { SerialTaskQueue } from "./serial-task-queue";
 
 type PatchTool = "select" | "four_point" | "rectangle" | "polygon";
+type WorkspaceSelection =
+  | { kind: "none" }
+  | { kind: "patch"; patchId: string }
+  | { kind: "region"; selection: WorkbenchRegionSelection };
 
 interface PatchWorkspaceProps {
   hidden: boolean;
@@ -57,6 +65,22 @@ interface DraftState {
 }
 interface ContextMenuState { patchId: string; x: number; y: number }
 interface MapContextMenuState { channel: SourceChannel; x: number; y: number }
+interface PatchReorderGesture {
+  pointerId: number;
+  patchId: string;
+  start: { x: number; y: number };
+  offset: { x: number; y: number };
+  width: number;
+  moved: boolean;
+}
+interface PatchDragGhost {
+  patchId: string;
+  name: string;
+  enabled: boolean;
+  left: number;
+  top: number;
+  width: number;
+}
 interface PaneResize {
   kind: "sources" | "workbench";
   pointerId: number;
@@ -159,6 +183,21 @@ function sourcePreviewUrl(source: SourceSnapshot | undefined): string | undefine
   return source?.thumbnailMipmaps.find((mipmap) => mipmap.maxEdge === 1280)?.dataUrl
     ?? source?.thumbnailDataUrl;
 }
+interface SourceCropBounds { x: number; y: number; width: number; height: number }
+interface SourceCropDrag {
+  pointerId: number;
+  kind: "move" | "corner" | "rotate";
+  corner?: 0 | 1 | 2 | 3;
+  start: NormalizedPoint;
+  original: PatchGeometry;
+  current: PatchGeometry;
+  sourceLayer?: RegionSourceLayer;
+  regionId?: string;
+  center?: NormalizedPoint;
+  startAngle?: number;
+  moved: boolean;
+  group: number;
+}
 
 export function PatchWorkspace({
   hidden,
@@ -171,7 +210,7 @@ export function PatchWorkspace({
   onOpenSourceChannel,
 }: PatchWorkspaceProps): React.JSX.Element {
   const [tool, setTool] = useState<PatchTool>("select");
-  const [selectedPatchId, setSelectedPatchId] = useState<string | null>(project.patches[0]?.id ?? null);
+  const [selection, setSelection] = useState<WorkspaceSelection>({ kind: "none" });
   const [editingPatchId, setEditingPatchId] = useState<string | null>(null);
   const [view, setView] = useState<ViewTransform>({ x: 0, y: 0, scale: 1 });
   const [draft, setDraft] = useState<DraftState | null>(null);
@@ -188,13 +227,21 @@ export function PatchWorkspace({
   const [renameDraft, setRenameDraft] = useState("");
   const [draggedPatchId, setDraggedPatchId] = useState<string | null>(null);
   const [dropTargetPatchId, setDropTargetPatchId] = useState<string | null>(null);
+  const [patchDragGhost, setPatchDragGhost] = useState<PatchDragGhost | null>(null);
   const [precisionPoint, setPrecisionPoint] = useState<NormalizedPoint | null>(null);
   const [loupeZoom, setLoupeZoom] = useState<2 | 3 | 4>(3);
   const [sourceRailWidth, setSourceRailWidth] = useState(208);
   const [workbenchShare, setWorkbenchShare] = useState(55);
+  const [sourceTransform, setSourceTransform] = useState<TemplateSourceTransform>(project.layout?.template?.sourceFraming ?? defaultTemplateSourceTransform);
+  const [editingSourceRegion, setEditingSourceRegion] = useState(false);
+  const [liveSourceGeometry, setLiveSourceGeometry] = useState<PatchGeometry | null>(null);
   const [workingSourceId, setWorkingSourceId] = useState<string | null>(
     project.sources.find((candidate) => candidate.channel === "base_color")?.id ?? project.sources[0]?.id ?? null,
   );
+  function setSelectedPatchId(patchId: string | null): void {
+    if (patchId) setEditingSourceRegion(false);
+    setSelection(patchId ? { kind: "patch", patchId } : { kind: "none" });
+  }
   const imageRef = useRef<HTMLImageElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const manipulation = useRef<Manipulation | null>(null);
@@ -202,12 +249,17 @@ export function PatchWorkspace({
   const previewSequence = useRef(0);
   const latestPatches = useRef(project.patches);
   const latestGeometryCommit = useRef(0);
+  const latestSourceGeometryCommit = useRef(0);
+  const nextManipulationGroup = useRef(0);
+  const sourceLayerQueue = useRef(new SerialTaskQueue());
   const previousSourceIds = useRef(new Set(project.sources.map((candidate) => candidate.id)));
   const lastCursor = useRef<{ x: number; y: number } | null>(null);
   const authoringSplitRef = useRef<HTMLDivElement | null>(null);
   const sourceBodyRef = useRef<HTMLDivElement | null>(null);
   const paneResize = useRef<PaneResize | null>(null);
-  const draggedPatch = useRef<string | null>(null);
+  const sourceCropDrag = useRef<SourceCropDrag | null>(null);
+  const patchReorder = useRef<PatchReorderGesture | null>(null);
+  const patchReorderCleanup = useRef<(() => void) | null>(null);
   const source = project.sources.find((candidate) => candidate.id === workingSourceId)
     ?? project.sources.find((candidate) => candidate.channel === "base_color")
     ?? project.sources[0];
@@ -218,13 +270,38 @@ export function PatchWorkspace({
     : [];
   const selectedSetSourceIds = new Set(selectedSetSources.map((candidate) => candidate.id));
   const sourcePatches = project.patches.filter((patch) => selectedSetSourceIds.has(patch.sourceId));
-  const selectedPatch = sourcePatches.find((patch) => patch.id === selectedPatchId) ?? null;
+  const workbenchRegion = selection.kind === "region" ? selection.selection : null;
+  const selectedPatchId = selection.kind === "patch" ? selection.patchId : editingPatchId;
   const sourceSets = project.sourceSets.map((sourceSet) => {
     const inputs = project.sources.filter((candidate) => candidate.sourceSetId === sourceSet.id);
     return { ...sourceSet, inputs, base: inputs.find((candidate) => candidate.channel === "base_color") ?? inputs[0] };
   });
   const imageUrl = sourcePreviewUrl(selectedSource);
+  const workbenchRegionFill = workbenchRegion?.region.fill;
+  const assignedRegionPatch = workbenchRegionFill?.type === "rectified_patch"
+    ? project.patches.find((patch) => patch.id === workbenchRegionFill.patchId) ?? null
+    : null;
+  const selectedPatch = sourcePatches.find((patch) => patch.id === selectedPatchId) ?? assignedRegionPatch;
   const displayGeometry = liveGeometry ?? selectedPatch?.geometry;
+  const sourceCropBounds = sourceTransform.cropBounds ?? { x: 0, y: 0, width: 1, height: 1 };
+  const sourceCropGeometry = rectangleGeometry(
+    { x: sourceCropBounds.x, y: sourceCropBounds.y },
+    { x: sourceCropBounds.x + sourceCropBounds.width, y: sourceCropBounds.y + sourceCropBounds.height },
+  );
+  const persistedRegionSourceLayer = workbenchRegion ? project.layout?.sourceLayers[workbenchRegion.region.id] : undefined;
+  const regionSourceLayer = workbenchRegion ? persistedRegionSourceLayer ?? defaultRegionSourceLayer() : null;
+  const inferredRegionSourceGeometry = workbenchRegion && selectedSource && !persistedRegionSourceLayer
+    ? (() => {
+      const footprint = sourceFootprintsForRegion(workbenchRegion.region.bounds, workbenchRegion.output, sourceTransform, selectedSource)[0];
+      return footprint ? rectangleGeometry(
+        { x: footprint.bounds.x, y: footprint.bounds.y },
+        { x: footprint.bounds.x + footprint.bounds.width, y: footprint.bounds.y + footprint.bounds.height },
+      ) : null;
+    })()
+    : null;
+  const regionSourceGeometry = regionSourceLayer
+    ? liveSourceGeometry ?? inferredRegionSourceGeometry ?? sourceLayerGeometry(regionSourceLayer)
+    : null;
 
   function selectSourceSet(sourceSetId: string): void {
     const inputs = project.sources.filter((candidate) => candidate.sourceSetId === sourceSetId);
@@ -233,7 +310,7 @@ export function PatchWorkspace({
     const sourceIds = new Set(inputs.map((candidate) => candidate.id));
     const nextPatch = project.patches.find((patch) => sourceIds.has(patch.sourceId));
     setWorkingSourceId(nextSource.id);
-    setSelectedPatchId(nextPatch?.id ?? null);
+    if (!editingPatchId) setSelection({ kind: "none" });
     setEditingPatchId(null);
     setLiveGeometry(null);
     setDraft(null);
@@ -243,6 +320,45 @@ export function PatchWorkspace({
     setTool("select");
     setView({ x: 0, y: 0, scale: 1 });
   }
+
+  const acceptRegionSelection = useCallback((selection: WorkbenchRegionSelection | null): void => {
+    if (selection) setEditingSourceRegion(false);
+    setSelection(selection ? { kind: "region", selection } : { kind: "none" });
+    if (!selection) {
+      setEditingPatchId(null);
+      return;
+    }
+    const fill = selection.region.fill;
+    const patch = fill.type === "rectified_patch"
+      ? project.patches.find((candidate) => candidate.id === fill.patchId)
+      : undefined;
+    const sourceSetId = fill.type === "whole_source_set" || fill.type === "rectified_patch"
+      ? fill.sourceSetId
+      : null;
+    const nextSource = patch
+      ? project.sources.find((candidate) => candidate.id === patch.sourceId)
+      : project.sources.find((candidate) => candidate.sourceSetId === sourceSetId && candidate.channel === "base_color")
+        ?? project.sources.find((candidate) => candidate.sourceSetId === sourceSetId);
+    if (nextSource) setWorkingSourceId(nextSource.id);
+    setEditingPatchId(null);
+    setLiveGeometry(null);
+    setDraft(null);
+    setTool("select");
+  }, [project.patches, project.sources]);
+
+  function clearSelectionFromEmpty(event: React.PointerEvent<HTMLElement>): void {
+    if (event.button !== 0 || editingPatchId || tool !== "select") return;
+    const target = event.target as Element;
+    if (target.closest("button, input, select, textarea, label, summary, [role='button'], [role='menuitem'], [data-patch-id], [data-preserve-selection], .layout-region, .modal")) return;
+    setSelection({ kind: "none" });
+    setContextMenu(null);
+    setMapContextMenu(null);
+  }
+
+  useEffect(() => {
+    setSourceTransform(project.layout?.template?.sourceFraming ?? defaultTemplateSourceTransform);
+    setSelection({ kind: "none" });
+  }, [project.id]);
 
   useEffect(() => {
     latestPatches.current = project.patches;
@@ -275,12 +391,17 @@ export function PatchWorkspace({
 
   useEffect(() => {
     if (!contextMenu && !mapContextMenu) return;
-    const close = () => { setContextMenu(null); setMapContextMenu(null); };
-    window.addEventListener("pointerdown", close);
-    window.addEventListener("blur", close);
+    const close = (event: PointerEvent): void => {
+      if (event.button !== 0 || (event.target as Element | null)?.closest(".patch-context-menu")) return;
+      setContextMenu(null);
+      setMapContextMenu(null);
+    };
+    const closeOnBlur = (): void => { setContextMenu(null); setMapContextMenu(null); };
+    window.addEventListener("pointerdown", close, true);
+    window.addEventListener("blur", closeOnBlur);
     return () => {
-      window.removeEventListener("pointerdown", close);
-      window.removeEventListener("blur", close);
+      window.removeEventListener("pointerdown", close, true);
+      window.removeEventListener("blur", closeOnBlur);
     };
   }, [contextMenu, mapContextMenu]);
 
@@ -486,6 +607,50 @@ export function PatchWorkspace({
     setGeometryMessage(null);
   }
 
+  function createManipulationGroup(): number {
+    nextManipulationGroup.current += 1;
+    return nextManipulationGroup.current;
+  }
+
+  async function editSelectedRegionSource(): Promise<void> {
+    if (!workbenchRegion) return;
+    setEditingPatchId(null);
+    setLiveGeometry(null);
+    setLiveSourceGeometry(null);
+    setTool("select");
+    setEditingSourceRegion(true);
+  }
+
+  async function assignSelectedRegionFill(fill: RegionFill): Promise<void> {
+    if (!workbenchRegion) return;
+    try {
+      const layoutState = await invoke<LayoutStateSnapshot>("apply_layout_command", {
+        request: {
+          protocolVersion: IPC_PROTOCOL_VERSION,
+          command: { type: "set_fill", regionId: workbenchRegion.region.id, fill },
+          coalescingGroup: Date.now(),
+        },
+      });
+      onLayoutState(layoutState);
+      onFailure(null);
+    } catch (reason) {
+      onFailure(failureFrom(reason, "Assigning the region source failed."));
+    }
+  }
+
+  function setSourceCropField(field: keyof SourceCropBounds, percent: number): void {
+    if (!Number.isFinite(percent)) return;
+    const value = percent / 100;
+    setSourceTransform((current) => {
+      const bounds = { ...(current.cropBounds ?? { x: 0, y: 0, width: 1, height: 1 }) };
+      if (field === "x") bounds.x = Math.max(0, Math.min(1 - bounds.width, value));
+      else if (field === "y") bounds.y = Math.max(0, Math.min(1 - bounds.height, value));
+      else if (field === "width") bounds.width = Math.max(0.01, Math.min(1 - bounds.x, value));
+      else bounds.height = Math.max(0.01, Math.min(1 - bounds.y, value));
+      return { ...current, cropBounds: bounds };
+    });
+  }
+
   async function fitPolygonPoints(points: NormalizedPoint[]): Promise<void> {
     if (points.length < 4) return;
     try {
@@ -504,6 +669,11 @@ export function PatchWorkspace({
   }
 
   function cancelManipulation(): boolean {
+    if (sourceCropDrag.current) {
+      sourceCropDrag.current = null;
+      setLiveSourceGeometry(null);
+      return true;
+    }
     if (!manipulation.current) return false;
     const active = manipulation.current;
     manipulation.current = null;
@@ -517,6 +687,38 @@ export function PatchWorkspace({
       setView(active.origin);
     }
     return true;
+  }
+
+  function beginSourceCropDrag(event: React.PointerEvent<SVGElement>, kind: SourceCropDrag["kind"], corner?: 0 | 1 | 2 | 3): void {
+    if (!editingSourceRegion || event.button !== 0) return;
+    const point = normalizedManipulationAt(event.clientX, event.clientY, kind === "rotate");
+    if (!point) return;
+    captureManipulationPointer(event);
+    const geometry = regionSourceGeometry ?? sourceCropGeometry;
+    const bounds = geometryBounds(geometry);
+    const center = { x: (bounds.left + bounds.right) / 2, y: (bounds.top + bounds.bottom) / 2 };
+    const startAngle = selectedSource ? Math.atan2((point.y - center.y) * selectedSource.height, (point.x - center.x) * selectedSource.width) : undefined;
+    sourceCropDrag.current = {
+      pointerId: event.pointerId, kind, corner, start: point, original: geometry, current: geometry,
+      sourceLayer: regionSourceLayer ?? undefined, regionId: workbenchRegion?.region.id, center, startAngle,
+      moved: false, group: createManipulationGroup(),
+    };
+    latestSourceGeometryCommit.current = sourceCropDrag.current.group;
+  }
+
+  function updateSourceCropDrag(point: NormalizedPoint): void {
+    const active = sourceCropDrag.current;
+    if (!active) return;
+    if (active.kind === "move") {
+      active.current = translateGeometry(active.original, point.x - active.start.x, point.y - active.start.y);
+    } else if (active.kind === "rotate" && active.center && active.startAngle !== undefined && selectedSource) {
+      const angle = Math.atan2((point.y - active.center.y) * selectedSource.height, (point.x - active.center.x) * selectedSource.width);
+      active.current = rotateGeometry(active.original, active.center, angle - active.startAngle, selectedSource.width / selectedSource.height);
+    } else if (active.corner !== undefined) {
+      active.current = moveCorner(active.original, active.corner, point);
+    }
+    active.moved = true;
+    setLiveSourceGeometry(active.current);
   }
 
   useEffect(() => {
@@ -600,7 +802,14 @@ export function PatchWorkspace({
   function pointerMove(event: React.PointerEvent<HTMLDivElement>): void {
     lastCursor.current = { x: event.clientX, y: event.clientY };
     const active = manipulation.current;
-    const hoverPoint = normalizedAt(event.clientX, event.clientY);
+    const activeSourceCrop = sourceCropDrag.current;
+    const hoverPoint = activeSourceCrop
+      ? normalizedManipulationAt(event.clientX, event.clientY, activeSourceCrop.kind === "rotate")
+      : normalizedAt(event.clientX, event.clientY);
+    if (activeSourceCrop?.pointerId === event.pointerId && hoverPoint) {
+      updateSourceCropDrag(hoverPoint);
+      return;
+    }
     if ((draft || editingPatchId) && hoverPoint) setPrecisionPoint(hoverPoint);
     if (!active || active.pointerId !== event.pointerId) return;
     if (active.kind === "pan") {
@@ -642,6 +851,39 @@ export function PatchWorkspace({
   }
 
   function pointerUp(event: React.PointerEvent<HTMLDivElement>): void {
+    if (sourceCropDrag.current?.pointerId === event.pointerId) {
+      const activeCrop = sourceCropDrag.current;
+      sourceCropDrag.current = null;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+      if (!activeCrop.moved) {
+        setLiveSourceGeometry(null);
+        return;
+      }
+      setLiveSourceGeometry(activeCrop.current);
+      if (activeCrop.regionId && activeCrop.sourceLayer) {
+        const sourceLayer = sourceLayerWithGeometry(activeCrop.sourceLayer, activeCrop.current);
+        void sourceLayerQueue.current.run(async () => invoke<LayoutStateSnapshot>("apply_layout_command", {
+          request: {
+            protocolVersion: IPC_PROTOCOL_VERSION,
+            command: { type: "set_source_layer", regionId: activeCrop.regionId, sourceLayer },
+            coalescingGroup: activeCrop.group,
+          },
+        })).then((state) => {
+          if (latestSourceGeometryCommit.current !== activeCrop.group) return;
+          onLayoutState(state);
+          onFailure(null);
+          setLiveSourceGeometry(null);
+        }).catch((reason) => {
+          if (latestSourceGeometryCommit.current !== activeCrop.group) return;
+          setLiveSourceGeometry(null);
+          onFailure(failureFrom(reason, "Updating the region source transform failed."));
+        });
+      } else {
+        const bounds = geometryBounds(activeCrop.current);
+        setSourceTransform((current) => ({ ...current, cropBounds: { x: bounds.left, y: bounds.top, width: bounds.right - bounds.left, height: bounds.bottom - bounds.top } }));
+      }
+      return;
+    }
     const active = manipulation.current;
     if (!active || active.pointerId !== event.pointerId) return;
     manipulation.current = null;
@@ -665,7 +907,6 @@ export function PatchWorkspace({
       setLiveGeometry(null);
       return;
     }
-    latestGeometryCommit.current = active.group;
     void apply({ type: "replace_geometry", patchId: active.patchId, geometry: active.current }, "Transform patch", active.group)
       .then(() => {
         if (latestGeometryCommit.current === active.group && manipulation.current === null) setLiveGeometry(null);
@@ -673,6 +914,10 @@ export function PatchWorkspace({
   }
 
   function pointerCancel(event: React.PointerEvent<HTMLDivElement>): void {
+    if (sourceCropDrag.current?.pointerId === event.pointerId) {
+      sourceCropDrag.current = null;
+      setLiveSourceGeometry(null);
+    }
     if (manipulation.current?.pointerId === event.pointerId) cancelManipulation();
     setPrecisionPoint(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
@@ -684,15 +929,16 @@ export function PatchWorkspace({
     if (event.button !== 0) return;
     const point = normalizedAt(event.clientX, event.clientY);
     if (!point) return;
-    event.stopPropagation();
+    captureManipulationPointer(event);
     setSelectedPatchId(patch.id);
     setWorkingSourceId(patch.sourceId);
     if (editingPatchId !== patch.id) setEditingPatchId(null);
     manipulation.current = {
       kind: "move", pointerId: event.pointerId, patchId: patch.id, start: point,
       startClient: { x: event.clientX, y: event.clientY }, moved: false,
-      geometry, current: geometry, group: Date.now(),
+      geometry, current: geometry, group: createManipulationGroup(),
     };
+    latestGeometryCommit.current = manipulation.current.group;
   }
 
   function beginCorner(event: React.PointerEvent<SVGCircleElement>, corner: number): void {
@@ -701,8 +947,9 @@ export function PatchWorkspace({
     setPrecisionPoint(displayGeometry.corners[corner] ?? null);
     manipulation.current = {
       kind: "corner", pointerId: event.pointerId, patchId: selectedPatch.id, corner,
-      geometry: displayGeometry, current: displayGeometry, moved: false, group: Date.now(),
+      geometry: displayGeometry, current: displayGeometry, moved: false, group: createManipulationGroup(),
     };
+    latestGeometryCommit.current = manipulation.current.group;
   }
 
   function beginScale(event: React.PointerEvent<SVGRectElement>, handle: 0 | 1 | 2 | 3): void {
@@ -710,8 +957,9 @@ export function PatchWorkspace({
     captureManipulationPointer(event);
     manipulation.current = {
       kind: "scale", pointerId: event.pointerId, patchId: selectedPatch.id, handle,
-      geometry: displayGeometry, current: displayGeometry, moved: false, group: Date.now(),
+      geometry: displayGeometry, current: displayGeometry, moved: false, group: createManipulationGroup(),
     };
+    latestGeometryCommit.current = manipulation.current.group;
   }
 
   function beginRotate(event: React.PointerEvent<SVGCircleElement>): void {
@@ -724,8 +972,9 @@ export function PatchWorkspace({
     const startAngle = Math.atan2((point.y - center.y) * selectedSource.height, (point.x - center.x) * selectedSource.width);
     manipulation.current = {
       kind: "rotate", pointerId: event.pointerId, patchId: selectedPatch.id, center, startAngle,
-      geometry: displayGeometry, current: displayGeometry, moved: false, group: Date.now(),
+      geometry: displayGeometry, current: displayGeometry, moved: false, group: createManipulationGroup(),
     };
+    latestGeometryCommit.current = manipulation.current.group;
   }
 
   function openContextMenu(event: React.MouseEvent, patch: PatchSnapshot): void {
@@ -765,15 +1014,88 @@ export function PatchWorkspace({
     setDropTargetPatchId(row?.dataset.patchId ?? null);
   }
 
-  function finishPatchReorder(event: React.PointerEvent<HTMLElement>): void {
-    const dragged = draggedPatch.current;
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-patch-id]")?.dataset.patchId ?? null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    draggedPatch.current = null;
+  function resetPatchReorder(): void {
+    patchReorderCleanup.current?.();
+    patchReorderCleanup.current = null;
+    patchReorder.current = null;
+    document.body.classList.remove("patch-reordering");
     setDraggedPatchId(null);
     setDropTargetPatchId(null);
-    if (dragged && target) reorderPatch(dragged, target);
+    setPatchDragGhost(null);
   }
+
+  function suppressPointerClick(): void {
+    const suppress = (event: MouseEvent): void => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+    };
+    document.addEventListener("click", suppress, { capture: true, once: true });
+    window.setTimeout(() => document.removeEventListener("click", suppress, true), 100);
+  }
+
+  function beginPatchReorder(event: React.PointerEvent<HTMLElement>, patch: PatchSnapshot): void {
+    if (tool !== "select" || event.button !== 0) return;
+    resetPatchReorder();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const gesture: PatchReorderGesture = {
+      pointerId: event.pointerId,
+      patchId: patch.id,
+      start: { x: event.clientX, y: event.clientY },
+      offset: { x: event.clientX - bounds.left, y: event.clientY - bounds.top },
+      width: bounds.width,
+      moved: false,
+    };
+    patchReorder.current = gesture;
+
+    const move = (pointerEvent: PointerEvent): void => {
+      const active = patchReorder.current;
+      if (!active || pointerEvent.pointerId !== active.pointerId) return;
+      if (!active.moved && !exceedsDragThreshold(active.start, { x: pointerEvent.clientX, y: pointerEvent.clientY })) return;
+      pointerEvent.preventDefault();
+      if (!active.moved) {
+        active.moved = true;
+        document.body.classList.add("patch-reordering");
+        setDraggedPatchId(active.patchId);
+      }
+      setPatchDragGhost({
+        patchId: active.patchId,
+        name: patch.name,
+        enabled: patch.enabled,
+        left: pointerEvent.clientX - active.offset.x,
+        top: pointerEvent.clientY - active.offset.y,
+        width: active.width,
+      });
+      updatePatchDropTarget(pointerEvent.clientX, pointerEvent.clientY);
+    };
+    const finish = (pointerEvent: PointerEvent): void => {
+      const active = patchReorder.current;
+      if (!active || pointerEvent.pointerId !== active.pointerId) return;
+      const target = document.elementFromPoint(pointerEvent.clientX, pointerEvent.clientY)?.closest<HTMLElement>("[data-patch-id]")?.dataset.patchId ?? null;
+      const moved = active.moved;
+      const patchId = active.patchId;
+      if (moved) {
+        pointerEvent.preventDefault();
+        suppressPointerClick();
+      }
+      resetPatchReorder();
+      if (moved && target) reorderPatch(patchId, target);
+    };
+    const cancel = (pointerEvent: PointerEvent): void => {
+      if (patchReorder.current?.pointerId === pointerEvent.pointerId) resetPatchReorder();
+    };
+    const cleanup = (): void => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", cancel);
+    };
+    patchReorderCleanup.current = cleanup;
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", cancel);
+  }
+
+  useEffect(() => () => resetPatchReorder(), []);
 
   function beginRename(patch: PatchSnapshot): void {
     setSelectedPatchId(patch.id);
@@ -929,7 +1251,7 @@ export function PatchWorkspace({
   return (
     <>
       <section className="workspace patch-workspace" aria-labelledby="patch-workspace-title" hidden={hidden}>
-        <div ref={authoringSplitRef} className="authoring-split" style={{ gridTemplateColumns: `${workbenchShare}% 5px minmax(320px, 1fr)` }}>
+        <div ref={authoringSplitRef} className="authoring-split" style={{ gridTemplateColumns: `${workbenchShare}% 5px minmax(320px, 1fr)` }} onPointerDownCapture={clearSelectionFromEmpty}>
           <section className="source-workbench" aria-label="Patch source workbench">
             <header className="split-pane-title">
               <div><span>Workbench</span><strong id="patch-workspace-title">Material source</strong></div>
@@ -951,8 +1273,22 @@ export function PatchWorkspace({
                     key={patch.id}
                     data-patch-id={patch.id}
                     className={`${patch.id === selectedPatch?.id ? "active" : ""} ${patch.id === dropTargetPatchId ? "drop-target" : ""} ${patch.id === draggedPatchId ? "dragging" : ""}`}
+                    onPointerDown={(event) => beginPatchReorder(event, patch)}
+                    onClick={(event) => {
+                      if ((event.target as Element).closest("button, input")) return;
+                      setSelectedPatchId(patch.id);
+                      setWorkingSourceId(patch.sourceId);
+                      setEditingPatchId(null);
+                    }}
                     onContextMenu={(event) => openContextMenu(event, patch)}
                     onKeyDown={(event) => {
+                      const offset = event.altKey && event.key === "ArrowUp" ? -1 : event.altKey && event.key === "ArrowDown" ? 1 : 0;
+                      if (offset) {
+                        event.preventDefault();
+                        const target = sourcePatches[Math.min(sourcePatches.length - 1, Math.max(0, index + offset))];
+                        if (target) reorderPatch(patch.id, target.id);
+                        return;
+                      }
                       if (event.key !== "Delete" || tool !== "select") return;
                       event.preventDefault();
                       void deletePatch(patch);
@@ -966,38 +1302,18 @@ export function PatchWorkspace({
                       title="Patch actions"
                       onClick={(event) => openContextMenu(event, patch)}
                     >...</button>
-                    <span
-                      className="drag-grip"
-                      role="button"
-                      tabIndex={tool === "select" ? 0 : -1}
-                      aria-label={`Reorder ${patch.name}`}
-                      title="Drag to reorder"
-                      onPointerDown={(event) => {
-                        if (tool !== "select" || event.button !== 0) return;
-                        event.preventDefault();
-                        event.currentTarget.setPointerCapture(event.pointerId);
-                        draggedPatch.current = patch.id;
-                        setDraggedPatchId(patch.id);
-                        setDropTargetPatchId(patch.id);
-                      }}
-                      onPointerMove={(event) => { if (draggedPatch.current === patch.id) updatePatchDropTarget(event.clientX, event.clientY); }}
-                      onPointerUp={finishPatchReorder}
-                      onPointerCancel={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); draggedPatch.current = null; setDraggedPatchId(null); setDropTargetPatchId(null); }}
-                      onKeyDown={(event) => {
-                        const offset = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
-                        if (!offset) return;
-                        event.preventDefault();
-                        const target = sourcePatches[Math.min(sourcePatches.length - 1, Math.max(0, index + offset))];
-                        if (target) reorderPatch(patch.id, target.id);
-                      }}
-                    >⠿</span>
                   </div>)}
                   {!sourcePatches.length ? <p>No patches yet. Double-click the image to capture one.</p> : null}
                 </section>
               </aside>
               <div className="pane-splitter source-splitter" role="separator" aria-label="Resize source list" aria-orientation="vertical" onPointerDown={(event) => beginPaneResize("sources", event)} onPointerMove={movePaneResize} onPointerUp={endPaneResize} onPointerCancel={endPaneResize} />
               <div className="source-canvas-column">
-              <div className="source-map-tabs" role="tablist" aria-label="Material map slots">
+              <div className="source-map-tabs" role="tablist" aria-label="Material map slots" onWheel={(event) => {
+                const movement = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+                if (!movement) return;
+                event.preventDefault();
+                event.currentTarget.scrollLeft += movement;
+              }}>
                   {channelOrder.map((channel) => {
                     const input = selectedSetSources.find((candidate) => candidate.channel === channel);
                     const appearance = channelAppearance[channel];
@@ -1016,6 +1332,7 @@ export function PatchWorkspace({
                       }}
                       onClick={() => {
                         if (!input) { if (selectedSourceSetId) onOpenSourceChannel(channel, selectedSourceSetId); return; }
+                        if (!editingPatchId) setSelection({ kind: "none" });
                         setWorkingSourceId(input.id); setEditingPatchId(null); setLiveGeometry(null); setDraft(null); setPreview(null); setPrecisionPoint(null); manipulation.current = null; setTool("select");
                       }}
                     ><span className={`channel-swatch ${appearance.tone}`}>{appearance.short}</span><span><strong>{appearance.label}</strong><small>{input?.displayName ?? (needsBaseColor ? "Needs Base Color" : "+ Add map")}</small></span></button>;
@@ -1047,7 +1364,7 @@ export function PatchWorkspace({
               <svg className="patch-overlay" viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`} aria-label="Editable patch outlines">
                 {overlayGeometries.map(({ patch, geometry }) => {
                   const points = geometry.corners.map(overlayPoint);
-                  return <g key={patch.id} className={`${patch.id === selectedPatch?.id ? "selected" : ""} ${patch.enabled ? "" : "disabled"}`}>
+                  return <g key={patch.id} data-preserve-selection className={`${patch.id === selectedPatch?.id ? "selected" : ""} ${patch.enabled ? "" : "disabled"}`}>
                     <polygon
                       points={points.map((point) => `${point.x},${point.y}`).join(" ")}
                       aria-label={`${patch.name} patch outline`}
@@ -1067,7 +1384,28 @@ export function PatchWorkspace({
                     </g>) : null}
                   </g>;
                 })}
-                {selectedPatch && transformCorners.length === 4 && editingPatchId !== selectedPatch.id ? <g className="transform-box">
+                {editingSourceRegion ? (() => {
+                  const geometry = regionSourceGeometry ?? sourceCropGeometry;
+                  const points = geometry.corners.map(overlayPoint);
+                  const center = points.reduce((total, point) => ({ x: total.x + point.x / points.length, y: total.y + point.y / points.length }), { x: 0, y: 0 });
+                  return <g className="source-region-editor" data-preserve-selection>
+                    <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} onPointerDown={(event) => beginSourceCropDrag(event, "move")} />
+                    {points.map((point, index) => <g key={index} className="source-region-handle">
+                      <rect className="source-region-handle-hit" x={point.x - 18} y={point.y - 18} width={36} height={36} onPointerDown={(event) => beginSourceCropDrag(event, "corner", index as 0 | 1 | 2 | 3)} />
+                      <rect className="source-region-handle-visible" x={point.x - 7} y={point.y - 7} width={14} height={14} />
+                    </g>)}
+                    {regionSourceLayer ? points.map((point, index) => <circle key={`rotate-${index}`} className="corner-rotate" cx={center.x + (point.x - center.x) * 1.2} cy={center.y + (point.y - center.y) * 1.2} r={13} onPointerDown={(event) => beginSourceCropDrag(event, "rotate")} />) : null}
+                  </g>;
+                })() : null}
+                {regionSourceGeometry && !editingSourceRegion ? (() => {
+                  const activate = (): void => { void editSelectedRegionSource(); };
+                  const points = regionSourceGeometry.corners.map(overlayPoint);
+                  return <g className="region-source-selection" data-preserve-selection>
+                    <polygon points={points.map((point) => `${point.x},${point.y}`).join(" ")} aria-label={`${workbenchRegion?.label ?? "Selected region"} source layer; press Enter to edit`} role="button" tabIndex={0} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); }} onClick={(event) => { event.preventDefault(); event.stopPropagation(); activate(); }} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); activate(); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); activate(); } }} />
+                    {points.map((point, index) => <g key={index}><circle cx={point.x} cy={point.y} r={6} /><path d={`M ${point.x - 10} ${point.y} H ${point.x + 10} M ${point.x} ${point.y - 10} V ${point.y + 10}`} /></g>)}
+                  </g>;
+                })() : null}
+                {selectedPatch && !editingSourceRegion && transformCorners.length === 4 && editingPatchId !== selectedPatch.id ? <g className="transform-box" data-preserve-selection>
                   {transformCorners.map((point, index) => <rect key={index} x={point.x - 6} y={point.y - 6} width={12} height={12} onPointerDown={(event) => beginScale(event, index as 0 | 1 | 2 | 3)} />)}
                   {rotationHandles.map((point, index) => <circle key={index} className="corner-rotate" cx={point.x} cy={point.y} r={13} onPointerDown={beginRotate} />)}
                 </g> : null}
@@ -1107,13 +1445,44 @@ export function PatchWorkspace({
 
           <div className="pane-splitter workbench-splitter" role="separator" aria-label="Resize source and preview workspaces" aria-orientation="vertical" onPointerDown={(event) => beginPaneResize("workbench", event)} onPointerMove={movePaneResize} onPointerUp={endPaneResize} onPointerCancel={endPaneResize} />
 
-          <LayoutWorkspace project={project} selectedPatchId={selectedPatch?.id ?? null} selectedSourceSetId={selectedSourceSetId} onLayoutState={onLayoutState} onFailure={onFailure} />
+          <LayoutWorkspace project={project} selectedPatchId={selection.kind === "patch" ? selection.patchId : null} selectedRegionId={workbenchRegion?.region.id ?? null} selectedSourceSetId={selectedSourceSetId} onLayoutState={onLayoutState} onFailure={onFailure} sourceTransform={sourceTransform} onRegionSelectionChange={acceptRegionSelection} />
         </div>
         {busy ? <div className="busy" role="status"><span /><strong>{busy}…</strong></div> : null}
       </section>
 
-      <aside className="inspector patch-inspector" aria-label="Patch manager" hidden={hidden}>
-        {selectedPatch ? <section className="inspector-section patch-properties"><h2>Placement behavior</h2>
+      <aside className="inspector patch-inspector" aria-label="Patch manager" hidden={hidden} onPointerDownCapture={clearSelectionFromEmpty}>
+        {selection.kind === "none" && !editingPatchId ? <section className="inspector-section source-region-properties"><h2>Source framing</h2>
+          <div className="source-framing-quick" role="group" aria-label="Source framing mode">
+            {([{"mode":"cover","label":"Cover / crop"},{"mode":"stretch","label":"Stretch"},{"mode":"repeat","label":"Repeat"}] as const).map((option) => <button key={option.mode} className={sourceTransform.mode === option.mode ? "active" : ""} aria-pressed={sourceTransform.mode === option.mode} onClick={() => setSourceTransform((current) => ({ ...current, mode: option.mode }))}>{option.label}</button>)}
+          </div>
+          {sourceTransform.mode === "cover" ? <div className="inspector-focus-controls"><label>Focus X<input type="range" min={0} max={1} step={0.01} value={sourceTransform.cropFocus.x} onChange={(event) => setSourceTransform((current) => ({ ...current, cropFocus: { ...current.cropFocus, x: event.target.valueAsNumber } }))} /></label><label>Focus Y<input type="range" min={0} max={1} step={0.01} value={sourceTransform.cropFocus.y} onChange={(event) => setSourceTransform((current) => ({ ...current, cropFocus: { ...current.cropFocus, y: event.target.valueAsNumber } }))} /></label></div> : null}
+          <button className={editingSourceRegion ? "active" : "primary"} onClick={() => {
+            setEditingSourceRegion((current) => !current);
+            setSelection({ kind: "none" });
+            setEditingPatchId(null);
+            setLiveGeometry(null);
+          }}>{editingSourceRegion ? "Finish editing source framing" : "Edit Source Framing"}</button>
+          <div className="source-region-bounds"><label>X (%)<input type="number" min={0} max={100} step={0.1} value={(sourceCropBounds.x * 100).toFixed(1)} onChange={(event) => setSourceCropField("x", event.target.valueAsNumber)} /></label><label>Y (%)<input type="number" min={0} max={100} step={0.1} value={(sourceCropBounds.y * 100).toFixed(1)} onChange={(event) => setSourceCropField("y", event.target.valueAsNumber)} /></label><label>Width (%)<input type="number" min={1} max={100} step={0.1} value={(sourceCropBounds.width * 100).toFixed(1)} onChange={(event) => setSourceCropField("width", event.target.valueAsNumber)} /></label><label>Height (%)<input type="number" min={1} max={100} step={0.1} value={(sourceCropBounds.height * 100).toFixed(1)} onChange={(event) => setSourceCropField("height", event.target.valueAsNumber)} /></label></div>
+          <button onClick={() => setSourceTransform((current) => ({ ...current, cropBounds: { x: 0, y: 0, width: 1, height: 1 } }))}>Reset to full source</button>
+          <p className="hint">Move or resize this crop directly on the source texture. Every whole-source trim region is sampled from it.</p>
+        </section> : null}
+        {workbenchRegion ? <section className="inspector-section region-properties"><h2>Selected region</h2>
+          <p><strong>{workbenchRegion.label}</strong></p>
+          <label>Source / patch<select value={workbenchRegion.region.fill.type === "rectified_patch" ? `patch:${workbenchRegion.region.fill.patchId}` : workbenchRegion.region.fill.type === "whole_source_set" ? `source:${workbenchRegion.region.fill.sourceSetId}` : ""} onChange={(event) => {
+            const value = event.target.value;
+            if (value.startsWith("source:")) void assignSelectedRegionFill({ type: "whole_source_set", sourceSetId: value.slice(7) });
+            else if (value.startsWith("patch:")) {
+              const patch = project.patches.find((candidate) => candidate.id === value.slice(6));
+              const sourceForPatch = patch ? project.sources.find((candidate) => candidate.id === patch.sourceId) : undefined;
+              if (patch && sourceForPatch) void assignSelectedRegionFill({ type: "rectified_patch", sourceSetId: sourceForPatch.sourceSetId, patchId: patch.id });
+            }
+          }}><option value="" disabled>Choose source</option>{project.sourceSets.map((sourceSet) => <option key={`source:${sourceSet.id}`} value={`source:${sourceSet.id}`}>{sourceSet.name} · whole source</option>)}{project.patches.filter((patch) => patch.enabled).map((patch) => <option key={`patch:${patch.id}`} value={`patch:${patch.id}`}>{patch.name} · patch</option>)}</select></label>
+          {workbenchRegion.templateMode ? <label>Source framing<select value={sourceTransform.mode} onChange={(event) => setSourceTransform((current) => ({ ...current, mode: event.target.value as TemplateSourceTransform["mode"] }))}><option value="cover">Cover / crop</option><option value="stretch">Stretch</option><option value="repeat">Repeat</option></select></label> : null}
+          {workbenchRegion.templateMode && sourceTransform.mode === "cover" ? <div className="inspector-focus-controls"><label>Focus X<input type="range" min={0} max={1} step={0.01} value={sourceTransform.cropFocus.x} onChange={(event) => setSourceTransform((current) => ({ ...current, cropFocus: { ...current.cropFocus, x: event.target.valueAsNumber } }))} /></label><label>Focus Y<input type="range" min={0} max={1} step={0.01} value={sourceTransform.cropFocus.y} onChange={(event) => setSourceTransform((current) => ({ ...current, cropFocus: { ...current.cropFocus, y: event.target.valueAsNumber } }))} /></label></div> : null}
+          <button className="primary" onClick={() => void editSelectedRegionSource()}>Edit source area</button>
+          {regionSourceGeometry ? <p className="hint">Source layer: {regionSourceGeometry.corners.map((point) => `${(point.x * 100).toFixed(1)}%, ${(point.y * 100).toFixed(1)}%`).join(" · ")}</p> : null}
+          <p className="hint">Edit the highlighted source layer in place. Move, resize, rotate, or adjust perspective without changing this trim-sheet region’s bounds.</p>
+        </section> : selectedPatch && (selection.kind === "patch" || editingPatchId === selectedPatch.id) ? <section className="inspector-section patch-properties"><h2>Placement behavior</h2>
           <div className="behavior-options" role="group" aria-label="Patch placement behavior">{behaviorOptions.map((option) => <button
             key={option.value}
             className={selectedPatch.properties.repeatMode === option.value ? "active" : ""}
@@ -1124,7 +1493,7 @@ export function PatchWorkspace({
           {(selectedPatch.properties.repeatMode === "repeat_x" || selectedPatch.properties.repeatMode === "repeat_y") ? <label className="check-field"><input type="checkbox" checked={selectedPatch.properties.trimCap} onChange={(event) => updateProperties({ trimCap: event.target.checked })} /> Add a non-repeating end cap</label> : null}
           <details className="advanced-properties">
             <summary>Output settings</summary>
-            <p>These settings are consumed when Phase 3 builds the final sheet.</p>
+            <p>These settings are used when rebuilding the final trim sheet.</p>
             <div className="numeric-pair"><label>Safe edge (px)<input type="number" min={0} max={4096} value={selectedPatch.properties.paddingPx} onChange={(event) => updateProperties({ paddingPx: event.target.valueAsNumber })} /><small>Empty spacing kept around the packed region.</small></label><label>Texture bleed (px)<input type="number" min={0} max={4096} value={selectedPatch.properties.bleedPx} onChange={(event) => updateProperties({ bleedPx: event.target.valueAsNumber })} /><small>Pixels extended past the UV edge to prevent seams.</small></label></div>
             <label>Material ID<input type="number" min={0} max={65535} placeholder="None" value={selectedPatch.properties.materialId ?? ""} onChange={(event) => updateProperties({ materialId: event.target.value === "" ? undefined : event.target.valueAsNumber })} /></label>
             <label>Maps included<select value={selectedPatch.properties.mapParticipation} onChange={(event) => updateProperties({ mapParticipation: event.target.value as PatchProperties["mapParticipation"] })}><option value="all">Every registered map</option><option value="base_color_only">Base Color only</option><option value="excluded">Do not generate maps</option></select></label>
@@ -1134,6 +1503,16 @@ export function PatchWorkspace({
           <p className="hint">Drag inside to move. Drag a square corner to resize; hold Shift to keep proportions. Move just outside a corner for rotation. Double-click the patch to edit its four perspective points.</p>
         </section> : <section className="inspector-section"><p className="hint">Select a patch or create one on the source workbench.</p></section>}
       </aside>
+
+      {patchDragGhost ? <div
+        className="patch-drag-ghost"
+        aria-hidden="true"
+        style={{ left: patchDragGhost.left, top: patchDragGhost.top, width: patchDragGhost.width }}
+      >
+        <span className={`patch-drag-check ${patchDragGhost.enabled ? "checked" : ""}`}>{patchDragGhost.enabled ? "✓" : ""}</span>
+        <strong>{patchDragGhost.name}</strong>
+        <span className="patch-drag-menu">...</span>
+      </div> : null}
 
       {contextMenu ? <div className="patch-context-menu" role="menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
         {(() => { const patch = project.patches.find((candidate) => candidate.id === contextMenu.patchId); return patch ? <>
@@ -1146,7 +1525,7 @@ export function PatchWorkspace({
       {mapContextMenu && selectedSourceSetId ? <div className="patch-context-menu map-context-menu" role="menu" style={{ left: mapContextMenu.x, top: mapContextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
         <strong>{channelAppearance[mapContextMenu.channel].label}</strong>
         <button role="menuitem" onClick={() => { onOpenSourceChannel(mapContextMenu.channel, selectedSourceSetId); setMapContextMenu(null); }}>{selectedSetSources.some((source) => source.channel === mapContextMenu.channel) ? "Replace map…" : "Import map…"}</button>
-        <button role="menuitem" disabled title="Estimated map generation is implemented in Phase 4">Generate from Base Color <small>Phase 4</small></button>
+        <button role="menuitem" disabled title="Map estimation is not available in this workspace">Generate from Base Color</button>
       </div> : null}
     </>
   );

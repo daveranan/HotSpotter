@@ -10,6 +10,7 @@ import {
   cancelLayoutDrag,
   clampBoundsToClearance,
   defaultLayoutSettings,
+  defaultRegionSourceLayer,
   defaultTemplateSourceTransform,
   externalGuideStyle,
   keyboardBounds,
@@ -23,12 +24,18 @@ import {
   reorderRegionPreview,
   settingsForPreset,
   sheetPointFromClient,
+  sourceFootprintsForRegion,
+  sourceLayerGeometry,
+  sourceLayerWithGeometry,
   switchAuthoringSource,
+  templateRegionName,
   genericArchitectureTemplate,
   templateOptions,
   templateSourceTransform,
   updateLayoutDrag,
+  regionLabelDetail,
 } from "./layout-authoring.ts";
+import { normalizedFromRect, zoomViewAtPoint } from "./patch-authoring.ts";
 
 function source(id: string, sourceSetId: string, width: number, height: number): SourceSnapshot {
   return {
@@ -81,9 +88,59 @@ test("template generation request includes selected whole-source framing", () =>
     sourceSetId: "set-a",
     layoutId: "layout",
     settings,
-    sourceTransform: { mode: "repeat", cropFocus: { x: 0.25, y: 0.75 } },
+    sourceTransform: { mode: "repeat", cropFocus: { x: 0.25, y: 0.75 }, cropBounds: { x: 0, y: 0, width: 1, height: 1 } },
     coalescingGroup: undefined,
   });
+});
+
+test("template generation preserves the directly edited source crop", () => {
+  const settings = defaultLayoutSettings();
+  const request = buildTemplateGenerateLayoutRequest("set-a", "layout", settings, {
+    mode: "cover",
+    cropFocus: { x: 0.5, y: 0.5 },
+    cropBounds: { x: 0.15, y: 0.2, width: 0.6, height: 0.5 },
+  });
+  assert.deepEqual(request.sourceTransform.cropBounds, { x: 0.15, y: 0.2, width: 0.6, height: 0.5 });
+});
+
+test("region source transforms persist as source layers without changing sheet bounds", () => {
+  const original = defaultRegionSourceLayer();
+  const transformed = sourceLayerWithGeometry(original, {
+    corners: [{ x: 0.1, y: 0.2 }, { x: 0.8, y: 0.15 }, { x: 0.75, y: 0.9 }, { x: 0.05, y: 0.8 }],
+  });
+  assert.equal(transformed.mapping.type, "perspective");
+  assert.deepEqual(sourceLayerGeometry(transformed).corners, transformed.mapping.type === "perspective" ? transformed.mapping.quad : []);
+  assert.deepEqual(region("stable", "source:set-a").bounds, { x: 0, y: 0, width: 128, height: 128 });
+});
+
+test("source footprints use the same framing transform as the compiled template request", () => {
+  const footprint = sourceFootprintsForRegion(
+    { x: 200, y: 100, width: 400, height: 200 },
+    { width: 1000, height: 500 },
+    templateSourceTransform("stretch", { x: 0.5, y: 0.5 }, { x: 0.1, y: 0.2, width: 0.6, height: 0.5 }),
+    { width: 2048, height: 1024 },
+  );
+  assert.deepEqual(footprint, [{ bounds: { x: 0.22, y: 0.3, width: 0.24, height: 0.2 }, wrapped: false }]);
+});
+
+test("repeat framing exposes each wrapped source footprint instead of a false spanning rectangle", () => {
+  const footprints = sourceFootprintsForRegion(
+    { x: 400, y: 0, width: 300, height: 500 },
+    { width: 1000, height: 500 },
+    templateSourceTransform("repeat"),
+    { width: 1000, height: 1000 },
+  );
+  assert.equal(footprints.length, 2);
+  assert.deepEqual(footprints.map((footprint) => footprint.wrapped), [false, true]);
+  assert.deepEqual(footprints.map((footprint) => footprint.bounds.width), [0.2, 0.4]);
+});
+
+test("template region labels and label detail are semantic at the appropriate zoom", () => {
+  assert.equal(templateRegionName(region("trim", "template:recessed_rail")), "Recessed Rail");
+  assert.equal(templateRegionName(region("detail", "source:set-a", { x: 0, y: 0, width: 80, height: 80 })), "Radial detail");
+  assert.equal(regionLabelDetail(1, false, false), "hidden");
+  assert.equal(regionLabelDetail(1, true, false), "compact");
+  assert.equal(regionLabelDetail(1.5, false, true), "expanded");
 });
 
 test("template generation accepts each built-in trim-sheet identity", () => {
@@ -162,6 +219,29 @@ test("sheet coordinate transforms are normalized at 100 and 300 percent zoom", (
   assert.deepEqual(sheetPointFromClient({ x: 110, y: 70 }, { left: 10, top: 20, width: 200, height: 100 }, { width: 1000, height: 500 }), { x: 500, y: 250 });
   assert.equal(pixelDeltaAtZoom(15, 1), 15);
   assert.equal(pixelDeltaAtZoom(45, 3), 15);
+});
+
+test("trim-sheet wheel zoom keeps the cursor anchor stable across repeated steps", () => {
+  const base = { left: 100, top: 50, width: 400, height: 200 };
+  const cursor = { x: 420, y: 90 };
+  const expected = normalizedFromRect(cursor.x, cursor.y, base);
+  let view = { x: 0, y: 0, scale: 1 };
+  let rendered = base;
+  for (const factor of [1.1, 1.1, 1.1, 0.9, 1.1, 0.9]) {
+    const nextScale = Number((view.scale * factor).toFixed(2));
+    view = zoomViewAtPoint(view, nextScale, cursor, rendered);
+    rendered = {
+      left: base.left + base.width / 2 + view.x - base.width * view.scale / 2,
+      top: base.top + base.height / 2 + view.y - base.height * view.scale / 2,
+      width: base.width * view.scale,
+      height: base.height * view.scale,
+    };
+    const actual = normalizedFromRect(cursor.x, cursor.y, rendered);
+    assert.ok(actual);
+    assert.ok(expected);
+    assert.ok(Math.abs(actual.x - expected.x) < 1e-10);
+    assert.ok(Math.abs(actual.y - expected.y) < 1e-10);
+  }
 });
 
 test("live validation distinguishes overlap, external clearance, and sheet-edge resolution", () => {

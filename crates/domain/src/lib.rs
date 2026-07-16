@@ -15,9 +15,10 @@ pub use layout::{
     LayoutContractError, LayoutItem, LayoutKind, LayoutOrder, LayoutPreset, LayoutRegion,
     LayoutRequest, LayoutSettings, MAX_LAYOUT_EDGE, MAX_LAYOUT_PIXELS, MAX_LAYOUT_REGIONS,
     MAX_REGION_INSET, MAX_REGION_KEY_BYTES, NormalizedBounds, PackPriority, PixelBounds, PixelSize,
-    RegionConstraints, RegionFill, RegionLocks, SimpleDataInput, SlotBinding, SourceFraming,
-    SourceFramingMode, StyleRecipe, TemplateIdentity, TemplateLayoutContract, TemplateSnapshot,
-    TrimAxis, TrimCaps,
+    RegionConstraints, RegionFill, RegionLocks, RegionSourceLayer, SimpleDataInput, SlotBinding,
+    SourceBlend, SourceFraming, SourceFramingMode, SourceLayerError, SourceMapping,
+    SourceRectification, SourceRectificationMode, SourceSampling, SourceSamplingMode, SourceWarp,
+    StyleRecipe, TemplateIdentity, TemplateLayoutContract, TemplateSnapshot, TrimAxis, TrimCaps,
 };
 pub use patch::{
     MapParticipation, Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchGeometry,
@@ -25,8 +26,8 @@ pub use patch::{
 };
 pub use protocol::{FoundationStatusRequest, IPC_PROTOCOL_VERSION};
 pub use templates::{
-    CanonicalRect, Hotspot, RadialParameters, StructuralProfile, TemplateDefinition,
-    TemplateRegistry, TemplateRegistryError, TemplateSlot, TemplateSlotRole, WorldPlacement,
-    CANONICAL_TEMPLATE_EDGE,
+    CANONICAL_TEMPLATE_EDGE, CanonicalRect, Hotspot, RadialParameters, StructuralProfile,
+    TemplateDefinition, TemplateRegistry, TemplateRegistryError, TemplateSlot, TemplateSlotRole,
+    WorldPlacement,
 };
 pub use units::{NormalizedPoint, NormalizedScalar};

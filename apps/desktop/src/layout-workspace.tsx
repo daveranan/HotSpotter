@@ -19,15 +19,14 @@ import {
   type SourceChannel,
   type StoredLayout,
   type TemplateIdentity,
+  type TemplateSourceTransform,
 } from "@hot-trimmer/ipc-contracts";
 import {
   LayoutSolveSequencer,
-  beginLayoutDrag,
   availableLayoutPreviewMaps,
   buildCustomAtlasGenerateLayoutRequest,
   buildLayoutRequest,
   buildTemplateGenerateLayoutRequest,
-  cancelLayoutDrag,
   cssBounds,
   defaultLayoutSettings,
   externalGuideStyle,
@@ -37,16 +36,13 @@ import {
   layoutRegionPresentation,
   layoutPreviewDataUrl,
   layoutPreviewMapOptions,
-  nearestValidLayoutBounds,
+  regionLabelDetail,
   settingsForPreset,
-  sheetPointFromClient,
-  updateLayoutDrag,
+  templateRegionName,
   usedAreaRatio,
   withUpdatedItem,
-  defaultTemplateSourceTransform,
   genericArchitectureTemplate,
   templateOptions,
-  type LayoutDrag,
 } from "./layout-authoring";
 import { zoomViewAtPoint } from "./patch-authoring";
 import { SerialTaskQueue } from "./serial-task-queue";
@@ -54,9 +50,19 @@ import { SerialTaskQueue } from "./serial-task-queue";
 interface LayoutWorkspaceProps {
   project: ProjectSnapshot;
   selectedPatchId: string | null;
+  selectedRegionId: string | null;
   selectedSourceSetId: string | null;
   onLayoutState: (state: LayoutStateSnapshot) => void;
   onFailure: (failure: CommandFailure | null) => void;
+  sourceTransform: TemplateSourceTransform;
+  onRegionSelectionChange: (selection: WorkbenchRegionSelection | null) => void;
+}
+
+export interface WorkbenchRegionSelection {
+  region: LayoutRegion;
+  output: { width: number; height: number };
+  label: string;
+  templateMode: boolean;
 }
 
 interface SheetView {
@@ -113,7 +119,8 @@ function imageForRegion(project: ProjectSnapshot, region: LayoutRegion): string 
   return source?.thumbnailMipmaps.find((mipmap) => mipmap.maxEdge === 640)?.dataUrl ?? source?.thumbnailDataUrl;
 }
 
-function regionLabel(project: ProjectSnapshot, region: LayoutRegion): string {
+function regionLabel(project: ProjectSnapshot, region: LayoutRegion, templateMode = false): string {
+  if (templateMode) return templateRegionName(region);
   if (region.fill.type === "rectified_patch") {
     const patchId = region.fill.patchId;
     return project.patches.find((patch) => patch.id === patchId)?.name ?? "Patch";
@@ -134,35 +141,37 @@ function hexColor(value: string): [number, number, number, number] {
   return [Number.parseInt(value.slice(1, 3), 16), Number.parseInt(value.slice(3, 5), 16), Number.parseInt(value.slice(5, 7), 16), 255];
 }
 
-export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId, onLayoutState, onFailure }: LayoutWorkspaceProps): React.JSX.Element {
+export function LayoutWorkspace({ project, selectedPatchId, selectedRegionId, selectedSourceSetId, onLayoutState, onFailure, sourceTransform, onRegionSelectionChange }: LayoutWorkspaceProps): React.JSX.Element {
   const initialLayout = project.layout;
   const [stored, setStored] = useState<StoredLayout | null>(initialLayout);
   const [preset, setPreset] = useState<LayoutPreset>(initialLayout?.layout.preset ?? "balanced");
   const [settings, setSettings] = useState<LayoutSettings>(initialLayout?.layout.settings ?? defaultLayoutSettings());
   const [items, setItems] = useState<LayoutItem[]>(initialLayout?.items ?? []);
   const [selectedSourceSetIds, setSelectedSourceSetIds] = useState<string[]>(project.sourceSets.map((sourceSet) => sourceSet.id));
-  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(initialLayout?.layout.regions[0]?.id ?? null);
   const [sheetView, setSheetView] = useState<SheetView>({ x: 0, y: 0, scale: 1 });
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<CommandFailure | null>(null);
-  const [drag, setDrag] = useState<LayoutDrag | null>(null);
   const [simpleColor, setSimpleColor] = useState("#6987a5");
   const [simpleChannel, setSimpleChannel] = useState<SourceChannel>("roughness");
   const [simpleValue, setSimpleValue] = useState(0.5);
   const [compiledPreview, setCompiledPreview] = useState<CompiledLayoutPreview | null>(null);
   const [previewMap, setPreviewMap] = useState<CompiledLayoutPreviewMap>("baseColor");
-  const [sourceTransform, setSourceTransform] = useState(defaultTemplateSourceTransform);
-  const [templateIdentity, setTemplateIdentity] = useState<TemplateIdentity>(genericArchitectureTemplate);
+  const [previewMode, setPreviewMode] = useState<"sheet" | "material">("sheet");
+  const [hoveredRegionId, setHoveredRegionId] = useState<string | null>(null);
+  const [normalStrength, setNormalStrength] = useState(1);
+  const [roughnessPreview, setRoughnessPreview] = useState(0.5);
+  const [templateIdentity, setTemplateIdentity] = useState<TemplateIdentity>(initialLayout?.template?.snapshot?.identity ?? genericArchitectureTemplate);
   const [regionContextMenu, setRegionContextMenu] = useState<RegionContextMenu | null>(null);
+  const [showTrimSettings, setShowTrimSettings] = useState(false);
   const sheetRef = useRef<HTMLDivElement | null>(null);
-  const scrollportRef = useRef<HTMLDivElement | null>(null);
   const sheetPanDrag = useRef<SheetPanDrag | null>(null);
   const lastSheetCursor = useRef<{ x: number; y: number } | null>(null);
-  const dragElement = useRef<HTMLElement | null>(null);
   const solveSequence = useRef(new LayoutSolveSequencer());
   const commandQueue = useRef(new SerialTaskQueue());
   const commandGroup = useRef(1);
+  const latestLayoutRevision = useRef(project.authoringRevision);
   const autoGeneratedSources = useRef<string | null>(null);
+  const latestPreviewInputSignature = useRef("");
   const rawRegions = stored?.layout.preset === preset ? stored.layout.regions : [];
   const presentation = useMemo(() => layoutRegionPresentation(rawRegions, selectedPatchId), [rawRegions, selectedPatchId]);
   const regions = presentation.regions;
@@ -188,8 +197,22 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
       .map((source) => `${source.channel}:${source.id}:${source.width}x${source.height}:${source.encodedBytes}`)
       .sort()
       .join("|");
-    return `${preset}|${templateIdentity.templateId}|${JSON.stringify(sourceTransform)}|${sourceRevision}`;
-  }, [preset, project.patches, project.sources, selectedSourceSetIds, sourceTransform, templateIdentity]);
+    const patchRevision = project.patches
+      .filter((patch) => {
+        const source = project.sources.find((candidate) => candidate.id === patch.sourceId);
+        return Boolean(source && selected.has(source.sourceSetId));
+      })
+      .map((patch) => JSON.stringify(patch))
+      .sort()
+      .join("|");
+    // The local snapshot changes immediately after a source-layer or fill command,
+    // before the parent project snapshot returns. Include both inputs so the
+    // authoritative preview is regenerated for that committed assignment.
+    const sourceLayerRevision = JSON.stringify(stored?.sourceLayers ?? project.layout?.sourceLayers ?? {});
+    const regionFillRevision = JSON.stringify((stored?.layout.regions ?? project.layout?.layout.regions ?? []).map(({ id, fill }) => ({ id, fill })));
+    return `${preset}|${templateIdentity.templateId}|${JSON.stringify(sourceTransform)}|${sourceRevision}|${patchRevision}|${sourceLayerRevision}|${regionFillRevision}`;
+  }, [preset, project.layout?.layout.regions, project.layout?.sourceLayers, project.patches, project.sources, selectedSourceSetIds, sourceTransform, stored?.layout.regions, stored?.sourceLayers, templateIdentity]);
+  latestPreviewInputSignature.current = contentSignature;
   const selectedRegion = regions.find((region) => region.id === selectedRegionId) ?? null;
   const selectedItem = selectedRegion ? items.find((item) => item.key === selectedRegion.itemKey) ?? null : null;
   const templateSourceSetId = selectedSourceSetIds.find((id) => project.sources.some((source) => source.sourceSetId === id && source.channel === "base_color"));
@@ -197,15 +220,20 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
     ?? templateOptions[0]!;
 
   useEffect(() => {
+    if (project.authoringRevision < latestLayoutRevision.current) return;
+    const externallyUpdated = project.authoringRevision > latestLayoutRevision.current;
+    latestLayoutRevision.current = project.authoringRevision;
+    if (externallyUpdated) {
+      solveSequence.current.cancel();
+      setBusy(false);
+    }
     setStored(project.layout);
     if (project.layout) {
       setPreset(project.layout.layout.preset);
       setSettings(project.layout.layout.settings);
       setItems(project.layout.items);
-      setTemplateIdentity(project.layout.template?.snapshot?.identity ?? genericArchitectureTemplate);
-      setSelectedRegionId((current) => project.layout?.layout.regions.some((region) => region.id === current) ? current : project.layout?.layout.regions[0]?.id ?? null);
     }
-  }, [project.layout]);
+  }, [project.authoringRevision, project.layout]);
 
   useEffect(() => {
     const valid = new Set(project.sourceSets.map((sourceSet) => sourceSet.id));
@@ -220,29 +248,51 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
   }, [availablePreviewMaps, previewMap]);
 
   useEffect(() => {
-    if (busy || !contentSignature || autoGeneratedSources.current === contentSignature) return;
+    if (!regionContextMenu) return;
+    const close = (event: PointerEvent): void => {
+      if (event.button !== 0 || (event.target as Element | null)?.closest(".region-context-menu")) return;
+      setRegionContextMenu(null);
+    };
+    const closeOnBlur = (): void => setRegionContextMenu(null);
+    window.addEventListener("pointerdown", close, true);
+    window.addEventListener("blur", closeOnBlur);
+    return () => {
+      window.removeEventListener("pointerdown", close, true);
+      window.removeEventListener("blur", closeOnBlur);
+    };
+  }, [regionContextMenu]);
+
+  useEffect(() => {
+    if (!selectedRegion) return;
+    onRegionSelectionChange({ region: selectedRegion, output, label: regionLabel(project, selectedRegion, templateMode), templateMode });
+  }, [onRegionSelectionChange, output, selectedRegion, templateMode]);
+
+  useEffect(() => {
+    if (!showTrimSettings) return;
+    const close = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setShowTrimSettings(false);
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [showTrimSettings]);
+
+  useEffect(() => {
+    if (!contentSignature) return;
+    if (busy) {
+      if (autoGeneratedSources.current !== contentSignature) {
+        solveSequence.current.cancel();
+        setBusy(false);
+      }
+      return;
+    }
+    if (autoGeneratedSources.current === contentSignature) return;
     autoGeneratedSources.current = contentSignature;
     void generate();
   }, [busy, contentSignature]);
 
-  useEffect(() => {
-    if (!drag) return;
-    const activeDrag = drag;
-    function cancel(event: KeyboardEvent): void {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      const element = dragElement.current;
-      if (element?.hasPointerCapture(activeDrag.pointerId)) element.releasePointerCapture(activeDrag.pointerId);
-      setDrag(null);
-      dragElement.current = null;
-    }
-    window.addEventListener("keydown", cancel);
-    return () => window.removeEventListener("keydown", cancel);
-  }, [drag]);
-
   const invalidIds = useMemo(() => {
-    return layoutRegionIssues(regions, output, drag ? { regionId: drag.regionId, bounds: drag.preview } : undefined);
-  }, [drag, output, regions]);
+    return layoutRegionIssues(regions, output);
+  }, [output, regions]);
 
   function publishFailure(next: CommandFailure | null): void {
     setFailure(next);
@@ -250,6 +300,7 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
   }
 
   function acceptState(state: LayoutStateSnapshot): void {
+    latestLayoutRevision.current = Math.max(latestLayoutRevision.current, state.authoringRevision);
     setStored(state.layout);
     if (state.layout) {
       setItems(state.layout.items);
@@ -292,17 +343,18 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
       return;
     }
     const generation = solveSequence.current.begin();
+    const generationInputSignature = contentSignature;
     setBusy(true);
     publishFailure(null);
     try {
       const result = await invoke<GenerateLayoutResult>("generate_layout", {
         request,
       });
-      if (!solveSequence.current.isCurrent(generation)) return;
+      if (!solveSequence.current.isCurrent(generation) || latestPreviewInputSignature.current !== generationInputSignature) return;
       setCompiledPreview(result.preview ?? null);
       acceptState(result.state);
     } catch (reason) {
-      if (!solveSequence.current.isCurrent(generation)) return;
+      if (!solveSequence.current.isCurrent(generation) || latestPreviewInputSignature.current !== generationInputSignature) return;
       const nextFailure = failureFrom(reason, "Trim-sheet generation failed.");
       if (nextFailure.code !== "operation_cancelled") publishFailure(nextFailure);
     } finally {
@@ -317,6 +369,9 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
   }
 
   async function apply(command: LayoutCommand, coalescingGroup?: number): Promise<void> {
+    // A direct pointer transaction supersedes any older asynchronous solve result.
+    solveSequence.current.cancel();
+    setBusy(false);
     try {
       const state = await commandQueue.current.run(() => invoke<LayoutStateSnapshot>("apply_layout_command", {
           request: { protocolVersion: IPC_PROTOCOL_VERSION, command, coalescingGroup },
@@ -342,12 +397,12 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
     const nextSettings = settingsForPreset(settings, next);
     setPreset(next);
     setSettings(nextSettings);
-    setSelectedRegionId(null);
+    onRegionSelectionChange(null);
   }
 
   function chooseTemplate(identity: TemplateIdentity): void {
     setTemplateIdentity(identity);
-    setSelectedRegionId(null);
+    onRegionSelectionChange(null);
   }
 
   function zoomBy(factor: number): void {
@@ -363,13 +418,17 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
     if (!rect) return;
     const anchor = cursor ?? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     setSheetView((current) => {
-      const nextScale = Math.max(0.25, Math.min(3, Number((current.scale * factor).toFixed(2))));
+      const nextScale = Math.max(0.1, Math.min(8, current.scale * factor));
       return zoomViewAtPoint(current, nextScale, anchor, rect);
     });
   }
 
   function beginSheetPan(event: React.PointerEvent<HTMLDivElement>): void {
     lastSheetCursor.current = { x: event.clientX, y: event.clientY };
+    if (event.button === 0) {
+      onRegionSelectionChange(null);
+      return;
+    }
     if (event.button !== 1) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -396,61 +455,18 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
 
   function beginRegionPointer(event: React.PointerEvent<HTMLElement>, region: LayoutRegion): void {
     if (event.button !== 0 || busy) return;
-    const sheet = sheetRef.current;
-    if (!sheet) return;
     event.preventDefault(); event.stopPropagation();
-    const kind = ((event.target as HTMLElement).dataset.handle ?? "move") as LayoutDrag["kind"];
-    event.currentTarget.setPointerCapture(event.pointerId);
-    dragElement.current = event.currentTarget;
-    setSelectedRegionId(region.id);
-    setDrag(beginLayoutDrag(region, kind, event.pointerId, sheetPointFromClient({ x: event.clientX, y: event.clientY }, sheet.getBoundingClientRect(), output), commandGroup.current++));
-  }
-
-  function moveRegionPointer(event: React.PointerEvent<HTMLElement>, region: LayoutRegion): void {
-    if (!drag || drag.pointerId !== event.pointerId || drag.regionId !== region.id || !sheetRef.current) return;
-    const next = updateLayoutDrag(drag, sheetPointFromClient({ x: event.clientX, y: event.clientY }, sheetRef.current.getBoundingClientRect(), output), output, region.locks, region.paddingPx + region.bleedPx);
-    setDrag({ ...next, preview: nearestValidLayoutBounds(regions, region.id, next.original, next.preview, output) });
-  }
-
-  function endRegionPointer(event: React.PointerEvent<HTMLElement>, cancelled = false): void {
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    const bounds = cancelled ? cancelLayoutDrag(drag) : drag.preview;
-    const original = drag.original;
-    const group = drag.coalescingGroup;
-    setDrag(null); dragElement.current = null;
-    if (!cancelled && (bounds.x !== original.x || bounds.y !== original.y || bounds.width !== original.width || bounds.height !== original.height)) {
-      void apply({ type: "set_bounds", regionId: drag.regionId, bounds }, group);
-    }
+    onRegionSelectionChange({ region, output, label: regionLabel(project, region, templateMode), templateMode });
   }
 
   function displayedBounds(region: LayoutRegion): PixelBounds {
-    return drag?.regionId === region.id ? drag.preview : region.bounds;
+    return region.bounds;
   }
 
   function regionKeyDown(event: React.KeyboardEvent<HTMLElement>, region: LayoutRegion): void {
-    if (busy) return;
-    if (event.key === "p" || event.key === "P") {
-      event.preventDefault(); void apply({ type: "set_locks", regionId: region.id, locks: { ...region.locks, position: !region.locks.position } }); return;
-    }
-    if (event.key === "w" || event.key === "W") {
-      event.preventDefault(); void apply({ type: "set_locks", regionId: region.id, locks: { ...region.locks, width: !region.locks.width } }); return;
-    }
-    if (event.key === "h" || event.key === "H") {
-      event.preventDefault(); void apply({ type: "set_locks", regionId: region.id, locks: { ...region.locks, height: !region.locks.height } }); return;
-    }
-    if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
-      event.preventDefault();
-      const offset = event.key === "ArrowUp" ? -1 : 1;
-      void apply({ type: "reorder", regionId: region.id, toIndex: Math.max(0, Math.min(regions.length - 1, region.orderIndex + offset)) }); return;
-    }
-    if (!event.key.startsWith("Arrow")) return;
+    if (busy || (event.key !== "Enter" && event.key !== " ")) return;
     event.preventDefault();
-    if (!event.shiftKey && region.locks.position) return;
-    if (event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight") && region.locks.width) return;
-    if (event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown") && region.locks.height) return;
-    const requested = keyboardBounds(region.bounds, event.key, { shift: event.shiftKey, alt: event.ctrlKey }, output);
-    void apply({ type: "set_bounds", regionId: region.id, bounds: nearestValidLayoutBounds(regions, region.id, region.bounds, requested, output) }, commandGroup.current++);
+    onRegionSelectionChange({ region, output, label: regionLabel(project, region, templateMode), templateMode });
   }
 
   function updateSelectedItem(update: Partial<LayoutItem>): void {
@@ -489,26 +505,27 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
     <header className="split-pane-title layout-title">
       <div><span>Patches &amp; Layout</span><strong>Trim sheet</strong></div>
       <div className="layout-history" aria-label="Project layout history">
+        <button aria-controls="trim-settings-panel" aria-expanded={showTrimSettings} onClick={() => setShowTrimSettings((current) => !current)}>Trim Sheet Settings</button>
         <button onClick={() => void history(false)} disabled={!project.canUndoProject || busy} title="Undo project layout edit (Ctrl+Z)">Undo</button>
         <button onClick={() => void history(true)} disabled={!project.canRedoProject || busy} title="Redo project layout edit (Ctrl+Shift+Z)">Redo</button>
       </div>
     </header>
 
-    <section className="layout-first-entry" aria-labelledby="layout-first-title">
-      <span className="eyebrow">{templateMode ? "Trim sheet workbench" : "Patch atlas"}</span><h2 id="layout-first-title">{templateMode ? "Build a reusable trim-sheet layout" : "Pack captured patches as an atlas"}</h2>
-      <p>{templateMode ? "Choose a stable template, frame the source, and keep every registered map on the same slot boundaries." : "Atlas mode contains enabled patches only. Padding, bleed, ordering, and free placement apply here."}</p>
-      <div className="layout-mode-chooser" role="group" aria-label="Sheet mode">
-        <button className={templateMode && templateIdentity.templateId === genericArchitectureTemplate.templateId ? "active" : ""} aria-pressed={templateMode && templateIdentity.templateId === genericArchitectureTemplate.templateId} onClick={() => { choosePreset(genericArchitecturePreset); chooseTemplate(genericArchitectureTemplate); }}>Hotspot</button>
-        <button className={templateMode && templateIdentity.templateId !== genericArchitectureTemplate.templateId ? "active" : ""} aria-pressed={templateMode && templateIdentity.templateId !== genericArchitectureTemplate.templateId} onClick={() => { choosePreset(genericArchitecturePreset); chooseTemplate(templateOptions[1]!.identity); }}>Trim</button>
-        <button className={!templateMode ? "active" : ""} aria-pressed={!templateMode} onClick={() => choosePreset("atlas")}>Atlas</button>
+    <section className={`layout-first-entry${templateMode ? " template-entry" : ""}`} aria-labelledby="layout-first-title">
+      <span className="eyebrow" id={templateMode ? "layout-first-title" : undefined}>{templateMode ? "Trim sheet workbench" : "Patch atlas"}</span>
+      {!templateMode ? <><h2 id="layout-first-title">Pack captured patches as an atlas</h2><p>Atlas mode contains enabled patches only. Padding, bleed, ordering, and free placement apply here.</p></> : null}
+      <div className="layout-entry-controls">
+        <div className="layout-mode-chooser" role="group" aria-label="Sheet mode">
+          <button className={templateMode && templateIdentity.templateId === genericArchitectureTemplate.templateId ? "active" : ""} aria-pressed={templateMode && templateIdentity.templateId === genericArchitectureTemplate.templateId} onClick={() => { choosePreset(genericArchitecturePreset); chooseTemplate(genericArchitectureTemplate); }}>Hotspot</button>
+          <button className={templateMode && templateIdentity.templateId !== genericArchitectureTemplate.templateId ? "active" : ""} aria-pressed={templateMode && templateIdentity.templateId !== genericArchitectureTemplate.templateId} onClick={() => { choosePreset(genericArchitecturePreset); chooseTemplate(templateOptions[1]!.identity); }}>Trim</button>
+          <button className={!templateMode ? "active" : ""} aria-pressed={!templateMode} onClick={() => choosePreset("atlas")}>Atlas</button>
+        </div>
+        {templateMode ? <div className="template-controls">
+          <label>Template<select title={selectedTemplateOption.description} value={templateIdentity.templateId} onChange={(event) => { const option = templateOptions.find((candidate) => candidate.identity.templateId === event.target.value); if (option) chooseTemplate(option.identity); }}>
+            {templateOptions.map((option) => <option key={option.identity.templateId} value={option.identity.templateId}>{option.label}</option>)}
+          </select></label>
+        </div> : null}
       </div>
-      {templateMode ? <div className="template-controls">
-        <label>Template<select value={templateIdentity.templateId} onChange={(event) => { const option = templateOptions.find((candidate) => candidate.identity.templateId === event.target.value); if (option) chooseTemplate(option.identity); }}>
-          {templateOptions.map((option) => <option key={option.identity.templateId} value={option.identity.templateId}>{option.label}</option>)}
-        </select><small>{selectedTemplateOption.description}</small></label>
-        <label>Source framing<select value={sourceTransform.mode} onChange={(event) => setSourceTransform((current) => ({ ...current, mode: event.target.value as typeof current.mode }))}><option value="cover">Cover / crop</option><option value="stretch">Stretch to sheet</option><option value="repeat">Repeat</option></select></label>
-        {sourceTransform.mode === "cover" ? <div className="source-framing-focus"><label>Focus X<input aria-label="Source framing focus X" type="range" min={0} max={1} step={0.01} value={sourceTransform.cropFocus.x} onChange={(event) => setSourceTransform((current) => ({ ...current, cropFocus: { ...current.cropFocus, x: event.target.valueAsNumber } }))} /></label><label>Focus Y<input aria-label="Source framing focus Y" type="range" min={0} max={1} step={0.01} value={sourceTransform.cropFocus.y} onChange={(event) => setSourceTransform((current) => ({ ...current, cropFocus: { ...current, y: event.target.valueAsNumber } }))} /></label></div> : null}
-      </div> : null}
     </section>
 
     <div className="layout-canvas-shell">
@@ -516,19 +533,23 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
         <span>{output.width} Ã— {output.height}</span><span>{regions.length} region{regions.length === 1 ? "" : "s"}</span>
         <span>{Math.round((1 - used) * 100)}% unused</span>
         {invalidIds.size ? <strong className="invalid-summary">{invalidIds.size} invalid</strong> : null}
-        {templateMode ? <label>Map <select aria-label="Template preview map" value={previewMap} disabled={!compiledPreview} onChange={(event) => setPreviewMap(event.target.value as CompiledLayoutPreviewMap)}>{layoutPreviewMapOptions.filter((option) => availablePreviewMaps.includes(option.key)).map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></label> : null}
+        {templateMode ? <><div className="preview-mode-toggle" role="group" aria-label="Workbench preview mode"><button className={previewMode === "sheet" ? "active" : ""} aria-pressed={previewMode === "sheet"} onClick={() => setPreviewMode("sheet")}>Sheet</button><button className={previewMode === "material" ? "active" : ""} aria-pressed={previewMode === "material"} onClick={() => setPreviewMode("material")}>Material</button></div><label>Map <select aria-label="Compiled map inspection" value={previewMap} disabled={!compiledPreview} onChange={(event) => setPreviewMap(event.target.value as CompiledLayoutPreviewMap)}>{layoutPreviewMapOptions.filter((option) => availablePreviewMaps.includes(option.key)).map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></label></> : null}
       </div>
       <div
-        ref={scrollportRef}
         className="layout-scrollport"
         onPointerDown={beginSheetPan}
         onPointerMove={moveSheetPan}
         onPointerUp={endSheetPan}
         onPointerCancel={endSheetPan}
-        onWheel={(event) => { event.preventDefault(); lastSheetCursor.current = { x: event.clientX, y: event.clientY }; zoomAtPoint(event.deltaY < 0 ? 1.1 : 0.9, lastSheetCursor.current); }}
+        onWheel={(event) => { event.preventDefault(); lastSheetCursor.current = { x: event.clientX, y: event.clientY }; zoomAtCursor(event.deltaY < 0 ? 1.1 : 0.9, lastSheetCursor.current); }}
       >
-        <div className="layout-sheet-stage" style={{ transform: `translate(${sheetPan.x}px, ${sheetPan.y}px)` }}>
-          <div ref={sheetRef} className="layout-sheet" style={{ aspectRatio: `${output.width} / ${output.height}`, maxWidth: "760px", transform: `scale(${zoom})` }} aria-label={`Complete ${output.width} by ${output.height} trim sheet`}>
+        <div className="layout-sheet-stage">
+          {previewMode === "material" ? <section className="material-preview" aria-label={`Material preview of ${layoutPreviewMapOptions.find((option) => option.key === previewMap)?.label ?? "compiled map"}`}>
+            <header><strong>Material preview</strong><span>Neutral study · {layoutPreviewMapOptions.find((option) => option.key === previewMap)?.label ?? "Base Color"}</span></header>
+            <div className="material-preview-controls"><label>Normal strength <input aria-label="Material preview normal strength" type="range" min={0} max={2} step={0.1} value={normalStrength} onChange={(event) => setNormalStrength(event.target.valueAsNumber)} /></label><label>Roughness <input aria-label="Material preview roughness" type="range" min={0} max={1} step={0.05} value={roughnessPreview} onChange={(event) => setRoughnessPreview(event.target.valueAsNumber)} /></label></div>
+            <div className="material-preview-scene" style={{ "--preview-map": compiledPreviewDataUrl ? `url("${compiledPreviewDataUrl}")` : "none", "--normal-strength": normalStrength, "--roughness-preview": roughnessPreview } as React.CSSProperties}><div className="material-wall"><span>Wall</span></div><div className="material-panel"><span>Broad panel</span></div><div className="material-edge"><span>Edge trim</span></div><div className="material-strip"><span>Strip</span></div><div className="material-radial"><span>Radial detail</span></div></div>
+            <p>Inspect the selected compiled map across representative trim shapes. Switch back to Sheet to choose a region.</p>
+          </section> : <div ref={sheetRef} className="layout-sheet" style={{ aspectRatio: `${output.width} / ${output.height}`, maxWidth: "760px", transform: `translate(${sheetView.x}px, ${sheetView.y}px) scale(${sheetView.scale})` }} aria-label={`Complete ${output.width} by ${output.height} trim sheet`}>
             {compiledPreview && compiledPreviewDataUrl ? <img className="layout-compiled-preview" src={compiledPreviewDataUrl} width={compiledPreview.width} height={compiledPreview.height} alt="" /> : null}
             {regions.map((region) => {
               const bounds = displayedBounds(region);
@@ -539,35 +560,36 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
               const invalid = Boolean(regionIssues);
               const locks = [region.locks.position ? "P" : "", region.locks.width ? "W" : "", region.locks.height ? "H" : ""].filter(Boolean).join("");
               const regionColor = `rgb(${region.idColor.join(" ")})`;
+              const labelDetail = regionLabelDetail(sheetView.scale, selected, region.id === hoveredRegionId);
               return <div
                 key={region.id}
                 className={`layout-region ${templateMode ? "template-slot" : ""} ${selected ? "selected" : ""} ${patchSelected ? "patch-selected" : ""} ${invalid ? "invalid" : ""}`}
                 role="button" tabIndex={0} aria-pressed={selected}
-                aria-label={`${regionLabel(project, region)} region, x ${bounds.x}, y ${bounds.y}, width ${bounds.width}, height ${bounds.height}${locks ? `, locks ${locks}` : ""}`}
+                aria-label={`${regionLabel(project, region, templateMode)} region, x ${bounds.x}, y ${bounds.y}, width ${bounds.width}, height ${bounds.height}${locks ? `, locks ${locks}` : ""}`}
                 style={{ ...cssBounds(bounds, output), "--region-color": regionColor, backgroundImage: image ? `linear-gradient(rgb(12 16 18 / 22%), rgb(12 16 18 / 22%)), url("${image}")` : undefined, backgroundColor: templateMode ? "transparent" : region.fill.type === "simple_color" ? colorHex(region.fill.rgba) : regionColor } as React.CSSProperties}
-                onFocus={() => setSelectedRegionId(region.id)} onClick={() => setSelectedRegionId(region.id)} onKeyDown={(event) => regionKeyDown(event, region)}
-                onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedRegionId(region.id); setRegionContextMenu({ regionId: region.id, x: event.clientX, y: event.clientY }); }}
-                onPointerDown={(event) => beginRegionPointer(event, region)} onPointerMove={(event) => moveRegionPointer(event, region)} onPointerUp={(event) => endRegionPointer(event)} onPointerCancel={(event) => endRegionPointer(event, true)}
+                onPointerEnter={() => setHoveredRegionId(region.id)} onPointerLeave={() => setHoveredRegionId((current) => current === region.id ? null : current)}
+                onFocus={() => { setHoveredRegionId(region.id); onRegionSelectionChange({ region, output, label: regionLabel(project, region, templateMode), templateMode }); }} onBlur={() => setHoveredRegionId((current) => current === region.id ? null : current)} onKeyDown={(event) => regionKeyDown(event, region)}
+                onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); onRegionSelectionChange({ region, output, label: regionLabel(project, region, templateMode), templateMode }); setRegionContextMenu({ regionId: region.id, x: event.clientX, y: event.clientY }); }}
+                onPointerDown={(event) => beginRegionPointer(event, region)}
               >
-                <span className="layout-region-label"><strong>{regionLabel(project, region)}</strong><small>{bounds.width} Ã— {bounds.height} Â· {region.behavior.replaceAll("_", " ")}</small></span>
+                <span className={`layout-region-label ${labelDetail}`}><strong>{regionLabel(project, region, templateMode)}</strong>{labelDetail === "expanded" ? <small>{bounds.width} × {bounds.height} · {region.behavior.replaceAll("_", " ")}</small> : null}</span>
                 {region.trimCaps ? <><i className={`trim-cap leading ${region.trimCaps.axis}`} /><i className={`trim-cap trailing ${region.trimCaps.axis}`} /></> : null}
                 {locks ? <span className="region-locks" title="Position / width / height locks">ðŸ”’ {locks}</span> : null}
                 {regionIssues ? <span className="region-invalid">{layoutRegionIssueLabel(regionIssues)}</span> : null}
                 <i className="padding-guide" style={externalGuideStyle(bounds, region.paddingPx)} />
                 <i className="bleed-guide" style={externalGuideStyle(bounds, region.paddingPx + region.bleedPx)} />
-                {(["north", "east", "south", "west", "north-east", "south-east", "south-west", "north-west"] as const).map((handle) => <span key={handle} className={`region-handle ${handle}`} data-handle={handle} aria-hidden="true" />)}
               </div>;
             })}
-            {!regions.length ? <div className="layout-empty-sheet"><strong>{busy ? "Updating sheet..." : templateMode ? "Add a Base Color material" : "Create or enable a patch"}</strong><span>{templateMode ? "The selected hotspot template is generated automatically. Patches are optional slot replacements." : "Patch Atlas packs enabled patches only; it never invents regions from the whole source."}</span></div> : null}
-          </div>
+            {!regions.length ? <div className="layout-empty-sheet"><strong>{busy ? "Updating sheet..." : templateMode ? "Add a Base Color material" : "Create or enable a patch"}</strong><span>{templateMode ? "The selected trim-sheet template is generated automatically. Patches can replace a region’s source content." : "Patch Atlas packs enabled patches only; it never invents regions from the whole source."}</span></div> : null}
+          </div>}
         </div>
-        <div className="viewport-tools layout-viewport-tools" role="group" aria-label="Sheet viewport controls" onPointerDown={(event) => event.stopPropagation()}><button className="active" title="Pan with middle mouse drag">Pan</button><button title="Zoom out (-)" onClick={() => zoomBy(0.8)}>−</button><output aria-live="polite">{Math.round(zoom * 100)}%</output><button title="Zoom in (+)" onClick={() => zoomBy(1.25)}>+</button><button title="Fit sheet (0)" onClick={fitSheet}>Fit</button></div>
+        <div className="viewport-tools layout-viewport-tools" role="group" aria-label="Sheet viewport controls" onPointerDown={(event) => event.stopPropagation()}><button className="active" title="Pan with middle mouse drag">Pan</button><button title="Zoom out (-)" onClick={() => zoomBy(0.8)}>−</button><output aria-live="polite">{Math.round(sheetView.scale * 100)}%</output><button title="Zoom in (+)" onClick={() => zoomBy(1.25)}>+</button><button title="Fit sheet (0)" onClick={fitSheet}>Fit</button></div>
       </div>
       <div className="layout-legend" aria-label="Layout visualization legend"><span><i className="legend-padding" />Padding</span><span><i className="legend-bleed" />Bleed</span><span><i className="legend-cap" />Trim cap</span><span>ðŸ”’ Locked</span><span className="legend-invalid">Overlap / invalid</span></div>
     </div>
 
     <div className="layout-dock">
-      <details open className="layout-panel"><summary>Sheet setup</summary>
+      <details className="layout-panel"><summary>Trim settings</summary>
         {templateMode
           ? <div className="automatic-input-note"><strong>{selectedTemplateOption.label}</strong><span>{selectedTemplateOption.description}</span></div>
           : <div className="automatic-input-note"><strong>Custom Atlas</strong><button onClick={() => choosePreset("balanced")}>Return to Template Presets</button></div>}
@@ -592,7 +614,7 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
 
       <details open={Boolean(selectedRegion)} className="layout-panel"><summary>Selected region</summary>
         {selectedRegion ? <>
-          <strong>{regionLabel(project, selectedRegion)}</strong>
+          <strong>{regionLabel(project, selectedRegion, templateMode)}</strong>
           <label>Source / patch<select aria-label="Region source or patch" value={selectedRegion.fill.type === "rectified_patch" ? `patch:${selectedRegion.fill.patchId}` : selectedRegion.fill.type === "whole_source_set" ? `source:${selectedRegion.fill.sourceSetId}` : "simple"} onChange={(event) => {
             const value = event.target.value;
             if (value.startsWith("source:")) setRegionFill(selectedRegion, { type: "whole_source_set", sourceSetId: value.slice(7) });
@@ -603,15 +625,15 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
             }
           }}>
             {project.sourceSets.map((sourceSet) => <option key={`source:${sourceSet.id}`} value={`source:${sourceSet.id}`}>{sourceSet.name} · whole source</option>)}
-            {project.patches.map((patch) => <option key={`patch:${patch.id}`} value={`patch:${patch.id}`}>{patch.name} · patch</option>)}
+            {project.patches.filter((patch) => patch.enabled).map((patch) => <option key={`patch:${patch.id}`} value={`patch:${patch.id}`}>{patch.name} · patch</option>)}
             {selectedRegion.fill.type !== "whole_source_set" && selectedRegion.fill.type !== "rectified_patch" ? <option value="simple">Simple region</option> : null}
           </select><small>Double-click a region to edit its bounds. Right-click it to choose a patch directly.</small></label>
-          {templateMode ? <small>Template regions are selected against the compiled preview, but their slot bounds and source assignment remain editable.</small> : <><label>Behavior<select value={selectedItem?.behavior ?? selectedRegion.behavior} onChange={(event) => { const behavior = event.target.value as FillBehavior; const span = Math.max(1, selectedItem?.naturalSize.width ?? selectedRegion.bounds.width); const cap = Math.min(16, Math.max(0, Math.floor((span - 1) / 2))); updateSelectedItem({ behavior, trimCaps: behavior === "trim_cap" ? selectedItem?.trimCaps ?? { axis: "horizontal", leadingPx: cap, trailingPx: cap } : undefined }); }}>{behaviorOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+          {templateMode ? <small>Template regions keep stable sheet bounds while you edit their source assignment.</small> : <><label>Behavior<select value={selectedItem?.behavior ?? selectedRegion.behavior} onChange={(event) => { const behavior = event.target.value as FillBehavior; const span = Math.max(1, selectedItem?.naturalSize.width ?? selectedRegion.bounds.width); const cap = Math.min(16, Math.max(0, Math.floor((span - 1) / 2))); updateSelectedItem({ behavior, trimCaps: behavior === "trim_cap" ? selectedItem?.trimCaps ?? { axis: "horizontal", leadingPx: cap, trailingPx: cap } : undefined }); }}>{behaviorOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
           {(selectedItem?.behavior ?? selectedRegion.behavior) === "trim_cap" ? <div className="trim-cap-fields"><label>Axis<select value={selectedItem?.trimCaps?.axis ?? "horizontal"} onChange={(event) => updateSelectedItem({ trimCaps: { axis: event.target.value as "horizontal" | "vertical", leadingPx: selectedItem?.trimCaps?.leadingPx ?? 16, trailingPx: selectedItem?.trimCaps?.trailingPx ?? 16 } })}><option value="horizontal">Horizontal</option><option value="vertical">Vertical</option></select></label><label>Leading<input type="number" min={0} value={selectedItem?.trimCaps?.leadingPx ?? 16} onChange={(event) => updateSelectedItem({ trimCaps: { axis: selectedItem?.trimCaps?.axis ?? "horizontal", leadingPx: event.target.valueAsNumber, trailingPx: selectedItem?.trimCaps?.trailingPx ?? 16 } })} /></label><label>Trailing<input type="number" min={0} value={selectedItem?.trimCaps?.trailingPx ?? 16} onChange={(event) => updateSelectedItem({ trimCaps: { axis: selectedItem?.trimCaps?.axis ?? "horizontal", leadingPx: selectedItem?.trimCaps?.leadingPx ?? 16, trailingPx: event.target.valueAsNumber } })} /></label></div> : null}</>}
           {!templateMode ? <>
           <fieldset className="region-bounds-editor"><legend>Exact pixel bounds</legend>{(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field.toUpperCase()}<input key={`${selectedRegion.id}-${field}-${selectedRegion.bounds[field]}`} type="number" min={field === "width" || field === "height" ? 1 : 0} defaultValue={selectedRegion.bounds[field]} disabled={(field === "x" || field === "y") ? selectedRegion.locks.position : field === "width" ? selectedRegion.locks.width : selectedRegion.locks.height} onBlur={(event) => { const value = event.currentTarget.valueAsNumber; if (!Number.isFinite(value)) { event.currentTarget.value = String(selectedRegion.bounds[field]); return; } void apply({ type: "set_bounds", regionId: selectedRegion.id, bounds: keyboardBounds({ ...selectedRegion.bounds, [field]: Math.round(value) }, "", {}, output) }, commandGroup.current++); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); else if (event.key === "Escape") { event.currentTarget.value = String(selectedRegion.bounds[field]); event.currentTarget.blur(); } }} /></label>)}</fieldset>
           <div className="region-lock-controls" role="group" aria-label="Region dimension locks">{(["position", "width", "height"] as const).map((lock) => <button key={lock} aria-pressed={selectedRegion.locks[lock]} className={selectedRegion.locks[lock] ? "active" : ""} onClick={() => void apply({ type: "set_locks", regionId: selectedRegion.id, locks: { ...selectedRegion.locks, [lock]: !selectedRegion.locks[lock] } })}>Lock {lock}</button>)}</div>
-          <div className="button-row"><button onClick={() => void apply({ type: "reorder", regionId: selectedRegion.id, toIndex: Math.max(0, selectedRegion.orderIndex - 1) })} disabled={selectedRegion.orderIndex === 0}>Earlier</button><button onClick={() => void apply({ type: "reorder", regionId: selectedRegion.id, toIndex: Math.min(regions.length - 1, selectedRegion.orderIndex + 1) })} disabled={selectedRegion.orderIndex === regions.length - 1}>Later</button><button className="danger" onClick={() => void deleteSelectedSimple()} disabled={selectedRegion.fill.type !== "simple_color" && selectedRegion.fill.type !== "simple_data"}>Delete simple region</button></div>
+          <div className="button-row"><button onClick={() => void apply({ type: "reorder", regionId: selectedRegion.id, toIndex: Math.max(0, selectedRegion.orderIndex - 1) })} disabled={selectedRegion.orderIndex === 0}>Move up</button><button onClick={() => void apply({ type: "reorder", regionId: selectedRegion.id, toIndex: Math.min(regions.length - 1, selectedRegion.orderIndex + 1) })} disabled={selectedRegion.orderIndex === regions.length - 1}>Move down</button><button className="danger" onClick={() => void deleteSelectedSimple()} disabled={selectedRegion.fill.type !== "simple_color" && selectedRegion.fill.type !== "simple_data"}>Delete simple region</button></div>
           <small>Keyboard: arrows move; Shift+arrows resize; Ctrl accelerates; Alt+Up/Down reorders; P/W/H toggle locks.</small>
           </> : null}
         </> : <p>Select a region on the complete sheet. Selecting a patch on the left only highlights its region.</p>}
@@ -622,13 +644,30 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
       </details> : null}
     </div>
 
+    {showTrimSettings ? <section id="trim-settings-panel" className="trim-settings-panel" role="dialog" aria-labelledby="trim-settings-title">
+        <header><div><span className="modal-kicker">Trim sheet</span><h2 id="trim-settings-title">Trim Sheet Settings</h2></div><button aria-label="Close Trim Sheet Settings" onClick={() => setShowTrimSettings(false)}>Close</button></header>
+        <div className="trim-settings-body">
+          {templateMode ? <>
+            <label>Material<select value={templateSourceSetId ?? ""} onChange={(event) => setSelectedSourceSetIds(event.target.value ? [event.target.value] : [])}><option value="">Choose a Base Color material</option>{project.sourceSets.filter((sourceSet) => project.sources.some((source) => source.sourceSetId === sourceSet.id && source.channel === "base_color")).map((sourceSet) => <option key={sourceSet.id} value={sourceSet.id}>{sourceSet.name}</option>)}</select><small>Source framing and the selected region’s source area are edited on the left workbench.</small></label>
+            <div className="automatic-input-note"><strong>{selectedTemplateOption.label}</strong><span>{selectedTemplateOption.description}</span></div>
+          </> : <>
+            <div className="numeric-pair"><label>Width<input type="number" min={64} max={16384} value={settings.output.width} onChange={(event) => setOutput("width", event.target.valueAsNumber)} /></label><label>Height<input type="number" min={64} max={16384} value={settings.output.height} onChange={(event) => setOutput("height", event.target.valueAsNumber)} /></label></div>
+            <div className="numeric-pair"><label>Padding<input type="number" min={0} value={settings.paddingPx} onChange={(event) => setSettings((current) => ({ ...current, paddingPx: Math.max(0, event.target.valueAsNumber || 0) }))} /></label><label>Bleed<input type="number" min={0} value={settings.bleedPx} onChange={(event) => setSettings((current) => ({ ...current, bleedPx: Math.max(0, event.target.valueAsNumber || 0) }))} /></label></div>
+            <label>Patch order<select value={settings.order} onChange={(event) => setSettings((current) => ({ ...current, order: event.target.value as LayoutSettings["order"] }))}><option value="input">Input order</option><option value="largest_first">Largest first</option><option value="horizontal_first">Horizontal first</option><option value="vertical_first">Vertical first</option></select></label>
+            <label>Pack priority<select value={settings.autoPack.priority} onChange={(event) => setSettings((current) => ({ ...current, autoPack: { ...current.autoPack, priority: event.target.value as LayoutSettings["autoPack"]["priority"] } }))}><option value="balanced">Balanced</option><option value="horizontal_strips">Horizontal trims</option><option value="vertical_strips">Vertical trims</option></select></label>
+            <fieldset className="layout-source-choices"><legend>Included materials</legend>{project.sourceSets.map((sourceSet) => <label key={sourceSet.id} className="check-field"><input type="checkbox" checked={selectedSourceSetIds.includes(sourceSet.id)} onChange={(event) => setSelectedSourceSetIds((current) => event.target.checked ? [...current, sourceSet.id] : current.filter((id) => id !== sourceSet.id))} />{sourceSet.name}</label>)}</fieldset>
+          </>}
+        </div>
+        <footer className="modal-actions"><button onClick={() => setShowTrimSettings(false)}>Close</button><button className="primary" onClick={() => { setShowTrimSettings(false); void generate(); }}>Update sheet</button></footer>
+    </section> : null}
+
     {regionContextMenu ? <div className="patch-context-menu region-context-menu" role="menu" style={{ left: regionContextMenu.x, top: regionContextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
       <strong>Assign region source</strong>
       {(() => {
         const region = regions.find((candidate) => candidate.id === regionContextMenu.regionId);
         return region ? <>
           {project.sourceSets.map((sourceSet) => <button key={`source:${sourceSet.id}`} role="menuitem" onClick={() => setRegionFill(region, { type: "whole_source_set", sourceSetId: sourceSet.id })}>{sourceSet.name} · whole source</button>)}
-          {project.patches.map((patch) => {
+          {project.patches.filter((patch) => patch.enabled).map((patch) => {
             const source = project.sources.find((candidate) => candidate.id === patch.sourceId);
             return source ? <button key={`patch:${patch.id}`} role="menuitem" onClick={() => setRegionFill(region, { type: "rectified_patch", sourceSetId: source.sourceSetId, patchId: patch.id })}>{patch.name} · patch</button> : null;
           })}
@@ -638,6 +677,6 @@ export function LayoutWorkspace({ project, selectedPatchId, selectedSourceSetId,
 
     {project.warnings.map((warning) => <section key={`${warning.code}-${warning.message}`} className="layout-warning" role="status"><strong>{warning.message}</strong><span>{warning.recovery}</span></section>)}
     {failure ? <section className="layout-error" role="alert"><strong>{failure.message}</strong><span>{failure.recovery}</span>{failure.detail ? <details><summary>Technical detail</summary><code>{failure.detail}</code></details> : null}</section> : null}
-    <div className="layout-generate-bar"><button className="primary" onClick={() => void generate()} disabled={busy}>Update sheet</button>{busy ? <><span role="status">Updating sheetâ€¦</span><button onClick={() => void cancelSolve()}>Cancel</button></> : <small>{templateMode ? "Automatic on material or template changes; use Update sheet after editing slot behavior." : "Atlas repacks enabled patches with the current packing settings."}</small>}</div>
+    <div className="layout-generate-bar"><button className="primary" onClick={() => void generate()} disabled={busy}>Update sheet</button>{busy ? <><span role="status">Updating sheet…</span><button onClick={() => void cancelSolve()}>Cancel</button></> : <small>{templateMode ? "Automatic on material, framing, or region source edits; use Update sheet to commit." : "Atlas repacks enabled patches with the current packing settings."}</small>}</div>
   </section>;
 }

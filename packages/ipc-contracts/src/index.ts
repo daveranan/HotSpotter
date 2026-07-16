@@ -251,6 +251,7 @@ export interface TemplateLayoutContract {
   snapshot?: TemplateSnapshot;
   slotBindings: SlotBinding[];
   styleRecipe: StyleRecipe;
+  sourceFraming?: TemplateSourceTransform;
 }
 export type LayoutOrder = "input" | "largest_first" | "horizontal_first" | "vertical_first";
 export type PackPriority = "balanced" | "horizontal_strips" | "vertical_strips";
@@ -316,6 +317,40 @@ export interface StoredLayout {
   items: LayoutItem[];
   layoutKind: LayoutKind;
   template?: TemplateLayoutContract;
+  /** Missing entries use the versioned whole-source default. */
+  sourceLayers: Record<string, RegionSourceLayer>;
+}
+
+export type SourceMapping =
+  | { type: "whole_source" }
+  | { type: "bounds"; bounds: { x: number; y: number; width: number; height: number } }
+  | { type: "perspective"; quad: [NormalizedPoint, NormalizedPoint, NormalizedPoint, NormalizedPoint] };
+
+export type SourceRectificationMode = "none" | "perspective";
+export type SourceSamplingMode = "nearest" | "linear" | "cubic";
+export type SourceBlend = "replace" | "normal" | "multiply" | "overlay";
+
+export type SourceWarp =
+  | { type: "planar"; scaleX: number; scaleY: number; offsetX: number; offsetY: number }
+  | { type: "perspective"; strength: number }
+  | { type: "polar"; centerX: number; centerY: number; radius: number }
+  | { type: "spiral_twirl"; centerX: number; centerY: number; radius: number; strength: number; iterations: number }
+  | { type: "radial_lens"; centerX: number; centerY: number; radius: number; strength: number }
+  | { type: "cylindrical_arc"; radius: number; arcDegrees: number };
+
+/** Executable source UV recipe. Warp order is exactly the array order. */
+export interface RegionSourceLayer {
+  version: number;
+  mapping: SourceMapping;
+  rectification: { mode: SourceRectificationMode; maxIntermediateEdge: number };
+  sampling: { mode: SourceSamplingMode; scale: number };
+  rotationDegrees: number;
+  mirrorX: boolean;
+  mirrorY: boolean;
+  blend: SourceBlend;
+  opacity: number;
+  variationOffset: [number, number];
+  warps: SourceWarp[];
 }
 
 export interface LayoutRequest {
@@ -331,6 +366,7 @@ export type SourceFramingMode = "cover" | "stretch" | "repeat";
 export interface TemplateSourceTransform {
   mode: SourceFramingMode;
   cropFocus: NormalizedPoint;
+  cropBounds?: { x: number; y: number; width: number; height: number };
 }
 
 export type GenerateLayoutRequest =
@@ -366,6 +402,7 @@ export interface GenerateLayoutResult {
 export type LayoutCommand =
   | { type: "set_bounds"; regionId: string; bounds: PixelBounds }
   | { type: "set_fill"; regionId: string; fill: RegionFill }
+  | { type: "set_source_layer"; regionId: string; sourceLayer: RegionSourceLayer }
   | { type: "set_locks"; regionId: string; locks: { position: boolean; width: boolean; height: boolean } }
   | { type: "reorder"; regionId: string; toIndex: number }
   | { type: "delete_simple"; regionId: string };

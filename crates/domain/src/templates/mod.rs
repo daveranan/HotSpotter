@@ -146,7 +146,9 @@ impl TemplateDefinition {
         let mut colors = BTreeSet::new();
         for slot in &self.slots {
             if slot.slot_key.trim().is_empty() || !slot_keys.insert(slot.slot_key.as_str()) {
-                return Err(TemplateRegistryError::DuplicateSlotKey(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::DuplicateSlotKey(
+                    slot.slot_key.clone(),
+                ));
             }
             if slot.compatibility_key.trim().is_empty()
                 || !compatibility_keys.insert(slot.compatibility_key.as_str())
@@ -156,13 +158,19 @@ impl TemplateDefinition {
                 ));
             }
             if slot.material_group.trim().is_empty() {
-                return Err(TemplateRegistryError::InvalidMaterialGroup(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::InvalidMaterialGroup(
+                    slot.slot_key.clone(),
+                ));
             }
             if slot.variation_group.trim().is_empty() {
-                return Err(TemplateRegistryError::InvalidVariationGroup(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::InvalidVariationGroup(
+                    slot.slot_key.clone(),
+                ));
             }
             let profile_matches_role = match slot.role {
-                TemplateSlotRole::Planar => matches!(slot.structural_profile, StructuralProfile::Flat),
+                TemplateSlotRole::Planar => {
+                    matches!(slot.structural_profile, StructuralProfile::Flat)
+                }
                 TemplateSlotRole::RepeatingStrip => matches!(
                     slot.structural_profile,
                     StructuralProfile::Flat
@@ -190,7 +198,9 @@ impl TemplateDefinition {
                 ),
             };
             if !profile_matches_role {
-                return Err(TemplateRegistryError::InvalidRoleProfile(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::InvalidRoleProfile(
+                    slot.slot_key.clone(),
+                ));
             }
             if !slot.id_color.is_valid() || !colors.insert(slot.id_color) {
                 return Err(TemplateRegistryError::DuplicateIdColor(slot.id_color));
@@ -202,7 +212,9 @@ impl TemplateDefinition {
                 || right > self.canonical_width
                 || bottom > self.canonical_height
             {
-                return Err(TemplateRegistryError::InvalidAllocation(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::InvalidAllocation(
+                    slot.slot_key.clone(),
+                ));
             }
             if let Some(hotspot) = slot.hotspot
                 && (hotspot.x < slot.allocation.x
@@ -218,7 +230,9 @@ impl TemplateDefinition {
                 || slot.world_placement.width <= 0.0
                 || slot.world_placement.height <= 0.0
             {
-                return Err(TemplateRegistryError::InvalidWorldPlacement(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::InvalidWorldPlacement(
+                    slot.slot_key.clone(),
+                ));
             }
             match (slot.role, slot.radial_parameters) {
                 (TemplateSlotRole::Radial, Some(radial)) => {
@@ -274,7 +288,9 @@ impl TemplateRegistry {
             include_str!("../../../../assets/templates/horizontal_moulding/1.0.0/template.json"),
             include_str!("../../../../assets/templates/vertical_trim/1.0.0/template.json"),
             include_str!("../../../../assets/templates/wood_board_moulding/1.0.0/template.json"),
-            include_str!("../../../../assets/templates/detail_ribbon_microtrim/1.0.0/template.json"),
+            include_str!(
+                "../../../../assets/templates/detail_ribbon_microtrim/1.0.0/template.json"
+            ),
         ];
 
         let mut definitions = BTreeMap::new();
@@ -410,7 +426,10 @@ mod tests {
         assert_eq!(snapshot.identity.template_id, "hotspot");
         assert_eq!(snapshot.canonical_width, CANONICAL_TEMPLATE_EDGE);
         assert_eq!(snapshot.snapshot_hash.len(), 64);
-        assert_eq!(snapshot.snapshot_json, serde_json::to_string(definition).expect("canonical JSON"));
+        assert_eq!(
+            snapshot.snapshot_json,
+            serde_json::to_string(definition).expect("canonical JSON")
+        );
     }
 
     #[test]
@@ -425,7 +444,10 @@ mod tests {
             TemplateRegistry::from_json(&duplicate_color),
             Err(TemplateRegistryError::DuplicateIdColor(_))
         ));
-        let missing_group = CATALOG.replace("\"materialGroup\": \"architecture\"", "\"materialGroup\": \"\"");
+        let missing_group = CATALOG.replace(
+            "\"materialGroup\": \"architecture\"",
+            "\"materialGroup\": \"\"",
+        );
         assert!(matches!(
             TemplateRegistry::from_json(&missing_group),
             Err(TemplateRegistryError::InvalidMaterialGroup(_))
@@ -442,7 +464,10 @@ mod tests {
             "ht.wood_board_moulding",
             "ht.detail_ribbon_microtrim",
         ] {
-            assert!(registry.get(template_id, "1.0.0").is_some(), "{template_id}");
+            assert!(
+                registry.get(template_id, "1.0.0").is_some(),
+                "{template_id}"
+            );
         }
     }
 }
