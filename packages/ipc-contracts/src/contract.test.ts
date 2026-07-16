@@ -3,11 +3,16 @@ import test from "node:test";
 import fixture from "../../../fixtures/contracts/foundation-status.json" with { type: "json" };
 import lifecycle from "../../../fixtures/contracts/phase-1-lifecycle.json" with { type: "json" };
 import patchAuthoring from "../../../fixtures/contracts/phase-2-patch-authoring.json" with { type: "json" };
+import layoutAuthoring from "../../../fixtures/contracts/phase-3-layout-authoring.json" with { type: "json" };
 import {
   IPC_PROTOCOL_VERSION,
+  type AuthoringHistorySnapshot,
   type CloseProjectRequest,
   type CreateProjectRequest,
   type ImportSourceRequest,
+  type GenerateLayoutRequest,
+  type LayoutCommandRequest,
+  type LayoutStateSnapshot,
   type PatchCommandRequest,
   type PatchPreviewRequest,
   type PatchStateSnapshot,
@@ -44,6 +49,7 @@ test("phase 1 project and import requests remain protocol versioned", () => {
     path: "<source>",
     ownership: "owned_copy",
     channel: "base_color",
+    sourceSetId: "00000000-0000-4000-8000-000000000001",
   };
   assert.equal(create.protocolVersion, IPC_PROTOCOL_VERSION);
   assert.equal(source.protocolVersion, IPC_PROTOCOL_VERSION);
@@ -68,12 +74,19 @@ test("phase 1 lifecycle and snapshot contracts carry recovery and registration s
     schemaVersion: 5,
     dirty: true,
     staleLockRecovered: false,
+    isDraft: false,
+    authoringRevision: 0,
     warnings: [],
     patches: [],
     canUndoPatch: false,
     canRedoPatch: false,
+    canUndoProject: false,
+    canRedoProject: false,
+    layout: null,
+    sourceSets: [{ id: "00000000-0000-4000-8000-000000000001", name: "Material 1" }],
     sources: [{
       id: "00000000-0000-0000-0000-000000000002",
+      sourceSetId: "00000000-0000-4000-8000-000000000001",
       channel: "roughness",
       ownership: "verified_external_reference",
       displayName: "roughness.tif",
@@ -109,7 +122,7 @@ test("phase 1 fixture covers native lifecycle shapes and expanded material slots
   assert.equal(lifecycle.importRequest.channel, "specular");
   assert.equal(lifecycle.closeRequest.disposition, "discard");
   assert.notEqual(lifecycle.recoverRequest.recoveryPath, lifecycle.recoverRequest.destinationPath);
-  assert.equal(lifecycle.projectSnapshot.schemaVersion, 6);
+  assert.equal(lifecycle.projectSnapshot.schemaVersion, 7);
   assert.equal(lifecycle.projectSnapshot.sources[0]?.channel, "specular");
   assert.equal(lifecycle.projectSnapshot.warnings[0]?.code, "recovery_failed");
   assert.equal(clearSpecular.channel, lifecycle.importRequest.channel);
@@ -129,4 +142,25 @@ test("phase 2 fixtures preserve camel-case patch commands, assistance, preview, 
   assert.equal(preview.maxEdge, 768);
   assert.equal(state.canUndoPatch, true);
   assert.equal(state.canRedoPatch, false);
+});
+
+test("phase 3 fixture preserves solver intent, stable references, manual commands, and project history", () => {
+  const generate = layoutAuthoring.generateRequest as GenerateLayoutRequest;
+  const command = layoutAuthoring.layoutCommandRequest as LayoutCommandRequest;
+  const state = layoutAuthoring.layoutState as LayoutStateSnapshot;
+  const history = layoutAuthoring.historyState as AuthoringHistorySnapshot;
+  assert.equal(generate.protocolVersion, IPC_PROTOCOL_VERSION);
+  assert.equal(generate.request.preset, "horizontal_trims");
+  assert.equal(generate.request.items[0]?.fill.type, "whole_source_set");
+  assert.equal(generate.request.items[1]?.fill.type, "rectified_patch");
+  assert.equal(generate.request.existingRegions[0]?.locks.position, true);
+  assert.equal(command.command.type, "set_bounds");
+  assert.equal(command.coalescingGroup, 72);
+  assert.equal(state.canUndoProject, true);
+  assert.equal(state.canUndoPatch, true);
+  assert.equal(state.layout, null);
+  assert.deepEqual(history.patches, []);
+  assert.equal(history.layout, null);
+  assert.equal(history.canUndoPatch, history.canUndoProject);
+  assert.equal(history.canRedoPatch, history.canRedoProject);
 });

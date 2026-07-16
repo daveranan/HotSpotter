@@ -1,5 +1,9 @@
 #![doc = "Validated patch geometry, homography, polygon assistance, and rectified output sizing."]
 
+mod layout;
+
+pub use layout::{LayoutSolveError, solve_layout, validate_layout};
+
 use std::cmp::Ordering;
 
 use hot_trimmer_domain::{ErrorCode, NormalizedPoint, RectificationSettings, UserFacingError};

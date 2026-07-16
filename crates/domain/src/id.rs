@@ -16,6 +16,18 @@ macro_rules! stable_id {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
+
+            /// Restores an ID from its stable 128-bit wire representation.
+            #[must_use]
+            pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+                Self(Uuid::from_bytes(bytes))
+            }
+
+            /// Returns the stable bytes used by deterministic derived identifiers and colors.
+            #[must_use]
+            pub const fn to_bytes(self) -> [u8; 16] {
+                *self.0.as_bytes()
+            }
         }
 
         impl Default for $name {
@@ -42,8 +54,10 @@ macro_rules! stable_id {
 
 stable_id!(ProjectId);
 stable_id!(SourceId);
+stable_id!(SourceSetId);
 stable_id!(PatchId);
 stable_id!(LayoutId);
+stable_id!(RegionId);
 stable_id!(LayerId);
 stable_id!(MapId);
 

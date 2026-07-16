@@ -15,6 +15,7 @@ pub enum ErrorCode {
     RecoveryFailed,
     SourceRegistrationFailed,
     PatchGeometryInvalid,
+    LayoutInvalid,
     OperationCancelled,
     Internal,
 }

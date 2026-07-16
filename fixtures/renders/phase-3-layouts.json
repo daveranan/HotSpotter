@@ -1,0 +1,280 @@
+{
+  "version": 2,
+  "coordinatePolicy": "integer_content_bounds_with_external_padding_and_bleed",
+  "cases": [
+    {
+      "name": "mixed-behavior-order-and-colors",
+      "request": {
+        "layoutId": "10000000-0000-4000-8000-000000000001",
+        "preset": "horizontal_trims",
+        "settings": {
+          "output": { "width": 512, "height": 256 },
+          "paddingPx": 4,
+          "bleedPx": 8,
+          "order": "horizontal_first",
+          "autoPack": { "enabled": true, "priority": "horizontal_strips", "seed": 42 }
+        },
+        "items": [
+          {
+            "key": "patch:tile",
+            "fill": { "type": "simple_color", "rgba": [20, 40, 60, 255] },
+            "behavior": "tile",
+            "naturalSize": { "width": 256, "height": 256 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000003"
+          },
+          {
+            "key": "source:strip",
+            "fill": { "type": "simple_color", "rgba": [80, 100, 120, 255] },
+            "behavior": "horizontal_loop",
+            "naturalSize": { "width": 4096, "height": 128 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "key": "patch:cap",
+            "fill": { "type": "simple_color", "rgba": [140, 160, 180, 255] },
+            "behavior": "trim_cap",
+            "trimCaps": { "axis": "horizontal", "leadingPx": 12, "trailingPx": 20 },
+            "naturalSize": { "width": 2048, "height": 96 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000002"
+          }
+        ],
+        "existingRegions": []
+      },
+      "expect": {
+        "result": "success",
+        "regions": [
+          {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "itemKey": "source:strip",
+            "fill": { "type": "simple_color", "rgba": [80, 100, 120, 255] },
+            "behavior": "horizontal_loop",
+            "bounds": { "x": 12, "y": 12, "width": 488, "height": 61 },
+            "paddingPx": 4,
+            "bleedPx": 8,
+            "orderIndex": 0,
+            "locks": { "position": false, "width": false, "height": false },
+            "idColor": [64, 64, 65]
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "itemKey": "patch:cap",
+            "fill": { "type": "simple_color", "rgba": [140, 160, 180, 255] },
+            "behavior": "trim_cap",
+            "trimCaps": { "axis": "horizontal", "leadingPx": 12, "trailingPx": 20 },
+            "bounds": { "x": 12, "y": 97, "width": 488, "height": 61 },
+            "paddingPx": 4,
+            "bleedPx": 8,
+            "orderIndex": 1,
+            "locks": { "position": false, "width": false, "height": false },
+            "idColor": [64, 64, 66]
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000003",
+            "itemKey": "patch:tile",
+            "fill": { "type": "simple_color", "rgba": [20, 40, 60, 255] },
+            "behavior": "tile",
+            "bounds": { "x": 12, "y": 182, "width": 488, "height": 61 },
+            "paddingPx": 4,
+            "bleedPx": 8,
+            "orderIndex": 2,
+            "locks": { "position": false, "width": false, "height": false },
+            "idColor": [64, 64, 67]
+          }
+        ]
+      }
+    },
+    {
+      "name": "locked-region-and-trim-caps",
+      "request": {
+        "layoutId": "20000000-0000-4000-8000-000000000001",
+        "preset": "modular_kit",
+        "settings": {
+          "output": { "width": 512, "height": 512 },
+          "paddingPx": 4,
+          "bleedPx": 4,
+          "order": "input",
+          "autoPack": { "enabled": true, "priority": "balanced", "seed": 7 }
+        },
+        "items": [
+          {
+            "key": "source:locked",
+            "fill": { "type": "simple_color", "rgba": [30, 50, 70, 255] },
+            "behavior": "stretch",
+            "naturalSize": { "width": 512, "height": 512 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000011"
+          },
+          {
+            "key": "patch:vertical-cap",
+            "fill": { "type": "simple_color", "rgba": [90, 110, 130, 255] },
+            "behavior": "trim_cap",
+            "trimCaps": { "axis": "vertical", "leadingPx": 20, "trailingPx": 20 },
+            "naturalSize": { "width": 80, "height": 2048 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000012"
+          }
+        ],
+        "existingRegions": [
+          {
+            "id": "00000000-0000-4000-8000-000000000011",
+            "itemKey": "source:locked",
+            "fill": { "type": "simple_color", "rgba": [30, 50, 70, 255] },
+            "behavior": "stretch",
+            "bounds": { "x": 16, "y": 8, "width": 160, "height": 200 },
+            "paddingPx": 4,
+            "bleedPx": 4,
+            "orderIndex": 0,
+            "locks": { "position": true, "width": true, "height": true },
+            "idColor": [100, 101, 102]
+          }
+        ]
+      },
+      "expect": {
+        "result": "success",
+        "regions": [
+          {
+            "id": "00000000-0000-4000-8000-000000000011",
+            "itemKey": "source:locked",
+            "fill": { "type": "simple_color", "rgba": [30, 50, 70, 255] },
+            "behavior": "stretch",
+            "bounds": { "x": 16, "y": 8, "width": 160, "height": 200 },
+            "paddingPx": 4,
+            "bleedPx": 4,
+            "orderIndex": 0,
+            "locks": { "position": true, "width": true, "height": true },
+            "idColor": [100, 101, 102]
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000012",
+            "itemKey": "patch:vertical-cap",
+            "fill": { "type": "simple_color", "rgba": [90, 110, 130, 255] },
+            "behavior": "trim_cap",
+            "trimCaps": { "axis": "vertical", "leadingPx": 20, "trailingPx": 20 },
+            "bounds": { "x": 192, "y": 8, "width": 240, "height": 496 },
+            "paddingPx": 4,
+            "bleedPx": 4,
+            "orderIndex": 1,
+            "locks": { "position": false, "width": false, "height": false },
+            "idColor": [64, 64, 82]
+          }
+        ]
+      }
+    },
+    {
+      "name": "extreme-aspect-ratios",
+      "request": {
+        "layoutId": "30000000-0000-4000-8000-000000000001",
+        "preset": "atlas",
+        "settings": {
+          "output": { "width": 256, "height": 2048 },
+          "paddingPx": 2,
+          "bleedPx": 2,
+          "order": "input",
+          "autoPack": { "enabled": true, "priority": "vertical_strips", "seed": 99 }
+        },
+        "items": [
+          {
+            "key": "source:one-pixel-pillar",
+            "fill": { "type": "simple_color", "rgba": [40, 60, 80, 255] },
+            "behavior": "vertical_loop",
+            "naturalSize": { "width": 1, "height": 16000 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000021"
+          },
+          {
+            "key": "patch:one-pixel-edge",
+            "fill": { "type": "simple_color", "rgba": [100, 120, 140, 255] },
+            "behavior": "horizontal_loop",
+            "naturalSize": { "width": 16000, "height": 1 },
+            "enabled": true,
+            "participates": true,
+            "constraints": {},
+            "regionId": "00000000-0000-4000-8000-000000000022"
+          }
+        ],
+        "existingRegions": []
+      },
+      "expect": {
+        "result": "success",
+        "regions": [
+          {
+            "id": "00000000-0000-4000-8000-000000000021",
+            "itemKey": "source:one-pixel-pillar",
+            "fill": { "type": "simple_color", "rgba": [40, 60, 80, 255] },
+            "behavior": "vertical_loop",
+            "bounds": { "x": 4, "y": 4, "width": 1, "height": 1016 },
+            "paddingPx": 2,
+            "bleedPx": 2,
+            "orderIndex": 0,
+            "locks": { "position": false, "width": false, "height": false },
+            "idColor": [64, 64, 97]
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000022",
+            "itemKey": "patch:one-pixel-edge",
+            "fill": { "type": "simple_color", "rgba": [100, 120, 140, 255] },
+            "behavior": "horizontal_loop",
+            "bounds": { "x": 4, "y": 1028, "width": 248, "height": 1 },
+            "paddingPx": 2,
+            "bleedPx": 2,
+            "orderIndex": 1,
+            "locks": { "position": false, "width": false, "height": false },
+            "idColor": [64, 64, 98]
+          }
+        ]
+      }
+    },
+    {
+      "name": "typed-impossible-padding-fit",
+      "request": {
+        "layoutId": "40000000-0000-4000-8000-000000000001",
+        "preset": "atlas",
+        "settings": {
+          "output": { "width": 128, "height": 128 },
+          "paddingPx": 32,
+          "bleedPx": 32,
+          "order": "input",
+          "autoPack": { "enabled": true, "priority": "balanced", "seed": 1 }
+        },
+        "items": [
+          {
+            "key": "source:oversized",
+            "fill": { "type": "simple_color", "rgba": [160, 180, 200, 255] },
+            "behavior": "stretch",
+            "naturalSize": { "width": 128, "height": 128 },
+            "enabled": true,
+            "participates": true,
+            "constraints": { "fixedWidthPx": 128, "fixedHeightPx": 128 },
+            "regionId": "00000000-0000-4000-8000-000000000031"
+          }
+        ],
+        "existingRegions": []
+      },
+      "expect": {
+        "result": "failure",
+        "error": {
+          "kind": "impossible_fit",
+          "itemKey": "source:oversized",
+          "requested": { "width": 1, "height": 1 },
+          "output": { "width": 128, "height": 128 },
+          "reason": "padding and bleed consume the available output"
+        }
+      }
+    }
+  ]
+}

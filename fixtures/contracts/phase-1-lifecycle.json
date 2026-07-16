@@ -24,10 +24,11 @@
     "id": "00000000-0000-4000-8000-000000000001",
     "name": "Brick",
     "path": "<project>",
-    "schemaVersion": 6,
+    "schemaVersion": 7,
     "dirty": true,
     "staleLockRecovered": false,
     "isDraft": false,
+    "authoringRevision": 0,
     "sources": [
       {
         "id": "00000000-0000-4000-8000-000000000002",
@@ -51,9 +52,18 @@
         ]
       }
     ],
+    "sourceSets": [
+      {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "name": "Material 1"
+      }
+    ],
     "patches": [],
+    "layout": null,
     "canUndoPatch": false,
     "canRedoPatch": false,
+    "canUndoProject": false,
+    "canRedoProject": false,
     "warnings": [
       {
         "code": "recovery_failed",

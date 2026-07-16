@@ -12,6 +12,8 @@ import {
   type CommandFailure,
   type FoundationStatusRequest,
   type ImportSourceRequest,
+  type LayoutStateSnapshot,
+  type AuthoringHistorySnapshot,
   type ProjectNameRequest,
   type ProjectPathRequest,
   type ProjectSnapshot,
@@ -29,7 +31,7 @@ import { PatchWorkspace } from "./patch-workspace";
 import "../styles.css";
 
 const workspaceModes = [
-  { id: "patches", label: "Workbench & Hotspot Sheet", available: true, detail: "Build material sources, patches, and the final workpiece" },
+  { id: "patches", label: "Patches & Layout", available: true, detail: "Build material sources, patches, and the final trim sheet" },
   { id: "maps", label: "Layers & Maps", available: false, detail: "Nondestructive material layers and generated maps" },
 ] as const;
 
@@ -84,9 +86,7 @@ function nextEmptyChannel(sources: SourceSnapshot[]): SourceChannel {
 }
 
 function activeSourceSetId(project: ProjectSnapshot): string {
-  // Schema v5 has one registered material set. The project ID is its stable compatibility identity until
-  // Phase 3 persists explicit ordered source sets and native snapshots return their IDs.
-  return project.sources[0]?.sourceSetId ?? project.id;
+  return project.sourceSets[0]?.id ?? project.id;
 }
 
 function App(): React.JSX.Element {
@@ -316,13 +316,32 @@ function App(): React.JSX.Element {
     }
   }
 
-  function acceptPatchState(state: PatchStateSnapshot): void {
+  function acceptPatchState(state: PatchStateSnapshot | AuthoringHistorySnapshot): void {
     setProject((current) => current ? {
       ...current,
       patches: state.patches,
+      ...("layout" in state ? { layout: state.layout } : {}),
       dirty: state.dirty,
+      authoringRevision: state.authoringRevision,
       canUndoPatch: state.canUndoPatch,
       canRedoPatch: state.canRedoPatch,
+      canUndoProject: state.canUndoProject,
+      canRedoProject: state.canRedoProject,
+      warnings: state.warnings,
+    } : current);
+  }
+
+  function acceptLayoutState(state: LayoutStateSnapshot | AuthoringHistorySnapshot): void {
+    setProject((current) => current ? {
+      ...current,
+      ...("patches" in state ? { patches: state.patches } : {}),
+      layout: state.layout,
+      dirty: state.dirty,
+      authoringRevision: state.authoringRevision,
+      canUndoPatch: state.canUndoPatch,
+      canRedoPatch: state.canRedoPatch,
+      canUndoProject: state.canUndoProject,
+      canRedoProject: state.canRedoProject,
       warnings: state.warnings,
     } : current);
   }
@@ -592,7 +611,9 @@ function App(): React.JSX.Element {
             return <button key={mode.id} className={`mode ${mode.id === workspaceMode ? "active" : ""}`} aria-current={mode.id === workspaceMode ? "page" : undefined} disabled={unavailable} onClick={() => { if (mode.id !== "maps") setWorkspaceMode(mode.id); }} title={mode.detail}>{mode.label}{!mode.available ? <small>Later</small> : null}</button>;
           })}
         </nav> : null}
-        {project ? <div className="publish-actions" aria-label="Output actions"><button disabled title="Export arrives in a later phase">Export <small>Later</small></button><button disabled title="Send directly to Blender arrives after export integration">Send to Blender <small>Later</small></button></div> : <span className="window-drag-space" data-tauri-drag-region />}
+        <span className="window-drag-space window-drag-space-main" data-tauri-drag-region aria-hidden="true" />
+        {project ? <div className="publish-actions" aria-label="Output actions"><button disabled title="Export arrives in a later phase">Export <small>Later</small></button><button disabled title="Send directly to Blender arrives after export integration">Send to Blender <small>Later</small></button></div> : null}
+        <span className="window-drag-space window-drag-space-tail" data-tauri-drag-region aria-hidden="true" />
         {native ? <div className="window-controls" aria-label="Window controls">
           <button aria-label="Minimize" title="Minimize" onClick={() => void getCurrentWindow().minimize()}>−</button>
           <button aria-label="Maximize or restore" title="Maximize or restore" onClick={() => void getCurrentWindow().toggleMaximize()}>□</button>
@@ -643,7 +664,7 @@ function App(): React.JSX.Element {
       </aside>
 
       <section className="bottom-tray" aria-label="Imported source library" hidden={!project || workspaceMode !== "sources"}><span className="tray-label">Sources</span>{project?.sources.map((source) => { const option = channelOptions.find((candidate) => candidate.value === source.channel)!; return <button key={source.id} title={source.sourcePath || source.displayName} className={`tray tray-source ${source.channel === selectedSource?.channel ? "active" : ""}`} onClick={() => { setSelectedChannel(source.channel); setImportChannel(source.channel); fitView(); }}><span className={`channel-swatch ${option.tone}`}>{option.short}</span><span><strong>{source.displayName}</strong><small>{source.width} × {source.height}</small></span></button>; })}{project && project.sources.length < channelOptions.length ? <button className="tray add-tray" onClick={() => void chooseImages()}>+ Open all</button> : null}{warningCount ? <span className="tray warning" role="status">Warnings <b>{warningCount}</b></span> : null}</section>
-      {project ? <PatchWorkspace hidden={workspaceMode !== "patches"} project={project} onPatchState={acceptPatchState} onFailure={setFailure} onAddSource={() => void chooseImage("base_color", crypto.randomUUID())} onOpenSources={(sourceSetId) => void chooseImages(sourceSetId)} onOpenSourceChannel={(channel, sourceSetId) => void chooseImage(channel, sourceSetId)} /> : null}
+      {project ? <PatchWorkspace hidden={workspaceMode !== "patches"} project={project} onPatchState={acceptPatchState} onLayoutState={acceptLayoutState} onFailure={setFailure} onAddSource={() => void chooseImage("base_color", crypto.randomUUID())} onOpenSources={(sourceSetId) => void chooseImages(sourceSetId)} onOpenSourceChannel={(channel, sourceSetId) => void chooseImage(channel, sourceSetId)} /> : null}
       {project ? <footer className="statusbar"><span>{project.name}</span><span>{project.isDraft ? "Draft · choose Save when ready" : project.dirty ? "Unsaved changes" : "Saved"}</span><span>{selectedSource ? `${channelLabel(selectedSource.channel)} · ${selectedSource.width} × ${selectedSource.height}` : "No source selected"}</span></footer> : null}
 
       {showDirtyPrompt ? <div className="modal-backdrop" role="presentation"><section ref={modalRef} className="modal" role="alertdialog" aria-modal="true" aria-labelledby="dirty-title" aria-describedby="dirty-description"><span className="modal-kicker">Unsaved changes</span><h2 id="dirty-title">Save changes to {project?.name}?</h2><p id="dirty-description">Autosave recovery exists, but closing with Discard restores the last explicit save.</p><div className="modal-actions"><button className="primary" onClick={() => void resolveDirty("save")}>Save</button><button className="danger" onClick={() => void resolveDirty("discard")}>Discard</button><button onClick={() => { pendingAfterClose.current = null; setShowDirtyPrompt(false); }}>Cancel</button></div></section></div> : null}

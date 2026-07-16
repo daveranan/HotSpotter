@@ -1,0 +1,92 @@
+{
+  "generateRequest": {
+    "protocolVersion": 1,
+    "coalescingGroup": 71,
+    "request": {
+      "layoutId": "00000000-0000-4000-8000-000000000300",
+      "preset": "horizontal_trims",
+      "settings": {
+        "output": { "width": 2048, "height": 2048 },
+        "paddingPx": 4,
+        "bleedPx": 8,
+        "order": "horizontal_first",
+        "autoPack": { "enabled": true, "priority": "horizontal_strips", "seed": 42 }
+      },
+      "items": [
+        {
+          "key": "source:brick",
+          "fill": { "type": "whole_source_set", "sourceSetId": "00000000-0000-4000-8000-000000000301" },
+          "behavior": "horizontal_loop",
+          "naturalSize": { "width": 2048, "height": 512 },
+          "enabled": true,
+          "participates": true,
+          "constraints": {}
+        },
+        {
+          "key": "patch:cap",
+          "fill": {
+            "type": "rectified_patch",
+            "sourceSetId": "00000000-0000-4000-8000-000000000301",
+            "patchId": "00000000-0000-4000-8000-000000000302"
+          },
+          "behavior": "trim_cap",
+          "trimCaps": { "axis": "horizontal", "leadingPx": 32, "trailingPx": 32 },
+          "naturalSize": { "width": 1024, "height": 256 },
+          "enabled": true,
+          "participates": true,
+          "constraints": { "fixedHeightPx": 256 },
+          "regionId": "00000000-0000-4000-8000-000000000303"
+        }
+      ],
+      "existingRegions": [
+        {
+          "id": "00000000-0000-4000-8000-000000000303",
+          "itemKey": "patch:cap",
+          "fill": {
+            "type": "rectified_patch",
+            "sourceSetId": "00000000-0000-4000-8000-000000000301",
+            "patchId": "00000000-0000-4000-8000-000000000302"
+          },
+          "behavior": "trim_cap",
+          "trimCaps": { "axis": "horizontal", "leadingPx": 32, "trailingPx": 32 },
+          "bounds": { "x": 16, "y": 16, "width": 1024, "height": 256 },
+          "paddingPx": 4,
+          "bleedPx": 8,
+          "orderIndex": 0,
+          "locks": { "position": true, "width": false, "height": true },
+          "idColor": [82, 143, 211]
+        }
+      ]
+    }
+  },
+  "layoutCommandRequest": {
+    "protocolVersion": 1,
+    "coalescingGroup": 72,
+    "command": {
+      "type": "set_bounds",
+      "regionId": "00000000-0000-4000-8000-000000000303",
+      "bounds": { "x": 24, "y": 24, "width": 1024, "height": 256 }
+    }
+  },
+  "layoutState": {
+    "layout": null,
+    "dirty": true,
+    "authoringRevision": 3,
+    "canUndoPatch": true,
+    "canRedoPatch": false,
+    "canUndoProject": true,
+    "canRedoProject": false,
+    "warnings": []
+  },
+  "historyState": {
+    "patches": [],
+    "layout": null,
+    "dirty": true,
+    "authoringRevision": 4,
+    "canUndoPatch": true,
+    "canRedoPatch": true,
+    "canUndoProject": true,
+    "canRedoProject": true,
+    "warnings": []
+  }
+}

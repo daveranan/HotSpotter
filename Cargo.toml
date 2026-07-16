@@ -9,6 +9,7 @@ members = [
   "crates/preview",
   "crates/project-store",
   "crates/render-core",
+  "crates/sheet-compiler",
 ]
 
 [workspace.package]

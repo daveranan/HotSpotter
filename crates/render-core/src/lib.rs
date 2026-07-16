@@ -8,6 +8,14 @@ use std::sync::{
 use hot_trimmer_geometry::{GeometryError, Point, Quadrilateral};
 use thiserror::Error;
 
+mod structural_profile;
+
+pub use structural_profile::{
+    NormalConvention, ProfileKind, StructuralProfile, StructuralProfileError,
+    StructuralProfileMaps, StructuralProfileRequest, compile_structural_profile,
+    profile_kind_for_slot_key, validate_hotspot_normal_sampling,
+};
+
 pub const RENDER_OPERATION_VERSION: u16 = 1;
 pub const DEFAULT_TILE_EDGE: u32 = 256;
 

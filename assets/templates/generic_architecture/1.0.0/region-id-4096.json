@@ -1,0 +1,749 @@
+{
+  "width": 4096,
+  "height": 4096,
+  "coverage": "half-open allocation rectangles; pixels outside the listed rectangles are gutter/background",
+  "regions": [
+    {
+      "slotKey": "cornice_long",
+      "rect": [
+        32,
+        32,
+        4032,
+        128
+      ],
+      "idColor": [
+        64,
+        64,
+        64
+      ]
+    },
+    {
+      "slotKey": "crown_bevel",
+      "rect": [
+        32,
+        192,
+        4032,
+        96
+      ],
+      "idColor": [
+        93,
+        117,
+        143
+      ]
+    },
+    {
+      "slotKey": "reveal_groove",
+      "rect": [
+        32,
+        320,
+        4032,
+        64
+      ],
+      "idColor": [
+        122,
+        170,
+        222
+      ]
+    },
+    {
+      "slotKey": "header_left",
+      "rect": [
+        32,
+        416,
+        1984,
+        128
+      ],
+      "idColor": [
+        151,
+        223,
+        109
+      ]
+    },
+    {
+      "slotKey": "header_right",
+      "rect": [
+        2048,
+        416,
+        2016,
+        128
+      ],
+      "idColor": [
+        180,
+        84,
+        188
+      ]
+    },
+    {
+      "slotKey": "fine_strip_a",
+      "rect": [
+        32,
+        576,
+        960,
+        64
+      ],
+      "idColor": [
+        209,
+        137,
+        75
+      ]
+    },
+    {
+      "slotKey": "fine_strip_b",
+      "rect": [
+        1024,
+        576,
+        960,
+        64
+      ],
+      "idColor": [
+        238,
+        190,
+        154
+      ]
+    },
+    {
+      "slotKey": "fine_strip_c",
+      "rect": [
+        2016,
+        576,
+        960,
+        64
+      ],
+      "idColor": [
+        75,
+        243,
+        233
+      ]
+    },
+    {
+      "slotKey": "fine_strip_d",
+      "rect": [
+        3008,
+        576,
+        1056,
+        64
+      ],
+      "idColor": [
+        104,
+        104,
+        120
+      ]
+    },
+    {
+      "slotKey": "wall_primary",
+      "rect": [
+        32,
+        672,
+        896,
+        1024
+      ],
+      "idColor": [
+        133,
+        157,
+        199
+      ]
+    },
+    {
+      "slotKey": "wall_secondary",
+      "rect": [
+        960,
+        672,
+        896,
+        1024
+      ],
+      "idColor": [
+        162,
+        210,
+        86
+      ]
+    },
+    {
+      "slotKey": "door_panel",
+      "rect": [
+        1888,
+        672,
+        896,
+        1024
+      ],
+      "idColor": [
+        191,
+        71,
+        165
+      ]
+    },
+    {
+      "slotKey": "window_panel",
+      "rect": [
+        2816,
+        672,
+        896,
+        1024
+      ],
+      "idColor": [
+        220,
+        124,
+        244
+      ]
+    },
+    {
+      "slotKey": "detail_cell_a",
+      "rect": [
+        32,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        249,
+        177,
+        131
+      ]
+    },
+    {
+      "slotKey": "detail_cell_b",
+      "rect": [
+        536,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        86,
+        230,
+        210
+      ]
+    },
+    {
+      "slotKey": "detail_cell_c",
+      "rect": [
+        1040,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        115,
+        91,
+        97
+      ]
+    },
+    {
+      "slotKey": "detail_cell_d",
+      "rect": [
+        1544,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        144,
+        144,
+        176
+      ]
+    },
+    {
+      "slotKey": "detail_cell_e",
+      "rect": [
+        2048,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        173,
+        197,
+        255
+      ]
+    },
+    {
+      "slotKey": "detail_cell_f",
+      "rect": [
+        2552,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        202,
+        250,
+        142
+      ]
+    },
+    {
+      "slotKey": "detail_cell_g",
+      "rect": [
+        3056,
+        1728,
+        472,
+        160
+      ],
+      "idColor": [
+        231,
+        111,
+        221
+      ]
+    },
+    {
+      "slotKey": "detail_cell_h",
+      "rect": [
+        3560,
+        1728,
+        504,
+        160
+      ],
+      "idColor": [
+        68,
+        164,
+        108
+      ]
+    },
+    {
+      "slotKey": "radial_fixture_a",
+      "rect": [
+        32,
+        1920,
+        448,
+        448
+      ],
+      "idColor": [
+        97,
+        217,
+        187
+      ]
+    },
+    {
+      "slotKey": "radial_fixture_b",
+      "rect": [
+        512,
+        1920,
+        448,
+        448
+      ],
+      "idColor": [
+        126,
+        78,
+        74
+      ]
+    },
+    {
+      "slotKey": "radial_fixture_c",
+      "rect": [
+        992,
+        1920,
+        448,
+        448
+      ],
+      "idColor": [
+        155,
+        131,
+        153
+      ]
+    },
+    {
+      "slotKey": "radial_fixture_d",
+      "rect": [
+        1472,
+        1920,
+        448,
+        448
+      ],
+      "idColor": [
+        184,
+        184,
+        232
+      ]
+    },
+    {
+      "slotKey": "trim_cap_left",
+      "rect": [
+        1952,
+        1920,
+        512,
+        448
+      ],
+      "idColor": [
+        213,
+        237,
+        119
+      ]
+    },
+    {
+      "slotKey": "trim_cap_inner_left",
+      "rect": [
+        2496,
+        1920,
+        512,
+        448
+      ],
+      "idColor": [
+        242,
+        98,
+        198
+      ]
+    },
+    {
+      "slotKey": "trim_cap_inner_right",
+      "rect": [
+        3040,
+        1920,
+        512,
+        448
+      ],
+      "idColor": [
+        79,
+        151,
+        85
+      ]
+    },
+    {
+      "slotKey": "trim_cap_right",
+      "rect": [
+        3584,
+        1920,
+        480,
+        448
+      ],
+      "idColor": [
+        108,
+        204,
+        164
+      ]
+    },
+    {
+      "slotKey": "sill_long_a",
+      "rect": [
+        32,
+        2400,
+        1312,
+        128
+      ],
+      "idColor": [
+        137,
+        65,
+        243
+      ]
+    },
+    {
+      "slotKey": "sill_long_b",
+      "rect": [
+        1376,
+        2400,
+        1312,
+        128
+      ],
+      "idColor": [
+        166,
+        118,
+        130
+      ]
+    },
+    {
+      "slotKey": "sill_long_c",
+      "rect": [
+        2720,
+        2400,
+        1344,
+        128
+      ],
+      "idColor": [
+        195,
+        171,
+        209
+      ]
+    },
+    {
+      "slotKey": "mid_groove_a",
+      "rect": [
+        32,
+        2560,
+        960,
+        96
+      ],
+      "idColor": [
+        224,
+        224,
+        96
+      ]
+    },
+    {
+      "slotKey": "mid_groove_b",
+      "rect": [
+        1024,
+        2560,
+        960,
+        96
+      ],
+      "idColor": [
+        253,
+        85,
+        175
+      ]
+    },
+    {
+      "slotKey": "mid_groove_c",
+      "rect": [
+        2016,
+        2560,
+        960,
+        96
+      ],
+      "idColor": [
+        90,
+        138,
+        254
+      ]
+    },
+    {
+      "slotKey": "mid_groove_d",
+      "rect": [
+        3008,
+        2560,
+        1056,
+        96
+      ],
+      "idColor": [
+        119,
+        191,
+        141
+      ]
+    },
+    {
+      "slotKey": "lower_detail_a",
+      "rect": [
+        32,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        148,
+        244,
+        220
+      ]
+    },
+    {
+      "slotKey": "lower_detail_b",
+      "rect": [
+        536,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        177,
+        105,
+        107
+      ]
+    },
+    {
+      "slotKey": "lower_detail_c",
+      "rect": [
+        1040,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        206,
+        158,
+        186
+      ]
+    },
+    {
+      "slotKey": "lower_detail_d",
+      "rect": [
+        1544,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        235,
+        211,
+        73
+      ]
+    },
+    {
+      "slotKey": "lower_detail_e",
+      "rect": [
+        2048,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        72,
+        72,
+        152
+      ]
+    },
+    {
+      "slotKey": "lower_detail_f",
+      "rect": [
+        2552,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        101,
+        125,
+        231
+      ]
+    },
+    {
+      "slotKey": "lower_detail_g",
+      "rect": [
+        3056,
+        2688,
+        472,
+        352
+      ],
+      "idColor": [
+        130,
+        178,
+        118
+      ]
+    },
+    {
+      "slotKey": "lower_detail_h",
+      "rect": [
+        3560,
+        2688,
+        504,
+        352
+      ],
+      "idColor": [
+        159,
+        231,
+        197
+      ]
+    },
+    {
+      "slotKey": "baseboard_a",
+      "rect": [
+        32,
+        3072,
+        1312,
+        640
+      ],
+      "idColor": [
+        188,
+        92,
+        84
+      ]
+    },
+    {
+      "slotKey": "baseboard_b",
+      "rect": [
+        1376,
+        3072,
+        1312,
+        640
+      ],
+      "idColor": [
+        217,
+        145,
+        163
+      ]
+    },
+    {
+      "slotKey": "baseboard_c",
+      "rect": [
+        2720,
+        3072,
+        1344,
+        640
+      ],
+      "idColor": [
+        246,
+        198,
+        242
+      ]
+    },
+    {
+      "slotKey": "footer_groove_a",
+      "rect": [
+        32,
+        3744,
+        1312,
+        160
+      ],
+      "idColor": [
+        83,
+        251,
+        129
+      ]
+    },
+    {
+      "slotKey": "footer_groove_b",
+      "rect": [
+        1376,
+        3744,
+        1312,
+        160
+      ],
+      "idColor": [
+        112,
+        112,
+        208
+      ]
+    },
+    {
+      "slotKey": "footer_groove_c",
+      "rect": [
+        2720,
+        3744,
+        1344,
+        160
+      ],
+      "idColor": [
+        141,
+        165,
+        95
+      ]
+    },
+    {
+      "slotKey": "plinth_a",
+      "rect": [
+        32,
+        3936,
+        1312,
+        128
+      ],
+      "idColor": [
+        170,
+        218,
+        174
+      ]
+    },
+    {
+      "slotKey": "plinth_b",
+      "rect": [
+        1376,
+        3936,
+        1312,
+        128
+      ],
+      "idColor": [
+        199,
+        79,
+        253
+      ]
+    },
+    {
+      "slotKey": "plinth_c",
+      "rect": [
+        2720,
+        3936,
+        1344,
+        128
+      ],
+      "idColor": [
+        228,
+        132,
+        140
+      ]
+    }
+  ]
+}

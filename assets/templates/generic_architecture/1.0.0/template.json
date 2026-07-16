@@ -1,0 +1,1579 @@
+{
+  "templates": [
+    {
+      "identity": {
+        "templateId": "ht.generic_architecture",
+        "templateVersion": "1.0.0",
+        "compatibilityKey": "ht.generic_architecture.topology.v1"
+      },
+      "schemaVersion": 1,
+      "canonicalWidth": 4096,
+      "canonicalHeight": 4096,
+      "stableOrder": [
+        "cornice_long",
+        "crown_bevel",
+        "reveal_groove",
+        "header_left",
+        "header_right",
+        "fine_strip_a",
+        "fine_strip_b",
+        "fine_strip_c",
+        "fine_strip_d",
+        "wall_primary",
+        "wall_secondary",
+        "door_panel",
+        "window_panel",
+        "detail_cell_a",
+        "detail_cell_b",
+        "detail_cell_c",
+        "detail_cell_d",
+        "detail_cell_e",
+        "detail_cell_f",
+        "detail_cell_g",
+        "detail_cell_h",
+        "radial_fixture_a",
+        "radial_fixture_b",
+        "radial_fixture_c",
+        "radial_fixture_d",
+        "trim_cap_left",
+        "trim_cap_inner_left",
+        "trim_cap_inner_right",
+        "trim_cap_right",
+        "sill_long_a",
+        "sill_long_b",
+        "sill_long_c",
+        "mid_groove_a",
+        "mid_groove_b",
+        "mid_groove_c",
+        "mid_groove_d",
+        "lower_detail_a",
+        "lower_detail_b",
+        "lower_detail_c",
+        "lower_detail_d",
+        "lower_detail_e",
+        "lower_detail_f",
+        "lower_detail_g",
+        "lower_detail_h",
+        "baseboard_a",
+        "baseboard_b",
+        "baseboard_c",
+        "footer_groove_a",
+        "footer_groove_b",
+        "footer_groove_c",
+        "plinth_a",
+        "plinth_b",
+        "plinth_c"
+      ],
+      "slots": [
+        {
+          "slotKey": "cornice_long",
+          "compatibilityKey": "ht.generic_architecture.cornice_long.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 32,
+            "y": 32,
+            "width": 4032,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 96
+          },
+          "idColor": [
+            64,
+            64,
+            64
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "crown_bevel",
+          "compatibilityKey": "ht.generic_architecture.crown_bevel.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 32,
+            "y": 192,
+            "width": 4032,
+            "height": 96
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 240
+          },
+          "idColor": [
+            93,
+            117,
+            143
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 0.3,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "reveal_groove",
+          "compatibilityKey": "ht.generic_architecture.reveal_groove.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 32,
+            "y": 320,
+            "width": 4032,
+            "height": 64
+          },
+          "hotspot": {
+            "x": 2048,
+            "y": 352
+          },
+          "idColor": [
+            122,
+            170,
+            222
+          ],
+          "worldPlacement": {
+            "width": 12.6,
+            "height": 0.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "header_left",
+          "compatibilityKey": "ht.generic_architecture.header_left.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 32,
+            "y": 416,
+            "width": 1984,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 1024,
+            "y": 480
+          },
+          "idColor": [
+            151,
+            223,
+            109
+          ],
+          "worldPlacement": {
+            "width": 6.2,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "header_right",
+          "compatibilityKey": "ht.generic_architecture.header_right.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 2048,
+            "y": 416,
+            "width": 2016,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 3056,
+            "y": 480
+          },
+          "idColor": [
+            180,
+            84,
+            188
+          ],
+          "worldPlacement": {
+            "width": 6.3,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "fine_strip_a",
+          "compatibilityKey": "ht.generic_architecture.fine_strip_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 32,
+            "y": 576,
+            "width": 960,
+            "height": 64
+          },
+          "hotspot": {
+            "x": 512,
+            "y": 608
+          },
+          "idColor": [
+            209,
+            137,
+            75
+          ],
+          "worldPlacement": {
+            "width": 3,
+            "height": 0.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "fine_strip_b",
+          "compatibilityKey": "ht.generic_architecture.fine_strip_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 1024,
+            "y": 576,
+            "width": 960,
+            "height": 64
+          },
+          "hotspot": {
+            "x": 1504,
+            "y": 608
+          },
+          "idColor": [
+            238,
+            190,
+            154
+          ],
+          "worldPlacement": {
+            "width": 3,
+            "height": 0.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "fine_strip_c",
+          "compatibilityKey": "ht.generic_architecture.fine_strip_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 2016,
+            "y": 576,
+            "width": 960,
+            "height": 64
+          },
+          "hotspot": {
+            "x": 2496,
+            "y": 608
+          },
+          "idColor": [
+            75,
+            243,
+            233
+          ],
+          "worldPlacement": {
+            "width": 3,
+            "height": 0.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "fine_strip_d",
+          "compatibilityKey": "ht.generic_architecture.fine_strip_d.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 3008,
+            "y": 576,
+            "width": 1056,
+            "height": 64
+          },
+          "hotspot": {
+            "x": 3536,
+            "y": 608
+          },
+          "idColor": [
+            104,
+            104,
+            120
+          ],
+          "worldPlacement": {
+            "width": 3.3,
+            "height": 0.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "wall_primary",
+          "compatibilityKey": "ht.generic_architecture.wall_primary.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 32,
+            "y": 672,
+            "width": 896,
+            "height": 1024
+          },
+          "hotspot": {
+            "x": 480,
+            "y": 1184
+          },
+          "idColor": [
+            133,
+            157,
+            199
+          ],
+          "worldPlacement": {
+            "width": 2.8,
+            "height": 3.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "wall_secondary",
+          "compatibilityKey": "ht.generic_architecture.wall_secondary.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 960,
+            "y": 672,
+            "width": 896,
+            "height": 1024
+          },
+          "hotspot": {
+            "x": 1408,
+            "y": 1184
+          },
+          "idColor": [
+            162,
+            210,
+            86
+          ],
+          "worldPlacement": {
+            "width": 2.8,
+            "height": 3.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "door_panel",
+          "compatibilityKey": "ht.generic_architecture.door_panel.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 1888,
+            "y": 672,
+            "width": 896,
+            "height": 1024
+          },
+          "hotspot": {
+            "x": 2336,
+            "y": 1184
+          },
+          "idColor": [
+            191,
+            71,
+            165
+          ],
+          "worldPlacement": {
+            "width": 2.8,
+            "height": 3.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "window_panel",
+          "compatibilityKey": "ht.generic_architecture.window_panel.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 2816,
+            "y": 672,
+            "width": 896,
+            "height": 1024
+          },
+          "hotspot": {
+            "x": 3264,
+            "y": 1184
+          },
+          "idColor": [
+            220,
+            124,
+            244
+          ],
+          "worldPlacement": {
+            "width": 2.8,
+            "height": 3.2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_a",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 32,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 268,
+            "y": 1808
+          },
+          "idColor": [
+            249,
+            177,
+            131
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_b",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 536,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 772,
+            "y": 1808
+          },
+          "idColor": [
+            86,
+            230,
+            210
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_c",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 1040,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 1276,
+            "y": 1808
+          },
+          "idColor": [
+            115,
+            91,
+            97
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_d",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_d.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 1544,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 1780,
+            "y": 1808
+          },
+          "idColor": [
+            144,
+            144,
+            176
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_e",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_e.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 2048,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 2284,
+            "y": 1808
+          },
+          "idColor": [
+            173,
+            197,
+            255
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_f",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_f.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 2552,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 2788,
+            "y": 1808
+          },
+          "idColor": [
+            202,
+            250,
+            142
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_g",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_g.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 3056,
+            "y": 1728,
+            "width": 472,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 3292,
+            "y": 1808
+          },
+          "idColor": [
+            231,
+            111,
+            221
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "detail_cell_h",
+          "compatibilityKey": "ht.generic_architecture.detail_cell_h.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 3560,
+            "y": 1728,
+            "width": 504,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 3812,
+            "y": 1808
+          },
+          "idColor": [
+            68,
+            164,
+            108
+          ],
+          "worldPlacement": {
+            "width": 1.575,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "radial_fixture_a",
+          "compatibilityKey": "ht.generic_architecture.radial_fixture_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "radial_fixture",
+          "role": "radial",
+          "structuralProfile": "radialDisc",
+          "allocation": {
+            "x": 32,
+            "y": 1920,
+            "width": 448,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 256,
+            "y": 2144
+          },
+          "idColor": [
+            97,
+            217,
+            187
+          ],
+          "worldPlacement": {
+            "width": 1.4,
+            "height": 1.4,
+            "rotationDegrees": 0
+          },
+          "radialParameters": {
+            "centerX": 0.5,
+            "centerY": 0.5,
+            "innerRadius": 0,
+            "outerRadius": 0.48
+          }
+        },
+        {
+          "slotKey": "radial_fixture_b",
+          "compatibilityKey": "ht.generic_architecture.radial_fixture_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "radial_fixture",
+          "role": "radial",
+          "structuralProfile": "annulus",
+          "allocation": {
+            "x": 512,
+            "y": 1920,
+            "width": 448,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 736,
+            "y": 2144
+          },
+          "idColor": [
+            126,
+            78,
+            74
+          ],
+          "worldPlacement": {
+            "width": 1.4,
+            "height": 1.4,
+            "rotationDegrees": 0
+          },
+          "radialParameters": {
+            "centerX": 0.5,
+            "centerY": 0.5,
+            "innerRadius": 0.08,
+            "outerRadius": 0.48
+          }
+        },
+        {
+          "slotKey": "radial_fixture_c",
+          "compatibilityKey": "ht.generic_architecture.radial_fixture_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "radial_fixture",
+          "role": "radial",
+          "structuralProfile": "annulus",
+          "allocation": {
+            "x": 992,
+            "y": 1920,
+            "width": 448,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 1216,
+            "y": 2144
+          },
+          "idColor": [
+            155,
+            131,
+            153
+          ],
+          "worldPlacement": {
+            "width": 1.4,
+            "height": 1.4,
+            "rotationDegrees": 0
+          },
+          "radialParameters": {
+            "centerX": 0.5,
+            "centerY": 0.5,
+            "innerRadius": 0.16,
+            "outerRadius": 0.48
+          }
+        },
+        {
+          "slotKey": "radial_fixture_d",
+          "compatibilityKey": "ht.generic_architecture.radial_fixture_d.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "radial_fixture",
+          "role": "radial",
+          "structuralProfile": "annulus",
+          "allocation": {
+            "x": 1472,
+            "y": 1920,
+            "width": 448,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 1696,
+            "y": 2144
+          },
+          "idColor": [
+            184,
+            184,
+            232
+          ],
+          "worldPlacement": {
+            "width": 1.4,
+            "height": 1.4,
+            "rotationDegrees": 0
+          },
+          "radialParameters": {
+            "centerX": 0.5,
+            "centerY": 0.5,
+            "innerRadius": 0.24,
+            "outerRadius": 0.48
+          }
+        },
+        {
+          "slotKey": "trim_cap_left",
+          "compatibilityKey": "ht.generic_architecture.trim_cap_left.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "trimCap",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 1952,
+            "y": 1920,
+            "width": 512,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 2208,
+            "y": 2144
+          },
+          "idColor": [
+            213,
+            237,
+            119
+          ],
+          "worldPlacement": {
+            "width": 1.6,
+            "height": 1.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "trim_cap_inner_left",
+          "compatibilityKey": "ht.generic_architecture.trim_cap_inner_left.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "trimCap",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 2496,
+            "y": 1920,
+            "width": 512,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 2752,
+            "y": 2144
+          },
+          "idColor": [
+            242,
+            98,
+            198
+          ],
+          "worldPlacement": {
+            "width": 1.6,
+            "height": 1.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "trim_cap_inner_right",
+          "compatibilityKey": "ht.generic_architecture.trim_cap_inner_right.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "trimCap",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 3040,
+            "y": 1920,
+            "width": 512,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 3296,
+            "y": 2144
+          },
+          "idColor": [
+            79,
+            151,
+            85
+          ],
+          "worldPlacement": {
+            "width": 1.6,
+            "height": 1.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "trim_cap_right",
+          "compatibilityKey": "ht.generic_architecture.trim_cap_right.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "trimCap",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 3584,
+            "y": 1920,
+            "width": 480,
+            "height": 448
+          },
+          "hotspot": {
+            "x": 3824,
+            "y": 2144
+          },
+          "idColor": [
+            108,
+            204,
+            164
+          ],
+          "worldPlacement": {
+            "width": 1.5,
+            "height": 1.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "sill_long_a",
+          "compatibilityKey": "ht.generic_architecture.sill_long_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 32,
+            "y": 2400,
+            "width": 1312,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 688,
+            "y": 2464
+          },
+          "idColor": [
+            137,
+            65,
+            243
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "sill_long_b",
+          "compatibilityKey": "ht.generic_architecture.sill_long_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 1376,
+            "y": 2400,
+            "width": 1312,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 2032,
+            "y": 2464
+          },
+          "idColor": [
+            166,
+            118,
+            130
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "sill_long_c",
+          "compatibilityKey": "ht.generic_architecture.sill_long_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 2720,
+            "y": 2400,
+            "width": 1344,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 3392,
+            "y": 2464
+          },
+          "idColor": [
+            195,
+            171,
+            209
+          ],
+          "worldPlacement": {
+            "width": 4.2,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "mid_groove_a",
+          "compatibilityKey": "ht.generic_architecture.mid_groove_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 32,
+            "y": 2560,
+            "width": 960,
+            "height": 96
+          },
+          "hotspot": {
+            "x": 512,
+            "y": 2608
+          },
+          "idColor": [
+            224,
+            224,
+            96
+          ],
+          "worldPlacement": {
+            "width": 3,
+            "height": 0.3,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "mid_groove_b",
+          "compatibilityKey": "ht.generic_architecture.mid_groove_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 1024,
+            "y": 2560,
+            "width": 960,
+            "height": 96
+          },
+          "hotspot": {
+            "x": 1504,
+            "y": 2608
+          },
+          "idColor": [
+            253,
+            85,
+            175
+          ],
+          "worldPlacement": {
+            "width": 3,
+            "height": 0.3,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "mid_groove_c",
+          "compatibilityKey": "ht.generic_architecture.mid_groove_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 2016,
+            "y": 2560,
+            "width": 960,
+            "height": 96
+          },
+          "hotspot": {
+            "x": 2496,
+            "y": 2608
+          },
+          "idColor": [
+            90,
+            138,
+            254
+          ],
+          "worldPlacement": {
+            "width": 3,
+            "height": 0.3,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "mid_groove_d",
+          "compatibilityKey": "ht.generic_architecture.mid_groove_d.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 3008,
+            "y": 2560,
+            "width": 1056,
+            "height": 96
+          },
+          "hotspot": {
+            "x": 3536,
+            "y": 2608
+          },
+          "idColor": [
+            119,
+            191,
+            141
+          ],
+          "worldPlacement": {
+            "width": 3.3,
+            "height": 0.3,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_a",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 32,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 268,
+            "y": 2864
+          },
+          "idColor": [
+            148,
+            244,
+            220
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_b",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 536,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 772,
+            "y": 2864
+          },
+          "idColor": [
+            177,
+            105,
+            107
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_c",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 1040,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 1276,
+            "y": 2864
+          },
+          "idColor": [
+            206,
+            158,
+            186
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_d",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_d.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 1544,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 1780,
+            "y": 2864
+          },
+          "idColor": [
+            235,
+            211,
+            73
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_e",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_e.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 2048,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 2284,
+            "y": 2864
+          },
+          "idColor": [
+            72,
+            72,
+            152
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_f",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_f.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 2552,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 2788,
+            "y": 2864
+          },
+          "idColor": [
+            101,
+            125,
+            231
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_g",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_g.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 3056,
+            "y": 2688,
+            "width": 472,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 3292,
+            "y": 2864
+          },
+          "idColor": [
+            130,
+            178,
+            118
+          ],
+          "worldPlacement": {
+            "width": 1.475,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "lower_detail_h",
+          "compatibilityKey": "ht.generic_architecture.lower_detail_h.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "uniqueDetail",
+          "structuralProfile": "panelFrame",
+          "allocation": {
+            "x": 3560,
+            "y": 2688,
+            "width": 504,
+            "height": 352
+          },
+          "hotspot": {
+            "x": 3812,
+            "y": 2864
+          },
+          "idColor": [
+            159,
+            231,
+            197
+          ],
+          "worldPlacement": {
+            "width": 1.575,
+            "height": 1.1,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "baseboard_a",
+          "compatibilityKey": "ht.generic_architecture.baseboard_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 32,
+            "y": 3072,
+            "width": 1312,
+            "height": 640
+          },
+          "hotspot": {
+            "x": 688,
+            "y": 3392
+          },
+          "idColor": [
+            188,
+            92,
+            84
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "baseboard_b",
+          "compatibilityKey": "ht.generic_architecture.baseboard_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 1376,
+            "y": 3072,
+            "width": 1312,
+            "height": 640
+          },
+          "hotspot": {
+            "x": 2032,
+            "y": 3392
+          },
+          "idColor": [
+            217,
+            145,
+            163
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "baseboard_c",
+          "compatibilityKey": "ht.generic_architecture.baseboard_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "roundedBevel",
+          "allocation": {
+            "x": 2720,
+            "y": 3072,
+            "width": 1344,
+            "height": 640
+          },
+          "hotspot": {
+            "x": 3392,
+            "y": 3392
+          },
+          "idColor": [
+            246,
+            198,
+            242
+          ],
+          "worldPlacement": {
+            "width": 4.2,
+            "height": 2,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "footer_groove_a",
+          "compatibilityKey": "ht.generic_architecture.footer_groove_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 32,
+            "y": 3744,
+            "width": 1312,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 688,
+            "y": 3824
+          },
+          "idColor": [
+            83,
+            251,
+            129
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "footer_groove_b",
+          "compatibilityKey": "ht.generic_architecture.footer_groove_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 1376,
+            "y": 3744,
+            "width": 1312,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 2032,
+            "y": 3824
+          },
+          "idColor": [
+            112,
+            112,
+            208
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "footer_groove_c",
+          "compatibilityKey": "ht.generic_architecture.footer_groove_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "groove",
+          "allocation": {
+            "x": 2720,
+            "y": 3744,
+            "width": 1344,
+            "height": 160
+          },
+          "hotspot": {
+            "x": 3392,
+            "y": 3824
+          },
+          "idColor": [
+            141,
+            165,
+            95
+          ],
+          "worldPlacement": {
+            "width": 4.2,
+            "height": 0.5,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "plinth_a",
+          "compatibilityKey": "ht.generic_architecture.plinth_a.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 32,
+            "y": 3936,
+            "width": 1312,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 688,
+            "y": 4000
+          },
+          "idColor": [
+            170,
+            218,
+            174
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "plinth_b",
+          "compatibilityKey": "ht.generic_architecture.plinth_b.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 1376,
+            "y": 3936,
+            "width": 1312,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 2032,
+            "y": 4000
+          },
+          "idColor": [
+            199,
+            79,
+            253
+          ],
+          "worldPlacement": {
+            "width": 4.1,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        },
+        {
+          "slotKey": "plinth_c",
+          "compatibilityKey": "ht.generic_architecture.plinth_c.v1",
+          "materialGroup": "architecture",
+          "variationGroup": "neutral",
+          "role": "repeatingStrip",
+          "structuralProfile": "bevel",
+          "allocation": {
+            "x": 2720,
+            "y": 3936,
+            "width": 1344,
+            "height": 128
+          },
+          "hotspot": {
+            "x": 3392,
+            "y": 4000
+          },
+          "idColor": [
+            228,
+            132,
+            140
+          ],
+          "worldPlacement": {
+            "width": 4.2,
+            "height": 0.4,
+            "rotationDegrees": 0
+          }
+        }
+      ]
+    }
+  ]
+}

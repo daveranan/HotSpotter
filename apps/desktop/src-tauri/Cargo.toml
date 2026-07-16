@@ -19,6 +19,7 @@ hot-trimmer-geometry = { path = "../../../crates/geometry" }
 hot-trimmer-image-io = { path = "../../../crates/image-io" }
 hot-trimmer-project-store = { path = "../../../crates/project-store" }
 hot-trimmer-render-core = { path = "../../../crates/render-core" }
+hot-trimmer-sheet-compiler = { path = "../../../crates/sheet-compiler" }
 image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,6 +31,7 @@ tauri-plugin-window-state = "2"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 

@@ -4,6 +4,8 @@ import {
   IPC_PROTOCOL_VERSION,
   type CommandFailure,
   type FoundationStatusRequest,
+  type LayoutStateSnapshot,
+  type AuthoringHistorySnapshot,
   type NormalizedPoint,
   type PatchCommand,
   type PatchGeometry,
@@ -30,6 +32,7 @@ import {
   zoomViewAtPoint,
 } from "./patch-authoring";
 import { LiveRectifiedCanvas } from "./live-rectified-canvas";
+import { LayoutWorkspace } from "./layout-workspace";
 import { SerialTaskQueue } from "./serial-task-queue";
 
 type PatchTool = "select" | "four_point" | "rectangle" | "polygon";
@@ -38,6 +41,7 @@ interface PatchWorkspaceProps {
   hidden: boolean;
   project: ProjectSnapshot;
   onPatchState: (state: PatchStateSnapshot) => void;
+  onLayoutState: (state: LayoutStateSnapshot) => void;
   onFailure: (failure: CommandFailure | null) => void;
   onAddSource: () => void;
   onOpenSources: (sourceSetId: string) => void;
@@ -160,6 +164,7 @@ export function PatchWorkspace({
   hidden,
   project,
   onPatchState,
+  onLayoutState,
   onFailure,
   onAddSource,
   onOpenSources,
@@ -207,17 +212,16 @@ export function PatchWorkspace({
     ?? project.sources.find((candidate) => candidate.channel === "base_color")
     ?? project.sources[0];
   const selectedSource = source;
-  const sourceSetIds = [...new Set(project.sources.map((candidate) => candidate.sourceSetId))];
-  const selectedSourceSetId = selectedSource?.sourceSetId ?? sourceSetIds[0] ?? null;
+  const selectedSourceSetId = selectedSource?.sourceSetId ?? project.sourceSets[0]?.id ?? null;
   const selectedSetSources = selectedSourceSetId
     ? project.sources.filter((candidate) => candidate.sourceSetId === selectedSourceSetId)
     : [];
   const selectedSetSourceIds = new Set(selectedSetSources.map((candidate) => candidate.id));
   const sourcePatches = project.patches.filter((patch) => selectedSetSourceIds.has(patch.sourceId));
   const selectedPatch = sourcePatches.find((patch) => patch.id === selectedPatchId) ?? null;
-  const sourceSets = sourceSetIds.map((id) => {
-    const inputs = project.sources.filter((candidate) => candidate.sourceSetId === id);
-    return { id, inputs, base: inputs.find((candidate) => candidate.channel === "base_color") ?? inputs[0] };
+  const sourceSets = project.sourceSets.map((sourceSet) => {
+    const inputs = project.sources.filter((candidate) => candidate.sourceSetId === sourceSet.id);
+    return { ...sourceSet, inputs, base: inputs.find((candidate) => candidate.channel === "base_color") ?? inputs[0] };
   });
   const imageUrl = sourcePreviewUrl(selectedSource);
   const displayGeometry = liveGeometry ?? selectedPatch?.geometry;
@@ -242,6 +246,10 @@ export function PatchWorkspace({
 
   useEffect(() => {
     latestPatches.current = project.patches;
+    // A null selection is intentional while starting a capture or after clicking
+    // empty canvas space. Only reconcile an id that has actually gone stale.
+    if (selectedPatchId === null) return;
+
     if (selectedPatchId && sourcePatches.some((patch) => patch.id === selectedPatchId)) return;
     setSelectedPatchId(sourcePatches[0]?.id ?? null);
     setEditingPatchId(null);
@@ -435,7 +443,7 @@ export function PatchWorkspace({
     return enqueuePatchMutation(async () => {
       setBusy(redo ? "Redo" : "Undo");
       try {
-        const state = await invoke<PatchStateSnapshot>(redo ? "redo_patch_command" : "undo_patch_command", { request });
+        const state = await invoke<AuthoringHistorySnapshot>(redo ? "redo_patch_command" : "undo_patch_command", { request });
         latestPatches.current = state.patches;
         onPatchState(state);
         setLiveGeometry(null);
@@ -448,7 +456,7 @@ export function PatchWorkspace({
     });
   }
 
-  function beginNew(mode: DraftState["mode"] = "four_point"): void {
+  function beginNew(mode: DraftState["mode"] = "four_point", initialPoint?: NormalizedPoint): void {
     if (!source) {
       onAddSource();
       return;
@@ -458,7 +466,7 @@ export function PatchWorkspace({
     setEditingPatchId(null);
     setLiveGeometry(null);
     setGeometryMessage(null);
-    setDraft({ mode, points: [] });
+    setDraft({ mode, points: initialPoint ? [initialPoint] : [] });
   }
 
   async function createPatch(geometry: PatchGeometry): Promise<void> {
@@ -924,7 +932,7 @@ export function PatchWorkspace({
         <div ref={authoringSplitRef} className="authoring-split" style={{ gridTemplateColumns: `${workbenchShare}% 5px minmax(320px, 1fr)` }}>
           <section className="source-workbench" aria-label="Patch source workbench">
             <header className="split-pane-title">
-              <div><span>Workplace</span><strong id="patch-workspace-title">Material source</strong></div>
+              <div><span>Workbench</span><strong id="patch-workspace-title">Material source</strong></div>
               <button onClick={() => selectedSourceSetId && onOpenSources(selectedSourceSetId)} disabled={!selectedSourceSetId} title="Auto-assign additional maps to the selected source">Add maps...</button>
             </header>
             <div ref={sourceBodyRef} className="source-workbench-body" style={{ gridTemplateColumns: `${sourceRailWidth}px 5px minmax(0, 1fr)` }}>
@@ -944,9 +952,20 @@ export function PatchWorkspace({
                     data-patch-id={patch.id}
                     className={`${patch.id === selectedPatch?.id ? "active" : ""} ${patch.id === dropTargetPatchId ? "drop-target" : ""} ${patch.id === draggedPatchId ? "dragging" : ""}`}
                     onContextMenu={(event) => openContextMenu(event, patch)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Delete" || tool !== "select") return;
+                      event.preventDefault();
+                      void deletePatch(patch);
+                    }}
                   >
                     <input type="checkbox" checked={patch.enabled} aria-label={`Enable ${patch.name}`} onChange={(event) => void apply({ type: "set_enabled", patchId: patch.id, enabled: event.target.checked }, "Toggle patch")} />
                     {renamingPatchId === patch.id ? <input className="patch-name-editor" autoFocus value={renameDraft} maxLength={255} onChange={(event) => setRenameDraft(event.target.value)} onBlur={() => commitRename(patch)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); else if (event.key === "Escape") { setRenamingPatchId(null); setRenameDraft(patch.name); } }} /> : <button className="patch-select" disabled={tool !== "select"} onClick={() => { setSelectedPatchId(patch.id); setWorkingSourceId(patch.sourceId); setEditingPatchId(null); }} onDoubleClick={() => beginRename(patch)}>{patch.name}</button>}
+                    <button
+                      className="patch-menu-button"
+                      aria-label={`Actions for ${patch.name}`}
+                      title="Patch actions"
+                      onClick={(event) => openContextMenu(event, patch)}
+                    >...</button>
                     <span
                       className="drag-grip"
                       role="button"
@@ -1010,7 +1029,8 @@ export function PatchWorkspace({
                 if (tool !== "select" || event.button !== 0) return;
                 if ((event.target as Element).closest("button, polygon, circle, rect, input, .precision-loupe")) return;
                 event.preventDefault();
-                beginNew("four_point");
+                const point = normalizedAt(event.clientX, event.clientY);
+                beginNew("four_point", point ?? undefined);
               }}
               onPointerMove={pointerMove}
               onPointerUp={pointerUp}
@@ -1074,6 +1094,11 @@ export function PatchWorkspace({
                 }}><span className="loupe-crosshair" /></div>
                 <div className="loupe-controls">{([2, 3, 4] as const).map((zoom) => <button key={zoom} className={loupeZoom === zoom ? "active" : ""} onClick={() => setLoupeZoom(zoom)}>{zoom}×</button>)}</div>
               </div> : null}
+              {selectedPatch && selectedPreviewGeometry && imageUrl ? <section className="patch-preview-card" aria-label="Patch authoring preview" onPointerDown={(event) => event.stopPropagation()}>
+                <header><strong>Patch view · {selectedPatch.name}</strong><span>{previewBusy ? "Refining…" : preview ? `${preview.width} × ${preview.height}` : "Live"}</span></header>
+                <div><LiveRectifiedCanvas geometry={selectedPreviewGeometry} imageUrl={imageUrl} label={`Rectified authoring preview of ${selectedPatch.name}`} aspectRatio={selectedPatch.rectification.aspectRatio} /></div>
+                {previewBusy ? <progress aria-label="Patch preview refinement" /> : null}
+              </section> : null}
               <div className="viewport-tools"><span>MMB pan · Wheel zoom</span><button onClick={() => setView({ x: 0, y: 0, scale: 1 })}>Fit</button><output>{Math.round(view.scale * 100)}%</output></div>
             </div>
               </div>
@@ -1082,18 +1107,7 @@ export function PatchWorkspace({
 
           <div className="pane-splitter workbench-splitter" role="separator" aria-label="Resize source and preview workspaces" aria-orientation="vertical" onPointerDown={(event) => beginPaneResize("workbench", event)} onPointerMove={movePaneResize} onPointerUp={endPaneResize} onPointerCancel={endPaneResize} />
 
-          <section className="hotspot-workpiece" aria-label="Hotspot sheet workpiece">
-            <header className="split-pane-title">
-              <div><span>Live preview</span><strong>Selected rectified patch</strong></div>
-              <small>Phase 3 turns this into the layout canvas</small>
-            </header>
-            <div className="workpiece-canvas">
-              {selectedPatch && selectedPreviewGeometry && imageUrl ? <>
-                <LiveRectifiedCanvas geometry={selectedPreviewGeometry} imageUrl={imageUrl} label={`Real-time rectified preview of ${selectedPatch.name}`} aspectRatio={selectedPatch.rectification.aspectRatio} />
-                <div className="workpiece-selection-label"><strong>{selectedPatch.name}</strong><span>{previewBusy ? "Refining…" : preview ? `Verified ${preview.width} × ${preview.height}` : "Live"}</span></div>
-              </> : <div className="workpiece-empty"><strong>Rectified patch preview</strong><span>Create or select a patch on the left. Phase 3 places enabled patches and patch-free regions into the actual trim layout.</span></div>}
-            </div>
-          </section>
+          <LayoutWorkspace project={project} selectedPatchId={selectedPatch?.id ?? null} selectedSourceSetId={selectedSourceSetId} onLayoutState={onLayoutState} onFailure={onFailure} />
         </div>
         {busy ? <div className="busy" role="status"><span /><strong>{busy}…</strong></div> : null}
       </section>

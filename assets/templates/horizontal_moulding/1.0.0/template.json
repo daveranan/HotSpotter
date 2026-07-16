@@ -1,0 +1,21 @@
+{
+  "templates": [{
+    "identity": {"templateId": "ht.horizontal_moulding", "templateVersion": "1.0.0", "compatibilityKey": "ht.horizontal_moulding.topology.v1"},
+    "schemaVersion": 1,
+    "canonicalWidth": 4096,
+    "canonicalHeight": 4096,
+    "stableOrder": ["crown_wide", "crown_narrow", "reveal", "rail_large", "rail_medium", "rail_small", "sill", "cap_left", "cap_center", "cap_right"],
+    "slots": [
+      {"slotKey":"crown_wide","compatibilityKey":"ht.horizontal_moulding.crown_wide.v1","materialGroup":"moulding","variationGroup":"wide","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":32,"y":32,"width":4032,"height":384},"hotspot":{"x":2048,"y":224},"idColor":[64,91,121],"worldPlacement":{"width":12.6,"height":1.2,"rotationDegrees":0}},
+      {"slotKey":"crown_narrow","compatibilityKey":"ht.horizontal_moulding.crown_narrow.v1","materialGroup":"moulding","variationGroup":"narrow","role":"repeatingStrip","structuralProfile":"bevel","allocation":{"x":32,"y":448,"width":4032,"height":192},"hotspot":{"x":2048,"y":544},"idColor":[84,124,164],"worldPlacement":{"width":12.6,"height":0.6,"rotationDegrees":0}},
+      {"slotKey":"reveal","compatibilityKey":"ht.horizontal_moulding.reveal.v1","materialGroup":"moulding","variationGroup":"groove","role":"repeatingStrip","structuralProfile":"groove","allocation":{"x":32,"y":672,"width":4032,"height":96},"hotspot":{"x":2048,"y":720},"idColor":[107,157,207],"worldPlacement":{"width":12.6,"height":0.3,"rotationDegrees":0}},
+      {"slotKey":"rail_large","compatibilityKey":"ht.horizontal_moulding.rail_large.v1","materialGroup":"moulding","variationGroup":"large","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":32,"y":800,"width":4032,"height":896},"hotspot":{"x":2048,"y":1248},"idColor":[130,190,250],"worldPlacement":{"width":12.6,"height":2.8,"rotationDegrees":0}},
+      {"slotKey":"rail_medium","compatibilityKey":"ht.horizontal_moulding.rail_medium.v1","materialGroup":"moulding","variationGroup":"medium","role":"repeatingStrip","structuralProfile":"bevel","allocation":{"x":32,"y":1728,"width":4032,"height":576},"hotspot":{"x":2048,"y":2016},"idColor":[153,223,83],"worldPlacement":{"width":12.6,"height":1.8,"rotationDegrees":0}},
+      {"slotKey":"rail_small","compatibilityKey":"ht.horizontal_moulding.rail_small.v1","materialGroup":"moulding","variationGroup":"small","role":"repeatingStrip","structuralProfile":"groove","allocation":{"x":32,"y":2336,"width":4032,"height":256},"hotspot":{"x":2048,"y":2464},"idColor":[176,76,126],"worldPlacement":{"width":12.6,"height":0.8,"rotationDegrees":0}},
+      {"slotKey":"sill","compatibilityKey":"ht.horizontal_moulding.sill.v1","materialGroup":"moulding","variationGroup":"sill","role":"repeatingStrip","structuralProfile":"roundedBevel","allocation":{"x":32,"y":2624,"width":4032,"height":704},"hotspot":{"x":2048,"y":2976},"idColor":[199,109,169],"worldPlacement":{"width":12.6,"height":2.2,"rotationDegrees":0}},
+      {"slotKey":"cap_left","compatibilityKey":"ht.horizontal_moulding.cap_left.v1","materialGroup":"moulding","variationGroup":"cap","role":"trimCap","structuralProfile":"panelFrame","allocation":{"x":32,"y":3360,"width":1312,"height":704},"hotspot":{"x":688,"y":3712},"idColor":[222,142,212],"worldPlacement":{"width":4.1,"height":2.2,"rotationDegrees":0}},
+      {"slotKey":"cap_center","compatibilityKey":"ht.horizontal_moulding.cap_center.v1","materialGroup":"moulding","variationGroup":"cap","role":"trimCap","structuralProfile":"panelFrame","allocation":{"x":1376,"y":3360,"width":1312,"height":704},"hotspot":{"x":2032,"y":3712},"idColor":[245,175,95],"worldPlacement":{"width":4.1,"height":2.2,"rotationDegrees":0}},
+      {"slotKey":"cap_right","compatibilityKey":"ht.horizontal_moulding.cap_right.v1","materialGroup":"moulding","variationGroup":"cap","role":"trimCap","structuralProfile":"panelFrame","allocation":{"x":2720,"y":3360,"width":1344,"height":704},"hotspot":{"x":3392,"y":3712},"idColor":[72,208,138],"worldPlacement":{"width":4.2,"height":2.2,"rotationDegrees":0}}
+    ]
+  }]
+}

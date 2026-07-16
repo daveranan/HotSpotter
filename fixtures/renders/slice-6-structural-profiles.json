@@ -1,0 +1,13 @@
+{
+  "width": 32,
+  "height": 24,
+  "cases": [
+    { "kind": "flat", "openGlSha256": "042c20eafee52054a93fff2cacd1d8a88014078c362e56a5f35b5085ded814b3", "directXSha256": "042c20eafee52054a93fff2cacd1d8a88014078c362e56a5f35b5085ded814b3" },
+    { "kind": "convexBevel45", "openGlSha256": "53acf163a7abbf523184ecfbd7d7f24725af92195c650e30522e070ca8b13715", "directXSha256": "977f5d8ca07f4cd275933c7bec4d4a295b2d887a24e608eeea3a840ca78e7e30" },
+    { "kind": "concaveGroove45", "openGlSha256": "5b35780a4c2db372677cc3f892de9cde6eaafbe445da3cdbaacbd513a31691eb", "directXSha256": "ab6c0f5f7b589216db65a4feb78b16b4c2802b9fa5f4edd5ebc1d2af463d26f5" },
+    { "kind": "roundedBevel", "openGlSha256": "bcec29ae16e971ab9e37ae70b3cb483e95a4aeaf898695858265c6fa2af39961", "directXSha256": "8e15d9a352a2df6eedfc8ab7d2f98e388948a1c453f794654a07f7df92a5c0d6" },
+    { "kind": "panelFrame", "openGlSha256": "4f8f6b9f5bbe19c6b4379de7804d076190624df8627948959912e4752d1909be", "directXSha256": "b5dacde3bc361945651a9cf602291eefd63353d4828ec34064a031e4dade721d" },
+    { "kind": "radialDisc", "openGlSha256": "28da694249eb941fc2ff1d811ab4f695b51dc2ca2babe524c5ea00615a7f3488", "directXSha256": "ba8210fb9887910759061ec7ef1c448f8eb223a8fa2a22a2f11b90a8ad57cd95" },
+    { "kind": "annulus", "openGlSha256": "8ae1424edd09f210858999bfd08d1c3c8d5deda7e45e5209dda0e5175d53098c", "directXSha256": "fccb3dbcb359fde6b30293a92530c216c66aed7e9e7beff51fe71440a1ff30d0" }
+  ]
+}

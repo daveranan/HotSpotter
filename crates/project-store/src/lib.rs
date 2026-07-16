@@ -8,17 +8,21 @@ use std::{
 };
 
 use hot_trimmer_domain::{
-    Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchSet, ProjectId, SourceId,
+    Layout, LayoutId, LayoutItem, LayoutKind, LayoutPreset, LayoutRegion, LayoutRequest,
+    LayoutSettings, Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchSet,
+    PixelBounds, ProjectId, RegionFill, RegionId, RegionLocks, SourceId, SourceSetId,
+    TemplateLayoutContract,
 };
-use hot_trimmer_geometry::Quadrilateral;
+use hot_trimmer_geometry::{LayoutSolveError, Quadrilateral, solve_layout, validate_layout};
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 pub const MAX_RECOVERY_SNAPSHOTS: usize = 5;
+const MAX_PROJECT_HISTORY: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,13 +128,71 @@ pub struct StoredSource {
     pub input: SourceInput,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSetSnapshot {
+    pub id: SourceSetId,
+    pub name: String,
+}
+
+/// Durable solver intent plus its authoritative ordered result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredLayout {
+    pub layout: Layout,
+    pub items: Vec<LayoutItem>,
+    #[serde(default)]
+    pub layout_kind: LayoutKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateLayoutContract>,
+}
+
+impl StoredLayout {
+    #[must_use]
+    pub fn regeneration_request(&self) -> LayoutRequest {
+        LayoutRequest {
+            layout_id: self.layout.id,
+            preset: self.layout.preset,
+            settings: self.layout.settings.clone(),
+            items: self.items.clone(),
+            existing_regions: self.layout.regions.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum LayoutCommand {
+    SetBounds {
+        region_id: RegionId,
+        bounds: PixelBounds,
+    },
+    SetLocks {
+        region_id: RegionId,
+        locks: RegionLocks,
+    },
+    Reorder {
+        region_id: RegionId,
+        to_index: usize,
+    },
+    DeleteSimple {
+        region_id: RegionId,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectSummary {
     pub id: ProjectId,
     pub name: String,
     pub path: PathBuf,
     pub sources: Vec<StoredSource>,
+    pub source_sets: Vec<SourceSetSnapshot>,
     pub patches: Vec<Patch>,
+    pub layout: Option<StoredLayout>,
     pub stale_lock_recovered: bool,
 }
 
@@ -178,6 +240,12 @@ pub enum StoreError {
     },
     #[error("the source is used by one or more patches")]
     SourceInUseByPatches,
+    #[error("the source or patch is used by the current layout: {0}")]
+    LayoutReference(String),
+    #[error("the layout command is invalid: {0}")]
+    LayoutCommand(String),
+    #[error("the layout could not be solved: {0}")]
+    LayoutSolve(#[from] LayoutSolveError),
     #[error("the patch command is invalid: {0}")]
     PatchCommand(#[from] PatchCommandError),
     #[error("patch data could not be serialized: {0}")]
@@ -190,6 +258,25 @@ pub struct ProjectStore {
     _lock: ProjectLock,
     stale_lock_recovered: bool,
     patch_set: PatchSet,
+    layout: Option<StoredLayout>,
+    history: Vec<ProjectHistoryEntry>,
+    history_cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryKind {
+    Patch,
+    Layout,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProjectHistoryEntry {
+    kind: HistoryKind,
+    before_patches: Vec<Patch>,
+    after_patches: Vec<Patch>,
+    before_layout: Option<StoredLayout>,
+    after_layout: Option<StoredLayout>,
+    coalescing_group: Option<u64>,
 }
 
 impl ProjectStore {
@@ -234,6 +321,9 @@ impl ProjectStore {
             _lock: lock,
             stale_lock_recovered,
             patch_set: PatchSet::default(),
+            layout: None,
+            history: Vec::new(),
+            history_cursor: 0,
         })
     }
 
@@ -250,12 +340,16 @@ impl ProjectStore {
         verify_integrity(&connection)?;
 
         let patch_set = PatchSet::new(load_patches(&connection)?)?;
+        let layout = load_layout(&connection)?;
         let store = Self {
             connection,
             project_path: path.to_path_buf(),
             _lock: lock,
             stale_lock_recovered,
             patch_set,
+            layout,
+            history: Vec::new(),
+            history_cursor: 0,
         };
         store.summary()?;
         Ok(store)
@@ -421,6 +515,7 @@ impl ProjectStore {
         transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
         transaction.commit()?;
         self.patch_set = next_patch_set;
+        self.clear_history();
         checkpoint(&self.connection)
     }
 
@@ -476,6 +571,24 @@ impl ProjectStore {
         }) {
             return Err(StoreError::SourceInUseByPatches);
         }
+        if channel == SourceChannel::BaseColor
+            && self.layout.as_ref().is_some_and(|stored| {
+                stored.items.iter().any(|item| match item.fill {
+                    RegionFill::WholeSourceSet {
+                        source_set_id: referenced,
+                    }
+                    | RegionFill::RectifiedPatch {
+                        source_set_id: referenced,
+                        ..
+                    } => referenced.to_string() == source_set_id.to_string(),
+                    RegionFill::SimpleColor { .. } | RegionFill::SimpleData { .. } => false,
+                })
+            })
+        {
+            return Err(StoreError::LayoutReference(
+                "Base Color anchors a whole-source or patch layout region".into(),
+            ));
+        }
         let now = unix_timestamp()?;
         let transaction = self.connection.transaction()?;
         let removed = transaction.execute(
@@ -500,6 +613,7 @@ impl ProjectStore {
         )?;
         transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
         transaction.commit()?;
+        self.clear_history();
         checkpoint(&self.connection)
     }
 
@@ -536,13 +650,18 @@ impl ProjectStore {
     }
 
     #[must_use]
+    pub const fn layout(&self) -> Option<&StoredLayout> {
+        self.layout.as_ref()
+    }
+
+    #[must_use]
     pub fn can_undo_patch_command(&self) -> bool {
-        self.patch_set.can_undo()
+        self.history_cursor > 0
     }
 
     #[must_use]
     pub fn can_redo_patch_command(&self) -> bool {
-        self.patch_set.can_redo()
+        self.history_cursor < self.history.len()
     }
 
     /// Applies and durably journals one validated patch command in the same transaction as patch state.
@@ -555,19 +674,52 @@ impl ProjectStore {
         command: &PatchCommand,
         coalescing_group: Option<u64>,
     ) -> Result<PatchEditOutcome, StoreError> {
-        let mut next = self.patch_set.clone();
-        let outcome = next.execute(command.clone(), coalescing_group)?;
+        let before = self.patch_set.patches().to_vec();
+        let before_layout = self.layout.clone();
+        let mut next = PatchSet::new(before.clone())?;
+        let outcome = next.execute(command.clone(), None)?;
         validate_patch_geometries(next.patches())?;
+        let next_layout = self.layout_after_patch_command(command)?;
+        validate_patch_layout_references_in(next_layout.as_ref(), next.patches())?;
+        if let Some(stored) = &next_layout {
+            self.validate_layout_request_catalog(&stored.regeneration_request())?;
+        }
         let payload = serde_json::to_string(command)?;
-        persist_patch_state(
-            &mut self.connection,
-            next.patches(),
-            "patch_command",
-            &payload,
-        )?;
+        if before_layout != next_layout {
+            persist_authoring_state(
+                &mut self.connection,
+                next.patches(),
+                next_layout.as_ref(),
+                "patch_command",
+                &payload,
+            )?;
+        } else {
+            persist_patch_state(
+                &mut self.connection,
+                next.patches(),
+                "patch_command",
+                &payload,
+            )?;
+        }
+        let after = next.patches().to_vec();
         self.patch_set = next;
+        self.layout = next_layout.clone();
+        if before != after || before_layout != next_layout {
+            self.push_history(ProjectHistoryEntry {
+                kind: HistoryKind::Patch,
+                before_patches: before,
+                after_patches: after,
+                before_layout,
+                after_layout: next_layout,
+                coalescing_group,
+            });
+        }
         checkpoint(&self.connection)?;
-        Ok(outcome)
+        Ok(PatchEditOutcome {
+            can_undo: self.can_undo_patch_command(),
+            can_redo: self.can_redo_patch_command(),
+            ..outcome
+        })
     }
 
     /// Undoes the latest coalesced patch command and persists the restored state.
@@ -576,13 +728,7 @@ impl ProjectStore {
     ///
     /// Returns a typed failure without changing state when history is empty or persistence fails.
     pub fn undo_patch_command(&mut self) -> Result<PatchEditOutcome, StoreError> {
-        let mut next = self.patch_set.clone();
-        let outcome = next.undo()?;
-        let payload = serde_json::to_string(&outcome.invalidated_patch_ids)?;
-        persist_patch_state(&mut self.connection, next.patches(), "patch_undo", &payload)?;
-        self.patch_set = next;
-        checkpoint(&self.connection)?;
-        Ok(outcome)
+        self.undo_project_command()
     }
 
     /// Redoes the next patch command and persists the restored state.
@@ -591,13 +737,226 @@ impl ProjectStore {
     ///
     /// Returns a typed failure without changing state when redo history is empty or persistence fails.
     pub fn redo_patch_command(&mut self) -> Result<PatchEditOutcome, StoreError> {
-        let mut next = self.patch_set.clone();
-        let outcome = next.redo()?;
-        let payload = serde_json::to_string(&outcome.invalidated_patch_ids)?;
-        persist_patch_state(&mut self.connection, next.patches(), "patch_redo", &payload)?;
-        self.patch_set = next;
-        checkpoint(&self.connection)?;
-        Ok(outcome)
+        self.redo_project_command()
+    }
+
+    /// Validates a solver request against the current source-set and patch catalog without publishing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded contract or catalog-reference error for invalid source-set or patch ownership.
+    pub fn validate_layout_request_catalog(
+        &self,
+        request: &LayoutRequest,
+    ) -> Result<(), StoreError> {
+        request.validate().map_err(LayoutSolveError::Contract)?;
+        let source_sets = load_source_sets(&self.connection)?;
+        for item in &request.items {
+            match &item.fill {
+                RegionFill::WholeSourceSet { source_set_id } => {
+                    if !source_sets.iter().any(|entry| entry.id == *source_set_id) {
+                        return Err(StoreError::LayoutReference(format!(
+                            "unknown source set {source_set_id}"
+                        )));
+                    }
+                    let base_exists = self.connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sources WHERE source_set_id = ?1 AND channel = 'base_color')",
+                        [source_set_id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    if !base_exists {
+                        return Err(StoreError::LayoutReference(format!(
+                            "source set {source_set_id} has no Base Color"
+                        )));
+                    }
+                }
+                RegionFill::RectifiedPatch {
+                    source_set_id,
+                    patch_id,
+                } => {
+                    let Some(patch) = self
+                        .patch_set
+                        .patches()
+                        .iter()
+                        .find(|patch| patch.id == *patch_id)
+                    else {
+                        return Err(StoreError::LayoutReference(format!(
+                            "unknown patch {patch_id}"
+                        )));
+                    };
+                    if !patch.enabled {
+                        return Err(StoreError::LayoutReference(format!(
+                            "patch {patch_id} is disabled"
+                        )));
+                    }
+                    let owns = self.connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sources WHERE source_set_id = ?1 AND id = ?2)",
+                        params![source_set_id.to_string(), patch.source_id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    if !owns {
+                        return Err(StoreError::LayoutReference(format!(
+                            "patch {patch_id} does not belong to source set {source_set_id}"
+                        )));
+                    }
+                }
+                RegionFill::SimpleColor { .. } | RegionFill::SimpleData { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Solves and commits a layout only after all catalog references and geometry constraints pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns without publishing when validation, solving, serialization, or persistence fails.
+    pub fn solve_and_commit_layout(
+        &mut self,
+        request: &LayoutRequest,
+        coalescing_group: Option<u64>,
+    ) -> Result<&StoredLayout, StoreError> {
+        self.validate_layout_request_catalog(request)?;
+        let solved = solve_layout(request)?;
+        self.commit_solved_layout(request, solved, coalescing_group)
+    }
+
+    /// Commits a previously solved layout after rechecking stale catalog state and solver output.
+    ///
+    /// # Errors
+    ///
+    /// Returns without publishing when the solve is stale, inconsistent, invalid, or cannot be persisted.
+    pub fn commit_solved_layout(
+        &mut self,
+        request: &LayoutRequest,
+        solved: Layout,
+        coalescing_group: Option<u64>,
+    ) -> Result<&StoredLayout, StoreError> {
+        self.validate_layout_request_catalog(request)?;
+        if solved.id != request.layout_id
+            || solved.preset != request.preset
+            || solved.settings != request.settings
+        {
+            return Err(StoreError::LayoutCommand(
+                "solved layout disagrees with its authoritative intent".into(),
+            ));
+        }
+        validate_layout(&solved)?;
+        let next = StoredLayout {
+            layout: solved,
+            items: request.items.clone(),
+            layout_kind: LayoutKind::CustomAtlas,
+            template: None,
+        };
+        self.commit_layout(next, "layout_solve", coalescing_group)?;
+        self.layout.as_ref().ok_or_else(|| {
+            StoreError::InvalidData("committed layout disappeared from memory".into())
+        })
+    }
+
+    /// Commits a solved template layout together with its authoritative pinned contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns without publishing when the template snapshot or slot bindings disagree with the solved layout.
+    pub fn commit_solved_template_layout(
+        &mut self,
+        request: &LayoutRequest,
+        solved: Layout,
+        template: TemplateLayoutContract,
+        coalescing_group: Option<u64>,
+    ) -> Result<&StoredLayout, StoreError> {
+        self.validate_layout_request_catalog(request)?;
+        if solved.id != request.layout_id
+            || solved.preset != request.preset
+            || solved.settings != request.settings
+        {
+            return Err(StoreError::LayoutCommand(
+                "solved template layout disagrees with its authoritative intent".into(),
+            ));
+        }
+        if template.snapshot.is_none() || template.slot_bindings.len() != solved.regions.len() {
+            return Err(StoreError::LayoutCommand(
+                "template snapshot and one binding per solved region are required".into(),
+            ));
+        }
+        for region in &solved.regions {
+            let matches = template.slot_bindings.iter().any(|binding| {
+                binding.slot_key == region.item_key
+                    && binding.item_key == region.item_key
+                    && binding.region_id == region.id
+                    && binding.id_color == region.id_color
+            });
+            if !matches {
+                return Err(StoreError::LayoutCommand(format!(
+                    "template binding is missing or stale for slot {}",
+                    region.item_key
+                )));
+            }
+        }
+        validate_layout(&solved)?;
+        let next = StoredLayout {
+            layout: solved,
+            items: request.items.clone(),
+            layout_kind: LayoutKind::Template,
+            template: Some(template),
+        };
+        self.commit_layout(next, "template_layout_solve", coalescing_group)?;
+        self.layout.as_ref().ok_or_else(|| {
+            StoreError::InvalidData("committed template layout disappeared from memory".into())
+        })
+    }
+    /// Applies a bounded manual region edit without invoking or mutating patch geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns without publishing for missing regions, invalid bounds/order, or persistence failures.
+    pub fn execute_layout_command(
+        &mut self,
+        command: &LayoutCommand,
+        coalescing_group: Option<u64>,
+    ) -> Result<&StoredLayout, StoreError> {
+        let mut next = self.layout.clone().ok_or_else(|| {
+            StoreError::LayoutCommand("create a trim sheet before editing regions".into())
+        })?;
+        apply_layout_command(&mut next, command)?;
+        validate_layout(&next.layout)?;
+        self.validate_stored_layout_catalog(&next)?;
+        self.commit_layout(next, "layout_command", coalescing_group)?;
+        self.layout.as_ref().ok_or_else(|| {
+            StoreError::InvalidData("committed layout disappeared from memory".into())
+        })
+    }
+
+    /// Undoes the latest patch or layout mutation on the coherent authoring timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns when no edit exists or the restored state cannot be validated and persisted.
+    pub fn undo_project_command(&mut self) -> Result<PatchEditOutcome, StoreError> {
+        if self.history_cursor == 0 {
+            return Err(StoreError::PatchCommand(PatchCommandError::NothingToUndo));
+        }
+        let entry = self.history[self.history_cursor - 1].clone();
+        self.restore_history_entry(&entry, false)?;
+        self.history_cursor -= 1;
+        Ok(self.history_outcome(&entry))
+    }
+
+    /// Redoes the next patch or layout mutation on the coherent authoring timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns when no edit exists or the restored state cannot be validated and persisted.
+    pub fn redo_project_command(&mut self) -> Result<PatchEditOutcome, StoreError> {
+        let entry = self
+            .history
+            .get(self.history_cursor)
+            .cloned()
+            .ok_or(StoreError::PatchCommand(PatchCommandError::NothingToRedo))?;
+        self.restore_history_entry(&entry, true)?;
+        self.history_cursor += 1;
+        Ok(self.history_outcome(&entry))
     }
 
     /// Returns the durable autosave command journal in commit order.
@@ -666,6 +1025,8 @@ impl ProjectStore {
         checkpoint(&self.connection)?;
         verify_integrity(&self.connection)?;
         self.patch_set = PatchSet::new(load_patches(&self.connection)?)?;
+        self.layout = load_layout(&self.connection)?;
+        self.clear_history();
         Ok(())
     }
 
@@ -697,7 +1058,10 @@ impl ProjectStore {
             project_path: destination.to_path_buf(),
             _lock: lock,
             stale_lock_recovered,
-            patch_set: self.patch_set.clone(),
+            patch_set: PatchSet::new(self.patch_set.patches().to_vec())?,
+            layout: self.layout.clone(),
+            history: Vec::new(),
+            history_cursor: 0,
         })
     }
 
@@ -794,6 +1158,210 @@ impl ProjectStore {
             })
         }
     }
+
+    fn layout_after_patch_command(
+        &self,
+        command: &PatchCommand,
+    ) -> Result<Option<StoredLayout>, StoreError> {
+        let affected_patch_id = match command {
+            PatchCommand::Delete { patch_id }
+            | PatchCommand::SetEnabled {
+                patch_id,
+                enabled: false,
+            } => Some(*patch_id),
+            _ => None,
+        };
+        let Some(affected_patch_id) = affected_patch_id else {
+            return Ok(self.layout.clone());
+        };
+        let Some(mut stored) = self.layout.clone() else {
+            return Ok(None);
+        };
+
+        let mut changed = false;
+        if stored.layout.preset == LayoutPreset::Atlas {
+            stored.items.retain(|item| {
+                let remove = matches!(
+                    item.fill,
+                    RegionFill::RectifiedPatch { patch_id, .. } if patch_id == affected_patch_id
+                );
+                changed |= remove;
+                !remove
+            });
+        } else {
+            for item in &mut stored.items {
+                if let RegionFill::RectifiedPatch {
+                    source_set_id,
+                    patch_id,
+                } = item.fill
+                    && patch_id == affected_patch_id
+                {
+                    item.fill = RegionFill::WholeSourceSet { source_set_id };
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(Some(stored));
+        }
+        if stored
+            .items
+            .iter()
+            .all(|item| !item.enabled || !item.participates)
+        {
+            stored.layout.regions.clear();
+            return Ok(Some(stored));
+        }
+        let request = stored.regeneration_request();
+        stored.layout = solve_layout(&request)?;
+        Ok(Some(stored))
+    }
+
+    fn validate_stored_layout_catalog(&self, stored: &StoredLayout) -> Result<(), StoreError> {
+        self.validate_layout_request_catalog(&stored.regeneration_request())
+    }
+
+    fn commit_layout(
+        &mut self,
+        next: StoredLayout,
+        operation: &str,
+        coalescing_group: Option<u64>,
+    ) -> Result<(), StoreError> {
+        if coalescing_group == Some(0) {
+            return Err(StoreError::LayoutCommand(
+                "coalescing group zero is reserved".into(),
+            ));
+        }
+        let before = self.layout.clone();
+        if before.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        persist_layout_state(&mut self.connection, Some(&next), operation)?;
+        self.layout = Some(next.clone());
+        self.push_history(ProjectHistoryEntry {
+            kind: HistoryKind::Layout,
+            before_patches: Vec::new(),
+            after_patches: Vec::new(),
+            before_layout: before,
+            after_layout: Some(next),
+            coalescing_group,
+        });
+        checkpoint(&self.connection)
+    }
+
+    fn push_history(&mut self, entry: ProjectHistoryEntry) {
+        if self.history_cursor < self.history.len() {
+            self.history.truncate(self.history_cursor);
+        }
+        let coalesces = entry.coalescing_group.is_some()
+            && self.history.last().is_some_and(|previous| {
+                previous.kind == entry.kind && previous.coalescing_group == entry.coalescing_group
+            });
+        if coalesces {
+            if let Some(previous) = self.history.last_mut() {
+                previous.after_patches = entry.after_patches;
+                previous.after_layout = entry.after_layout;
+            }
+        } else {
+            self.history.push(entry);
+            if self.history.len() > MAX_PROJECT_HISTORY {
+                self.history.remove(0);
+            }
+        }
+        self.history_cursor = self.history.len();
+    }
+
+    fn clear_history(&mut self) {
+        self.history.clear();
+        self.history_cursor = 0;
+    }
+
+    fn restore_history_entry(
+        &mut self,
+        entry: &ProjectHistoryEntry,
+        use_after: bool,
+    ) -> Result<(), StoreError> {
+        match entry.kind {
+            HistoryKind::Patch => {
+                let patches = if use_after {
+                    &entry.after_patches
+                } else {
+                    &entry.before_patches
+                };
+                let layout_changed = entry.before_layout != entry.after_layout;
+                let restored_layout = if use_after {
+                    entry.after_layout.clone()
+                } else {
+                    entry.before_layout.clone()
+                };
+                let layout = if layout_changed {
+                    restored_layout.as_ref()
+                } else {
+                    self.layout.as_ref()
+                };
+                validate_patch_layout_references_in(layout, patches)?;
+                let operation = if use_after {
+                    "patch_redo"
+                } else {
+                    "patch_undo"
+                };
+                if layout_changed {
+                    persist_authoring_state(
+                        &mut self.connection,
+                        patches,
+                        restored_layout.as_ref(),
+                        operation,
+                        "{}",
+                    )?;
+                    self.layout = restored_layout;
+                } else {
+                    persist_patch_state(&mut self.connection, patches, operation, "{}")?;
+                }
+                self.patch_set = PatchSet::new(patches.clone())?;
+            }
+            HistoryKind::Layout => {
+                let layout = if use_after {
+                    entry.after_layout.as_ref()
+                } else {
+                    entry.before_layout.as_ref()
+                };
+                if let Some(layout) = layout {
+                    self.validate_stored_layout_catalog(layout)?;
+                }
+                persist_layout_state(
+                    &mut self.connection,
+                    layout,
+                    if use_after {
+                        "project_redo"
+                    } else {
+                        "project_undo"
+                    },
+                )?;
+                self.layout = layout.cloned();
+            }
+        }
+        checkpoint(&self.connection)
+    }
+
+    fn history_outcome(&self, entry: &ProjectHistoryEntry) -> PatchEditOutcome {
+        let invalidated_patch_ids = if entry.kind == HistoryKind::Patch {
+            entry
+                .before_patches
+                .iter()
+                .chain(&entry.after_patches)
+                .map(|patch| patch.id)
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        PatchEditOutcome {
+            invalidated_patch_ids,
+            dirty: true,
+            can_undo: self.can_undo_patch_command(),
+            can_redo: self.can_redo_patch_command(),
+        }
+    }
 }
 
 fn summary_from_connection(
@@ -810,12 +1378,21 @@ fn summary_from_connection(
     let id = id_text
         .parse::<ProjectId>()
         .map_err(|_| StoreError::InvalidId(id_text.clone()))?;
+    let sources = load_sources(connection)?;
+    let source_sets = load_source_sets(connection)?;
+    let patches = load_patches(connection)?;
+    let layout = load_layout(connection)?;
+    if let Some(stored) = &layout {
+        validate_layout_catalog_snapshot(stored, &source_sets, &sources, &patches)?;
+    }
     Ok(ProjectSummary {
         id,
         name,
         path: path.to_path_buf(),
-        sources: load_sources(connection)?,
-        patches: load_patches(connection)?,
+        sources,
+        source_sets,
+        patches,
+        layout,
         stale_lock_recovered,
     })
 }
@@ -857,6 +1434,242 @@ fn validate_patch_geometries(patches: &[Patch]) -> Result<(), StoreError> {
         })?;
     }
     Ok(())
+}
+
+fn load_source_sets(connection: &Connection) -> Result<Vec<SourceSetSnapshot>, StoreError> {
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 6 {
+        let value: String =
+            connection.query_row("SELECT id FROM project LIMIT 1", [], |row| row.get(0))?;
+        return Ok(vec![SourceSetSnapshot {
+            id: value.parse().map_err(|_| StoreError::InvalidId(value))?,
+            name: "Material 1".into(),
+        }]);
+    }
+    let mut statement = connection.prepare("SELECT id, name FROM source_sets ORDER BY ordinal")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        let (id, name) = row?;
+        Ok(SourceSetSnapshot {
+            id: id.parse().map_err(|_| StoreError::InvalidId(id))?,
+            name,
+        })
+    })
+    .collect()
+}
+
+fn load_layout(connection: &Connection) -> Result<Option<StoredLayout>, StoreError> {
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 7 {
+        return Ok(None);
+    }
+    let row = connection
+        .query_row(
+            "SELECT id, preset, settings_json, items_json, layout_kind, template_json FROM layouts WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id_text, preset_text, settings_json, items_json, layout_kind_json, template_json)) = row else {
+        return Ok(None);
+    };
+    let id: LayoutId = id_text
+        .parse()
+        .map_err(|_| StoreError::InvalidId(id_text.clone()))?;
+    let preset: LayoutPreset = serde_json::from_str(&format!("\"{preset_text}\""))?;
+    let settings: LayoutSettings = serde_json::from_str(&settings_json)?;
+    let items: Vec<LayoutItem> = serde_json::from_str(&items_json)?;
+    let layout_kind: LayoutKind = serde_json::from_str(&format!("\"{layout_kind_json}\""))?;
+    let template = template_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?;
+    let mut statement = connection.prepare(
+        "SELECT id, item_key, region_json FROM layout_regions WHERE layout_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map([id_text], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut regions = Vec::new();
+    for row in rows {
+        let (region_id, item_key, json) = row?;
+        let region: LayoutRegion = serde_json::from_str(&json)?;
+        if region.id.to_string() != region_id || region.item_key != item_key {
+            return Err(StoreError::InvalidData(
+                "layout region identifiers disagree with indexed project data".into(),
+            ));
+        }
+        regions.push(region);
+    }
+    let layout = Layout {
+        id,
+        preset,
+        settings,
+        regions,
+    };
+    validate_layout(&layout)?;
+    let stored = StoredLayout {
+        layout,
+        items,
+        layout_kind,
+        template,
+    };
+    // Pure contract checks run here; catalog ownership is checked by `ProjectStore::open` through summary.
+    stored
+        .regeneration_request()
+        .validate()
+        .map_err(LayoutSolveError::Contract)?;
+    Ok(Some(stored))
+}
+
+fn validate_layout_catalog_snapshot(
+    stored: &StoredLayout,
+    source_sets: &[SourceSetSnapshot],
+    sources: &[StoredSource],
+    patches: &[Patch],
+) -> Result<(), StoreError> {
+    for item in &stored.items {
+        match item.fill {
+            RegionFill::WholeSourceSet { source_set_id } => {
+                if !source_sets.iter().any(|entry| entry.id == source_set_id)
+                    || !sources.iter().any(|source| {
+                        source.source_set_id.to_string() == source_set_id.to_string()
+                            && source.channel == SourceChannel::BaseColor
+                    })
+                {
+                    return Err(StoreError::LayoutReference(format!(
+                        "stored whole-source fill references unavailable set {source_set_id}"
+                    )));
+                }
+            }
+            RegionFill::RectifiedPatch {
+                source_set_id,
+                patch_id,
+            } => {
+                let patch = patches
+                    .iter()
+                    .find(|patch| patch.id == patch_id)
+                    .ok_or_else(|| {
+                        StoreError::LayoutReference(format!(
+                            "stored patch fill references unavailable patch {patch_id}"
+                        ))
+                    })?;
+                if !patch.enabled
+                    || !sources.iter().any(|source| {
+                        source.source_set_id.to_string() == source_set_id.to_string()
+                            && source.input.id == patch.source_id
+                    })
+                {
+                    return Err(StoreError::LayoutReference(format!(
+                        "stored patch {patch_id} is disabled or owned by another source set"
+                    )));
+                }
+            }
+            RegionFill::SimpleColor { .. } | RegionFill::SimpleData { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_layout_command(
+    stored: &mut StoredLayout,
+    command: &LayoutCommand,
+) -> Result<(), StoreError> {
+    match command {
+        LayoutCommand::SetBounds { region_id, bounds } => {
+            find_region_mut(stored, *region_id)?.bounds = *bounds;
+        }
+        LayoutCommand::SetFill { region_id, fill } => {
+            let region = find_region_mut(stored, *region_id)?;
+            region.fill = fill.clone();
+            if let Some(item) = stored.items.iter_mut().find(|item| item.key == region.item_key) {
+                item.fill = fill.clone();
+            }
+        }
+        LayoutCommand::SetLocks { region_id, locks } => {
+            find_region_mut(stored, *region_id)?.locks = *locks;
+        }
+        LayoutCommand::Reorder {
+            region_id,
+            to_index,
+        } => {
+            let Some(from) = stored
+                .layout
+                .regions
+                .iter()
+                .position(|region| region.id == *region_id)
+            else {
+                return Err(StoreError::LayoutCommand(format!(
+                    "region {region_id} does not exist"
+                )));
+            };
+            if *to_index >= stored.layout.regions.len() {
+                return Err(StoreError::LayoutCommand(format!(
+                    "region order index {to_index} exceeds the layout"
+                )));
+            }
+            let region = stored.layout.regions.remove(from);
+            stored.layout.regions.insert(*to_index, region);
+            for (index, region) in stored.layout.regions.iter_mut().enumerate() {
+                region.order_index = u32::try_from(index)
+                    .map_err(|_| StoreError::LayoutCommand("region order exceeds u32".into()))?;
+            }
+        }
+        LayoutCommand::DeleteSimple { region_id } => {
+            let Some(index) = stored
+                .layout
+                .regions
+                .iter()
+                .position(|region| region.id == *region_id)
+            else {
+                return Err(StoreError::LayoutCommand(format!(
+                    "region {region_id} does not exist"
+                )));
+            };
+            if !matches!(
+                stored.layout.regions[index].fill,
+                RegionFill::SimpleColor { .. } | RegionFill::SimpleData { .. }
+            ) {
+                return Err(StoreError::LayoutCommand(
+                    "only simple color/data regions can be deleted directly".into(),
+                ));
+            }
+            let key = stored.layout.regions.remove(index).item_key;
+            stored.items.retain(|item| item.key != key);
+            for (index, region) in stored.layout.regions.iter_mut().enumerate() {
+                region.order_index = u32::try_from(index)
+                    .map_err(|_| StoreError::LayoutCommand("region order exceeds u32".into()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_region_mut(
+    stored: &mut StoredLayout,
+    region_id: RegionId,
+) -> Result<&mut LayoutRegion, StoreError> {
+    stored
+        .layout
+        .regions
+        .iter_mut()
+        .find(|region| region.id == region_id)
+        .ok_or_else(|| StoreError::LayoutCommand(format!("region {region_id} does not exist")))
 }
 
 fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError> {
@@ -994,6 +1807,146 @@ fn persist_patch_state(
     Ok(())
 }
 
+fn validate_patch_layout_references_in(
+    stored: Option<&StoredLayout>,
+    patches: &[Patch],
+) -> Result<(), StoreError> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    for item in &stored.items {
+        if let RegionFill::RectifiedPatch { patch_id, .. } = item.fill {
+            let patch = patches
+                .iter()
+                .find(|patch| patch.id == patch_id)
+                .ok_or_else(|| {
+                    StoreError::LayoutReference(format!(
+                        "patch {patch_id} is still used by layout item {}",
+                        item.key
+                    ))
+                })?;
+            if !patch.enabled {
+                return Err(StoreError::LayoutReference(format!(
+                    "patch {patch_id} cannot be disabled while layout item {} uses it",
+                    item.key
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn persist_authoring_state(
+    connection: &mut Connection,
+    patches: &[Patch],
+    stored: Option<&StoredLayout>,
+    operation: &str,
+    payload_json: &str,
+) -> Result<(), StoreError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction()?;
+    persist_patch_rows(&transaction, patches)?;
+    transaction.execute("DELETE FROM layout_regions", [])?;
+    transaction.execute("DELETE FROM layouts", [])?;
+    if let Some(stored) = stored {
+        let preset_json = serde_json::to_string(&stored.layout.preset)?;
+        let preset = preset_json.trim_matches('"');
+        let settings_json = serde_json::to_string(&stored.layout.settings)?;
+        let items_json = serde_json::to_string(&stored.items)?;
+        transaction.execute(
+            "INSERT INTO layouts (singleton, id, preset, settings_json, items_json, layout_kind, template_json)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                stored.layout.id.to_string(),
+                preset,
+                settings_json,
+                items_json,
+                serde_json::to_string(&stored.layout_kind)?.trim_matches('"').to_owned(),
+                stored.template.as_ref().map(serde_json::to_string).transpose()?
+            ],
+        )?;
+        for (ordinal, region) in stored.layout.regions.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                StoreError::InvalidData("layout region count exceeds SQLite limits".into())
+            })?;
+            transaction.execute(
+                "INSERT INTO layout_regions (id, layout_id, ordinal, item_key, region_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    region.id.to_string(),
+                    stored.layout.id.to_string(),
+                    ordinal,
+                    region.item_key,
+                    serde_json::to_string(region)?
+                ],
+            )?;
+        }
+    }
+    transaction.execute(
+        "INSERT INTO autosave_journal (occurred_unix, operation, payload_json) VALUES (?1, ?2, ?3)",
+        params![now, operation, payload_json],
+    )?;
+    transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn persist_layout_state(
+    connection: &mut Connection,
+    stored: Option<&StoredLayout>,
+    operation: &str,
+) -> Result<(), StoreError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM layout_regions", [])?;
+    transaction.execute("DELETE FROM layouts", [])?;
+    if let Some(stored) = stored {
+        let preset_json = serde_json::to_string(&stored.layout.preset)?;
+        let preset = preset_json.trim_matches('"');
+        let settings_json = serde_json::to_string(&stored.layout.settings)?;
+        let items_json = serde_json::to_string(&stored.items)?;
+        transaction.execute(
+            "INSERT INTO layouts (singleton, id, preset, settings_json, items_json, layout_kind, template_json)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                stored.layout.id.to_string(),
+                preset,
+                settings_json,
+                items_json,
+                serde_json::to_string(&stored.layout_kind)?.trim_matches('"').to_owned(),
+                stored.template.as_ref().map(serde_json::to_string).transpose()?
+            ],
+        )?;
+        for (ordinal, region) in stored.layout.regions.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                StoreError::InvalidData("layout region count exceeds SQLite limits".into())
+            })?;
+            transaction.execute(
+                "INSERT INTO layout_regions (id, layout_id, ordinal, item_key, region_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    region.id.to_string(),
+                    stored.layout.id.to_string(),
+                    ordinal,
+                    region.item_key,
+                    serde_json::to_string(region)?
+                ],
+            )?;
+        }
+    }
+    let payload = match stored {
+        Some(stored) => serde_json::to_string(&stored.layout.id)?,
+        None => "null".to_owned(),
+    };
+    transaction.execute(
+        "INSERT INTO autosave_journal (occurred_unix, operation, payload_json) VALUES (?1, ?2, ?3)",
+        params![now, operation, payload],
+    )?;
+    transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     let mut version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > CURRENT_SCHEMA_VERSION {
@@ -1042,6 +1995,20 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         migrate_to_v6(&transaction)?;
         transaction.pragma_update(None, "user_version", 6_u32)?;
         transaction.commit()?;
+        version = 6;
+    }
+    if version == 6 {
+        let transaction = connection.transaction()?;
+        migrate_to_v7(&transaction)?;
+        transaction.pragma_update(None, "user_version", 7_u32)?;
+        transaction.commit()?;
+        version = 7;
+    }
+    if version == 7 {
+        let transaction = connection.transaction()?;
+        migrate_to_v8(&transaction)?;
+        transaction.pragma_update(None, "user_version", 8_u32)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -1082,6 +2049,20 @@ fn migrate_to_v5(transaction: &Transaction<'_>) -> Result<(), StoreError> {
 fn migrate_to_v6(transaction: &Transaction<'_>) -> Result<(), StoreError> {
     transaction.execute_batch(include_str!(
         "../../../fixtures/projects/migrate-v5-to-v6.sql"
+    ))?;
+    Ok(())
+}
+
+fn migrate_to_v7(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(include_str!(
+        "../../../fixtures/projects/migrate-v6-to-v7.sql"
+    ))?;
+    Ok(())
+}
+
+fn migrate_to_v8(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(include_str!(
+        "../../../fixtures/projects/migrate-v7-to-v8.sql"
     ))?;
     Ok(())
 }
@@ -1286,15 +2267,17 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use hot_trimmer_domain::{
-        NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId, PatchProperties,
-        RectificationSettings, SourceId,
+        AutoPackSettings, FillBehavior, LayoutId, LayoutItem, LayoutOrder, LayoutPreset,
+        LayoutRequest, LayoutSettings, NormalizedPoint, PackPriority, Patch, PatchCommand,
+        PatchGeometry, PatchId, PatchProperties, PixelBounds, PixelSize, RectificationSettings,
+        RegionConstraints, RegionFill, RegionLocks, SourceId, SourceSetId,
     };
     use rusqlite::Connection;
     use uuid::Uuid;
 
     use super::{
-        CURRENT_SCHEMA_VERSION, MAX_RECOVERY_SNAPSHOTS, ProjectStore, SourceChannel, SourceInput,
-        SourceOwnership, StoreError, lock_path, migrate,
+        CURRENT_SCHEMA_VERSION, LayoutCommand, MAX_RECOVERY_SNAPSHOTS, ProjectStore, SourceChannel,
+        SourceInput, SourceOwnership, StoreError, lock_path, migrate,
     };
 
     struct FixtureDir(PathBuf);
@@ -1350,6 +2333,49 @@ mod tests {
             },
             properties: PatchProperties::default(),
             rectification: RectificationSettings::default(),
+        }
+    }
+
+    fn source_item(source_set_id: SourceSetId, key: &str) -> LayoutItem {
+        LayoutItem {
+            key: key.into(),
+            fill: RegionFill::WholeSourceSet { source_set_id },
+            behavior: FillBehavior::Stretch,
+            trim_caps: None,
+            natural_size: PixelSize {
+                width: 1024,
+                height: 512,
+            },
+            enabled: true,
+            participates: true,
+            constraints: RegionConstraints::default(),
+            padding_px: None,
+            bleed_px: None,
+            region_id: None,
+        }
+    }
+
+    fn layout_request(items: Vec<LayoutItem>) -> LayoutRequest {
+        LayoutRequest {
+            layout_id: LayoutId::new(),
+            preset: LayoutPreset::Balanced,
+            settings: LayoutSettings {
+                output: PixelSize {
+                    width: 2048,
+                    height: 2048,
+                },
+                padding_px: 4,
+                bleed_px: 8,
+                order: LayoutOrder::Input,
+                auto_pack: AutoPackSettings {
+                    enabled: true,
+                    priority: PackPriority::Balanced,
+                    seed: 17,
+                },
+                fixed_selected_size: None,
+            },
+            items,
+            existing_regions: Vec::new(),
         }
     }
 
@@ -1520,6 +2546,445 @@ mod tests {
                 .expect("schema version"),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn version_six_fixture_adds_empty_layout_storage_transactionally() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-six.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v4.sql"))
+            .expect("v4 schema");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/data-v1.sql"))
+            .expect("v4 data");
+        connection
+            .execute_batch(include_str!(
+                "../../../fixtures/projects/migrate-v4-to-v5.sql"
+            ))
+            .expect("v5 schema");
+        connection
+            .execute_batch(include_str!(
+                "../../../fixtures/projects/migrate-v5-to-v6.sql"
+            ))
+            .expect("v6 schema");
+        connection
+            .pragma_update(None, "user_version", 6_u32)
+            .expect("mark v6");
+        migrate(&mut connection).expect("migrate v6");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        let layout_count: u32 = connection
+            .query_row("SELECT count(*) FROM layouts", [], |row| row.get(0))
+            .expect("layout count");
+        assert_eq!(layout_count, 0);
+    }
+
+    #[test]
+    fn version_seven_layout_migrates_to_custom_atlas_without_discarding_rows() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("version-seven.hottrimmer");
+        let mut connection = Connection::open(&path).expect("create fixture");
+        connection
+            .execute_batch(include_str!("../../../fixtures/projects/schema-v7.sql"))
+            .expect("v7 schema");
+        connection
+            .execute(
+                "INSERT INTO layouts (singleton, id, preset, settings_json, items_json)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                [
+                    "00000000-0000-4000-8000-000000000007",
+                    "atlas",
+                    "{\"output\":{\"width\":256,\"height\":256}}",
+                    "[]",
+                ],
+            )
+            .expect("legacy layout");
+        connection
+            .pragma_update(None, "user_version", 7_u32)
+            .expect("mark v7");
+
+        migrate(&mut connection).expect("migrate v7");
+
+        let row: (String, String, String, String, Option<String>) = connection
+            .query_row(
+                "SELECT id, preset, settings_json, items_json, template_json FROM layouts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("migrated layout");
+        let kind: String = connection
+            .query_row("SELECT layout_kind FROM layouts", [], |row| row.get(0))
+            .expect("layout kind");
+        assert_eq!(row.0, "00000000-0000-4000-8000-000000000007");
+        assert_eq!(row.1, "atlas");
+        assert_eq!(row.2, "{\"output\":{\"width\":256,\"height\":256}}");
+        assert_eq!(row.3, "[]");
+        assert_eq!(kind, "custom_atlas");
+        assert_eq!(row.4, None);
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+    #[test]
+    fn source_only_two_set_layout_reopens_with_explicit_set_names() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("two-sets.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Two sets").expect("create project");
+        let first_set = store.summary().expect("summary").source_sets[0].id;
+        let second_uuid = Uuid::new_v4();
+        let second_set: SourceSetId = second_uuid.to_string().parse().expect("source set id");
+        store
+            .replace_source_in_set(
+                Uuid::parse_str(&first_set.to_string()).expect("uuid"),
+                SourceChannel::BaseColor,
+                &source(1024, 512),
+            )
+            .expect("first source");
+        store
+            .replace_source_in_set(second_uuid, SourceChannel::BaseColor, &source(512, 1024))
+            .expect("second source");
+        let request = layout_request(vec![
+            source_item(first_set, "source:first"),
+            source_item(second_set, "source:second"),
+        ]);
+        store
+            .solve_and_commit_layout(&request, None)
+            .expect("source-only layout");
+        drop(store);
+
+        let reopened = ProjectStore::open(&path).expect("reopen");
+        let summary = reopened.summary().expect("summary");
+        assert_eq!(summary.source_sets.len(), 2);
+        assert_eq!(summary.source_sets[0].name, "Material 1");
+        assert_eq!(summary.source_sets[1].id, second_set);
+        assert_eq!(summary.layout.expect("layout").layout.regions.len(), 2);
+    }
+
+    #[test]
+    fn mixed_sets_and_optional_patches_are_one_to_one_in_recovery() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("mixed.hottrimmer");
+        let recovery = fixture.0.join("recovery");
+        let mut store = ProjectStore::create(&path, "Mixed").expect("create project");
+        let first_set = store.summary().expect("summary").source_sets[0].id;
+        let second_uuid = Uuid::new_v4();
+        let second_set: SourceSetId = second_uuid.to_string().parse().expect("source set id");
+        let first = source(1024, 512);
+        let second = source(512, 1024);
+        let authored = patch(first.id, "Optional patch");
+        store
+            .replace_source(SourceChannel::BaseColor, &first)
+            .expect("first source");
+        store
+            .replace_source_in_set(second_uuid, SourceChannel::BaseColor, &second)
+            .expect("second source");
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: authored.clone(),
+                    index: None,
+                },
+                None,
+            )
+            .expect("patch");
+        let mut patch_item = source_item(first_set, "patch:optional");
+        patch_item.fill = RegionFill::RectifiedPatch {
+            source_set_id: first_set,
+            patch_id: authored.id,
+        };
+        let mut simple_item = source_item(first_set, "simple:accent");
+        simple_item.fill = RegionFill::SimpleColor {
+            rgba: [32, 64, 96, 255],
+        };
+        simple_item.behavior = FillBehavior::UniqueDetail;
+        let request = layout_request(vec![
+            source_item(first_set, "source:first"),
+            source_item(second_set, "source:second"),
+            patch_item,
+            simple_item,
+        ]);
+        store
+            .solve_and_commit_layout(&request, None)
+            .expect("mixed layout");
+        assert_eq!(store.layout().expect("layout").layout.regions.len(), 4);
+        assert_eq!(
+            store
+                .layout()
+                .expect("layout")
+                .layout
+                .regions
+                .iter()
+                .filter(|region| matches!(region.fill, RegionFill::RectifiedPatch { .. }))
+                .count(),
+            1
+        );
+        let simple_id = store
+            .layout()
+            .expect("layout")
+            .layout
+            .regions
+            .iter()
+            .find(|region| region.item_key == "simple:accent")
+            .expect("simple region")
+            .id;
+        store
+            .execute_layout_command(
+                &LayoutCommand::DeleteSimple {
+                    region_id: simple_id,
+                },
+                None,
+            )
+            .expect("delete simple");
+        assert_eq!(store.layout().expect("layout").layout.regions.len(), 3);
+        store.undo_project_command().expect("undo simple delete");
+        assert_eq!(store.layout().expect("layout").layout.regions.len(), 4);
+        let last_id = store.layout().expect("layout").layout.regions[3].id;
+        store
+            .execute_layout_command(
+                &LayoutCommand::Reorder {
+                    region_id: last_id,
+                    to_index: 0,
+                },
+                None,
+            )
+            .expect("reorder");
+        assert_eq!(
+            store.layout().expect("layout").layout.regions[0].id,
+            last_id
+        );
+        let snapshot = store
+            .create_recovery_snapshot(&recovery)
+            .expect("recovery snapshot");
+        let inspected = ProjectStore::inspect(&snapshot).expect("inspect recovery");
+        assert_eq!(inspected.sources.len(), 2);
+        assert_eq!(inspected.patches, vec![authored]);
+        assert_eq!(inspected.layout.expect("layout").layout.regions.len(), 4);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn layout_regeneration_and_project_history_preserve_patch_rows_and_region_identity() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("layout-history.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Layout history").expect("create project");
+        let source_set = store.summary().expect("summary").source_sets[0].id;
+        let base = source(1024, 512);
+        let authored = patch(base.id, "Trim");
+        store
+            .replace_source(SourceChannel::BaseColor, &base)
+            .expect("base source");
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: authored.clone(),
+                    index: None,
+                },
+                None,
+            )
+            .expect("patch");
+        let patch_json_before: String = store
+            .connection
+            .query_row("SELECT patch_json FROM patches", [], |row| row.get(0))
+            .expect("patch json");
+        let mut item = source_item(source_set, "patch:trim");
+        item.fill = RegionFill::RectifiedPatch {
+            source_set_id: source_set,
+            patch_id: authored.id,
+        };
+        let request = layout_request(vec![item]);
+        let initial = store
+            .solve_and_commit_layout(&request, None)
+            .expect("initial")
+            .clone();
+        let mut regeneration = initial.regeneration_request();
+        regeneration.preset = LayoutPreset::Atlas;
+        let regenerated = store
+            .solve_and_commit_layout(&regeneration, None)
+            .expect("regenerate")
+            .clone();
+        assert_eq!(
+            initial.layout.regions[0].id,
+            regenerated.layout.regions[0].id
+        );
+        assert_eq!(
+            initial.layout.regions[0].id_color,
+            regenerated.layout.regions[0].id_color
+        );
+        let patch_json_after: String = store
+            .connection
+            .query_row("SELECT patch_json FROM patches", [], |row| row.get(0))
+            .expect("patch json");
+        assert_eq!(patch_json_before, patch_json_after);
+
+        let region_id = regenerated.layout.regions[0].id;
+        let bounds = PixelBounds {
+            x: 64,
+            y: 64,
+            width: 512,
+            height: 256,
+        };
+        let history_before_drag = store.history.len();
+        store
+            .execute_layout_command(&LayoutCommand::SetBounds { region_id, bounds }, Some(44))
+            .expect("manual resize");
+        let dragged = PixelBounds {
+            x: 96,
+            y: 80,
+            width: 480,
+            height: 240,
+        };
+        store
+            .execute_layout_command(
+                &LayoutCommand::SetBounds {
+                    region_id,
+                    bounds: dragged,
+                },
+                Some(44),
+            )
+            .expect("coalesced drag");
+        assert_eq!(store.history.len(), history_before_drag + 1);
+        store
+            .execute_layout_command(
+                &LayoutCommand::SetLocks {
+                    region_id,
+                    locks: RegionLocks {
+                        position: true,
+                        width: true,
+                        height: true,
+                    },
+                },
+                None,
+            )
+            .expect("lock");
+        store.undo_project_command().expect("undo lock");
+        assert!(
+            !store.layout().expect("layout").layout.regions[0]
+                .locks
+                .position
+        );
+        store.redo_project_command().expect("redo lock");
+        assert!(
+            store.layout().expect("layout").layout.regions[0]
+                .locks
+                .position
+        );
+    }
+
+    #[test]
+    fn impossible_layout_and_orphaning_patch_edit_do_not_commit() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("layout-reject.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Reject").expect("create project");
+        let source_set = store.summary().expect("summary").source_sets[0].id;
+        let base = source(64, 64);
+        let authored = patch(base.id, "Used");
+        store
+            .replace_source(SourceChannel::BaseColor, &base)
+            .expect("base");
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: authored.clone(),
+                    index: None,
+                },
+                None,
+            )
+            .expect("patch");
+        let mut impossible = source_item(source_set, "too-large");
+        impossible.constraints.fixed_width_px = Some(4096);
+        let mut request = layout_request(vec![impossible]);
+        request.settings.output = PixelSize {
+            width: 128,
+            height: 128,
+        };
+        assert!(matches!(
+            store.solve_and_commit_layout(&request, None),
+            Err(StoreError::LayoutSolve(_))
+        ));
+        assert!(store.layout().is_none());
+
+        let mut patch_item = source_item(source_set, "patch:used");
+        patch_item.fill = RegionFill::RectifiedPatch {
+            source_set_id: source_set,
+            patch_id: authored.id,
+        };
+        store
+            .solve_and_commit_layout(&layout_request(vec![patch_item]), None)
+            .expect("valid layout");
+        store
+            .execute_patch_command(
+                &PatchCommand::SetEnabled {
+                    patch_id: authored.id,
+                    enabled: false,
+                },
+                None,
+            )
+            .expect("disable restores source fallback");
+        assert!(!store.patches()[0].enabled);
+        assert!(matches!(
+            store.layout().expect("layout").items[0].fill,
+            RegionFill::WholeSourceSet { .. }
+        ));
+
+        store.undo_project_command().expect("undo fallback");
+        assert!(store.patches()[0].enabled);
+        assert!(matches!(
+            store.layout().expect("layout").items[0].fill,
+            RegionFill::RectifiedPatch { .. }
+        ));
+        store.redo_project_command().expect("redo fallback");
+        assert!(!store.patches()[0].enabled);
+        assert!(matches!(
+            store.layout().expect("layout").items[0].fill,
+            RegionFill::WholeSourceSet { .. }
+        ));
+    }
+
+    #[test]
+    fn current_schema_validation_rejects_dangling_layout_catalog_references() {
+        let fixture = FixtureDir::new();
+        let path = fixture.0.join("dangling-layout.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Dangling").expect("create project");
+        let source_set = store.summary().expect("summary").source_sets[0].id;
+        store
+            .replace_source(SourceChannel::BaseColor, &source(64, 64))
+            .expect("base");
+        store
+            .solve_and_commit_layout(
+                &layout_request(vec![source_item(source_set, "source:valid")]),
+                None,
+            )
+            .expect("layout");
+        let mut items = store.layout().expect("layout").items.clone();
+        let unknown: SourceSetId = "00000000-0000-4000-8000-000000009999"
+            .parse()
+            .expect("unknown source set");
+        items[0].fill = RegionFill::WholeSourceSet {
+            source_set_id: unknown,
+        };
+        drop(store);
+
+        let connection = Connection::open(&path).expect("tamper fixture");
+        connection
+            .execute(
+                "UPDATE layouts SET items_json = ?1",
+                [serde_json::to_string(&items).expect("items json")],
+            )
+            .expect("tamper catalog reference");
+        drop(connection);
+        assert!(matches!(
+            ProjectStore::inspect(&path),
+            Err(StoreError::LayoutReference(_))
+        ));
     }
 
     #[test]

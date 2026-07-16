@@ -32,6 +32,7 @@ const required = [
   "fixtures/contracts/foundation-status.json",
   "fixtures/contracts/phase-1-lifecycle.json",
   "fixtures/contracts/phase-2-patch-authoring.json",
+  "fixtures/contracts/phase-3-layout-authoring.json",
   "fixtures/projects/schema-v1.sql",
   "fixtures/projects/migrate-v1-to-v2.sql",
   "fixtures/projects/schema-v2.sql",
@@ -40,7 +41,11 @@ const required = [
   "fixtures/projects/migrate-v3-to-v4.sql",
   "fixtures/projects/schema-v4.sql",
   "fixtures/projects/migrate-v4-to-v5.sql",
+  "fixtures/projects/migrate-v5-to-v6.sql",
+  "fixtures/projects/migrate-v6-to-v7.sql",
+  "fixtures/projects/schema-v7.sql",
   "fixtures/renders/phase-2-rectification-cases.json",
+  "fixtures/renders/phase-3-layouts.json",
   "fixtures/projects/data-v1.sql",
 ];
 
@@ -91,4 +96,4 @@ if (!styles.includes("prefers-reduced-motion: reduce")) {
   process.exit(1);
 }
 
-console.log(`checked ${required.length} Hot Trimmer foundation through Phase 2 gate files`);
+console.log(`checked ${required.length} Hot Trimmer foundation through Phase 3 gate files`);

@@ -2,17 +2,24 @@ use std::{
     cmp::Reverse,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::UNIX_EPOCH,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hot_trimmer_domain::{
-    ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, NormalizedPoint, Patch, PatchCommand,
-    PatchGeometry, PatchId, SourceId, UserFacingError,
+    ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, Layout, LayoutItem,
+    LayoutRequest, LayoutSettings, NormalizedBounds, NormalizedPoint, NormalizedScalar, Patch,
+    PatchCommand, PatchGeometry, PatchId, PixelSize, RegionConstraints, RegionFill, RegionId,
+    SlotBinding, SourceFraming, SourceId, SourceSetId, StyleRecipe, TemplateIdentity,
+    TemplateLayoutContract, TemplateRegistry, TemplateSlotRole, TrimAxis, TrimCaps,
+    UserFacingError,
 };
 use hot_trimmer_geometry::{
-    Quadrilateral, RectificationLimits, assist_polygon, rectified_dimensions,
+    Quadrilateral, RectificationLimits, assist_polygon, rectified_dimensions, solve_layout,
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, ImageIoError, InspectedImage,
@@ -20,14 +27,17 @@ use hot_trimmer_image_io::{
     inspect_path_with_policy,
 };
 use hot_trimmer_project_store::{
-    ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
+    LayoutCommand, ProjectStore, SourceChannel, SourceInput, SourceOwnership, SourceSetSnapshot,
+    StoreError, StoredLayout, StoredSource,
 };
 use hot_trimmer_render_core::{
-    RectificationRequest, RenderCancellationToken, RenderError, SampleSpace, SamplingFilter,
-    rectify_rgba8_with_progress,
+    NormalConvention, RectificationRequest, RenderCancellationToken, RenderError, SampleSpace,
+    SamplingFilter, rectify_rgba8_with_progress,
 };
+use hot_trimmer_sheet_compiler::{SheetCompileOutput, SheetCompileRequest, compile_template_sheet};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Cursor;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -112,6 +122,73 @@ pub struct SourceSlotRequest {
 pub struct PatchCommandRequest {
     protocol_version: u16,
     command: PatchCommand,
+    coalescing_group: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateLayoutRequest {
+    protocol_version: u16,
+    #[serde(flatten)]
+    mode: GenerateLayoutMode,
+    coalescing_group: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum GenerateLayoutMode {
+    Template {
+        layout_id: hot_trimmer_domain::LayoutId,
+        settings: LayoutSettings,
+        source_set_id: SourceSetId,
+        template: TemplateIdentity,
+        #[serde(default)]
+        source_transform: SourceFraming,
+    },
+    CustomAtlas {
+        request: LayoutRequest,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetPreview {
+    width: u32,
+    height: u32,
+    data_url: String,
+    maps: SheetPreviewMaps,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetPreviewMaps {
+    base_color: String,
+    height: String,
+    normal: String,
+    roughness: String,
+    metallic: String,
+    ambient_occlusion: String,
+    region_id: String,
+    material_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateLayoutResponse {
+    state: LayoutStateSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<SheetPreview>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutCommandRequest {
+    protocol_version: u16,
+    command: LayoutCommand,
     coalescing_group: Option<u64>,
 }
 
@@ -204,10 +281,15 @@ pub struct ProjectSnapshot {
     dirty: bool,
     stale_lock_recovered: bool,
     is_draft: bool,
+    authoring_revision: u64,
     sources: Vec<SourceSnapshot>,
+    source_sets: Vec<SourceSetSnapshot>,
     patches: Vec<Patch>,
+    layout: Option<StoredLayout>,
     can_undo_patch: bool,
     can_redo_patch: bool,
+    can_undo_project: bool,
+    can_redo_project: bool,
     warnings: Vec<ProjectWarning>,
 }
 
@@ -222,11 +304,44 @@ pub struct PatchPreviewSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // Mirrors one shared history timeline for both UI workspaces.
 pub struct PatchStateSnapshot {
     patches: Vec<Patch>,
     dirty: bool,
+    authoring_revision: u64,
     can_undo_patch: bool,
     can_redo_patch: bool,
+    can_undo_project: bool,
+    can_redo_project: bool,
+    warnings: Vec<ProjectWarning>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // Mirrors one shared history timeline for both UI workspaces.
+pub struct LayoutStateSnapshot {
+    layout: Option<StoredLayout>,
+    dirty: bool,
+    authoring_revision: u64,
+    can_undo_patch: bool,
+    can_redo_patch: bool,
+    can_undo_project: bool,
+    can_redo_project: bool,
+    warnings: Vec<ProjectWarning>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // Complete atomic state returned by all history endpoints.
+pub struct AuthoringHistorySnapshot {
+    patches: Vec<Patch>,
+    layout: Option<StoredLayout>,
+    dirty: bool,
+    authoring_revision: u64,
+    can_undo_patch: bool,
+    can_redo_patch: bool,
+    can_undo_project: bool,
+    can_redo_project: bool,
     warnings: Vec<ProjectWarning>,
 }
 
@@ -280,6 +395,7 @@ pub struct ProjectSession {
     app_data_dir: PathBuf,
     draft_dir: PathBuf,
     is_draft: bool,
+    mutation_revision: u64,
 }
 
 impl ProjectSession {
@@ -292,6 +408,7 @@ impl ProjectSession {
             app_data_dir: paths.app_data.clone(),
             draft_dir: paths.drafts.clone(),
             is_draft: false,
+            mutation_revision: 0,
         }
     }
 
@@ -333,6 +450,7 @@ impl ProjectSession {
         self.store = Some(store);
         self.is_draft = is_draft;
         self.dirty = false;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
         if let Some(path) = previous_draft {
             if !is_draft
                 || self
@@ -385,6 +503,7 @@ impl ProjectSession {
             .replace_source_in_set(source_set_id, channel, source)
             .map_err(store_error)?;
         self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
         Ok(self
             .store
             .as_ref()
@@ -405,6 +524,7 @@ impl ProjectSession {
             .remove_source_in_set(source_set_id, channel)
             .map_err(store_error)?;
         self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
         Ok(self
             .store
             .as_ref()
@@ -424,6 +544,7 @@ impl ProjectSession {
             .rename_project(name)
             .map_err(store_error)?;
         self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
         Ok(self
             .store
             .as_ref()
@@ -445,6 +566,7 @@ impl ProjectSession {
             .execute_patch_command(command, coalescing_group)
             .map_err(store_error)?;
         self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
         Ok(self
             .store
             .as_ref()
@@ -466,6 +588,50 @@ impl ProjectSession {
         }
         .map_err(store_error)?;
         self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
+        Ok(self
+            .store
+            .as_ref()
+            .ok_or_else(no_open_project)?
+            .create_recovery_snapshot(&self.recovery_dir)
+            .err()
+            .map(recovery_refresh_warning))
+    }
+
+    fn commit_layout_and_refresh_recovery(
+        &mut self,
+        request: &LayoutRequest,
+        solved: Layout,
+        coalescing_group: Option<u64>,
+    ) -> Result<Option<UserFacingError>, UserFacingError> {
+        self.store
+            .as_mut()
+            .ok_or_else(no_open_project)?
+            .commit_solved_layout(request, solved, coalescing_group)
+            .map_err(store_error)?;
+        self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
+        Ok(self
+            .store
+            .as_ref()
+            .ok_or_else(no_open_project)?
+            .create_recovery_snapshot(&self.recovery_dir)
+            .err()
+            .map(recovery_refresh_warning))
+    }
+
+    fn apply_layout_and_refresh_recovery(
+        &mut self,
+        command: &LayoutCommand,
+        coalescing_group: Option<u64>,
+    ) -> Result<Option<UserFacingError>, UserFacingError> {
+        self.store
+            .as_mut()
+            .ok_or_else(no_open_project)?
+            .execute_layout_command(command, coalescing_group)
+            .map_err(store_error)?;
+        self.dirty = true;
+        self.mutation_revision = self.mutation_revision.wrapping_add(1);
         Ok(self
             .store
             .as_ref()
@@ -547,6 +713,31 @@ impl PatchPreviewJob {
 }
 
 pub type SharedPatchPreviewJob = Arc<Mutex<Option<PatchPreviewJob>>>;
+
+#[derive(Clone, Debug)]
+pub struct LayoutSolveJob {
+    id: Uuid,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl LayoutSolveJob {
+    fn new() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+pub type SharedLayoutSolveJob = Arc<Mutex<Option<LayoutSolveJob>>>;
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
@@ -864,13 +1055,13 @@ pub async fn apply_patch_command(
 pub async fn undo_patch_command(
     request: FoundationStatusRequest,
     session: State<'_, SharedProjectSession>,
-) -> Result<PatchStateSnapshot, UserFacingError> {
+) -> Result<AuthoringHistorySnapshot, UserFacingError> {
     request.validate().map_err(UserFacingError::from)?;
     let shared = Arc::clone(&session);
     run_blocking(move || {
         let mut guard = shared.lock().map_err(|_| session_poisoned())?;
         let warning = guard.patch_history_and_refresh_recovery(false)?;
-        patch_state_snapshot(&guard, warning)
+        authoring_history_snapshot(&guard, warning)
     })
     .await
 }
@@ -879,15 +1070,434 @@ pub async fn undo_patch_command(
 pub async fn redo_patch_command(
     request: FoundationStatusRequest,
     session: State<'_, SharedProjectSession>,
-) -> Result<PatchStateSnapshot, UserFacingError> {
+) -> Result<AuthoringHistorySnapshot, UserFacingError> {
     request.validate().map_err(UserFacingError::from)?;
     let shared = Arc::clone(&session);
     run_blocking(move || {
         let mut guard = shared.lock().map_err(|_| session_poisoned())?;
         let warning = guard.patch_history_and_refresh_recovery(true)?;
-        patch_state_snapshot(&guard, warning)
+        authoring_history_snapshot(&guard, warning)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn undo_project_command(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<AuthoringHistorySnapshot, UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let shared = Arc::clone(&session);
+    run_blocking(move || {
+        let mut guard = shared.lock().map_err(|_| session_poisoned())?;
+        let warning = guard.patch_history_and_refresh_recovery(false)?;
+        authoring_history_snapshot(&guard, warning)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn redo_project_command(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<AuthoringHistorySnapshot, UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let shared = Arc::clone(&session);
+    run_blocking(move || {
+        let mut guard = shared.lock().map_err(|_| session_poisoned())?;
+        let warning = guard.patch_history_and_refresh_recovery(true)?;
+        authoring_history_snapshot(&guard, warning)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn generate_layout(
+    request: GenerateLayoutRequest,
+    session: State<'_, SharedProjectSession>,
+    layout_job: State<'_, SharedLayoutSolveJob>,
+) -> Result<GenerateLayoutResponse, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let layout_request = match request.mode {
+        GenerateLayoutMode::Template {
+            layout_id,
+            settings,
+            source_set_id,
+            template,
+            source_transform,
+        } => {
+            let shared = Arc::clone(&session);
+            return run_blocking(move || {
+                let mut guard = shared.lock().map_err(|_| session_poisoned())?;
+                let preview = generate_template_layout(
+                    &mut guard,
+                    layout_id,
+                    settings,
+                    source_set_id,
+                    template,
+                    source_transform,
+                    request.coalescing_group,
+                )?;
+                let state = layout_state_snapshot(&guard, None)?;
+                Ok(GenerateLayoutResponse {
+                    state,
+                    preview: Some(preview),
+                })
+            })
+            .await;
+        }
+        GenerateLayoutMode::CustomAtlas { request } => request,
+    };
+    let job = LayoutSolveJob::new();
+    {
+        let mut current = layout_job.lock().map_err(|_| session_poisoned())?;
+        if let Some(previous) = current.replace(job.clone()) {
+            previous.cancel();
+        }
+    }
+    let shared_session = Arc::clone(&session);
+    let shared_job = Arc::clone(&layout_job);
+    run_blocking(move || {
+        let expected_revision = {
+            let guard = shared_session.lock().map_err(|_| session_poisoned())?;
+            guard
+                .store
+                .as_ref()
+                .ok_or_else(no_open_project)?
+                .validate_layout_request_catalog(&layout_request)
+                .map_err(store_error)?;
+            guard.mutation_revision
+        };
+        if job.is_cancelled() {
+            return Err(layout_cancelled());
+        }
+        // The deterministic solver runs without the project-session mutex.
+        let solved = solve_layout(&layout_request).map_err(UserFacingError::from)?;
+        if job.is_cancelled() {
+            return Err(layout_cancelled());
+        }
+        let mut guard = shared_session.lock().map_err(|_| session_poisoned())?;
+        let is_current = shared_job
+            .lock()
+            .map_err(|_| session_poisoned())?
+            .as_ref()
+            .is_some_and(|current| current.id == job.id);
+        validate_layout_publish(&job, is_current, expected_revision, guard.mutation_revision)?;
+        let warning = guard.commit_layout_and_refresh_recovery(
+            &layout_request,
+            solved,
+            request.coalescing_group,
+        )?;
+        let snapshot = layout_state_snapshot(&guard, warning)?;
+        let mut current = shared_job.lock().map_err(|_| session_poisoned())?;
+        if current.as_ref().is_some_and(|current| current.id == job.id) {
+            *current = None;
+        }
+        Ok(GenerateLayoutResponse {
+            state: snapshot,
+            preview: None,
+        })
+    })
+    .await
+}
+
+fn generate_template_layout(
+    session: &mut ProjectSession,
+    layout_id: hot_trimmer_domain::LayoutId,
+    settings: LayoutSettings,
+    source_set_id: SourceSetId,
+    identity: TemplateIdentity,
+    source_framing: SourceFraming,
+    coalescing_group: Option<u64>,
+) -> Result<SheetPreview, UserFacingError> {
+    let definition = TemplateRegistry::built_in()
+    .map_err(|error| template_error(error.to_string()))?
+    .get(&identity.template_id, &identity.template_version)
+    .filter(|definition| definition.identity.compatibility_key == identity.compatibility_key)
+    .cloned()
+    .ok_or_else(|| template_error("The requested template identity is not available.".into()))?;
+
+    let compiled = {
+        let store = session.store.as_mut().ok_or_else(no_open_project)?;
+        let source = store
+            .summary()
+            .map_err(store_error)?
+            .sources
+            .into_iter()
+            .find(|source| {
+                source.source_set_id.to_string() == source_set_id.to_string()
+                    && source.channel == SourceChannel::BaseColor
+            })
+            .ok_or_else(|| {
+                user_error(
+                    ErrorCode::InvalidInput,
+                    "The selected material has no Base Color source.",
+                    "Import a Base Color source for this material before compiling the template.",
+                    None,
+                )
+            })?;
+        let inspected = inspect_stored(&source)?;
+        let decoded = decode_rgba8_bytes_cancellable(
+            &inspected.source_bytes,
+            DecodeLimits::default(),
+            ColorPolicy::ConvertToSrgb,
+            &CancellationToken::new(),
+        )
+        .map_err(image_error)?;
+        let output = compile_template_sheet(SheetCompileRequest {
+            source_rgba8: &decoded.pixels,
+            source_width: decoded.width,
+            source_height: decoded.height,
+            template: &definition,
+            sheet_size: settings.output,
+            normal_convention: NormalConvention::OpenGl,
+            source_framing,
+        })
+        .map_err(|error| template_error(error.to_string()))?;
+        let layout_request = template_layout_request(layout_id, settings, source_set_id, &definition);
+        let mut solved = solve_layout(&layout_request).map_err(UserFacingError::from)?;
+        for region in &mut solved.regions {
+            let slot = definition
+                .slots
+                .iter()
+                .find(|slot| slot.slot_key == region.item_key)
+                .expect("template item has a manifest slot");
+            region.id_color = slot.id_color;
+        }
+        let template = TemplateLayoutContract {
+            snapshot: Some(definition.snapshot().map_err(|error| template_error(error.to_string()))?),
+            slot_bindings: solved
+                .regions
+                .iter()
+                .map(|region| SlotBinding {
+                    slot_key: region.item_key.clone(),
+                    item_key: region.item_key.clone(),
+                    region_id: region.id,
+                    id_color: region.id_color,
+            })
+                .collect(),
+            style_recipe: StyleRecipe::default(),
+            source_framing,
+        };
+        store
+            .commit_solved_template_layout(&layout_request, solved, template, coalescing_group)
+            .map_err(store_error)?;
+        output
+    };
+    session.dirty = true;
+    session.mutation_revision = session.mutation_revision.wrapping_add(1);
+    let _ = session
+        .store
+        .as_ref()
+        .ok_or_else(no_open_project)?
+        .create_recovery_snapshot(&session.recovery_dir);
+    png_preview(compiled)
+}
+
+fn template_layout_request(
+    layout_id: hot_trimmer_domain::LayoutId,
+    settings: LayoutSettings,
+    source_set_id: SourceSetId,
+    definition: &hot_trimmer_domain::TemplateDefinition,
+) -> LayoutRequest {
+    let items = definition
+        .stable_order
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let slot = definition
+                .slots
+                .iter()
+                .find(|slot| &slot.slot_key == key)
+                .expect("validated template stable order");
+            let (behavior, trim_caps) = template_slot_behavior(
+                slot,
+                settings.output,
+                PixelSize {
+                    width: definition.canonical_width,
+                    height: definition.canonical_height,
+                },
+            );
+            LayoutItem {
+                key: slot.slot_key.clone(),
+                fill: RegionFill::WholeSourceSet { source_set_id },
+                behavior,
+                trim_caps,
+                natural_size: PixelSize {
+                    width: slot.allocation.width,
+                    height: slot.allocation.height,
+                },
+                enabled: true,
+                participates: true,
+                constraints: RegionConstraints {
+                    fixed_width_px: None,
+                    fixed_height_px: None,
+                    template_bounds: Some(NormalizedBounds {
+                        x: NormalizedScalar::new(
+                            f64::from(slot.allocation.x) / f64::from(definition.canonical_width),
+                        )
+                        .expect("canonical template bounds"),
+                        y: NormalizedScalar::new(
+                            f64::from(slot.allocation.y) / f64::from(definition.canonical_height),
+                        )
+                        .expect("canonical template bounds"),
+                        width: NormalizedScalar::new(
+                            f64::from(slot.allocation.width) / f64::from(definition.canonical_width),
+                        )
+                        .expect("canonical template bounds"),
+                        height: NormalizedScalar::new(
+                            f64::from(slot.allocation.height) / f64::from(definition.canonical_height),
+                        )
+                        .expect("canonical template bounds"),
+                    }),
+                },
+                padding_px: Some(0),
+                bleed_px: Some(0),
+                region_id: Some(template_region_id(&definition.identity, &slot.slot_key, index)),
+            }
+        })
+        .collect();
+    LayoutRequest {
+        layout_id,
+        preset: hot_trimmer_domain::LayoutPreset::ModularKit,
+        settings,
+        items,
+        existing_regions: Vec::new(),
+    }
+}
+
+fn template_slot_behavior(
+    slot: &hot_trimmer_domain::TemplateSlot,
+    output: PixelSize,
+    canonical: PixelSize,
+) -> (hot_trimmer_domain::FillBehavior, Option<TrimCaps>) {
+    use hot_trimmer_domain::FillBehavior;
+
+    match slot.role {
+        TemplateSlotRole::Planar => (FillBehavior::Stretch, None),
+        TemplateSlotRole::RepeatingStrip => {
+            let behavior = if slot.allocation.width >= slot.allocation.height {
+                FillBehavior::HorizontalLoop
+            } else {
+                FillBehavior::VerticalLoop
+            };
+            (behavior, None)
+        }
+        TemplateSlotRole::UniqueDetail | TemplateSlotRole::Radial => {
+            (FillBehavior::UniqueDetail, None)
+        }
+        TemplateSlotRole::TrimCap => {
+            let axis = if slot.allocation.width >= slot.allocation.height {
+                TrimAxis::Horizontal
+            } else {
+                TrimAxis::Vertical
+            };
+            let (allocation_span, output_span, canonical_span) = if matches!(axis, TrimAxis::Horizontal) {
+                (slot.allocation.width, output.width, canonical.width)
+            } else {
+                (slot.allocation.height, output.height, canonical.height)
+            };
+            let span = u32::try_from(
+                u64::from(allocation_span) * u64::from(output_span) / u64::from(canonical_span),
+            )
+            .expect("scaled template span fits u32");
+            let cap = (span / 8).max(1).min(span.saturating_sub(1) / 2);
+            (
+                FillBehavior::TrimCap,
+                Some(TrimCaps {
+                    axis,
+                    leading_px: cap,
+                    trailing_px: cap,
+                }),
+            )
+        }
+    }
+}
+
+fn template_region_id(identity: &TemplateIdentity, slot_key: &str, index: usize) -> RegionId {
+    let mut hasher = Sha256::new();
+    hasher.update(identity.template_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.template_version.as_bytes());
+    hasher.update([0]);
+    hasher.update(slot_key.as_bytes());
+    hasher.update((index as u64).to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    RegionId::from_bytes(bytes)
+}
+
+fn png_data_url(width: u32, height: u32, rgba8: Vec<u8>) -> Result<String, UserFacingError> {
+    let image = RgbaImage::from_raw(width, height, rgba8).ok_or_else(|| {
+        user_error(ErrorCode::Internal, "The sheet pixels could not be encoded.", "Retry the sheet update.", None)
+    })?;
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| template_error(error.to_string()))?;
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(encoded.into_inner())))
+}
+
+fn png_preview(output: SheetCompileOutput) -> Result<SheetPreview, UserFacingError> {
+    let width = output.width;
+    let height = output.height;
+    let base_color = png_data_url(width, height, output.rgba8)?;
+    Ok(SheetPreview {
+        width,
+        height,
+        data_url: base_color.clone(),
+        maps: SheetPreviewMaps {
+            base_color,
+            height: png_data_url(width, height, output.height_rgba8)?,
+            normal: png_data_url(width, height, output.normal_rgba8)?,
+            roughness: png_data_url(width, height, output.roughness_rgba8)?,
+            metallic: png_data_url(width, height, output.metallic_rgba8)?,
+            ambient_occlusion: png_data_url(width, height, output.ambient_occlusion_rgba8)?,
+            region_id: png_data_url(width, height, output.region_id_rgba8)?,
+            material_id: png_data_url(width, height, output.material_id_rgba8)?,
+        },
+    })
+}
+
+fn template_error(detail: String) -> UserFacingError {
+    user_error(
+        ErrorCode::LayoutInvalid,
+        "The selected template could not be compiled.",
+        "Verify the template and source image, then try again.",
+        Some(detail),
+    )
+}
+
+#[tauri::command]
+pub async fn apply_layout_command(
+    request: LayoutCommandRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<LayoutStateSnapshot, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let shared = Arc::clone(&session);
+    run_blocking(move || {
+        let mut guard = shared.lock().map_err(|_| session_poisoned())?;
+        let warning =
+            guard.apply_layout_and_refresh_recovery(&request.command, request.coalescing_group)?;
+        layout_state_snapshot(&guard, warning)
+    })
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cancel_layout_solve(
+    request: FoundationStatusRequest,
+    layout_job: State<'_, SharedLayoutSolveJob>,
+) -> Result<(), UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    if let Some(job) = layout_job.lock().map_err(|_| session_poisoned())?.as_ref() {
+        job.cancel();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1155,10 +1765,15 @@ fn snapshot_session(
         dirty: session.dirty,
         stale_lock_recovered: summary.stale_lock_recovered,
         is_draft: session.is_draft,
+        authoring_revision: session.mutation_revision,
         sources,
+        source_sets: summary.source_sets,
         patches: summary.patches,
+        layout: summary.layout,
         can_undo_patch: store.can_undo_patch_command(),
         can_redo_patch: store.can_redo_patch_command(),
+        can_undo_project: store.can_undo_patch_command(),
+        can_redo_project: store.can_redo_patch_command(),
         warnings: Vec::new(),
     })
 }
@@ -1180,8 +1795,66 @@ fn patch_state_snapshot(
     Ok(PatchStateSnapshot {
         patches: store.patches().to_vec(),
         dirty: session.dirty,
+        authoring_revision: session.mutation_revision,
         can_undo_patch: store.can_undo_patch_command(),
         can_redo_patch: store.can_redo_patch_command(),
+        can_undo_project: store.can_undo_patch_command(),
+        can_redo_project: store.can_redo_patch_command(),
+        warnings,
+    })
+}
+
+fn layout_state_snapshot(
+    session: &ProjectSession,
+    warning: Option<UserFacingError>,
+) -> Result<LayoutStateSnapshot, UserFacingError> {
+    let store = session.store.as_ref().ok_or_else(no_open_project)?;
+    let warnings = warning
+        .map(|warning| {
+            vec![ProjectWarning {
+                code: warning.code,
+                message: warning.message,
+                recovery: warning.recovery,
+            }]
+        })
+        .unwrap_or_default();
+    Ok(LayoutStateSnapshot {
+        layout: store.layout().cloned(),
+        dirty: session.dirty,
+        authoring_revision: session.mutation_revision,
+        can_undo_patch: store.can_undo_patch_command(),
+        can_redo_patch: store.can_redo_patch_command(),
+        can_undo_project: store.can_undo_patch_command(),
+        can_redo_project: store.can_redo_patch_command(),
+        warnings,
+    })
+}
+
+fn authoring_history_snapshot(
+    session: &ProjectSession,
+    warning: Option<UserFacingError>,
+) -> Result<AuthoringHistorySnapshot, UserFacingError> {
+    let store = session.store.as_ref().ok_or_else(no_open_project)?;
+    let warnings = warning
+        .map(|warning| {
+            vec![ProjectWarning {
+                code: warning.code,
+                message: warning.message,
+                recovery: warning.recovery,
+            }]
+        })
+        .unwrap_or_default();
+    let can_undo = store.can_undo_patch_command();
+    let can_redo = store.can_redo_patch_command();
+    Ok(AuthoringHistorySnapshot {
+        patches: store.patches().to_vec(),
+        layout: store.layout().cloned(),
+        dirty: session.dirty,
+        authoring_revision: session.mutation_revision,
+        can_undo_patch: can_undo,
+        can_redo_patch: can_redo,
+        can_undo_project: can_undo,
+        can_redo_project: can_redo,
         warnings,
     })
 }
@@ -1693,6 +2366,13 @@ fn store_error(error: StoreError) -> UserFacingError {
             "This source is still used by authored patches.",
             "Delete those patches or replace the source while keeping its slot.",
         ),
+        StoreError::LayoutReference(_)
+        | StoreError::LayoutCommand(_)
+        | StoreError::LayoutSolve(_) => (
+            ErrorCode::LayoutInvalid,
+            "The trim-sheet edit could not be applied.",
+            "Review source participation, locks, bounds, padding, and bleed, then retry.",
+        ),
         StoreError::PatchCommand(_) => (
             ErrorCode::InvalidInput,
             "The patch edit could not be applied.",
@@ -1767,6 +2447,35 @@ fn cancelled() -> UserFacingError {
     )
 }
 
+fn layout_cancelled() -> UserFacingError {
+    user_error(
+        ErrorCode::OperationCancelled,
+        "Trim-sheet generation was cancelled.",
+        "Regenerate when you are ready. The project was not changed.",
+        None,
+    )
+}
+
+fn validate_layout_publish(
+    job: &LayoutSolveJob,
+    is_current: bool,
+    expected_revision: u64,
+    current_revision: u64,
+) -> Result<(), UserFacingError> {
+    if job.is_cancelled() {
+        return Err(layout_cancelled());
+    }
+    if !is_current || current_revision != expected_revision {
+        return Err(user_error(
+            ErrorCode::LayoutInvalid,
+            "The trim-sheet solve is stale.",
+            "Regenerate from the latest source, patch, and layout state.",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::needless_pass_by_value)] // Used as an owned map_err callback.
 fn recent_error(error: std::io::Error) -> UserFacingError {
     user_error(
@@ -1838,18 +2547,25 @@ fn user_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, io::Cursor, path::PathBuf};
 
-    use hot_trimmer_domain::{ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, SourceId};
-    use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
+    use base64::Engine as _;
+    use hot_trimmer_domain::{
+        ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, LayoutId, LayoutSettings,
+        SourceFraming, SourceId, SourceSetId, TemplateIdentity,
+    };
+    use hot_trimmer_project_store::{
+        ProjectStore, SourceChannel, SourceInput, SourceOwnership, SourceSetSnapshot,
+    };
     use serde_json::{Value, json};
 
     use super::{
-        CloseProjectRequest, CreateProjectRequest, FoundationStatus, ImportSourceRequest,
-        MAX_IPC_PATH_UTF16, NativeDirectories, PatchCommandRequest, PatchPreviewRequest,
-        PolygonAssistRequest, ProjectSession, ProjectSnapshot, ProjectWarning,
-        RecoverProjectRequest, SourceSnapshot, ThumbnailMipmapSnapshot, clear_recovery_directory,
-        validate_ipc_path,
+        AuthoringHistorySnapshot, CloseProjectRequest, CreateProjectRequest, FoundationStatus,
+        GenerateLayoutMode, GenerateLayoutRequest, ImportSourceRequest, LayoutCommandRequest, LayoutSolveJob,
+        LayoutStateSnapshot, MAX_IPC_PATH_UTF16, NativeDirectories, PatchCommandRequest,
+        PatchPreviewRequest, PolygonAssistRequest, ProjectSession, ProjectSnapshot, ProjectWarning,
+        RecoverProjectRequest, SourceSnapshot, ThumbnailMipmapSnapshot, authoring_history_snapshot,
+        clear_recovery_directory, validate_ipc_path, validate_layout_publish,
     };
 
     #[test]
@@ -1911,10 +2627,11 @@ mod tests {
             id: "00000000-0000-4000-8000-000000000001".into(),
             name: "Brick".into(),
             path: "<project>".into(),
-            schema_version: 6,
+            schema_version: 7,
             dirty: true,
             stale_lock_recovered: false,
             is_draft: false,
+            authoring_revision: 0,
             sources: vec![SourceSnapshot {
                 id: "00000000-0000-4000-8000-000000000002".into(),
                 source_set_id: "00000000-0000-4000-8000-000000000001".into(),
@@ -1937,9 +2654,18 @@ mod tests {
                     data_url: "data:image/png;base64,AA==".into(),
                 }],
             }],
+            source_sets: vec![SourceSetSnapshot {
+                id: "00000000-0000-4000-8000-000000000001"
+                    .parse::<SourceSetId>()
+                    .expect("source-set id"),
+                name: "Material 1".into(),
+            }],
             patches: Vec::new(),
+            layout: None,
             can_undo_patch: false,
             can_redo_patch: false,
+            can_undo_project: false,
+            can_redo_project: false,
             warnings: vec![ProjectWarning {
                 code: ErrorCode::RecoveryFailed,
                 message: "Recovery snapshot could not be refreshed.".into(),
@@ -1979,11 +2705,311 @@ mod tests {
     }
 
     #[test]
+    fn rust_requests_match_the_phase_three_layout_contract_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/contracts/phase-3-layout-authoring.json"
+        ))
+        .expect("valid layout contract fixture");
+        let generate: GenerateLayoutRequest =
+            serde_json::from_value(fixture["generateRequest"].clone()).expect("generate request");
+        let command: LayoutCommandRequest =
+            serde_json::from_value(fixture["layoutCommandRequest"].clone())
+                .expect("layout command request");
+        assert_eq!(generate.protocol_version, IPC_PROTOCOL_VERSION);
+        assert!(matches!(generate.mode, GenerateLayoutMode::CustomAtlas { .. }));
+        assert_eq!(generate.coalescing_group, Some(71));
+        assert_eq!(command.coalescing_group, Some(72));
+        let state = LayoutStateSnapshot {
+            layout: None,
+            dirty: true,
+            authoring_revision: 3,
+            can_undo_patch: true,
+            can_redo_patch: false,
+            can_undo_project: true,
+            can_redo_project: false,
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(state).expect("serialize layout state"),
+            fixture["layoutState"]
+        );
+        let history = AuthoringHistorySnapshot {
+            patches: Vec::new(),
+            layout: None,
+            dirty: true,
+            authoring_revision: 4,
+            can_undo_patch: true,
+            can_redo_patch: true,
+            can_undo_project: true,
+            can_redo_project: true,
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(history).expect("serialize authoring history state"),
+            fixture["historyState"]
+        );
+    }
+
+    #[test]
+    fn template_generate_request_accepts_desktop_camel_case_payload() {
+        let payload = serde_json::json!({
+            "protocolVersion": IPC_PROTOCOL_VERSION,
+            "mode": "template",
+            "layoutId": "00000000-0000-4000-8000-000000000010",
+            "settings": LayoutSettings::default(),
+            "sourceSetId": "00000000-0000-4000-8000-000000000011",
+            "template": {
+                "templateId": "ht.generic_architecture",
+                "templateVersion": "1.0.0",
+                "compatibilityKey": "ht.generic_architecture.topology.v1"
+            },
+            "sourceTransform": {
+                "mode": "cover",
+                "cropFocus": { "x": 0.5, "y": 0.5 }
+            },
+            "coalescingGroup": 73
+        });
+        let request: GenerateLayoutRequest =
+            serde_json::from_value(payload).expect("desktop template request");
+        assert_eq!(request.coalescing_group, Some(73));
+        assert!(matches!(
+            request.mode,
+            GenerateLayoutMode::Template {
+                source_transform: SourceFraming {
+                    mode: hot_trimmer_domain::SourceFramingMode::Cover,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn oversized_ipc_paths_are_rejected_before_file_access() {
         let oversized = "a".repeat(MAX_IPC_PATH_UTF16 + 1);
         let error = validate_ipc_path(&oversized).expect_err("reject oversized path");
         assert_eq!(error.code, ErrorCode::InvalidInput);
         assert!(validate_ipc_path("C:/project.hottrimmer").is_ok());
+    }
+
+    #[test]
+    fn cancelled_and_stale_layout_solves_cannot_publish() {
+        let cancelled = LayoutSolveJob::new();
+        cancelled.cancel();
+        let error = validate_layout_publish(&cancelled, true, 4, 4)
+            .expect_err("cancelled solve cannot publish");
+        assert_eq!(error.code, ErrorCode::OperationCancelled);
+
+        let stale = LayoutSolveJob::new();
+        let error =
+            validate_layout_publish(&stale, true, 4, 5).expect_err("stale solve cannot publish");
+        assert_eq!(error.code, ErrorCode::LayoutInvalid);
+        assert!(validate_layout_publish(&stale, true, 5, 5).is_ok());
+    }
+
+    #[test]
+    fn generic_architecture_update_sheet_returns_complete_53_slot_pbr_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-generic-architecture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        let mut store = ProjectStore::create(&root.join("template.hottrimmer"), "Template")
+            .expect("project");
+        let source_set_id = store.summary().expect("summary").source_sets[0].id;
+        let image = image::RgbaImage::from_pixel(16, 16, image::Rgba([130, 98, 74, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode source");
+        let encoded = bytes.into_inner();
+        store
+            .replace_source_in_set(
+                uuid::Uuid::parse_str(&source_set_id.to_string()).expect("source-set UUID"),
+                SourceChannel::BaseColor,
+                &SourceInput {
+                    id: SourceId::new(),
+                    ownership: SourceOwnership::OwnedCopy,
+                    external_path: None,
+                    origin_path: root.join("source.png"),
+                    sha256: "0".repeat(64),
+                    width: 16,
+                    height: 16,
+                    format: "PNG".into(),
+                    color_type: "Rgba8".into(),
+                    has_alpha: true,
+                    exif_orientation: 1,
+                    has_embedded_icc_profile: false,
+                    encoded_bytes: encoded.len() as u64,
+                    owned_bytes: Some(encoded),
+                },
+            )
+            .expect("base color");
+        let mut session = ProjectSession {
+            store: Some(store),
+            dirty: false,
+            baseline: None,
+            recovery_dir: root.clone(),
+            app_data_dir: root.clone(),
+            draft_dir: root.join("drafts"),
+            is_draft: false,
+            mutation_revision: 0,
+        };
+        let mut settings = LayoutSettings::default();
+        settings.output = hot_trimmer_domain::PixelSize {
+            width: 512,
+            height: 512,
+        };
+        let preview = super::generate_template_layout(
+            &mut session,
+            LayoutId::new(),
+            settings,
+            source_set_id,
+            TemplateIdentity {
+                template_id: "ht.generic_architecture".into(),
+                template_version: "1.0.0".into(),
+                compatibility_key: "ht.generic_architecture.topology.v1".into(),
+            },
+            SourceFraming::default(),
+            Some(7),
+        )
+        .expect("compile template sheet");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(preview.data_url.split(',').nth(1).expect("data URL"))
+            .expect("base64 PNG");
+        let decoded = image::load_from_memory(&png).expect("valid PNG");
+        assert_eq!(decoded.width(), 512);
+        assert_eq!(decoded.height(), 512);
+        let layout = session.store.as_ref().expect("store").layout().expect("layout");
+        assert_eq!(layout.layout.regions.len(), 53);
+        assert_eq!(layout.layout_kind, hot_trimmer_domain::LayoutKind::Template);
+        assert_eq!(
+            layout.template.as_ref().expect("template contract").slot_bindings.len(),
+            53
+        );
+        assert!(preview.maps.normal.starts_with("data:image/png;base64,"));
+        assert!(preview.maps.height.starts_with("data:image/png;base64,"));
+        assert!(preview.maps.region_id.starts_with("data:image/png;base64,"));
+        drop(session);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_history_snapshots_keep_patches_layout_and_availability_coherent() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-history-snapshot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("fixture directory");
+        let patch_fixture: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/contracts/phase-2-patch-authoring.json"
+        ))
+        .expect("valid patch fixture");
+        let patch: PatchCommandRequest =
+            serde_json::from_value(patch_fixture["patchCommandRequest"].clone())
+                .expect("patch command");
+        let layout_request: hot_trimmer_domain::LayoutRequest = serde_json::from_value(json!({
+            "layoutId": "00000000-0000-4000-8000-000000000200",
+            "preset": "balanced",
+            "settings": {
+                "output": { "width": 64, "height": 64 },
+                "paddingPx": 0,
+                "bleedPx": 0,
+                "order": "input",
+                "autoPack": { "enabled": true, "priority": "balanced", "seed": 0 }
+            },
+            "items": [{
+                "key": "color:history",
+                "fill": { "type": "simple_color", "rgba": [80, 120, 160, 255] },
+                "behavior": "stretch",
+                "naturalSize": { "width": 16, "height": 16 },
+                "enabled": true,
+                "participates": true,
+                "constraints": {}
+            }],
+            "existingRegions": []
+        }))
+        .expect("layout request");
+
+        let make_session = |name: &str| {
+            let mut store = ProjectStore::create(&root.join(format!("{name}.hottrimmer")), name)
+                .expect("project");
+            let source = SourceInput {
+                id: serde_json::from_value(json!("00000000-0000-4000-8000-000000000002"))
+                    .expect("source id"),
+                ownership: SourceOwnership::OwnedCopy,
+                external_path: None,
+                origin_path: root.join("history.png"),
+                sha256: "a".repeat(64),
+                width: 16,
+                height: 16,
+                format: "PNG".into(),
+                color_type: "Rgba8".into(),
+                has_alpha: true,
+                exif_orientation: 1,
+                has_embedded_icc_profile: false,
+                encoded_bytes: 4,
+                owned_bytes: Some(vec![0; 4]),
+            };
+            store
+                .replace_source_in_set(
+                    uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001")
+                        .expect("source set id"),
+                    SourceChannel::BaseColor,
+                    &source,
+                )
+                .expect("source");
+            ProjectSession {
+                store: Some(store),
+                dirty: false,
+                baseline: None,
+                recovery_dir: root.clone(),
+                app_data_dir: root.clone(),
+                draft_dir: root.join("drafts"),
+                is_draft: false,
+                mutation_revision: 0,
+            }
+        };
+
+        let mut layout_then_patch = make_session("layout-then-patch");
+        let solved = hot_trimmer_geometry::solve_layout(&layout_request).expect("solve layout");
+        layout_then_patch
+            .commit_layout_and_refresh_recovery(&layout_request, solved, None)
+            .expect("commit layout");
+        layout_then_patch
+            .apply_patch_and_refresh_recovery(&patch.command, None)
+            .expect("create patch");
+        layout_then_patch
+            .patch_history_and_refresh_recovery(false)
+            .expect("undo patch");
+        let after_patch_undo =
+            authoring_history_snapshot(&layout_then_patch, None).expect("history snapshot");
+        assert!(after_patch_undo.patches.is_empty());
+        assert!(after_patch_undo.layout.is_some());
+        assert!(after_patch_undo.can_undo_patch && after_patch_undo.can_undo_project);
+        assert!(after_patch_undo.can_redo_patch && after_patch_undo.can_redo_project);
+
+        let mut patch_then_layout = make_session("patch-then-layout");
+        patch_then_layout
+            .apply_patch_and_refresh_recovery(&patch.command, None)
+            .expect("create patch");
+        let solved = hot_trimmer_geometry::solve_layout(&layout_request).expect("solve layout");
+        patch_then_layout
+            .commit_layout_and_refresh_recovery(&layout_request, solved, None)
+            .expect("commit layout");
+        patch_then_layout
+            .patch_history_and_refresh_recovery(false)
+            .expect("undo layout");
+        let after_layout_undo =
+            authoring_history_snapshot(&patch_then_layout, None).expect("history snapshot");
+        assert_eq!(after_layout_undo.patches.len(), 1);
+        assert!(after_layout_undo.layout.is_none());
+        assert!(after_layout_undo.can_undo_patch && after_layout_undo.can_undo_project);
+        assert!(after_layout_undo.can_redo_patch && after_layout_undo.can_redo_project);
+
+        drop(layout_then_patch);
+        drop(patch_then_layout);
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -2003,6 +3029,7 @@ mod tests {
             app_data_dir: root.clone(),
             draft_dir: root.join("drafts"),
             is_draft: false,
+            mutation_revision: 0,
         };
         let source = SourceInput {
             id: SourceId::new(),

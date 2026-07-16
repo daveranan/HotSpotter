@@ -101,6 +101,11 @@ export interface SourceSnapshot {
   thumbnailMipmaps: ThumbnailMipmap[];
 }
 
+export interface SourceSetSnapshot {
+  id: string;
+  name: string;
+}
+
 export interface NormalizedPoint {
   x: number;
   y: number;
@@ -189,10 +194,199 @@ export interface PatchPreviewProgress {
 export interface PatchStateSnapshot {
   patches: PatchSnapshot[];
   dirty: boolean;
+  authoringRevision: number;
   canUndoPatch: boolean;
   canRedoPatch: boolean;
+  canUndoProject: boolean;
+  canRedoProject: boolean;
   warnings: ProjectWarning[];
 }
+
+export interface PixelSize {
+  width: number;
+  height: number;
+}
+
+export interface PixelBounds extends PixelSize {
+  x: number;
+  y: number;
+}
+
+export type LayoutPreset = "balanced" | "horizontal_trims" | "vertical_trims" | "modular_kit" | "atlas";
+export type LayoutKind = "template" | "custom_atlas";
+
+export interface TemplateIdentity {
+  templateId: string;
+  templateVersion: string;
+  compatibilityKey: string;
+}
+
+export interface TemplateSnapshot {
+  identity: TemplateIdentity;
+  schemaVersion: number;
+  canonicalWidth: number;
+  canonicalHeight: number;
+  snapshotJson: string;
+  snapshotHash: string;
+}
+
+export interface SlotBinding {
+  slotKey: string;
+  itemKey: string;
+  regionId: string;
+  idColor: [number, number, number];
+}
+
+export interface DecorationBinding {
+  decorationKey: string;
+  value: string;
+}
+
+export interface StyleRecipe {
+  recipeKey: string;
+  decorations: DecorationBinding[];
+}
+
+export interface TemplateLayoutContract {
+  snapshot?: TemplateSnapshot;
+  slotBindings: SlotBinding[];
+  styleRecipe: StyleRecipe;
+}
+export type LayoutOrder = "input" | "largest_first" | "horizontal_first" | "vertical_first";
+export type PackPriority = "balanced" | "horizontal_strips" | "vertical_strips";
+export type FillBehavior = "horizontal_loop" | "vertical_loop" | "tile" | "stretch" | "unique_detail" | "trim_cap";
+export type TrimAxis = "horizontal" | "vertical";
+
+export type RegionFill =
+  | { type: "whole_source_set"; sourceSetId: string }
+  | { type: "rectified_patch"; sourceSetId: string; patchId: string }
+  | { type: "simple_color"; rgba: [number, number, number, number] }
+  | { type: "simple_data"; input: { channel: SourceChannel; value: number } };
+
+export interface LayoutSettings {
+  output: PixelSize;
+  paddingPx: number;
+  bleedPx: number;
+  order: LayoutOrder;
+  autoPack: { enabled: boolean; priority: PackPriority; seed: number };
+  fixedSelectedSize?: { regionId: string; size: PixelSize };
+}
+
+export interface LayoutItem {
+  key: string;
+  fill: RegionFill;
+  behavior: FillBehavior;
+  trimCaps?: { axis: TrimAxis; leadingPx: number; trailingPx: number };
+  naturalSize: PixelSize;
+  enabled: boolean;
+  participates: boolean;
+  constraints: {
+    fixedWidthPx?: number;
+    fixedHeightPx?: number;
+    templateBounds?: { x: number; y: number; width: number; height: number };
+  };
+  paddingPx?: number;
+  bleedPx?: number;
+  regionId?: string;
+}
+
+export interface LayoutRegion {
+  id: string;
+  itemKey: string;
+  fill: RegionFill;
+  behavior: FillBehavior;
+  trimCaps?: { axis: TrimAxis; leadingPx: number; trailingPx: number };
+  bounds: PixelBounds;
+  paddingPx: number;
+  bleedPx: number;
+  orderIndex: number;
+  locks: { position: boolean; width: boolean; height: boolean };
+  idColor: [number, number, number];
+}
+
+export interface LayoutSnapshot {
+  id: string;
+  preset: LayoutPreset;
+  settings: LayoutSettings;
+  regions: LayoutRegion[];
+}
+
+export interface StoredLayout {
+  layout: LayoutSnapshot;
+  items: LayoutItem[];
+  layoutKind: LayoutKind;
+  template?: TemplateLayoutContract;
+}
+
+export interface LayoutRequest {
+  layoutId: string;
+  preset: LayoutPreset;
+  settings: LayoutSettings;
+  items: LayoutItem[];
+  existingRegions: LayoutRegion[];
+}
+
+export type SourceFramingMode = "cover" | "stretch" | "repeat";
+
+export interface TemplateSourceTransform {
+  mode: SourceFramingMode;
+  cropFocus: NormalizedPoint;
+}
+
+export type GenerateLayoutRequest =
+  | (FoundationStatusRequest & {
+    mode: "template";
+    template: TemplateIdentity;
+    sourceSetId: string;
+    layoutId: string;
+    settings: LayoutSettings;
+    sourceTransform: TemplateSourceTransform;
+    coalescingGroup?: number;
+  })
+  | (FoundationStatusRequest & {
+    mode: "custom_atlas";
+    request: LayoutRequest;
+    coalescingGroup?: number;
+  });
+
+export type CompiledLayoutPreviewMap = "baseColor" | "height" | "normal" | "roughness" | "metallic" | "ambientOcclusion" | "regionId" | "materialId";
+
+export interface CompiledLayoutPreview {
+  width: number;
+  height: number;
+  dataUrl: string;
+  maps?: Partial<Record<CompiledLayoutPreviewMap, string>>;
+}
+
+export interface GenerateLayoutResult {
+  state: LayoutStateSnapshot;
+  preview?: CompiledLayoutPreview;
+}
+
+export type LayoutCommand =
+  | { type: "set_bounds"; regionId: string; bounds: PixelBounds }
+  | { type: "set_fill"; regionId: string; fill: RegionFill }
+  | { type: "set_locks"; regionId: string; locks: { position: boolean; width: boolean; height: boolean } }
+  | { type: "reorder"; regionId: string; toIndex: number }
+  | { type: "delete_simple"; regionId: string };
+
+export interface LayoutCommandRequest extends FoundationStatusRequest {
+  command: LayoutCommand;
+  coalescingGroup?: number;
+}
+
+export interface LayoutStateSnapshot {
+  layout: StoredLayout | null;
+  dirty: boolean;
+  authoringRevision: number;
+  canUndoPatch: boolean;
+  canRedoPatch: boolean;
+  canUndoProject: boolean;
+  canRedoProject: boolean;
+  warnings: ProjectWarning[];
+}
+
+export interface AuthoringHistorySnapshot extends PatchStateSnapshot, LayoutStateSnapshot {}
 
 export interface ProjectSnapshot {
   id: string;
@@ -202,10 +396,15 @@ export interface ProjectSnapshot {
   dirty: boolean;
   staleLockRecovered: boolean;
   isDraft: boolean;
+  authoringRevision: number;
   sources: SourceSnapshot[];
+  sourceSets: SourceSetSnapshot[];
   patches: PatchSnapshot[];
+  layout: StoredLayout | null;
   canUndoPatch: boolean;
   canRedoPatch: boolean;
+  canUndoProject: boolean;
+  canRedoProject: boolean;
   warnings: ProjectWarning[];
 }
 

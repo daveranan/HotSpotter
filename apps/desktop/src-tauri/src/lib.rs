@@ -5,8 +5,8 @@ mod paths;
 use std::sync::{Arc, Mutex};
 
 use commands::{
-    PendingProjectPath, ProjectSession, SharedImportJob, SharedPatchPreviewJob,
-    SharedProjectSession, StartupState,
+    PendingProjectPath, ProjectSession, SharedImportJob, SharedLayoutSolveJob,
+    SharedPatchPreviewJob, SharedProjectSession, StartupState,
 };
 use paths::AppPaths;
 use tauri::{Emitter, Manager};
@@ -59,6 +59,7 @@ pub fn run() {
             app.manage(Arc::new(Mutex::new(ProjectSession::new(&paths))) as SharedProjectSession);
             app.manage(Arc::new(Mutex::new(None)) as SharedImportJob);
             app.manage(Arc::new(Mutex::new(None)) as SharedPatchPreviewJob);
+            app.manage(Arc::new(Mutex::new(None)) as SharedLayoutSolveJob);
             app.manage(StartupState {
                 previous_shutdown_clean: !previous_unclean,
             });
@@ -83,6 +84,11 @@ pub fn run() {
             commands::apply_patch_command,
             commands::undo_patch_command,
             commands::redo_patch_command,
+            commands::undo_project_command,
+            commands::redo_project_command,
+            commands::generate_layout,
+            commands::apply_layout_command,
+            commands::cancel_layout_solve,
             commands::fit_patch_polygon,
             commands::generate_patch_preview,
             commands::generate_draft_patch_preview,
