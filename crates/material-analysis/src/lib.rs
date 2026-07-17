@@ -4,9 +4,11 @@ use hot_trimmer_domain::{CompilationDiagnostic, RecoveryChoice, StageResult};
 
 mod delighting;
 mod quality_classification;
+mod scale_orientation;
 
 pub use delighting::*;
 pub use quality_classification::*;
+pub use scale_orientation::*;
 
 #[must_use]
 pub fn unsupported(stage: u8) -> StageResult {

@@ -12,6 +12,7 @@ import {
   type DelightingIntent,
   type MaterialBehaviorClass,
   type MaterialClassificationCommand,
+  type MaterialCalibrationCommand,
   type CompiledMapView,
   type CompiledSheetProjection,
   type NormalizedBounds,
@@ -100,6 +101,10 @@ interface PreparedPatchPreviewProjection {
     confidencePercent: number;
     evidenceSummary: string;
     warningCount: number;
+    scaleSummary: string;
+    orientationSummary: string;
+    worldScaleAvailable: boolean;
+    orientationOverlay: readonly { sourceXMilli: number; sourceYMilli: number; axisMillidegrees: number | null; confidenceMilli: number }[];
   };
 }
 
@@ -571,6 +576,24 @@ function App() {
     }
   }
 
+  async function applyMaterialCalibrationCommand(
+    materialSourceId: string,
+    calibrationCommand: MaterialCalibrationCommand,
+  ) {
+    if (!project) return;
+    try {
+      const next = await invoke<ProjectProjection>("apply_material_calibration_command", {
+        request: { ...protocol, materialSourceId, calibrationCommand },
+      });
+      setProject(next);
+      setPreparedPatchPreview(null);
+      setArtifact(null);
+      setProblem(null);
+    } catch (reason) {
+      setProblem(failure(reason));
+    }
+  }
+
   async function command(commandValue: TrimSheetDocumentCommand): Promise<ProjectProjection> {
     const next = await applyCommand(commandValue);
     setProject(next);
@@ -991,6 +1014,7 @@ function App() {
           onUndo={() => void history(false)}
           onRedo={() => void history(true)}
           onClassify={(materialSourceId, classificationCommand) => void applyMaterialClassificationCommand(materialSourceId, classificationCommand)}
+          onCalibrate={(materialSourceId, calibrationCommand) => void applyMaterialCalibrationCommand(materialSourceId, calibrationCommand)}
           onSetDestination={(regionId, rect, padding) => void setRegionDestination(regionId, rect, padding)}
           onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
           onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
@@ -1708,6 +1732,16 @@ function SheetWorkbench(props: {
         style={{ width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
       >
         <img src={props.preparedPatchPreview.dataUrl} alt="Selected Stage 3 rectified patch" />
+        <svg className="orientation-overlay" viewBox={`0 0 ${props.preparedPatchPreview.width} ${props.preparedPatchPreview.height}`} aria-label="Source-pixel orientation field">
+          {props.preparedPatchPreview.sourceAnalysis.orientationOverlay.map((sample, index) => {
+            if (sample.axisMillidegrees === null) return null;
+            const x = sample.sourceXMilli / 1000;
+            const y = sample.sourceYMilli / 1000;
+            const radians = sample.axisMillidegrees / 1000 * Math.PI / 180;
+            const radius = 7;
+            return <line key={index} x1={x - Math.cos(radians) * radius} y1={y - Math.sin(radians) * radius} x2={x + Math.cos(radians) * radius} y2={y + Math.sin(radians) * radius} />;
+          })}
+        </svg>
         <span>Rectified patch</span>
       </div> : <div className="empty-sheet">
         <strong>{props.project?.legacyLayoutDiscarded ? "No trim sheet yet" : "No compiled sheet"}</strong>
@@ -1760,6 +1794,7 @@ function Inspector(props: {
   onUndo: () => void;
   onRedo: () => void;
   onClassify: (materialSourceId: string, command: MaterialClassificationCommand) => void;
+  onCalibrate: (materialSourceId: string, command: MaterialCalibrationCommand) => void;
   onSetDestination: (regionId: string, rect: { x: number; y: number; width: number; height: number }, padding: number) => void;
   onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
@@ -1785,6 +1820,16 @@ function Inspector(props: {
         </dl>
         <p>{props.sourceAnalysis.sourceAnalysis.qualitySummary}</p>
         <p>{props.sourceAnalysis.sourceAnalysis.evidenceSummary}</p>
+        <p>{props.sourceAnalysis.sourceAnalysis.scaleSummary}</p>
+        <p>{props.sourceAnalysis.sourceAnalysis.orientationSummary}</p>
+        <div className="inspector-actions">
+          <button onClick={() => props.onCalibrate(props.sourceAnalysis!.materialSourceId, { command: "reset_scale" })}>Reset scale</button>
+          <button onClick={() => props.onCalibrate(props.sourceAnalysis!.materialSourceId, { command: "reset_orientation" })}>Reset axis</button>
+        </div>
+        <CalibrationEditor
+          materialSourceId={props.sourceAnalysis.materialSourceId}
+          onApply={props.onCalibrate}
+        />
         <label>Routing intent<select
           value={analyzedSource?.classification.overrideClass ?? "analysis"}
           onChange={(event) => {
@@ -1837,6 +1882,95 @@ function Inspector(props: {
     <LockedSection title="Profiles & Weathering" reason="Generated-map recipes are not command-backed in this slice." />
     <LockedSection title="Decorations" reason="Decoration bindings require authored patch commands." />
   </aside>;
+}
+
+function CalibrationEditor(props: {
+  materialSourceId: string;
+  onApply: (materialSourceId: string, command: MaterialCalibrationCommand) => void;
+}) {
+  const [mode, setMode] = useState<"measure" | "motif" | "imported" | "override" | "orientation">("measure");
+  const [values, setValues] = useState<Record<string, number>>({
+    x1: 0, y1: 0, x2: 100, y2: 0, distanceMm: 250,
+    motifWidthPx: 100, motifHeightPx: 100, motifWidthMm: 250, motifHeightMm: 250,
+    ppmX: 400, ppmY: 400, confidence: 100, orientationDegrees: 0,
+  });
+  const [provenance, setProvenance] = useState<"convention" | "prior_estimated">("convention");
+  const set = (key: string, value: number) => setValues((current) => ({ ...current, [key]: value }));
+  const positive = (...keys: string[]) => keys.every((key) => Number.isFinite(values[key]) && values[key] > 0);
+  const confidenceMilli = Math.round(Math.min(100, Math.max(0, values.confidence)) * 10);
+  const apply = () => {
+    let command: MaterialCalibrationCommand | null = null;
+    if (mode === "measure" && positive("distanceMm") && Number.isFinite(values.x1) && Number.isFinite(values.y1) && Number.isFinite(values.x2) && Number.isFinite(values.y2)) {
+      command = {
+        command: "measure_two_points",
+        start: { x: Math.round(values.x1 * 1000), y: Math.round(values.y1 * 1000) },
+        end: { x: Math.round(values.x2 * 1000), y: Math.round(values.y2 * 1000) },
+        distance_micrometers: Math.round(values.distanceMm * 1000),
+      };
+    } else if (mode === "motif" && positive("motifWidthPx", "motifHeightPx", "motifWidthMm", "motifHeightMm")) {
+      command = {
+        command: "set_known_motif_size",
+        motif_width_pixels_milli: Math.round(values.motifWidthPx * 1000),
+        motif_height_pixels_milli: Math.round(values.motifHeightPx * 1000),
+        motif_width_micrometers: Math.round(values.motifWidthMm * 1000),
+        motif_height_micrometers: Math.round(values.motifHeightMm * 1000),
+        confidence_milli: confidenceMilli,
+      };
+    } else if (mode === "imported" && positive("ppmX", "ppmY")) {
+      command = {
+        command: "set_imported_metadata",
+        source_pixels_per_meter_x_milli: Math.round(values.ppmX * 1000),
+        source_pixels_per_meter_y_milli: Math.round(values.ppmY * 1000),
+        confidence_milli: confidenceMilli,
+      };
+    } else if (mode === "override" && positive("ppmX", "ppmY")) {
+      command = {
+        command: "override_scale",
+        source_pixels_per_meter_x_milli: Math.round(values.ppmX * 1000),
+        source_pixels_per_meter_y_milli: Math.round(values.ppmY * 1000),
+        provenance,
+        confidence_milli: confidenceMilli,
+      };
+    } else if (mode === "orientation" && Number.isFinite(values.orientationDegrees) && values.orientationDegrees >= 0 && values.orientationDegrees < 180) {
+      command = { command: "override_orientation", axis_millidegrees: Math.round(values.orientationDegrees * 1000) };
+    }
+    if (command) props.onApply(props.materialSourceId, command);
+  };
+  const numeric = (key: string, label: string, min?: number, max?: number) => <label>{label}<input
+    type="number" step="any" min={min} max={max} value={values[key]}
+    onChange={(event) => set(key, event.currentTarget.valueAsNumber)}
+  /></label>;
+  return <div className="calibration-editor">
+    <label>Calibration source<select value={mode} onChange={(event) => setMode(event.currentTarget.value as typeof mode)}>
+      <option value="measure">Two-point measurement</option>
+      <option value="motif">Known motif size</option>
+      <option value="imported">Imported metadata</option>
+      <option value="override">Convention / prior</option>
+      <option value="orientation">Orientation override</option>
+    </select></label>
+    <div className="calibration-grid">
+      {mode === "measure" ? <>
+        {numeric("x1", "Start X (source px)")}{numeric("y1", "Start Y (source px)")}
+        {numeric("x2", "End X (source px)")}{numeric("y2", "End Y (source px)")}
+        {numeric("distanceMm", "Known distance (mm)", 0.001)}
+      </> : null}
+      {mode === "motif" ? <>
+        {numeric("motifWidthPx", "Motif width (px)", 0.001)}{numeric("motifHeightPx", "Motif height (px)", 0.001)}
+        {numeric("motifWidthMm", "Motif width (mm)", 0.001)}{numeric("motifHeightMm", "Motif height (mm)", 0.001)}
+        {numeric("confidence", "Confidence (%)", 0, 100)}
+      </> : null}
+      {mode === "imported" || mode === "override" ? <>
+        {numeric("ppmX", "Pixels per meter X", 0.001)}{numeric("ppmY", "Pixels per meter Y", 0.001)}
+        {numeric("confidence", "Confidence (%)", 0, 100)}
+        {mode === "override" ? <label>Provenance<select value={provenance} onChange={(event) => setProvenance(event.currentTarget.value as typeof provenance)}>
+          <option value="convention">Texture-set convention</option><option value="prior_estimated">Class prior (not world accurate)</option>
+        </select></label> : null}
+      </> : null}
+      {mode === "orientation" ? numeric("orientationDegrees", "Material axis (0-180°)", 0, 179.999) : null}
+    </div>
+    <button onClick={apply}>Apply calibration</button>
+    <small>Coordinates are authoritative source pixels; viewport zoom is ignored.</small>
+  </div>;
 }
 
 function DestinationEditor(props: {

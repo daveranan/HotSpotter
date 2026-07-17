@@ -9,7 +9,8 @@ use std::{
 
 use hot_trimmer_domain::{
     AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ContentDigest, LayoutId,
-    DelightingIntent, MaterialChannelRole, MaterialMapContent, MaterialMapKind, MaterialSourceSet,
+    DelightingIntent, MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole,
+    MaterialMapContent, MaterialMapKind, MaterialSourceSet,
     MaterialClassificationCommand, MaterialClassificationIntent,
     NormalConvention,
     Patch, PatchCommand, RegistrationDiagnostic, RegistrationDiagnosticCode,
@@ -25,7 +26,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub const MAX_RECOVERY_SNAPSHOTS: usize = 5;
 const MAX_PROJECT_HISTORY: usize = 256;
 
@@ -160,6 +161,7 @@ pub struct SourceSetSnapshot {
     pub registration_digest: ContentDigest,
     pub delighting: DelightingIntent,
     pub classification: MaterialClassificationIntent,
+    pub calibration: MaterialCalibrationIntent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -336,6 +338,7 @@ impl ProjectStore {
         let default_delighting = serde_json::to_string(&DelightingIntent::default())?;
         let default_classification =
             serde_json::to_string(&MaterialClassificationIntent::default())?;
+        let default_calibration = serde_json::to_string(&MaterialCalibrationIntent::default())?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO project (id, name, created_unix, modified_unix) VALUES (?1, ?2, ?3, ?3)",
@@ -344,13 +347,14 @@ impl ProjectStore {
         transaction.execute(
             "INSERT INTO source_sets (
                 id, name, ordinal, exemplar_group, source_revision, registration_digest,
-                delighting_json, classification_json
-             ) VALUES (?1, 'Material 1', 0, NULL, 0, ?2, ?3, ?4)",
+                delighting_json, classification_json, calibration_json
+             ) VALUES (?1, 'Material 1', 0, NULL, 0, ?2, ?3, ?4, ?5)",
             params![
                 project_id.to_string(),
                 ContentDigest::sha256(b"empty-registered-channel-set").0,
                 default_delighting,
                 default_classification,
+                default_calibration,
             ],
         )?;
         transaction.commit()?;
@@ -522,6 +526,7 @@ impl ProjectStore {
         let default_delighting = serde_json::to_string(&DelightingIntent::default())?;
         let default_classification =
             serde_json::to_string(&MaterialClassificationIntent::default())?;
+        let default_calibration = serde_json::to_string(&MaterialCalibrationIntent::default())?;
         let transaction = self.connection.transaction()?;
         let next_ordinal: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM source_sets",
@@ -531,8 +536,8 @@ impl ProjectStore {
         transaction.execute(
             "INSERT INTO source_sets (
                 id, name, ordinal, exemplar_group, source_revision, registration_digest,
-                delighting_json, classification_json
-             ) VALUES (?1, ?2, ?3, NULL, 0, ?4, ?5, ?6)
+                delighting_json, classification_json, calibration_json
+             ) VALUES (?1, ?2, ?3, NULL, 0, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO NOTHING",
             params![
                 source_set_id.to_string(),
@@ -544,6 +549,7 @@ impl ProjectStore {
                 ContentDigest::sha256(b"empty-registered-channel-set").0,
                 default_delighting,
                 default_classification,
+                default_calibration,
             ],
         )?;
         transaction.execute(
@@ -757,6 +763,35 @@ impl ProjectStore {
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "UPDATE source_sets SET classification_json = ?2 WHERE id = ?1",
+            params![source_set_id.to_string(), serde_json::to_string(&intent)?],
+        )?;
+        transaction.execute(
+            "DELETE FROM source_derived_cache WHERE source_set_id = ?1",
+            [source_set_id.to_string()],
+        )?;
+        transaction.commit()?;
+        self.clear_history();
+        checkpoint(&self.connection)
+    }
+
+    /// Persists a typed Stage 6 command and invalidates all downstream physical footprints.
+    pub fn apply_material_calibration_command(
+        &mut self,
+        source_set_id: Uuid,
+        command: MaterialCalibrationCommand,
+    ) -> Result<(), StoreError> {
+        let encoded: String = self.connection.query_row(
+            "SELECT calibration_json FROM source_sets WHERE id = ?1",
+            [source_set_id.to_string()],
+            |row| row.get(0),
+        ).optional()?.ok_or_else(|| StoreError::InvalidData("material source does not exist".into()))?;
+        let mut intent: MaterialCalibrationIntent = serde_json::from_str(&encoded)?;
+        intent.apply(command).map_err(|failure| {
+            StoreError::InvalidData(format!("invalid material calibration command: {failure:?}"))
+        })?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE source_sets SET calibration_json = ?2 WHERE id = ?1",
             params![source_set_id.to_string(), serde_json::to_string(&intent)?],
         )?;
         transaction.execute(
@@ -1404,10 +1439,11 @@ fn load_source_sets(connection: &Connection) -> Result<Vec<SourceSetSnapshot>, S
             registration_digest: ContentDigest::sha256(b"legacy-source-set"),
             delighting: DelightingIntent::default(),
             classification: MaterialClassificationIntent::default(),
+            calibration: MaterialCalibrationIntent::default(),
         }]);
     }
     let mut statement = connection.prepare(
-        "SELECT id, name, exemplar_group, source_revision, registration_digest, delighting_json, classification_json
+        "SELECT id, name, exemplar_group, source_revision, registration_digest, delighting_json, classification_json, calibration_json
          FROM source_sets ORDER BY ordinal",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1416,10 +1452,11 @@ fn load_source_sets(connection: &Connection) -> Result<Vec<SourceSetSnapshot>, S
             row.get::<_, Option<String>>(2)?, row.get::<_, u64>(3)?, row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, name, exemplar_group, source_revision, registration_digest, delighting_json, classification_json) = row?;
+        let (id, name, exemplar_group, source_revision, registration_digest, delighting_json, classification_json, calibration_json) = row?;
         Ok(SourceSetSnapshot {
             id: id.parse().map_err(|_| StoreError::InvalidId(id))?,
             name,
@@ -1428,6 +1465,7 @@ fn load_source_sets(connection: &Connection) -> Result<Vec<SourceSetSnapshot>, S
             registration_digest: ContentDigest(registration_digest),
             delighting: serde_json::from_str(&delighting_json)?,
             classification: serde_json::from_str(&classification_json)?,
+            calibration: serde_json::from_str(&calibration_json)?,
         })
     })
     .collect()
@@ -1831,7 +1869,24 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         migrate_to_v13(&transaction)?;
         transaction.pragma_update(None, "user_version", 13_u32)?;
         transaction.commit()?;
+        version = 13;
     }
+    if version == 13 {
+        let transaction = connection.transaction()?;
+        migrate_to_v14(&transaction)?;
+        transaction.pragma_update(None, "user_version", 14_u32)?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn migrate_to_v14(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let default_intent = serde_json::to_string(&MaterialCalibrationIntent::default())?;
+    transaction.execute(
+        "ALTER TABLE source_sets ADD COLUMN calibration_json TEXT NOT NULL DEFAULT '{}'",
+        [],
+    )?;
+    transaction.execute("UPDATE source_sets SET calibration_json = ?1", [default_intent])?;
     Ok(())
 }
 

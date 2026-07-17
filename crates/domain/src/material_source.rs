@@ -149,6 +149,9 @@ pub struct MaterialSource {
     /// Persisted Stage 5 routing intent. `None` means route from measured analysis.
     #[serde(default)]
     pub classification: MaterialClassificationIntent,
+    /// Persisted Stage 6 calibration intent. Derived orientation fields remain cache-owned.
+    #[serde(default)]
+    pub calibration: MaterialCalibrationIntent,
     pub registered_channels: Option<RegisteredChannelSet>,
 }
 
@@ -218,6 +221,203 @@ impl MaterialClassificationIntent {
             MaterialClassificationCommand::ResetToAnalysis => None,
         };
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleProvenance {
+    Imported,
+    UserMeasured,
+    MotifDerived,
+    Convention,
+    PriorEstimated,
+    #[default]
+    RelativeOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldScaleAvailability {
+    Available,
+    UnavailablePriorEstimate,
+    UnavailableRelativeOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePixelPointMilli {
+    /// Source-space coordinate in thousandths of a pixel, independent of display zoom.
+    pub x: i64,
+    /// Source-space coordinate in thousandths of a pixel, independent of display zoom.
+    pub y: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalScaleEvidence {
+    /// Thousandths of a source pixel per meter. `None` means no physical claim exists.
+    pub source_pixels_per_meter_x_milli: Option<u64>,
+    pub source_pixels_per_meter_y_milli: Option<u64>,
+    pub provenance: ScaleProvenance,
+    pub confidence_milli: u16,
+    pub world_scale: WorldScaleAvailability,
+}
+
+impl Default for PhysicalScaleEvidence {
+    fn default() -> Self {
+        Self {
+            source_pixels_per_meter_x_milli: None,
+            source_pixels_per_meter_y_milli: None,
+            provenance: ScaleProvenance::RelativeOnly,
+            confidence_milli: 0,
+            world_scale: WorldScaleAvailability::UnavailableRelativeOnly,
+        }
+    }
+}
+
+impl PhysicalScaleEvidence {
+    #[must_use]
+    pub const fn claims_world_accuracy(self) -> bool {
+        matches!(self.world_scale, WorldScaleAvailability::Available)
+            && self.source_pixels_per_meter_x_milli.is_some()
+            && self.source_pixels_per_meter_y_milli.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialCalibrationIntent {
+    pub scale: PhysicalScaleEvidence,
+    /// An optional user-authored 180-degree-equivalent material axis in millidegrees `[0,180000)`.
+    pub orientation_override_millidegrees: Option<u32>,
+    /// Changes whenever a command changes a downstream physical footprint or orientation choice.
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum MaterialCalibrationCommand {
+    SetImportedMetadata {
+        source_pixels_per_meter_x_milli: u64,
+        source_pixels_per_meter_y_milli: u64,
+        confidence_milli: u16,
+    },
+    MeasureTwoPoints {
+        start: SourcePixelPointMilli,
+        end: SourcePixelPointMilli,
+        distance_micrometers: u64,
+    },
+    SetKnownMotifSize {
+        motif_width_pixels_milli: u64,
+        motif_height_pixels_milli: u64,
+        motif_width_micrometers: u64,
+        motif_height_micrometers: u64,
+        confidence_milli: u16,
+    },
+    OverrideScale {
+        source_pixels_per_meter_x_milli: Option<u64>,
+        source_pixels_per_meter_y_milli: Option<u64>,
+        provenance: ScaleProvenance,
+        confidence_milli: u16,
+    },
+    ResetScale,
+    OverrideOrientation { axis_millidegrees: u32 },
+    ResetOrientation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterialCalibrationError {
+    InvalidScale,
+    InvalidMeasurement,
+    InvalidConfidence,
+    InvalidOrientation,
+}
+
+impl MaterialCalibrationIntent {
+    pub fn apply(&mut self, command: MaterialCalibrationCommand) -> Result<(), MaterialCalibrationError> {
+        let next_scale = match command {
+            MaterialCalibrationCommand::SetImportedMetadata {
+                source_pixels_per_meter_x_milli: x,
+                source_pixels_per_meter_y_milli: y,
+                confidence_milli,
+            } => Some(validated_scale(Some(x), Some(y), ScaleProvenance::Imported, confidence_milli)?),
+            MaterialCalibrationCommand::MeasureTwoPoints { start, end, distance_micrometers } => {
+                if distance_micrometers == 0 { return Err(MaterialCalibrationError::InvalidMeasurement); }
+                let dx = (end.x - start.x) as f64;
+                let dy = (end.y - start.y) as f64;
+                let distance_pixels_milli = dx.hypot(dy);
+                if !distance_pixels_milli.is_finite() || distance_pixels_milli < 1.0 {
+                    return Err(MaterialCalibrationError::InvalidMeasurement);
+                }
+                let ppm_milli = (distance_pixels_milli * 1_000_000.0 / distance_micrometers as f64).round();
+                if !(1.0..=u64::MAX as f64).contains(&ppm_milli) {
+                    return Err(MaterialCalibrationError::InvalidMeasurement);
+                }
+                let value = ppm_milli as u64;
+                Some(validated_scale(Some(value), Some(value), ScaleProvenance::UserMeasured, 1000)?)
+            }
+            MaterialCalibrationCommand::SetKnownMotifSize {
+                motif_width_pixels_milli, motif_height_pixels_milli,
+                motif_width_micrometers, motif_height_micrometers, confidence_milli,
+            } => {
+                if motif_width_micrometers == 0 || motif_height_micrometers == 0 {
+                    return Err(MaterialCalibrationError::InvalidMeasurement);
+                }
+                let x = motif_width_pixels_milli.checked_mul(1_000_000)
+                    .and_then(|value| value.checked_div(motif_width_micrometers))
+                    .ok_or(MaterialCalibrationError::InvalidMeasurement)?;
+                let y = motif_height_pixels_milli.checked_mul(1_000_000)
+                    .and_then(|value| value.checked_div(motif_height_micrometers))
+                    .ok_or(MaterialCalibrationError::InvalidMeasurement)?;
+                Some(validated_scale(Some(x), Some(y), ScaleProvenance::MotifDerived, confidence_milli)?)
+            }
+            MaterialCalibrationCommand::OverrideScale {
+                source_pixels_per_meter_x_milli: x,
+                source_pixels_per_meter_y_milli: y,
+                provenance,
+                confidence_milli,
+            } => Some(validated_scale(x, y, provenance, confidence_milli)?),
+            MaterialCalibrationCommand::ResetScale => Some(PhysicalScaleEvidence::default()),
+            MaterialCalibrationCommand::OverrideOrientation { axis_millidegrees } => {
+                if axis_millidegrees >= 180_000 { return Err(MaterialCalibrationError::InvalidOrientation); }
+                self.orientation_override_millidegrees = Some(axis_millidegrees);
+                None
+            }
+            MaterialCalibrationCommand::ResetOrientation => {
+                self.orientation_override_millidegrees = None;
+                None
+            }
+        };
+        if let Some(scale) = next_scale { self.scale = scale; }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+}
+
+fn validated_scale(
+    x: Option<u64>, y: Option<u64>, provenance: ScaleProvenance, confidence_milli: u16,
+) -> Result<PhysicalScaleEvidence, MaterialCalibrationError> {
+    if confidence_milli > 1000 { return Err(MaterialCalibrationError::InvalidConfidence); }
+    let relative = provenance == ScaleProvenance::RelativeOnly;
+    if relative {
+        if x.is_some() || y.is_some() { return Err(MaterialCalibrationError::InvalidScale); }
+        return Ok(PhysicalScaleEvidence::default());
+    }
+    if x.is_none() || y.is_none() || x == Some(0) || y == Some(0) {
+        return Err(MaterialCalibrationError::InvalidScale);
+    }
+    let world_scale = if provenance == ScaleProvenance::PriorEstimated {
+        WorldScaleAvailability::UnavailablePriorEstimate
+    } else {
+        WorldScaleAvailability::Available
+    };
+    Ok(PhysicalScaleEvidence {
+        source_pixels_per_meter_x_milli: x,
+        source_pixels_per_meter_y_milli: y,
+        provenance,
+        confidence_milli,
+        world_scale,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

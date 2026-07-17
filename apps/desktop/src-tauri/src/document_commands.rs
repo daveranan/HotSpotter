@@ -12,7 +12,8 @@ use hot_trimmer_domain::{
     ALGORITHM_STACK_CONTRACT_VERSION, AlgorithmProvenance, AssignmentProvenance,
     CancellationToken as EngineCancellationToken, ChannelRegistration,
     CompilerRequestHeader, ContentDigest, ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION,
-    DelightingIntent, MaterialBehaviorClass, MaterialClassificationCommand,
+    DelightingIntent, MaterialBehaviorClass, MaterialCalibrationCommand, MaterialCalibrationIntent,
+    MaterialClassificationCommand,
     MaterialClassificationIntent,
     MaterialMapKind, MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
     NormalConvention, OriginalAssetProvenance, OrientedPixelSize, Projection, RegisteredChannel,
@@ -25,8 +26,9 @@ use hot_trimmer_image_io::{
     NormalizationSettings, PreparedChannelSet,
 };
 use hot_trimmer_material_analysis::{
-    AnalysisSettings, SourceAnalysisCache, analyze_source, prepare_delit_exemplar,
-    source_analysis_cache_key,
+    AnalysisSettings, ScaleOrientationCache, ScaleOrientationSettings, SourceAnalysisCache,
+    analyze_source, calibrate_scale_orientation, prepare_delit_exemplar,
+    scale_orientation_cache_key, source_analysis_cache_key,
 };
 use hot_trimmer_project_store::{
     ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
@@ -67,6 +69,7 @@ pub struct ProjectSession {
     preview_prepared_sources: HashMap<(String, u64), Arc<PreparedChannelSet>>,
     prepared_exemplars: PreparedExemplarCache,
     source_analysis_cache: SourceAnalysisCache,
+    scale_orientation_cache: ScaleOrientationCache,
 }
 
 impl ProjectSession {
@@ -83,6 +86,7 @@ impl ProjectSession {
             preview_prepared_sources: HashMap::new(),
             prepared_exemplars: PreparedExemplarCache::default(),
             source_analysis_cache: SourceAnalysisCache::default(),
+            scale_orientation_cache: ScaleOrientationCache::default(),
         }
     }
 
@@ -101,6 +105,7 @@ impl ProjectSession {
         self.preview_prepared_sources.clear();
         self.prepared_exemplars = PreparedExemplarCache::default();
         self.source_analysis_cache = SourceAnalysisCache::default();
+        self.scale_orientation_cache = ScaleOrientationCache::default();
         self.baseline = Some(baseline);
         self.dirty = false;
         self.is_draft = is_draft;
@@ -217,6 +222,7 @@ struct MaterialSourceProjection {
     registration_digest: String,
     delighting: DelightingIntent,
     classification: MaterialClassificationIntent,
+    calibration: MaterialCalibrationIntent,
     registered_channels: Option<RegisteredChannelSetProjection>,
 }
 
@@ -301,6 +307,14 @@ pub struct MaterialClassificationCommandRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MaterialCalibrationCommandRequest {
+    protocol_version: u16,
+    material_source_id: Uuid,
+    calibration_command: MaterialCalibrationCommand,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectNameRequest {
     protocol_version: u16,
     name: String,
@@ -362,6 +376,19 @@ pub struct SourceInspectorProjection {
     confidence_percent: u8,
     evidence_summary: String,
     warning_count: u8,
+    scale_summary: String,
+    orientation_summary: String,
+    world_scale_available: bool,
+    orientation_overlay: Vec<OrientationOverlayProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrientationOverlayProjection {
+    source_x_milli: u64,
+    source_y_milli: u64,
+    axis_millidegrees: Option<u32>,
+    confidence_milli: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,6 +631,20 @@ pub fn apply_material_classification_command(
 }
 
 #[tauri::command]
+pub fn apply_material_calibration_command(
+    request: MaterialCalibrationCommandRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session.store.as_mut().ok_or_else(no_project)?
+        .apply_material_calibration_command(request.material_source_id, request.calibration_command)
+        .map_err(store_error)?;
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
 pub fn rename_project(
     request: ProjectNameRequest,
     session: State<'_, SharedProjectSession>,
@@ -813,6 +854,21 @@ pub fn prepare_patch_preview(
     };
     stage_five.classification.routing_intent = source_set.classification;
     let inspector = stage_five.inspector_evidence();
+    let stage_six_settings = ScaleOrientationSettings::default();
+    let stage_six_key = scale_orientation_cache_key(&stage_five, &source_set.calibration, &stage_six_settings);
+    let stage_six = if let Some(cached) = session.scale_orientation_cache.get(&stage_six_key) {
+        cached.clone()
+    } else {
+        let report = calibrate_scale_orientation(
+            &stage_four,
+            &stage_five,
+            &source_set.calibration,
+            &stage_six_settings,
+            &RenderCancellationToken::new(),
+        ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 6 calibration failed: {failure}")))?;
+        session.scale_orientation_cache.insert_complete(report.clone());
+        report
+    };
     prepared_preview_projection(
         &exemplar,
         stage_four.base_color(),
@@ -826,6 +882,18 @@ pub fn prepare_patch_preview(
             confidence_percent: inspector.confidence_percent,
             evidence_summary: inspector.evidence_summary,
             warning_count: inspector.warning_count,
+            scale_summary: stage_six.measurement_overlay.label.clone(),
+            orientation_summary: match stage_six.global_orientation.axis_millidegrees {
+                Some(axis) => format!("axis {:.1}°, confidence {}%", axis as f64 / 1000.0, stage_six.global_orientation.confidence_milli / 10),
+                None => format!("orientation unavailable, confidence {}%", stage_six.global_orientation.confidence_milli / 10),
+            },
+            world_scale_available: stage_six.measurement_overlay.world_scale_available,
+            orientation_overlay: stage_six.local_orientation.iter().map(|sample| OrientationOverlayProjection {
+                source_x_milli: sample.source_x_milli,
+                source_y_milli: sample.source_y_milli,
+                axis_millidegrees: sample.axis_millidegrees,
+                confidence_milli: sample.confidence_milli,
+            }).collect(),
         },
     )
 }
@@ -1116,6 +1184,7 @@ fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, Use
             registration_digest: material.registration_digest.0.clone(),
             delighting: material.delighting.clone(),
             classification: material.classification,
+            calibration: material.calibration,
             registered_channels,
         })
     }).collect::<Result<Vec<_>, UserFacingError>>()?;

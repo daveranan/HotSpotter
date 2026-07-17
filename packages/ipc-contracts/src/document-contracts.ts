@@ -157,6 +157,27 @@ export type MaterialClassificationCommand =
   | { command: "override"; class: MaterialBehaviorClass }
   | { command: "reset_to_analysis" };
 
+export type ScaleProvenance = "imported" | "user_measured" | "motif_derived" | "convention" | "prior_estimated" | "relative_only";
+export interface MaterialCalibrationIntent {
+  scale: {
+    sourcePixelsPerMeterXMilli: number | null;
+    sourcePixelsPerMeterYMilli: number | null;
+    provenance: ScaleProvenance;
+    confidenceMilli: number;
+    worldScale: "available" | "unavailable_prior_estimate" | "unavailable_relative_only";
+  };
+  orientationOverrideMillidegrees: number | null;
+  revision: number;
+}
+export type MaterialCalibrationCommand =
+  | { command: "set_imported_metadata"; source_pixels_per_meter_x_milli: number; source_pixels_per_meter_y_milli: number; confidence_milli: number }
+  | { command: "measure_two_points"; start: { x: number; y: number }; end: { x: number; y: number }; distance_micrometers: number }
+  | { command: "set_known_motif_size"; motif_width_pixels_milli: number; motif_height_pixels_milli: number; motif_width_micrometers: number; motif_height_micrometers: number; confidence_milli: number }
+  | { command: "override_scale"; source_pixels_per_meter_x_milli: number | null; source_pixels_per_meter_y_milli: number | null; provenance: ScaleProvenance; confidence_milli: number }
+  | { command: "reset_scale" }
+  | { command: "override_orientation"; axis_millidegrees: number }
+  | { command: "reset_orientation" };
+
 export interface MaterialSourceProjection {
   id: string;
   name: string;
@@ -165,6 +186,7 @@ export interface MaterialSourceProjection {
   registrationDigest: string;
   delighting: DelightingIntent;
   classification: MaterialClassificationIntent;
+  calibration: MaterialCalibrationIntent;
   registeredChannels: RegisteredChannelSetProjection | null;
 }
 
@@ -178,6 +200,12 @@ export interface MaterialClassificationCommandRequest {
   protocolVersion: typeof IPC_PROTOCOL_VERSION;
   materialSourceId: string;
   classificationCommand: MaterialClassificationCommand;
+}
+
+export interface MaterialCalibrationCommandRequest {
+  protocolVersion: typeof IPC_PROTOCOL_VERSION;
+  materialSourceId: string;
+  calibrationCommand: MaterialCalibrationCommand;
 }
 
 export interface ProjectProjection {

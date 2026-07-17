@@ -1029,3 +1029,33 @@ button:disabled {
 .global-error span {
   color: #f0b6aa;
 }
+.orientation-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  stroke: #ffd166;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.calibration-editor {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #474747;
+  background: #252525;
+}
+
+.calibration-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.calibration-editor label,
+.calibration-editor small {
+  display: grid;
+  gap: 3px;
+}
