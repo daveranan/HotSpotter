@@ -7,7 +7,7 @@
     "build": "vite build",
     "dev": "vite --configLoader runner --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
-    "test": "node --test src/document-workbench.test.ts src/source-frame-partition.test.ts",
+    "test": "node --test src/document-workbench.test.ts src/source-frame-partition.test.ts src/source-frame-preview-performance.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

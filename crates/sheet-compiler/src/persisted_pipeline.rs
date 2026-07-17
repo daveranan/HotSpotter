@@ -1,6 +1,6 @@
 //! First authoritative persisted-project orchestration through Stage 14.
 
-use std::{collections::BTreeMap, fs, sync::Arc};
+use std::{collections::BTreeMap, fs, sync::{Arc, Mutex}, time::Instant};
 
 use hot_trimmer_domain::{
     AddressMode, AlgorithmProvenance, CancellationToken, ContentDigest, ContentReference,
@@ -36,7 +36,7 @@ use hot_trimmer_project_store::{ProjectSummary, SourceOwnership, StoredSource};
 use hot_trimmer_render_core::{
     ExemplarMaskIntent, PlanarArea, PreparedExemplarRequest, PreparedExemplarScope,
     RectificationQuality, RectificationWorkLimits, RenderCancellationToken,
-    prepare_registered_exemplar,
+    prepare_registered_exemplar, registered_level_zero_channels,
 };
 
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl MaterialDomainView for MappedDomainView<'_> {
 
 use crate::{
     AlgorithmCompiler, CompilerFacadeError, IntermediateAtlasArtifact, IntermediateAtlasRequest,
-    IntermediateSlotInput, SlotSynthesisLimits, SlotSynthesisRequest,
+    IntermediateSlotInput, SlotSynthesisLimits, SlotSynthesisRequest, SynthesizedSlotMaterial,
     synthesize_slot_material_with_guard,
 };
 
@@ -81,6 +81,7 @@ use crate::{
 /// authored slot aspect is preserved while leaving Stage 11 multiple positions
 /// to choose from.
 const UNPLACED_SOURCE_FOOTPRINT_FRACTION: f64 = 0.5;
+const DIRECT_SOURCE_FRAME_DECODER_VERSION: &str = "stage-02-oriented-base-color-v1";
 
 #[derive(Clone, Debug)]
 pub struct PersistedStage14PreviewRequest<'a> {
@@ -88,6 +89,52 @@ pub struct PersistedStage14PreviewRequest<'a> {
     pub revision: u64,
     pub draft_id: Option<u64>,
     pub input_hash: Option<String>,
+    /// A request profile changes only output work/resolution.  SourceFrame topology,
+    /// source coordinates, stable identities, and DirectCrop ownership stay fixed.
+    pub profile: SourceFramePreviewProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceFramePreviewProfile { Draft512, Refinement1024, Authoritative }
+
+impl Default for SourceFramePreviewProfile { fn default() -> Self { Self::Authoritative } }
+
+#[derive(Clone, Debug, Default)]
+pub struct SourceFramePreviewCache {
+    direct_domains: BTreeMap<ContentDigest, Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>>,
+    rendered_regions: BTreeMap<ContentDigest, Arc<SynthesizedSlotMaterial>>,
+    composed_atlases: BTreeMap<ContentDigest, Arc<IntermediateAtlasArtifact>>,
+}
+
+impl SourceFramePreviewCache {
+    #[must_use]
+    pub fn entry_count(&self) -> usize { self.direct_domains.len() }
+    pub fn rendered_region_count(&self) -> usize { self.rendered_regions.len() }
+    pub fn composed_atlas_count(&self) -> usize { self.composed_atlases.len() }
+    fn get(&self, key: &ContentDigest) -> Option<Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>> { self.direct_domains.get(key).cloned() }
+    fn insert(&mut self, key: ContentDigest, domain: Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>) {
+        const MAX_DIRECT_DOMAINS: usize = 2;
+        if self.direct_domains.len() >= MAX_DIRECT_DOMAINS && !self.direct_domains.contains_key(&key) {
+            if let Some(oldest) = self.direct_domains.keys().next().cloned() { self.direct_domains.remove(&oldest); }
+        }
+        self.direct_domains.insert(key, domain);
+    }
+    fn get_rendered(&self, key: &ContentDigest) -> Option<Arc<SynthesizedSlotMaterial>> { self.rendered_regions.get(key).cloned() }
+    fn insert_rendered(&mut self, key: ContentDigest, result: Arc<SynthesizedSlotMaterial>) {
+        const MAX_RENDERED_REGIONS: usize = 128;
+        if self.rendered_regions.len() >= MAX_RENDERED_REGIONS && !self.rendered_regions.contains_key(&key) {
+            if let Some(oldest) = self.rendered_regions.keys().next().cloned() { self.rendered_regions.remove(&oldest); }
+        }
+        self.rendered_regions.insert(key, result);
+    }
+    fn get_composed(&self, key: &ContentDigest) -> Option<Arc<IntermediateAtlasArtifact>> { self.composed_atlases.get(key).cloned() }
+    fn insert_composed(&mut self, key: ContentDigest, artifact: Arc<IntermediateAtlasArtifact>) {
+        const MAX_COMPOSED_ATLASES: usize = 2;
+        if self.composed_atlases.len() >= MAX_COMPOSED_ATLASES && !self.composed_atlases.contains_key(&key) {
+            if let Some(oldest) = self.composed_atlases.keys().next().cloned() { self.composed_atlases.remove(&oldest); }
+        }
+        self.composed_atlases.insert(key, artifact);
+    }
 }
 
 impl AlgorithmCompiler {
@@ -96,6 +143,18 @@ impl AlgorithmCompiler {
         request: PersistedStage14PreviewRequest<'_>,
         cancellation: &CancellationToken,
         is_current: impl Fn() -> bool + Sync,
+    ) -> Result<IntermediateAtlasArtifact, CompilerFacadeError> {
+        self.compile_persisted_stage_14_preview_with_cache(request, cancellation, is_current, None)
+    }
+
+    /// The desktop-owned bounded cache is injected into the sole persisted compiler;
+    /// it is not a process-global image cache and never changes source authority.
+    pub fn compile_persisted_stage_14_preview_with_cache(
+        &self,
+        request: PersistedStage14PreviewRequest<'_>,
+        cancellation: &CancellationToken,
+        is_current: impl Fn() -> bool + Sync,
+        source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
     ) -> Result<IntermediateAtlasArtifact, CompilerFacadeError> {
         let image_cancellation = ImageCancellationToken::new();
         let render_cancellation = RenderCancellationToken::new();
@@ -113,7 +172,7 @@ impl AlgorithmCompiler {
                 }
             });
             let result = compile_persisted(request, cancellation, &image_cancellation,
-                &render_cancellation, &is_current).map_err(CompilerFacadeError::Pipeline);
+                &render_cancellation, &is_current, source_frame_cache).map_err(CompilerFacadeError::Pipeline);
             monitoring_complete.store(true, std::sync::atomic::Ordering::Release);
             result
         })
@@ -127,6 +186,7 @@ fn compile_persisted(
     image_cancellation: &ImageCancellationToken,
     render_cancellation: &RenderCancellationToken,
     is_current: &dyn Fn() -> bool,
+    source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
 ) -> Result<IntermediateAtlasArtifact, String> {
     let active = || !cancellation.is_cancelled() && is_current();
     if !active() { return Err("preview cancelled or superseded before Stage 1".into()); }
@@ -134,7 +194,7 @@ fn compile_persisted(
     if document.document_revision != request.revision { return Err("preview revision is already stale".into()); }
     let primary = document.primary_material.ok_or("persisted document has no primary material")?;
     if document.source_frame.is_some() {
-        return compile_source_frame(request, cancellation, image_cancellation, render_cancellation, is_current, document, primary);
+        return compile_source_frame(request, cancellation, image_cancellation, render_cancellation, is_current, document, primary, source_frame_cache);
     }
     let mut domains = Vec::<DomainArtifacts>::new();
     let mut domain_keys = BTreeMap::<String, usize>::new();
@@ -306,7 +366,7 @@ fn compile_persisted(
         (14, results.first().and_then(|result| executed_algorithm(&result.stage_result))),
     ]);
     AlgorithmCompiler::new().compile_intermediate_atlas(&IntermediateAtlasRequest { topology: &topology,
-        placement_plan: &placement, slots, revision: request.revision, algorithm_versions: versions, diagnostics: Vec::new() },
+        placement_plan: &placement, slots, revision: request.revision, algorithm_versions: versions, diagnostics: Vec::new(), regions: Vec::new() },
         cancellation, || if active() { request.revision } else { 0 }).map_err(|error| error.to_string())
 }
 
@@ -318,12 +378,19 @@ fn compile_source_frame(
     request: PersistedStage14PreviewRequest<'_>,
     cancellation: &CancellationToken,
     image_cancellation: &ImageCancellationToken,
-    render_cancellation: &RenderCancellationToken,
+    _render_cancellation: &RenderCancellationToken,
     is_current: &dyn Fn() -> bool,
     document: &hot_trimmer_domain::TrimSheetDocument,
     primary: hot_trimmer_domain::SourceSetId,
+    source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
 ) -> Result<IntermediateAtlasArtifact, String> {
+    let started = Instant::now();
     let active = || !cancellation.is_cancelled() && is_current();
+    let output_size = match request.profile {
+        SourceFramePreviewProfile::Draft512 => hot_trimmer_domain::PixelSize { width: 512, height: 512 },
+        SourceFramePreviewProfile::Refinement1024 => hot_trimmer_domain::PixelSize { width: 1024, height: 1024 },
+        SourceFramePreviewProfile::Authoritative => document.render_settings.output_size,
+    };
     let frame = document.source_frame.as_ref().ok_or("source-frame document has no SourceFrame")?;
     let grid = document.logical_grid.ok_or("source-frame document has no LogicalGridSpec")?;
     let provenance = document.partition_provenance.as_ref().ok_or("source-frame document has no partition provenance")?;
@@ -362,8 +429,21 @@ fn compile_source_frame(
     if coverage.iter().any(|value| *value != 1) {
         return Err("accepted SourceFrame partition has a logical gap or overlap".into());
     }
-    let artifacts = build_domain(request.project, primary, None, request.revision, true, image_cancellation, render_cancellation)?;
-    if artifacts.domain.width != frame.oriented_dimensions.width || artifacts.domain.height != frame.oriented_dimensions.height {
+    let composition_key = ContentDigest::sha256(format!(
+        "{SOURCE_FRAME_COMPILER_VERSION}|compose|profile={:?}|output={}x{}|revision={}|appearance={:?}|input={:?}",
+        request.profile, output_size.width, output_size.height, request.revision,
+        document.appearance_hash().map_err(|error| error.to_string())?, request.input_hash,
+    ).as_bytes());
+    if let Some(cached) = source_frame_cache.and_then(|cache| cache.lock().ok().and_then(|guard| guard.get_composed(&composition_key))) {
+        if !active() { return Err("preview cancelled or superseded before composed cache publication".into()); }
+        let mut cached = (*cached).clone();
+        cached.telemetry.push(format!("profile={:?}; composed_cache=hit; output={}x{}", request.profile, output_size.width, output_size.height));
+        return Ok(cached);
+    }
+    let decode_started = Instant::now();
+    let (domain, decode_cache_hit) = direct_source_frame_domain(request.project, primary, image_cancellation, source_frame_cache)?;
+    let decode_ms = decode_started.elapsed().as_millis();
+    if domain.width != frame.oriented_dimensions.width || domain.height != frame.oriented_dimensions.height {
         return Err("SourceFrame oriented dimensions do not match the prepared source".into());
     }
     let source_left = (frame.bounds.x.get() * f64::from(frame.oriented_dimensions.width)).round() as u32;
@@ -372,11 +452,13 @@ fn compile_source_frame(
     let source_height = (frame.bounds.height.get() * f64::from(frame.oriented_dimensions.height)).round() as u32;
     let source_x = hot_trimmer_domain::resolve_boundaries(source_left, source_width, grid.width);
     let source_y = hot_trimmer_domain::resolve_boundaries(source_top, source_height, grid.height);
-    let destination_x = hot_trimmer_domain::resolve_boundaries(0, document.render_settings.output_size.width, grid.width);
-    let destination_y = hot_trimmer_domain::resolve_boundaries(0, document.render_settings.output_size.height, grid.height);
+    let destination_x = hot_trimmer_domain::resolve_boundaries(0, output_size.width, grid.width);
+    let destination_y = hot_trimmer_domain::resolve_boundaries(0, output_size.height, grid.height);
     let mut slots = Vec::with_capacity(document.topology.regions.len());
     let mut plans = Vec::with_capacity(document.topology.regions.len());
     let mut results = Vec::with_capacity(document.topology.regions.len());
+    let render_started = Instant::now();
+    let mut rendered_cache_hits = 0_u32;
     for region in &document.topology.regions {
         if !active() { return Err("preview cancelled or superseded in source-frame stages".into()); }
         let rect = region.grid_rect.ok_or_else(|| format!("region {} has no persisted GridRect", region.id))?;
@@ -409,36 +491,52 @@ fn compile_source_frame(
             return Err(format!("detached SourceFrame region {} does not preserve its destination aspect", region.id));
         }
         let mapping_origin = if document.source_overrides.contains_key(&region.id) { "explicit_override" } else { "partition" };
-        let candidate_id = hot_trimmer_domain::ContentDigest::sha256(format!("source-frame|{}|{}|{}|{}|{}|{}|{}|{}",
+        let candidate_id = hot_trimmer_domain::ContentDigest::sha256(format!("source-frame|{}|{}|{}|{}|{}|{}|{}",
             frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>(), region.id,
-            crop.x, crop.y, crop.width, crop.height, allocation.x, mapping_origin).as_bytes());
-        let candidate = CropCandidate { candidate_id: candidate_id.clone(), source_id: artifacts.domain.prepared_source_digest.clone(),
-            domain_id: artifacts.domain.cache_key.clone(), slot_id: region.id, crop: Some(crop),
+            crop.x, crop.y, crop.width, crop.height, mapping_origin).as_bytes());
+        let candidate = CropCandidate { candidate_id: candidate_id.clone(), source_id: domain.prepared_source_digest.clone(),
+            domain_id: domain.cache_key.clone(), slot_id: region.id, crop: Some(crop),
             transform: CandidateTransform { rotation: QuarterTurn::Zero, mirror: MirrorTransform::None },
             isotropic_scale: 1.0, mapping_mode: hot_trimmer_domain::SamplingMode::DirectCrop,
             family: CandidateFamily::PanelDirect, route: CandidateRoute::Direct, position_strategy: PositionStrategy::DenseLowResolution,
-            period_pixels: None, seam_indices: Vec::new(), correspondence_reference: artifacts.domain.cache_key.clone(),
+            period_pixels: None, seam_indices: Vec::new(), correspondence_reference: domain.cache_key.clone(),
             descriptors: CandidateDescriptors { saliency_milli: 0, stationarity_milli: 0, feature_strength_milli: 0, usability_milli: 1000 },
             seed: provenance.recipe.seed, eligibility: EligibilityEvidence { mapping_permitted: true, transform_permitted: true,
                 isotropic_scale: true, exact_aspect: true, entire_crop_usable: Some(true), cross_axis_preserved: Some(true),
                 lattice_aligned: Some(true), direct_crop_applicable: true, direct_crop_rejection: None,
                 reasons: vec!["accepted SourceFrame + GridRect direct mapping".into()] } };
         let plan = SamplingPlan { slot_id: region.id, role: region.role, variation_group: region.material_group.clone(),
-            prepared_domain_dimensions: [artifacts.domain.width, artifacts.domain.height], candidate,
+            prepared_domain_dimensions: [domain.width, domain.height], candidate,
             slot_physical_size: [f64::from(crop.width), f64::from(crop.height)], source_pixels_per_physical_unit: 1.0,
             sampling_policy: SamplingPolicy { filter: hot_trimmer_domain::SourceSamplingMode::Linear, scale: 1.0, correct_tangent_normals: true },
             radial_mapping: None, stretch_override: StretchOverrideProvenance::NotAuthorized, slice_geometry: SliceGeometry::None,
             maximum_seam_cost_milli: 0, unary_cost: 0.0 };
         let slot_key = region.id.to_string();
         let topology_slot = hot_trimmer_domain::CompiledTemplateSlot { slot_key, allocation, hotspot: allocation };
-        let result = synthesize_slot_material_with_guard(SlotSynthesisRequest { plan: &plan, domain: &artifacts.domain,
-            output_dimensions: [allocation.width, allocation.height], limits: SlotSynthesisLimits::default() }, &|| !active())
-            .map_err(|error| format!("Stage 14 direct SourceFrame sampling failed for {}: {error}", region.id))?;
+        let rendered_key = ContentDigest::sha256(format!(
+            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|allocation={}x{}",
+            request.profile, output_size.width, output_size.height, plan.candidate.candidate_id,
+            allocation.width, allocation.height,
+        ).as_bytes());
+        let result = if let Some(cached) = source_frame_cache.and_then(|cache| cache.lock().ok().and_then(|guard| guard.get_rendered(&rendered_key))) {
+            rendered_cache_hits += 1;
+            (*cached).clone()
+        } else {
+            let result = synthesize_slot_material_with_guard(SlotSynthesisRequest { plan: &plan, domain: &domain,
+                output_dimensions: [allocation.width, allocation.height], limits: SlotSynthesisLimits::default() }, &|| !active())
+                .map_err(|error| format!("Stage 14 direct SourceFrame sampling failed for {}: {error}", region.id))?;
+            if let Some(cache) = source_frame_cache {
+                if let Ok(mut guard) = cache.lock() { guard.insert_rendered(rendered_key, Arc::new(result.clone())); }
+            }
+            result
+        };
         slots.push(topology_slot); plans.push(plan); results.push(result);
     }
+    let render_ms = render_started.elapsed().as_millis();
+    let compose_started = Instant::now();
     let topology = hot_trimmer_domain::CompiledTemplateTopology { identity: hot_trimmer_domain::TemplateIdentity {
         template_id: "source-frame".into(), template_version: SOURCE_FRAME_COMPILER_VERSION.into(),
-        compatibility_key: document.topology.compatibility_key.clone() }, output_size: document.render_settings.output_size, slots };
+        compatibility_key: document.topology.compatibility_key.clone() }, output_size, slots };
     let placement = PlacementPlan { stage_result: StageResult::Executed { algorithm: AlgorithmProvenance {
         algorithm_id: "hot-trimmer.stage-13.source-frame-direct".into(), version: SOURCE_FRAME_COMPILER_VERSION.into() },
         settings_hash: hot_trimmer_domain::ContentDigest::sha256(b"source-frame-direct-placement"), diagnostics: Vec::new() },
@@ -450,12 +548,46 @@ fn compile_source_frame(
         qa_views: vec![PlacementPlanQaView::SelectedPlacements, PlacementPlanQaView::Validation] };
     let inputs = topology.slots.iter().zip(document.topology.regions.iter()).zip(placement.placements.iter().zip(results.iter()))
         .map(|((slot, region), (plan, result))| IntermediateSlotInput { region_id: region.id, slot_key: slot.slot_key.as_str(),
-            display_name: region.display_name.as_str(), required: true, patch_id: None, domain: &artifacts.domain, plan, result, grid_rect: region.grid_rect }).collect();
+            display_name: region.display_name.as_str(), required: true, patch_id: None, domain: &domain, plan, result, grid_rect: region.grid_rect }).collect();
     let algorithms = (1..=14).map(|stage| (stage, AlgorithmProvenance { algorithm_id: format!("source-frame-stage-{stage:02}"), version: SOURCE_FRAME_COMPILER_VERSION.into() })).collect();
+    let profile_regions = crate::resolve_profile_regions(document, &topology)
+        .map_err(|error| error.to_string())?;
     let atlas_request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement, slots: inputs,
-        revision: request.revision, algorithm_versions: algorithms, diagnostics: Vec::new() };
-    AlgorithmCompiler::new().compile_intermediate_atlas(&atlas_request, cancellation, || request.revision)
-        .map_err(|error| error.to_string())
+        revision: request.revision, algorithm_versions: algorithms, diagnostics: Vec::new(), regions: profile_regions };
+    let mut artifact = AlgorithmCompiler::new().compile_intermediate_atlas(&atlas_request, cancellation, || request.revision)
+        .map_err(|error| error.to_string())?;
+    let compose_ms = compose_started.elapsed().as_millis();
+    artifact.pending.retain(|pending| *pending != "profiles");
+    artifact.pending.insert(0, match request.profile { SourceFramePreviewProfile::Draft512 => "Draft 512 Base Color complete; refinement pending", SourceFramePreviewProfile::Refinement1024 => "Refinement 1024 Base Color complete", SourceFramePreviewProfile::Authoritative => "Authoritative Base Color complete" });
+    let cache = if decode_cache_hit { "hit" } else { "miss" };
+    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; regions={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_ms={decode_ms}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; compose_ms={compose_ms}; decode_full_frame_allocations={}; elapsed_ms={}",
+        request.profile, frame.oriented_dimensions.width, frame.oriented_dimensions.height,
+        domain.width, domain.height, output_size.width, output_size.height, document.topology.regions.len(),
+        u8::from(!decode_cache_hit), started.elapsed().as_millis()));
+    if let Some(cache) = source_frame_cache {
+        if let Ok(mut guard) = cache.lock() { guard.insert_composed(composition_key, Arc::new(artifact.clone())); }
+    }
+    Ok(artifact)
+}
+
+fn direct_source_frame_domain(
+    project: &ProjectSummary, source_set_id: hot_trimmer_domain::SourceSetId,
+    cancellation: &ImageCancellationToken, cache: Option<&Mutex<SourceFramePreviewCache>>,
+) -> Result<(Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>, bool), String> {
+    let sources = project.sources.iter().filter(|source| source.source_set_id.to_string() == source_set_id.to_string()
+        && source.registration.role == MaterialChannelRole::BaseColor).collect::<Vec<_>>();
+    let (registered, encoded) = registered_inputs(&sources)?;
+    let settings = NormalizationSettings { max_levels: 1, max_memory_bytes: 4_294_967_296, max_level_zero_edge: None, ..NormalizationSettings::default() };
+    let prepared_key = hot_trimmer_image_io::prepared_cache_key(&registered, &settings).0;
+    let cache_key = ContentDigest::sha256(format!("{DIRECT_SOURCE_FRAME_DECODER_VERSION}|{}|orientation={}", prepared_key.0, registered.orientation).as_bytes());
+    if let Some(found) = cache.and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&cache_key))) { return Ok((found, true)); }
+    let prepared = prepare_registered_channel_set(&registered, &encoded, &settings, cancellation)
+        .map_err(|error| format!("Stage 2 direct SourceFrame decode/preparation failed: {error}"))?;
+    let channels = registered_level_zero_channels(&prepared).map_err(|error| format!("direct registered preparation failed: {error}"))?;
+    let domain = Arc::new(hot_trimmer_material_synthesis::PreparedMaterialDomain::from_registered_channels(
+        cache_key.clone(), cache_key.clone(), channels).map_err(|error| format!("direct SourceFrame domain failed: {error}"))?);
+    if let Some(cache) = cache { if let Ok(mut guard) = cache.lock() { guard.insert(cache_key, Arc::clone(&domain)); } }
+    Ok((domain, false))
 }
 
 const SOURCE_FRAME_COMPILER_VERSION: &str = "1.0.0";

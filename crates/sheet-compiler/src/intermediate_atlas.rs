@@ -6,6 +6,7 @@ use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, CompiledTemplateTopology, ContentDigest,
     GridRect, MaterialChannelRole, RegionId, SamplingMode,
 };
+use crate::ResolvedRegion;
 use hot_trimmer_material_synthesis::PreparedMaterialDomain;
 use hot_trimmer_placement_solver::{CandidateTransform, PlacementPlan, SamplingPlan, SourceCrop};
 use hot_trimmer_render_core::PreparedExemplarChannel;
@@ -23,6 +24,7 @@ pub struct IntermediateAtlasRequest<'a> {
     pub revision: u64,
     pub algorithm_versions: BTreeMap<u8, AlgorithmProvenance>,
     pub diagnostics: Vec<CompilationDiagnostic>,
+    pub regions: Vec<ResolvedRegion>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,11 @@ pub struct IntermediateAtlasArtifact {
     pub slots: Vec<IntermediateSlotInspection>,
     pub algorithm_versions: BTreeMap<u8, AlgorithmProvenance>,
     pub diagnostics: Vec<CompilationDiagnostic>,
+    /// Profile-local overlay records produced beside the pixels and slots.
+    pub regions: Vec<ResolvedRegion>,
+    /// Measured persisted-spine facts.  These describe the exact artifact, never a
+    /// separately reconstructed preview.
+    pub telemetry: Vec<String>,
     pub pending: Vec<&'static str>,
 }
 
@@ -210,7 +217,7 @@ pub(crate) fn compose_intermediate_atlas(
         channels: channel_pixels.into_iter().map(|(role, rgba8)| IntermediateAtlasChannel { role, rgba8 }).collect(),
         unavailable_channels: all_importable.into_iter().filter(|role| !roles.contains(role)).collect(),
         correspondence, validity, slots: inspections, algorithm_versions: request.algorithm_versions.clone(),
-        diagnostics: request.diagnostics.clone(),
+        diagnostics: request.diagnostics.clone(), regions: request.regions.clone(), telemetry: Vec::new(),
         pending: vec!["profiles", "semantic details", "effects", "final PBR composition", "finishing",
             "mips", "metadata", "export", "Blender application"],
     })

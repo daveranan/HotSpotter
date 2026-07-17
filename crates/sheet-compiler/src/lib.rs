@@ -10,6 +10,7 @@ pub use algorithm_compiler::*;
 pub use document_compiler::{
     CompiledMapSet, CompiledPreviewMap, PreviewMapKind, RegisteredMaterialMap, ResolvedRegion,
     SheetCompileError, compile_preview_map, compile_preview_map_incremental, resolve_compile_plan,
+    resolve_profile_regions,
 };
 pub use intermediate_atlas::*;
 pub use persisted_pipeline::*;

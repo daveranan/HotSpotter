@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { constrainAspectBounds } from "./source-workbench-geometry.ts";
 
@@ -22,4 +23,14 @@ test("source frame and detached crop field edits preserve pixel aspect", () => {
   const crop = constrainAspectBounds({ x: 0.2, y: 0.2, width: 0.4, height: 0.1 }, detachedAspect);
   assert.equal(crop.width / crop.height, detachedAspect);
   assert.ok(crop.x + crop.width <= 1 && crop.y + crop.height <= 1);
+});
+
+test("source preview is atlas-selected and SourceFrame editing is explicit", () => {
+  const app = readFileSync(new URL("./source-first-app.tsx", import.meta.url), "utf8");
+  assert.match(app, /data-selection-surface=\"atlas\"/);
+  assert.doesNotMatch(app, /data-selection-surface=\"source\"/);
+  assert.doesNotMatch(app, /props\.onSelectRegion\(region\.regionId\)/);
+  assert.match(app, /data-selection-surface=\"source-preview\"/);
+  assert.match(app, /Edit Source Frame/);
+  assert.match(app, /sourceFrameEditing \? \"auto\" : \"none\"/);
 });

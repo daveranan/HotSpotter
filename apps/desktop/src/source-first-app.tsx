@@ -33,6 +33,7 @@ import {
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
 import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
+import { SourceFramePreviewController } from "./source-frame-preview-controller";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
@@ -170,6 +171,7 @@ function App() {
   const [project, setProject] = useState<ProjectProjection | null>(null);
   const [artifact, setArtifact] = useState<IntermediateAtlasProjection | null>(null);
   const [preview, setPreview] = useState<PreviewSheetProjection | null>(null);
+  const [previewClientTelemetry, setPreviewClientTelemetry] = useState<string[]>([]);
   const [templateId, setTemplateId] = useState<string>(templates[0][0]);
   const [targetRegionCount, setTargetRegionCount] = useState(63);
   const [selectedSourceSetId, setSelectedSourceSetId] = useState<string>("");
@@ -178,6 +180,7 @@ function App() {
   const [draftPreviewFps, setDraftPreviewFps] = useState<10 | 30 | 60>(30);
   const [actualDraftPreviewFps, setActualDraftPreviewFps] = useState<number | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
+  const [sourceFrameEditing, setSourceFrameEditing] = useState(false);
   const [mapView, setMapView] = useState<CompiledMapView>("baseColor");
   const [activity, setActivity] = useState<Activity>("starting");
   const [problem, setProblem] = useState<CommandFailure | null>(null);
@@ -197,12 +200,15 @@ function App() {
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
   const lastAutomaticPreviewRevision = useRef<number | null>(null);
   const patchPreviewRequestId = useRef(0);
-  const lastTransientPreviewAt = useRef(0);
-  const transientPreviewInFlight = useRef(false);
-  const transientPreviewPending = useRef(false);
+  const previewPublishStartedAt = useRef<number | null>(null);
   const lastTransientCompletionAt = useRef(0);
   const smoothedTransientFps = useRef(0);
-  const [transientPreviewTick, setTransientPreviewTick] = useState(0);
+  const transientPreviewController = useRef(new SourceFramePreviewController<{
+    patchId: string;
+    geometry?: PatchGeometry;
+    maxEdge: number;
+    requestId: number;
+  }>());
   const paneDrag = useRef<{ kind: PaneDragKind; start: PaneState } | null>(null);
   const workbenchRef = useRef<HTMLElement | null>(null);
 
@@ -256,37 +262,27 @@ function App() {
   }, [native, project?.document?.documentRevision]);
 
   useEffect(() => {
+    const controller = transientPreviewController.current;
+    controller.setMaxFps(draftPreviewFps);
     if (!native || !activePatchId) {
+      controller.cancel();
       setPreparedPatchPreview(null);
       return;
     }
     const transient = draftPatchPreview?.patchId === activePatchId ? draftPatchPreview : null;
-    if (!transient) transientPreviewPending.current = false;
-    if (transient && transientPreviewInFlight.current) {
-      transientPreviewPending.current = true;
-      return;
-    }
-    const frameInterval = 1000 / draftPreviewFps;
-    const delay = transient ? Math.max(0, frameInterval - (performance.now() - lastTransientPreviewAt.current)) : 0;
-    let current = true;
-    const timer = window.setTimeout(() => {
-      const requestId = ++patchPreviewRequestId.current;
-      if (transient) {
-        lastTransientPreviewAt.current = performance.now();
-        transientPreviewInFlight.current = true;
-        transientPreviewPending.current = false;
-      }
-      void invoke<PreparedPatchPreviewProjection>("prepare_patch_preview", {
+    const requestId = ++patchPreviewRequestId.current;
+    controller.setExecutor(async (request) => {
+      return invoke<PreparedPatchPreviewProjection>("prepare_patch_preview", {
         request: {
           ...protocol,
-          patchId: activePatchId,
-          maxEdge: transient ? 256 : 512,
-          geometry: transient?.geometry,
+          patchId: request.patchId,
+          maxEdge: request.maxEdge,
+          geometry: request.geometry,
         },
       }).then((value) => {
-        if ((transient || current) && requestId === patchPreviewRequestId.current && value.patchId === activePatchId) {
+        if (request.requestId === patchPreviewRequestId.current && value.patchId === request.patchId) {
           setPreparedPatchPreview(value);
-          if (transient) {
+          if (request.maxEdge === 256) {
             const completedAt = performance.now();
             if (lastTransientCompletionAt.current > 0) {
               const sample = 1000 / Math.max(1, completedAt - lastTransientCompletionAt.current);
@@ -301,19 +297,11 @@ function App() {
           }
         }
       }).catch((reason) => {
-        if (current && requestId === patchPreviewRequestId.current && !transient) setProblem(failure(reason));
-      }).finally(() => {
-        if (transient) {
-          transientPreviewInFlight.current = false;
-          if (transientPreviewPending.current) {
-            transientPreviewPending.current = false;
-            setTransientPreviewTick((tick) => tick + 1);
-          }
-        }
+        if (request.requestId === patchPreviewRequestId.current && request.maxEdge !== 256) setProblem(failure(reason));
       });
-    }, delay);
-    return () => { current = false; window.clearTimeout(timer); };
-  }, [native, activePatchId, project?.patches, draftPatchPreview, draftPreviewFps, transientPreviewTick]);
+    });
+    controller.enqueue({ patchId: activePatchId, maxEdge: transient ? 256 : 512, geometry: transient?.geometry, requestId });
+  }, [native, activePatchId, project?.patches, draftPatchPreview, draftPreviewFps]);
 
   useEffect(() => {
     const element = workbenchRef.current;
@@ -642,12 +630,13 @@ function App() {
         setProject(current);
       }
       const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
-        request: { ...protocol, revision: current.document!.documentRevision },
+        request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
       });
       previewDraftId.current += 1;
       setPreview(null);
       setArtifact(compiled);
       setSelectedRegionId((selected) => compiled.regions.some((region) => region.regionId === selected) ? selected : null);
+      window.setTimeout(() => void requestPreview(undefined, undefined, "refinement1024", current.document!.documentRevision), 120);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -667,10 +656,11 @@ function App() {
       setProject(current);
       setArtifact(null);
       const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
-        request: { ...protocol, revision: current.document!.documentRevision },
+        request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
       });
       setArtifact(compiled);
       setSelectedRegionId(null);
+      window.setTimeout(() => void requestPreview(undefined, undefined, "refinement1024", current.document!.documentRevision), 120);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -694,10 +684,11 @@ function App() {
       suppressAutomaticPreviewRevision.current = current.document!.documentRevision;
       setProject(current);
       const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
-        request: { ...protocol, revision: current.document!.documentRevision },
+        request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
       });
       setArtifact(compiled);
       setSelectedRegionId(null);
+      window.setTimeout(() => void requestPreview(undefined, undefined, "refinement1024", current.document!.documentRevision), 120);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -724,25 +715,36 @@ function App() {
     }
   }
 
-  async function requestPreview(regionId?: string, projection?: CropProjection) {
-    if (!native || !project?.document) return;
+  async function requestPreview(regionId?: string, projection?: CropProjection, profile: "draft512" | "refinement1024" = "draft512", revision?: number) {
+    const requestedRevision = revision ?? project?.document?.documentRevision;
+    if (!native || requestedRevision === undefined) return;
     const draftId = ++previewDraftId.current;
     setProblem(null);
+    previewPublishStartedAt.current = performance.now();
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: {
           ...protocol,
-          revision: project.document.documentRevision,
+          revision: requestedRevision,
           regionId,
           transientProjection: projection,
           draftId,
-          inputHash: JSON.stringify({ revision: project.document.documentRevision, regionId, projection }),
+          inputHash: JSON.stringify({ revision: requestedRevision, regionId, projection }),
+          profile,
         },
       });
+      setPreviewClientTelemetry([`profile=${profile}`, `artifact_dimensions=${next.width}x${next.height}`, `ipc_round_trip_ms=${Math.round(performance.now() - (previewPublishStartedAt.current ?? performance.now()))}`]);
       if (draftId === previewDraftId.current) {
         setArtifact(next);
         setPreview(null);
         setProblem(null);
+        if (profile === "draft512") {
+          window.setTimeout(() => {
+            if (draftId === previewDraftId.current && requestedRevision === next.documentRevision) {
+              void requestPreview(regionId, projection, "refinement1024", requestedRevision);
+            }
+          }, 120);
+        }
       }
     } catch (reason) {
       if (failure(reason).code !== "operation_cancelled") setProblem(failure(reason));
@@ -1017,7 +1019,7 @@ function App() {
             selectedSlot={selectedSlot}
             crop={selectedCrop}
             selectedRegion={selectedRegion}
-            onSelectRegion={setSelectedRegionId}
+            sourceFrameEditing={sourceFrameEditing}
             importing={activity === "importing"}
             onOpenBase={() => void chooseImages("base_color")}
             onCommitCrop={(bounds) => void setSelectedCrop(bounds)}
@@ -1052,10 +1054,20 @@ function App() {
           build={build}
           activity={activity}
           setResolution={setResolution}
-          targetRegionCount={targetRegionCount}
-          setTargetRegionCount={setTargetRegionCount}
-          regenerateSourceFrame={regenerateSourceFrame}
-        />
+           targetRegionCount={targetRegionCount}
+           setTargetRegionCount={setTargetRegionCount}
+           regenerateSourceFrame={regenerateSourceFrame}
+           previewClientTelemetry={previewClientTelemetry}
+           onPreviewPaint={(dimensions) => {
+             if (previewPublishStartedAt.current !== null) {
+               setPreviewClientTelemetry((current) => [
+                 ...current.filter((entry) => !entry.startsWith("paint_ms=") && !entry.startsWith("png_decoded_dimensions=")),
+                 `png_decoded_dimensions=${dimensions.width}x${dimensions.height}`,
+                 `paint_ms=${Math.round(performance.now() - previewPublishStartedAt.current!)}`,
+               ]);
+             }
+           }}
+         />
         {paneMode === "full" ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         {paneMode === "full" ? <Inspector
           project={project}
@@ -1071,6 +1083,8 @@ function App() {
           onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
           onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
           onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
+          sourceFrameEditing={sourceFrameEditing}
+          onSetSourceFrameEditing={setSourceFrameEditing}
           onDetachSourceCell={(regionId) => void detachSourceCell(regionId)}
           onResetSourceCell={(regionId) => void resetSourceCell(regionId)}
         /> : null}
@@ -1250,7 +1264,7 @@ function SourceCanvas(props: {
   selectedSlot: Stage14SlotProjection | null;
   crop: CropProjection | null;
   selectedRegion: ResolvedRegion | null;
-  onSelectRegion: (regionId: string | null) => void;
+  sourceFrameEditing: boolean;
   importing: boolean;
   onOpenBase: () => void;
   onCommitCrop: (bounds: NormalizedBounds) => void;
@@ -1459,7 +1473,7 @@ function SourceCanvas(props: {
   }
 
   function beginFrame(event: React.PointerEvent<SVGElement>, action: CropDragAction) {
-    if (!effectiveFrame || event.button !== 0) return;
+    if (!props.sourceFrameEditing || !effectiveFrame || event.button !== 0) return;
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     const start = point(event);
@@ -1579,16 +1593,14 @@ function SourceCanvas(props: {
         {props.partitionRegions.map((region) => region.sourceBounds ? <rect
           key={region.regionId}
           data-region-id={region.regionId}
-          data-selection-surface="source"
-          aria-label={`Select ${region.displayName}`}
+          data-selection-surface="source-preview"
+          aria-label={`Preview ${region.displayName}`}
           x={region.sourceBounds.x * props.source!.orientedSize.width}
           y={region.sourceBounds.y * props.source!.orientedSize.height}
           width={region.sourceBounds.width * props.source!.orientedSize.width}
           height={region.sourceBounds.height * props.source!.orientedSize.height}
-          style={{ pointerEvents: "all" }}
+          style={{ pointerEvents: "none" }}
           className={`source-region-boundary ${region.regionId === props.selectedRegion?.regionId ? "selected" : ""}`}
-          onPointerDown={(event) => { event.stopPropagation(); props.onSelectRegion(region.regionId); }}
-          onClick={(event) => { event.stopPropagation(); props.onSelectRegion(region.regionId); }}
         /> : null)}
       </svg> : null}
       {props.selectedRegion && props.selectedSlot?.mappingOrigin === "partition" ? <div className="partition-selection-status" data-selection-status="partition-owned">
@@ -1605,27 +1617,16 @@ function SourceCanvas(props: {
       viewBox={`0 0 ${props.source.orientedSize.width} ${props.source.orientedSize.height}`}
       aria-label="Editable patch outlines"
     >
-      {effectiveFrame ? <g className="patch-outline active source-frame-transform">
+      {effectiveFrame ? <g
+        className={`patch-outline source-frame-transform ${props.sourceFrameEditing ? "active" : "source-frame-preview"}`}
+        style={{ pointerEvents: props.sourceFrameEditing ? "auto" : "none" }}
+      >
         <polygon
           points={`${effectiveFrame.x * props.source.orientedSize.width},${effectiveFrame.y * props.source.orientedSize.height} ${(effectiveFrame.x + effectiveFrame.width) * props.source.orientedSize.width},${effectiveFrame.y * props.source.orientedSize.height} ${(effectiveFrame.x + effectiveFrame.width) * props.source.orientedSize.width},${(effectiveFrame.y + effectiveFrame.height) * props.source.orientedSize.height} ${effectiveFrame.x * props.source.orientedSize.width},${(effectiveFrame.y + effectiveFrame.height) * props.source.orientedSize.height}`}
-          aria-label="Move SourceFrame"
-          onPointerDown={(event) => {
-            const target = point(event);
-            const selectedCell = props.partitionRegions.find((region) => {
-              const bounds = region.sourceBounds;
-              return bounds
-                && target.x >= bounds.x && target.x <= bounds.x + bounds.width
-                && target.y >= bounds.y && target.y <= bounds.y + bounds.height;
-            });
-            if (selectedCell) {
-              event.stopPropagation();
-              props.onSelectRegion(selectedCell.regionId);
-            } else {
-              beginFrame(event, "move");
-            }
-          }}
+          aria-label={props.sourceFrameEditing ? "Move SourceFrame" : "SourceFrame preview"}
+          onPointerDown={props.sourceFrameEditing ? (event) => beginFrame(event, "move") : undefined}
         />
-        <g className="patch-transform">
+        {props.sourceFrameEditing ? <g className="patch-transform">
           <rect
             className="rotation-guide"
             x={effectiveFrame.x * props.source.orientedSize.width - 15 / viewport.view.scale}
@@ -1642,7 +1643,7 @@ function SourceCanvas(props: {
             className={`resize-handle resize-${action}`}
             onPointerDown={(event) => beginFrame(event, action)}
           />)}
-        </g>
+        </g> : null}
       </g> : null}
       {effectiveCrop ? <g className="patch-outline active source-crop-transform">
         <polygon
@@ -1870,6 +1871,8 @@ function SheetWorkbench(props: {
   targetRegionCount: number;
   setTargetRegionCount: (count: number) => void;
   regenerateSourceFrame: (count: number) => void;
+  previewClientTelemetry: readonly string[];
+  onPreviewPaint: (dimensions: { width: number; height: number }) => void;
 }) {
   const artifact = props.artifact;
   const topologyHash = props.project?.document ? hashBytes(props.project.document.topology.topologyHash) : null;
@@ -1946,7 +1949,7 @@ function SheetWorkbench(props: {
           if (event.button === 0 && !(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
         }}
       >
-        <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} />
+        <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
         {sheetMatchesDocument ? <div
           className="sheet-grid"
           style={{
@@ -1976,6 +1979,10 @@ function SheetWorkbench(props: {
       <span>{props.artifact.label}</span>
       <span>incomplete after Stage {props.artifact.incompleteAfterStage} · non-exportable</span>
       <span>pending: {props.artifact.pending.join(", ")}</span>
+      {props.artifact.telemetry.length > 0 || props.previewClientTelemetry.length > 0 ? <details className="preview-telemetry">
+        <summary>Preview telemetry</summary>
+        <pre>{[...props.artifact.telemetry, ...props.previewClientTelemetry].join("\n")}</pre>
+      </details> : null}
     </footer> : null}
   </section>;
 }
@@ -1994,6 +2001,8 @@ function Inspector(props: {
   onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
   onSetSourceFrame: (bounds: NormalizedBounds) => void;
+  sourceFrameEditing: boolean;
+  onSetSourceFrameEditing: (editing: boolean) => void;
   onDetachSourceCell: (regionId: string) => void;
   onResetSourceCell: (regionId: string) => void;
 }) {
@@ -2066,6 +2075,8 @@ function Inspector(props: {
     {props.project?.document?.sourceFrame ? <SourceFrameEditor
       frame={props.project.document.sourceFrame}
       onApply={props.onSetSourceFrame}
+      editing={props.sourceFrameEditing}
+      onEditingChange={props.onSetSourceFrameEditing}
     /> : null}
     <section className="inspector-section">
       <span>SELECTED REGION</span>
@@ -2114,6 +2125,8 @@ function Inspector(props: {
 function SourceFrameEditor(props: {
   frame: SourceFrame;
   onApply: (bounds: NormalizedBounds) => void;
+  editing: boolean;
+  onEditingChange: (editing: boolean) => void;
 }) {
   const [bounds, setBounds] = useState<NormalizedBounds>(props.frame.bounds);
   useEffect(() => setBounds(props.frame.bounds), [props.frame.identity.join(",")]);
@@ -2139,6 +2152,10 @@ function SourceFrameEditor(props: {
     <span>SOURCE FRAME</span>
     <dl><dt>Oriented source</dt><dd>{props.frame.orientedDimensions.width} × {props.frame.orientedDimensions.height}</dd><dt>Revision</dt><dd>{props.frame.sourceRevision}</dd></dl>
     <p className="source-frame-aspect-lock">Aspect ratio locked to {props.frame.outputAspect[0]}:{props.frame.outputAspect[1]}</p>
+    <button className="primary source-frame-edit-toggle" onClick={() => props.onEditingChange(!props.editing)}>
+      {props.editing ? "Done Editing" : "Edit Source Frame"}
+    </button>
+    {props.editing ? <>
     <div className="region-bounds-editor">
       {(["x", "y", "width", "height"] as const).map((key) => <label key={key}>{key}<input type="number" min={0} max={1} step={0.0001} value={bounds[key]} onChange={(event) => set(key, Number(event.currentTarget.value))} /></label>)}
     </div>
@@ -2152,6 +2169,7 @@ function SourceFrameEditor(props: {
       <button onClick={() => fit("height")}>Fit Height</button>
       <button onClick={() => fit("largest")}>Largest Fit</button>
     </div>
+    </> : <p className="source-frame-edit-hint">Preview mode. Choose Edit Source Frame to move or resize the crop.</p>}
   </section>;
 }
 

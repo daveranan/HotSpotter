@@ -345,10 +345,24 @@ export interface IntermediateAtlasProjection {
   unavailableChannels: readonly string[];
   slots: readonly Stage14SlotProjection[];
   pending: readonly string[];
+  telemetry: readonly string[];
   finalCompileAvailable: false;
   exportAvailable: false;
   blenderAvailable: false;
   sourceFrame?: SourceFrame;
+}
+
+/** Preview work profile; this changes requested output work only, never SourceFrame ownership. */
+export type SourceFramePreviewProfile = "draft512" | "refinement1024" | "authoritative";
+
+export interface Stage14PreviewRequest {
+  protocolVersion: number;
+  revision: number;
+  regionId?: string;
+  transientProjection?: RegionMapping["projection"];
+  draftId?: number;
+  inputHash?: string;
+  profile?: SourceFramePreviewProfile;
 }
 
 export interface PreviewSheetProjection {

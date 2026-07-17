@@ -4245,7 +4245,13 @@ mod algorithm_stage_01_tests {
         assert_eq!((frame.oriented_dimensions.width, frame.oriented_dimensions.height), (7952, 4016));
         assert_eq!(frame.source_revision, 2);
         assert_eq!(frame.identity, frame.compute_identity());
-        assert!(after.source_overrides.contains_key(&detached_region));
+        let rebound_override = after.source_overrides.get(&detached_region).expect("detached override transformed");
+        let rebound_region = after.topology.regions.iter().find(|region| region.id == detached_region).expect("rebound region");
+        let source_aspect = rebound_override.source_bounds.width.get() * 7952.0
+            / (rebound_override.source_bounds.height.get() * 4016.0);
+        let destination_aspect = f64::from(rebound_region.allocation_rect.width)
+            / f64::from(rebound_region.allocation_rect.height);
+        assert!((source_aspect - destination_aspect).abs() < 1e-9);
         assert!(after.document_revision > before_revision);
         assert_eq!(
             after

@@ -10,6 +10,7 @@ use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, Source
 use hot_trimmer_domain::CancellationToken;
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use uuid::Uuid;
+use std::sync::Mutex;
 
 fn numbered_source() -> (Vec<u8>, Vec<u8>) {
     let width = 128_u32;
@@ -52,6 +53,10 @@ fn numbered_source() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn fixture_project(target: u32) -> (ProjectStore, Vec<u8>, TrimSheetDocument) {
+    fixture_project_with_output(target, PixelSize { width: 64, height: 64 })
+}
+
+fn fixture_project_with_output(target: u32, output: PixelSize) -> (ProjectStore, Vec<u8>, TrimSheetDocument) {
     let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create fixture directory");
     let project_path = root.join("source-frame.hottrimmer");
@@ -77,7 +82,7 @@ fn fixture_project(target: u32) -> (ProjectStore, Vec<u8>, TrimSheetDocument) {
     let frame = SourceFrame::centered_largest(source_set.id, OrientedPixelSize { width: 128, height: 64 }, [1, 1], source_set.source_revision);
     let recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, target, 19);
     let document = TrimSheetDocument::from_source_frame(
-        hot_trimmer_domain::LayoutId::new(), frame, recipe, PixelSize { width: 64, height: 64 },
+        hot_trimmer_domain::LayoutId::new(), frame, recipe, output,
         vec![material], Vec::new(),
     ).expect("create source-frame document");
     let mut summary = summary;
@@ -98,6 +103,7 @@ fn source_frame_persisted_pipeline_is_pixel_exact_for_accepted_partitions() {
             .compile_persisted_stage_14_preview(
                 hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
                     project: &summary, revision: document.document_revision, draft_id: None, input_hash: None,
+                    profile: Default::default(),
                 },
                 &CancellationToken::new(), || true,
             )
@@ -186,7 +192,7 @@ fn source_frame_authoring_uses_one_compiled_record_for_move_detach_and_reset() {
     let moved_summary = { let mut summary = summary.clone(); summary.document = Some(moved.clone()); summary };
     let moved_artifact = hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
         .compile_persisted_stage_14_preview(
-            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &moved_summary, revision: moved.document_revision, draft_id: None, input_hash: None },
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &moved_summary, revision: moved.document_revision, draft_id: None, input_hash: None, profile: Default::default() },
             &CancellationToken::new(), || true,
         ).expect("moved compile");
     assert_eq!(detached.source_overrides[&region_id].source_bounds, moved.source_frame.as_ref().unwrap().region_bounds(moved.logical_grid.unwrap(), moved.topology.regions[0].grid_rect.unwrap()));
@@ -195,10 +201,101 @@ fn source_frame_authoring_uses_one_compiled_record_for_move_detach_and_reset() {
     let reset_summary = { let mut summary = summary.clone(); summary.document = Some(reset.clone()); summary };
     let restored = hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
         .compile_persisted_stage_14_preview(
-            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &reset_summary, revision: reset.document_revision, draft_id: None, input_hash: None },
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &reset_summary, revision: reset.document_revision, draft_id: None, input_hash: None, profile: Default::default() },
             &CancellationToken::new(), || true,
         ).expect("reset compile");
     assert_eq!(moved_artifact.slots[0].grid_rect, restored.slots[0].grid_rect);
     assert_eq!(moved_artifact.slots[0].source_crop, restored.slots[0].source_crop);
     assert_eq!(moved_artifact.channels, restored.channels);
+}
+
+#[test]
+fn source_frame_preview_profile_keeps_direct_coordinates_and_reuses_warm_decode() {
+    let (store, _source, document) = fixture_project(63);
+    let mut summary = store.summary().expect("summary");
+    summary.document = Some(document.clone());
+    let compiler = hot_trimmer_sheet_compiler::AlgorithmCompiler::new();
+    let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
+    let request = |profile| hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+        project: &summary, revision: document.document_revision, draft_id: None, input_hash: None, profile,
+    };
+    let draft = compiler.compile_persisted_stage_14_preview_with_cache(
+        request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512), &CancellationToken::new(), || true, Some(&cache),
+    ).expect("cold 512 draft");
+    let refinement = compiler.compile_persisted_stage_14_preview_with_cache(
+        request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Refinement1024), &CancellationToken::new(), || true, Some(&cache),
+    ).expect("warm 1024 refinement");
+    assert_eq!((draft.topology.output_size.width, draft.topology.output_size.height), (512, 512));
+    assert_eq!((refinement.topology.output_size.width, refinement.topology.output_size.height), (1024, 1024));
+    assert_eq!(draft.channels.len(), 1, "Base Color is the only allocated preview map");
+    assert_eq!(refinement.channels.len(), 1, "Base Color is the only allocated preview map");
+    for (draft_slot, refined_slot) in draft.slots.iter().zip(&refinement.slots) {
+        assert_eq!(draft_slot.region_id, refined_slot.region_id);
+        assert_eq!(draft_slot.grid_rect, refined_slot.grid_rect);
+        assert_eq!(draft_slot.source_crop, refined_slot.source_crop);
+        assert_eq!(draft_slot.source_id, refined_slot.source_id);
+        assert_eq!(draft_slot.domain_id, refined_slot.domain_id);
+    }
+    assert_eq!(cache.lock().expect("cache").entry_count(), 1, "one cold decode and zero warm decodes");
+    let repeated = compiler.compile_persisted_stage_14_preview_with_cache(
+        request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Refinement1024), &CancellationToken::new(), || true, Some(&cache),
+    ).expect("composed warm refinement");
+    assert!(repeated.telemetry.iter().any(|entry| entry.contains("composed_cache=hit")));
+}
+
+#[test]
+fn source_frame_profiles_publish_atomic_full_square_artifacts() {
+    let (store, _source, document) = fixture_project_with_output(63, PixelSize { width: 2048, height: 2048 });
+    let mut summary = store.summary().expect("summary");
+    summary.document = Some(document.clone());
+    let compiler = hot_trimmer_sheet_compiler::AlgorithmCompiler::new();
+    let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
+    let request = |profile| hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+        project: &summary, revision: document.document_revision, draft_id: None, input_hash: None, profile,
+    };
+    let draft = compiler.compile_persisted_stage_14_preview_with_cache(
+        request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512), &CancellationToken::new(), || true, Some(&cache),
+    ).expect("512 draft");
+    let refinement = compiler.compile_persisted_stage_14_preview_with_cache(
+        request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Refinement1024), &CancellationToken::new(), || true, Some(&cache),
+    ).expect("1024 refinement");
+    let authoritative = compiler.compile_persisted_stage_14_preview_with_cache(
+        request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative), &CancellationToken::new(), || true, Some(&cache),
+    ).expect("2048 authoritative");
+
+    let profiles = [(&draft, 512_u32), (&refinement, 1024_u32), (&authoritative, 2048_u32)];
+    for (artifact, size) in profiles {
+        assert_eq!((artifact.topology.output_size.width, artifact.topology.output_size.height), (size, size));
+        assert_eq!(artifact.validity.len(), (size * size) as usize, "validity covers the published profile");
+        assert_eq!(artifact.correspondence.len(), (size * size) as usize, "correspondence covers the published profile");
+        assert!(artifact.validity.iter().all(|value| *value > 0), "profile has no transparent/invalid quadrant");
+        let base = artifact.channels.iter().find(|channel| channel.role == hot_trimmer_domain::MaterialChannelRole::BaseColor)
+            .expect("Base Color atlas");
+        assert_eq!(base.rgba8.len(), (size * size * 4) as usize, "pixels match profile dimensions");
+        assert!(base.rgba8.chunks_exact(4).all(|pixel| pixel[3] > 0), "Base Color alpha covers the profile");
+        let mut coverage = vec![0_u8; (size * size) as usize];
+        for slot in &artifact.slots {
+            for y in slot.allocation.y..slot.allocation.y + slot.allocation.height {
+                for x in slot.allocation.x..slot.allocation.x + slot.allocation.width {
+                    coverage[(y * size + x) as usize] += 1;
+                }
+            }
+        }
+        assert!(coverage.iter().all(|value| *value == 1), "profile allocations do not cover the entire output");
+    }
+    for (draft_region, refinement_region) in draft.regions.iter().zip(&refinement.regions) {
+        assert_eq!(draft_region.region_id, refinement_region.region_id);
+        assert_eq!(draft_region.source_crop, refinement_region.source_crop);
+        assert_eq!(draft_region.source_bounds, refinement_region.source_bounds);
+    }
+    for (refinement_region, authoritative_region) in refinement.regions.iter().zip(&authoritative.regions) {
+        assert_eq!(refinement_region.region_id, authoritative_region.region_id);
+        assert_eq!(refinement_region.source_crop, authoritative_region.source_crop);
+        assert_eq!(refinement_region.source_bounds, authoritative_region.source_bounds);
+    }
+    assert_ne!(draft.channels[0].rgba8.len(), refinement.channels[0].rgba8.len());
+    assert_ne!(refinement.channels[0].rgba8.len(), authoritative.channels[0].rgba8.len());
+    let cache = cache.lock().expect("cache");
+    assert!(cache.rendered_region_count() <= 128);
+    assert!(cache.composed_atlas_count() <= 2);
 }

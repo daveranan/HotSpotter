@@ -1,9 +1,9 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use hot_trimmer_domain::{
-    AddressMode, CanonicalRect, ContentReference, DocumentHash, IdColor, MaterialMapKind,
+    AddressMode, CanonicalRect, CompiledTemplateTopology, ContentReference, DocumentHash, IdColor, MaterialMapKind,
     PatchId, PixelBounds, PixelSize, Projection, RadialMappingSettings, RegionDefinition, RegionId, RegionMapping,
-    SourceId, SourceSetId,
+    SourceId, SourceSetId, NormalizedPoint,
     GridRect, MappingOrigin, NormalizedBounds,
     StructuralProfile, TemplateSlotRole, TrimSheetDocument, TrimSheetDocumentError,
 };
@@ -206,6 +206,66 @@ pub fn resolve_compile_plan(
         dimensions,
         regions,
     })
+}
+
+/// Resolves the overlay records for a profile-sized compiled topology.
+///
+/// This deliberately does not consult registered pixels. The SourceFrame compiler has
+/// already established the direct crop and profile-local allocation; this function only
+/// materializes the same stable identities beside that compiled topology.
+pub fn resolve_profile_regions(
+    document: &TrimSheetDocument,
+    topology: &CompiledTemplateTopology,
+) -> Result<Vec<ResolvedRegion>, SheetCompileError> {
+    document.validate()?;
+    let mut regions = Vec::with_capacity(topology.slots.len());
+    for slot in &topology.slots {
+        let region = document.topology.regions.iter().find(|region| region.id.to_string() == slot.slot_key)
+            .ok_or(SheetCompileError::UnsupportedRegionContent(RegionId::new()))?;
+        let binding = document.region_bindings.get(&region.id)
+            .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?;
+        let (material_id, source_patch_id, source_id, mut mapping) = match binding.content {
+            ContentReference::InheritPrimaryMaterial =>
+                (document.primary_material.ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?, None, None, binding.mapping.clone()),
+            ContentReference::MaterialSource(id) => (id, None, None, binding.mapping.clone()),
+            ContentReference::Patch(id) => {
+                let patch = document.patches.iter().find(|patch| patch.id == id && patch.enabled)
+                    .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?;
+                let mut mapping = binding.mapping.clone();
+                mapping.projection = Projection::Perspective { quad: patch.geometry.corners };
+                (document.primary_material.ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?, Some(id), Some(patch.source_id), mapping)
+            }
+            _ => return Err(SheetCompileError::UnsupportedRegionContent(region.id)),
+        };
+        let source_bounds = resolved_source_bounds(document, region);
+        if let Some(bounds) = source_bounds {
+            let focus = NormalizedPoint::new(
+                bounds.x.get() + bounds.width.get() * 0.5,
+                bounds.y.get() + bounds.height.get() * 0.5,
+            ).map_err(|_| SheetCompileError::UnsupportedRegionMapping(region.id))?;
+            mapping.projection = Projection::Crop { bounds, focus };
+        }
+        regions.push(ResolvedRegion {
+            region_id: region.id,
+            display_name: region.display_name.clone(),
+            allocation_bounds: PixelBounds { x: slot.allocation.x, y: slot.allocation.y, width: slot.allocation.width, height: slot.allocation.height },
+            hotspot_bounds: PixelBounds { x: slot.hotspot.x, y: slot.hotspot.y, width: slot.hotspot.width, height: slot.hotspot.height },
+            id_color: region.id_color,
+            material_id,
+            material_id_color: material_id_color(material_id),
+            source_patch_id,
+            source_id,
+            mapping,
+            role: region.role,
+            grid_rect: region.grid_rect,
+            source_crop: resolved_source_crop(document, region),
+            source_bounds,
+            mapping_origin: source_bounds.map(|_| {
+                if document.source_overrides.contains_key(&region.id) { MappingOrigin::ExplicitOverride } else { MappingOrigin::Partition }
+            }),
+        });
+    }
+    Ok(regions)
 }
 
 fn resolved_source_bounds(document: &TrimSheetDocument, region: &RegionDefinition) -> Option<NormalizedBounds> {

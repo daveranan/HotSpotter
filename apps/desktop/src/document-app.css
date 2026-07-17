@@ -538,6 +538,10 @@ button:disabled {
   letter-spacing: normal !important;
 }
 .source-frame-aspect-lock input { width: auto; margin: 0; }
+.source-frame-edit-toggle { width: 100%; margin-bottom: 8px; }
+.source-frame-edit-hint { color: #aeb7c5; margin: 6px 0 0; }
+.preview-telemetry { flex-basis: 100%; color: #9fb3c8; }
+.preview-telemetry pre { margin: 6px 0 0; max-height: 7em; overflow: auto; white-space: pre-wrap; }
 
 .source-region-boundary {
   fill: #d7ff7908;
@@ -545,7 +549,7 @@ button:disabled {
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
   paint-order: stroke;
-  pointer-events: all;
+  pointer-events: none;
 }
 
 .source-region-boundary:hover,
@@ -591,6 +595,12 @@ button:disabled {
   fill: #d7ff7933;
   stroke: #d7ff79;
   stroke-width: 2;
+}
+.patch-overlay .patch-outline.source-frame-preview polygon {
+  fill: transparent;
+  stroke: #d7ff79;
+  stroke-dasharray: 7 5;
+  cursor: default;
 }
 .patch-overlay .patch-outline.point-editing polygon { cursor: default; stroke-dasharray: 7 4; }
 .patch-overlay .patch-outline.draft {

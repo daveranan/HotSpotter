@@ -572,6 +572,14 @@ fn clone_level_zero(source: &PreparedChannelSet) -> Result<Vec<PreparedExemplarC
     }).collect()
 }
 
+/// Returns the already-oriented, registered level-zero channels without rectification.
+///
+/// SourceFrame DirectCrop is defined in original oriented source coordinates.  It must
+/// not manufacture a Stage 3 coordinate field merely to reach Stage 14.
+pub fn registered_level_zero_channels(source: &PreparedChannelSet) -> Result<Vec<PreparedExemplarChannel>, RectificationError> {
+    clone_level_zero(source)
+}
+
 fn level<T>(pyramid: &hot_trimmer_image_io::ResolutionPyramid<T>) -> Result<&ImagePlane<T>, RectificationError> {
     pyramid.level(0).ok_or(RectificationError::RegistrationDrift)
 }

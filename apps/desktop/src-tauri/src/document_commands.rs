@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -15,13 +15,13 @@ use hot_trimmer_domain::{
     DelightingIntent, MaterialBehaviorClass, MaterialCalibrationCommand, MaterialCalibrationIntent,
     MaterialClassificationCommand,
     MaterialClassificationIntent,
-    MaterialMapKind, MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
+    MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
     NormalConvention, OriginalAssetProvenance, OrientedPixelSize, Projection, RegisteredChannel,
     RegisteredChannelSet, RegionId, SourceId, SourceOwnershipIntent, SourceSetId,
     TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
 };
 use hot_trimmer_image_io::{
-    CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, decode_rgba8_bytes_cancellable,
+    CancellationToken, ColorPolicy, DecodeLimits, InspectedImage,
     inspect_bytes_with_policy, inspect_path_with_policy, prepare_registered_channel_set,
     NormalizationSettings, PreparedChannelSet,
 };
@@ -34,7 +34,7 @@ use hot_trimmer_project_store::{
     ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
 };
 use hot_trimmer_sheet_compiler::{
-    AlgorithmCompiler, CompiledMapSet, PreviewMapKind, RegisteredMaterialMap, ResolvedRegion,
+    AlgorithmCompiler, CompiledMapSet, PreviewMapKind, ResolvedRegion,
 };
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use hot_trimmer_render_core::{
@@ -147,7 +147,8 @@ pub type SharedPreviewService = Arc<PreviewService>;
 #[derive(Default)]
 pub struct PreviewService {
     latest_draft_id: AtomicU64,
-    decoded_sources: Mutex<HashMap<String, (u32, u32, Arc<[u8]>)>>,
+    cancellation_count: AtomicU64,
+    source_frame_cache: Mutex<hot_trimmer_sheet_compiler::SourceFramePreviewCache>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +474,19 @@ pub struct Stage14PreviewRequest {
     draft_id: Option<u64>,
     #[serde(default)]
     input_hash: Option<String>,
+    #[serde(default)]
+    profile: PreviewProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewProfile { Draft512, Refinement1024, #[default] Authoritative }
+
+impl From<PreviewProfile> for hot_trimmer_sheet_compiler::SourceFramePreviewProfile {
+    fn from(value: PreviewProfile) -> Self { match value {
+        PreviewProfile::Draft512 => Self::Draft512, PreviewProfile::Refinement1024 => Self::Refinement1024,
+        PreviewProfile::Authoritative => Self::Authoritative,
+    }}
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -521,6 +535,7 @@ pub struct IntermediateAtlasProjection {
     unavailable_channels: Vec<String>,
     slots: Vec<Stage14SlotProjection>,
     pending: Vec<&'static str>,
+    telemetry: Vec<String>,
     final_compile_available: bool,
     export_available: bool,
     blender_available: bool,
@@ -1205,11 +1220,14 @@ fn removed_preview_specific_fabrication(
     let algorithms = (1..=14).map(|stage| (stage, AlgorithmProvenance { algorithm_id: format!("installed-stage-{stage:02}"),
         version: if stage == 14 { hot_trimmer_sheet_compiler::STAGE_14_ALGORITHM_VERSION.into() } else { "installed".into() } })).collect();
     let atlas_request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement, slots: slot_inputs,
-        revision: requested_revision, algorithm_versions: algorithms, diagnostics: Vec::new() };
+        revision: requested_revision, algorithm_versions: algorithms, diagnostics: Vec::new(), regions: Vec::new() };
     let cancellation = EngineCancellationToken::new();
     let artifact = AlgorithmCompiler::new().compile_intermediate_atlas(&atlas_request, &cancellation, || {
         session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document.map(|value| value.document_revision)).unwrap_or(0)
-    }).map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
+    }).map_err(|failure| {
+        preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
+        error(ErrorCode::OperationCancelled, &failure.to_string())
+    })?;
     let mut maps = BTreeMap::new();
     for channel in &artifact.channels {
         maps.insert(channel_key(channel.role).into(), png_data_url(topology.output_size.width,
@@ -1232,7 +1250,7 @@ fn removed_preview_specific_fabrication(
         topology: artifact.topology, placement_plan_id: artifact.placement_plan_id.0, maps,
         regions: resolved.regions,
         unavailable_channels: artifact.unavailable_channels.iter().map(|role| format!("{role:?}")).collect(),
-        slots, pending: artifact.pending, final_compile_available: false, export_available: false, blender_available: false,
+        slots, pending: artifact.pending, telemetry: artifact.telemetry, final_compile_available: false, export_available: false, blender_available: false,
         source_frame: document.source_frame.clone() })
 }
 
@@ -1270,6 +1288,7 @@ fn build_stage_14_preview(
     let document = summary.document.as_ref().expect("summary document was present");
     let revision_current = AtomicBool::new(true);
     let monitoring_complete = AtomicBool::new(false);
+    let cancellation = EngineCancellationToken::new();
     let artifact = std::thread::scope(|scope| {
         scope.spawn(|| {
             while !monitoring_complete.load(Ordering::Acquire) {
@@ -1279,41 +1298,69 @@ fn build_stage_14_preview(
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let result = AlgorithmCompiler::new().compile_persisted_stage_14_preview(
-            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: request.revision, draft_id: request.draft_id, input_hash: request.input_hash.clone() },
-            &EngineCancellationToken::new(),
+        let result = AlgorithmCompiler::new().compile_persisted_stage_14_preview_with_cache(
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: request.revision, draft_id: request.draft_id, input_hash: request.input_hash.clone(), profile: request.profile.into() },
+            &cancellation,
             || preview_service.latest_draft_id.load(Ordering::Acquire) == job
                 && revision_current.load(Ordering::Acquire),
+            Some(&preview_service.source_frame_cache),
         );
         monitoring_complete.store(true, Ordering::Release);
         result
     }).map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
-    let live_revision = session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
-        .map(|document| document.document_revision)).unwrap_or(0);
-    if live_revision != request.revision || preview_service.latest_draft_id.load(Ordering::Acquire) != job {
+    let preview_is_current = || session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
+        .map(|document| document.document_revision == request.revision)).unwrap_or(false)
+        && preview_service.latest_draft_id.load(Ordering::Acquire) == job;
+    if !preview_is_current() {
+        preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
         return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
     }
-    let primary = document.primary_material.ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
-    let selected = summary.sources.iter().filter(|source| source.source_set_id.to_string() == primary.to_string())
-        .map(|source| registered_map_cached(source, preview_service)).collect::<Result<Vec<_>, _>>()?;
-    let resolved = hot_trimmer_sheet_compiler::resolve_compile_plan(document, &selected)
-        .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
+    if document.source_frame.is_some() && artifact.regions.is_empty() {
+        return Err(error(ErrorCode::LayoutInvalid, "The compiled SourceFrame artifact did not publish profile-local region metadata."));
+    }
+    let output_size = artifact.topology.output_size;
+    let expected_bytes = usize::try_from(u64::from(output_size.width) * u64::from(output_size.height) * 4)
+        .map_err(|_| error(ErrorCode::InvalidInput, "Compiled preview dimensions exceed the bounded publication limit."))?;
+    let encode_started = Instant::now();
     let mut maps = BTreeMap::new();
     for channel in &artifact.channels {
-        maps.insert(channel_key(channel.role).into(), png_data_url(artifact.topology.output_size.width,
-            artifact.topology.output_size.height, channel.rgba8.clone())?);
+        if channel.rgba8.len() != expected_bytes {
+            return Err(error(ErrorCode::LayoutInvalid, "Compiled preview pixels do not match the published profile dimensions."));
+        }
+        if !preview_is_current() {
+            cancellation.cancel();
+            preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
+            return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview during publication."));
+        }
+        maps.insert(channel_key(channel.role).into(), png_data_url_cancellable(
+            output_size.width, output_size.height, channel.rgba8.clone(), &cancellation,
+            || preview_is_current(),
+        )?);
     }
+    let encode_ms = encode_started.elapsed().as_millis();
+    if !preview_is_current() {
+        cancellation.cancel();
+        preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
+        return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview after publication."));
+    }
+    let ipc_payload_chars: usize = maps.values().map(String::len).sum();
+    let mut artifact = artifact;
+    let base_color_bounds = artifact.channels.iter().find(|channel| channel.role == MaterialChannelRole::BaseColor)
+        .map(|channel| rgba_nontransparent_bounds(&channel.rgba8, output_size.width, output_size.height))
+        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Compiled SourceFrame artifact did not publish Base Color pixels."))?;
+    artifact.telemetry.push(format!("publish_encode_ms={encode_ms}; ipc_payload_chars={ipc_payload_chars}; png_encoded_dimensions={}x{}; rgba_nontransparent_bounds={}; cancellation_count={}",
+        output_size.width, output_size.height, base_color_bounds,
+        preview_service.cancellation_count.load(Ordering::Acquire)));
     let slots = artifact.slots.iter().map(|slot| {
-        let region = resolved.regions.iter().find(|region| region.region_id == slot.region_id)
-            .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Stage 14 artifact refers to an unknown region identity."))?;
+        let region = artifact.regions.iter().find(|region| region.region_id == slot.region_id);
         Ok(Stage14SlotProjection {
-        region_id: region.region_id, slot_key: slot.slot_key.clone(), display_name: slot.display_name.clone(),
+        region_id: slot.region_id, slot_key: slot.slot_key.clone(), display_name: region.map_or_else(|| slot.display_name.clone(), |region| region.display_name.clone()),
         allocation_bounds: slot.allocation, hotspot_bounds: slot.hotspot, mapping_mode: format!("{:?}", slot.mapping_mode),
         source_transform: slot.source_transform, isotropic_scale: slot.isotropic_scale, sampling_scale: slot.sampling_scale,
         validity: format!("{} valid pixels", slot.valid_pixel_count), correspondence: "authoritative Stage 14 correspondence".into(),
         source_id: slot.source_id.0.clone(), patch_id: slot.patch_id.clone(), domain_id: slot.domain_id.0.clone(),
         candidate_id: slot.candidate_id.0.clone(), sampling_plan_id: slot.sampling_plan_id.0.clone(),
-        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.source_bounds, mapping_origin: region.mapping_origin, grid_rect: slot.grid_rect,
+        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.and_then(|region| region.source_bounds), mapping_origin: region.and_then(|region| region.mapping_origin), grid_rect: slot.grid_rect,
     })
     }).collect::<Result<Vec<_>, UserFacingError>>()?;
     Ok(IntermediateAtlasProjection {
@@ -1321,10 +1368,10 @@ fn build_stage_14_preview(
         document_revision: artifact.revision, topology_hash: hash_hex(document.topology.topology_hash),
         appearance_hash: hash_hex(document.appearance_hash().map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?),
         renderer_version: "intermediate-stage-14", width: artifact.topology.output_size.width,
-        height: artifact.topology.output_size.height, topology: artifact.topology,
-        placement_plan_id: artifact.placement_plan_id.0, maps, regions: resolved.regions,
+         height: output_size.height, topology: artifact.topology,
+         placement_plan_id: artifact.placement_plan_id.0, maps, regions: artifact.regions,
         unavailable_channels: artifact.unavailable_channels.iter().map(|role| format!("{role:?}")).collect(),
-        slots, pending: artifact.pending, final_compile_available: false, export_available: false, blender_available: false,
+        slots, pending: artifact.pending, telemetry: artifact.telemetry, final_compile_available: false, export_available: false, blender_available: false,
         source_frame: document.source_frame.clone(),
     })
 }
@@ -1645,51 +1692,6 @@ fn inspect_stored(source: &StoredSource) -> Result<InspectedImage, UserFacingErr
     Ok(inspected)
 }
 
-fn registered_map(source: &StoredSource) -> Result<RegisteredMaterialMap, UserFacingError> {
-    let bytes = source_bytes(source)?;
-    let decoded = decode_rgba8_bytes_cancellable(
-        &bytes,
-        DecodeLimits::default(),
-        color_policy(source.channel),
-        &CancellationToken::new(),
-    )
-    .map_err(image_error)?;
-    Ok(RegisteredMaterialMap {
-        source_id: source.input.id,
-        material_id: hot_trimmer_domain::SourceSetId::from_bytes(*source.source_set_id.as_bytes()),
-        kind: material_kind(source.channel),
-        sha256: source.input.sha256.clone(),
-        width: decoded.width,
-        height: decoded.height,
-        rgba8: decoded.pixels.into(),
-    })
-}
-
-fn registered_map_cached(
-    source: &StoredSource,
-    service: &PreviewService,
-) -> Result<RegisteredMaterialMap, UserFacingError> {
-    if let Some((width, height, pixels)) = service.decoded_sources.lock().map_err(|_| poisoned())?
-        .get(&source.input.sha256).cloned()
-    {
-        return Ok(RegisteredMaterialMap {
-            source_id: source.input.id,
-            material_id: hot_trimmer_domain::SourceSetId::from_bytes(*source.source_set_id.as_bytes()),
-            kind: material_kind(source.channel),
-            sha256: source.input.sha256.clone(),
-            width,
-            height,
-            rgba8: pixels,
-        });
-    }
-    let decoded = registered_map(source)?;
-    service.decoded_sources.lock().map_err(|_| poisoned())?.insert(
-        source.input.sha256.clone(),
-        (decoded.width, decoded.height, Arc::clone(&decoded.rgba8)),
-    );
-    Ok(decoded)
-}
-
 fn source_bytes(source: &StoredSource) -> Result<Vec<u8>, UserFacingError> {
     match source.input.ownership {
         SourceOwnership::OwnedCopy => source
@@ -1830,6 +1832,43 @@ fn png_data_url(width: u32, height: u32, pixels: Vec<u8>) -> Result<String, User
     ))
 }
 
+fn png_data_url_cancellable(
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    cancellation: &EngineCancellationToken,
+    active: impl Fn() -> bool,
+) -> Result<String, UserFacingError> {
+    if cancellation.is_cancelled() || !active() {
+        return Err(error(ErrorCode::OperationCancelled, "Preview publication was superseded."));
+    }
+    let image = RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| error(ErrorCode::Internal, "Compiled pixels are invalid."))?;
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|e| error(ErrorCode::Internal, &e.to_string()))?;
+    if cancellation.is_cancelled() || !active() {
+        return Err(error(ErrorCode::OperationCancelled, "Preview publication was superseded."));
+    }
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(encoded.into_inner())))
+}
+
+fn rgba_nontransparent_bounds(pixels: &[u8], width: u32, height: u32) -> String {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for y in 0..height {
+        for x in 0..width {
+            let index = ((y * width + x) * 4 + 3) as usize;
+            if pixels.get(index).copied().unwrap_or(0) == 0 { continue; }
+            bounds = Some(match bounds {
+                Some((left, top, right, bottom)) => (left.min(x), top.min(y), right.max(x + 1), bottom.max(y + 1)),
+                None => (x, y, x + 1, y + 1),
+            });
+        }
+    }
+    bounds.map_or_else(|| "none".into(), |(x, y, right, bottom)| format!("{x},{y} {}x{}", right - x, bottom - y))
+}
+
 fn source_input(path: &Path, ownership: SourceOwnership, image: &InspectedImage) -> SourceInput {
     SourceInput {
         id: SourceId::new(),
@@ -1847,21 +1886,6 @@ fn source_input(path: &Path, ownership: SourceOwnership, image: &InspectedImage)
         has_embedded_icc_profile: image.info.has_embedded_icc_profile,
         encoded_bytes: image.info.encoded_bytes,
         owned_bytes: (ownership == SourceOwnership::OwnedCopy).then(|| image.source_bytes.clone()),
-    }
-}
-
-const fn material_kind(channel: SourceChannel) -> MaterialMapKind {
-    match channel {
-        SourceChannel::BaseColor => MaterialMapKind::BaseColor,
-        SourceChannel::Normal => MaterialMapKind::Normal,
-        SourceChannel::Height => MaterialMapKind::Height,
-        SourceChannel::Roughness => MaterialMapKind::Roughness,
-        SourceChannel::Metallic => MaterialMapKind::Metallic,
-        SourceChannel::AmbientOcclusion => MaterialMapKind::AmbientOcclusion,
-        SourceChannel::Specular => MaterialMapKind::Specular,
-        SourceChannel::Opacity => MaterialMapKind::Opacity,
-        SourceChannel::EdgeMask => MaterialMapKind::EdgeMask,
-        SourceChannel::MaterialId => MaterialMapKind::MaterialId,
     }
 }
 
@@ -1992,7 +2016,7 @@ mod algorithm_stage_14_preview_a_tests {
                     required: true, patch_id: Some("patch-a".into()), domain: &first_domain, plan: &first_plan, result: &first, grid_rect: None },
                 IntermediateSlotInput { region_id: second_plan.slot_id, slot_key: "authored-patch-b", display_name: "Authored Patch B",
                     required: true, patch_id: Some("patch-b".into()), domain: &second_domain, plan: &second_plan, result: &second, grid_rect: None },
-            ], revision: 7, algorithm_versions: algorithms, diagnostics: Vec::new() };
+            ], revision: 7, algorithm_versions: algorithms, diagnostics: Vec::new(), regions: Vec::new() };
         let compiler = AlgorithmCompiler::new();
         let artifact = compiler.compile_intermediate_atlas(&request, &CancellationToken::new(), || 7).unwrap();
         assert_eq!(artifact.topology, topology);
@@ -2107,7 +2131,7 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         let job = service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
         let artifact = build_stage_14_preview(&session, &service, Stage14PreviewRequest {
             protocol_version: IPC_PROTOCOL_VERSION, revision, region_id: None,
-            transient_projection: None, draft_id: Some(job), input_hash: None,
+            transient_projection: None, draft_id: Some(job), input_hash: None, profile: PreviewProfile::Authoritative,
         }, job).expect("persisted Stage 1-14 preview");
         assert_eq!(artifact.slots.len(), 53, "Generic Architecture must publish every fixed-template slot");
         assert_eq!(artifact.slots.iter().map(|slot| slot.region_id).collect::<HashSet<_>>().len(), 53,
