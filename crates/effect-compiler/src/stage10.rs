@@ -7,6 +7,7 @@ use hot_trimmer_domain::{
     TemplateSlotRole, WorldScaleAvailability,
 };
 use serde::{Deserialize, Serialize};
+use hot_trimmer_placement_solver::{SlotDemandView, SourceFootprintKind};
 
 pub const STAGE_10_ALGORITHM_ID: &str = "hot-trimmer.stage-10.slot-capacity";
 pub const STAGE_10_ALGORITHM_VERSION: &str = "1.0.0";
@@ -165,6 +166,25 @@ pub struct ResolvedSlotDemand {
     pub supported_feature_lods: Vec<FeatureLod>,
     pub effect_capacity: EffectCapacity,
     pub diagnostics: Vec<CapacityDiagnostic>,
+}
+
+impl SlotDemandView for ResolvedSlotDemand {
+    fn slot_id(&self) -> RegionId { self.slot_id }
+    fn role(&self) -> TemplateSlotRole { self.slot_role }
+    fn orientation(&self) -> RegionOrientation { self.orientation }
+    fn destination_pixels(&self) -> (u32, u32) {
+        (self.destination_pixel_width, self.destination_pixel_height)
+    }
+    fn required_source_footprint(&self) -> (f64, f64, SourceFootprintKind) {
+        (self.required_source_footprint.width, self.required_source_footprint.height,
+            match self.required_source_footprint.unit {
+                SourceFootprintUnit::SourcePixels => SourceFootprintKind::SourcePixels,
+                SourceFootprintUnit::RelativeTexels => SourceFootprintKind::RelativeTexels,
+            })
+    }
+    fn allowed_mapping_modes(&self) -> &[SamplingMode] { &self.allowed_mapping_modes }
+    fn allowed_rotations(&self) -> &[QuarterTurn] { &self.allowed_rotations }
+    fn mirror_allowed(&self) -> bool { self.mirror_policy == MirrorPolicy::Allowed }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
