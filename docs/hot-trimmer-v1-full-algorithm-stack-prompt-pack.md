@@ -118,9 +118,12 @@ renderer, or an unrelated synthesis engine.
 | 00 | Corpus, harness, and engine cutover contracts | Cross-cutting setup |
 | 01-07 | One prompt per source-preparation/analysis stage | 1-7 |
 | 08A-08F | Domain engines and router | 8 |
-| 09-16 | One prompt per topology, placement, synthesis, profile, and detail stage | 9-16 |
+| 09-14 | One prompt per topology, placement, and synthesis stage | 9-14 |
 | 14P-A | First visible authoritative atlas integration | Through Stage 14 |
 | 14P-B | Intermediate-preview QA and cache hardening | Through Stage 14 |
+| 15 | Structural profiles and semantic occupancy | 15 |
+| LIB | Reusable source/patch/stamp/profile library and management window | Cross-cutting before Stage 16 |
+| 16 | Semantic details, stamps, and patterns | 16 |
 | 18 | Effect compilation | 18 |
 | 17 | PBR composition from compiled effects | 17 |
 | 19 | Finishing and metadata | 19 |
@@ -1102,12 +1105,21 @@ Scope:
   physical profile dimensions or seed.
 - Generate physical Height and analytic/compiled normal contributions; use analytic filtering or selected 1x/2x/4x/8x
   supersampling. Do not widen sub-pixel geometry in final pixels.
+- Publish typed structural occupancy rather than only flattened pixels: signed distance, inside/outside, flat-center,
+  raised, recessed, cap, groove, and profile-exclusion fields plus physical Height and derivative contributions.
+- Treat authored profile edges as material structure. Atlas allocation borders are never bevels, seams, or wear edges
+  merely because two rectangles touch. Preserve enough semantic occupancy for later stamps to conform above, below,
+  inside, outside, or across a profile without reverse-engineering pixels.
+- Keep physical Height authoritative until Stage 17 derives and composes normals. An imported normal may coexist with
+  the profile plan, but Stage 15 must not flatten the two into an opaque replacement map.
 - Add profile occupancy/LOD/fallback QA views and docs/phase-reports/algorithm-stage-15.md.
 
 Acceptance:
 - Required broad panel, extreme strips, radial, cap, sub-pixel, and opposing-bevel fixtures pass at 1K/2K/4K/8K.
 - Opposing profiles never overlap accidentally or leave negative center width.
 - Physical slope/width remain stable across slot aspect and resolution.
+- Allocation boundaries with no requested profile remain flat, while requested radial/linear profile occupancy can
+  be queried consistently by Stage 16 and Stage 18.
 - Every fallback is deterministic and present in EffectPlan diagnostics.
 
 Verification — run exactly:
@@ -1121,12 +1133,82 @@ Stop conditions:
 
 ---
 
+## Prompt LIB — reusable material-source, patch, stamp, and preset library
+
+```text
+Implement Prompt LIB from the full algorithm-stack prompt pack after Prompt 15 and before Prompt 16.
+
+Read the common rules and the revised reusable-library contract. This is a cross-cutting product milestone, not a
+new numbered image-algorithm stage. Consume no rendered atlas as library authority. No subagents.
+
+Objective:
+Give Hot Trimmer a durable, searchable, dependency-safe library for material source sets, authored patches, masks,
+registered stamp channels, profile presets, and effect recipes, with a real management window feeding typed references
+to source preparation, Stage 15, and Stage 16.
+
+Scope — library contracts and storage:
+- Define versioned LibraryAssetId, LibraryAssetVersion, content digest, LibraryAssetKind, StampAssetRef, provenance,
+  license/source metadata, tags, category, author, default physical size/range, aspect policy, pivot, orientation,
+  tileability, channel semantics, and preview metadata.
+- Initially support MaterialSourceSet, SourcePatchPreset, StampMask, RegisteredStampChannels, StampSheet,
+  ProfilePreset, and EffectRecipe while keeping the asset-kind enum extensible. Material sources retain registered
+  PBR channel identities/import settings; patch presets retain their authored crop/rectification/calibration lineage.
+  A library item stores reusable source evidence and defaults, never executable compiler truth, cached analysis as
+  primary data, or already-composited atlas pixels.
+- Support user-global and project-local libraries. Projects pin immutable asset versions/content digests and may
+  embed a portable snapshot; bare filesystem paths, filenames, thumbnails, and mutable latest-version pointers are
+  not authoritative references.
+- Import registered material sets, individual files, folders, and atlas/stencil sheets. Provide channel association,
+  bounded connected-component/alpha segmentation, manual rectangles for sheet extraction, shared registered-channel
+  cropping, pivot editing, physical-size/calibration defaults, mask polarity, and explicit linear/scalar/vector/color/
+  exact-ID channel roles.
+- Content-hash duplicates, preserve source/license provenance, generate bounded thumbnails asynchronously, and make
+  replacement/version creation explicit. Never gamma-correct scalar masks or treat a JPEG normal as trustworthy
+  without an explicit channel/convention declaration.
+- Deleting or replacing an asset referenced by a project must be blocked or produce an explicit migration/embed
+  choice. Missing assets remain typed unresolved references with recovery diagnostics; they never become blank or
+  substitute stamps silently.
+
+Scope — Hot Trimmer management window:
+- Add a Library window with searchable/filterable thumbnail grid, kinds/tags/categories, detail and registered-channel
+  preview, provenance/license, physical-size defaults, pivot/orientation, version history, project usage count, and
+  dependency-safe import/edit/tag/duplicate/replace/delete commands.
+- Provide atlas-sheet slicing with editable rectangles and a preview of each resulting item. All enabled controls
+  invoke typed native commands, persist transactionally, observe cancellation/revision guards, and update stable
+  references without UI-side compiler logic.
+- Let source selection, Stage 15 profile selection, and Stage 16 detail authoring browse/select items by compatible
+  kind, but do
+  not implement brush strokes, scattering, final PBR composition, export packaging, cloud sync, or marketplace work.
+
+Acceptance:
+- Registered material-set, authored-patch, folder, single-mask, registered-stamp-channel, and atlas-sheet fixtures
+  round-trip with stable IDs, content digests, metadata, mask polarity, pivots, physical defaults, and pixel
+  registration.
+- Global and project-local items can be searched and selected; embedded project snapshots reopen without the original
+  source path, while unresolved external references report an actionable failure.
+- Referenced assets cannot be destructively deleted or silently mutated, and editing creates deterministic versions.
+- The Library window can author every initial asset kind through command-backed controls; no thumbnail or filename is
+  used as compiler authority.
+
+Verification — run exactly:
+cargo test -p hot-trimmer-desktop reusable_asset_library
+
+Stop conditions:
+- Stop if a project depends on a mutable absolute path or an unversioned filename.
+- Stop if library deletion can alter an existing compile without an explicit migration decision.
+- Stop if masks, normals, scalar maps, or color maps share one ambiguous decode path.
+- Stop if this prompt implements raster brush painting or final channel composition.
+```
+
+---
+
 ## Prompt 16 — Stage 16: scale-constrained semantic details and patterns
 
 ```text
 Implement Prompt 16 / Stage 16 from the full algorithm-stack prompt pack.
 
-Read the common rules and revised Stage 16. Consume Stage 10 capacities and Stage 15 occupancy. No subagents.
+Read the common rules and revised Stage 16. Consume Stage 10 capacities, Stage 15 occupancy, and immutable Prompt LIB
+asset references. No subagents.
 
 Objective:
 Compile material-independent semantic detail overlays that remain physically valid across panels, strips, caps, and
@@ -1136,20 +1218,33 @@ Scope:
 - Define typed DetailDefinition/CompiledDetail contracts with physical range, scale space, compatible roles,
   orientation, aspect limits, minimum pixels, repeat period, contain/cover policy, channel contributions, fallback,
   provenance, and seed.
+- Define non-destructive StampOperation and StampStroke contracts: immutable asset/version reference, reusable-atlas
+  versus asset-specific-deferred scope, target slot/region, physical transform, pivot, rotation, mirror, opacity,
+  blend policy, clipping, seed, spacing/scatter/jitter, layer order, occupancy relation, and per-channel contributions.
+  Store deterministic operation parameters or stroke samples, never pasted display pixels.
 - Implement repeating strip, unique detail, radial detail, trim cap, bolt group, vent, panel stamp, groove, decal,
   procedural motif, and user-patch detail families.
 - Implement registered mask-to-SDF conversion and coherent bevel/groove/lip/stamp Height/Normal contributions.
+- Support planar and explicitly polar radial stamps without fisheye distortion by default. Preserve the stamp's
+  physical aspect under rotation; any conformal/polar warp is an authored mapping mode with visible provenance.
 - Implement physical motif periods and role-specific Surface/HorizontalStrip/VerticalStrip/Radial/TrimCap/Unique
   variants. Never squeeze an oversized motif to fit.
 - Implement full, simplified Height/Normal, NormalOnly, Roughness/Color, and Disabled detail LODs with explicit
   variant/fallback selection and occupancy interaction.
 - Distinguish source material-domain structure from semantic details supplied by template/user/procedural intent.
+- Emit registered masks, physical Height, vector-normal inputs, scalar/color/ID contributions, and operation lineage;
+  do not flatten them into final PBR pixels. Material-ID contributions remain exact categorical writes, Metallic is
+  legal only through explicit intent, and imported normal stamps retain their declared convention.
 - Add detail route/occupancy QA views and docs/phase-reports/algorithm-stage-16.md.
 
 Acceptance:
 - Details preserve physical size, orientation, and repeat period across slot shapes and output resolutions.
 - Panel bolt groups do not share the strip-rivet evaluator.
 - Oversized/incompatible details choose a declared variant/fallback or fail; they never stretch.
+- Stamp operations survive save/reopen and resolution changes with identical physical placement and seed. Library
+  version changes are explicit invalidations; missing assets cannot compile as invisible success.
+- A material-reusable stamp may compile into the atlas, while an asset-specific deferred stamp remains an operation
+  for Stage 20/Blender and is not accidentally baked into every asset using that material.
 - An empty detail list produces a valid SkippedBecauseUnused stage result.
 
 Verification — run exactly:
@@ -1159,6 +1254,8 @@ Stop conditions:
 - Stop if one square mask is resized into all slot roles.
 - Stop if decorations modify topology by default.
 - Stop if a user patch loses registered PBR correspondence.
+- Stop if display-space brush coordinates become placement authority.
+- Stop if asset-specific damage is baked into a reusable trim material without explicit scope.
 ```
 
 ---
@@ -1188,6 +1285,13 @@ Scope:
   Rusting, and Mossy as typed bundles compiled separately per slot.
 - Implement effect-family LOD ladders, deterministic placement, occupancy conflict resolution, 1x/2x/4x/8x
   supersampling, complete fallback diagnostics, and Clean/empty valid plans.
+- Compile profile, procedural detail, stamp, and decal operations into one deterministic dependency/layer plan. Resolve
+  above/below/conform/clip/accumulate relationships against Stage 15 occupancy before rendering and record every
+  conflict, suppressed contribution, library version, mask dependency, and fallback.
+- Preserve the Stage 16 scope boundary: reusable-atlas operations may enter the material plan; asset-specific deferred
+  operations remain referenced in the manifest for Stage 20/Blender and must not be rendered into the shared atlas.
+- Validate channel legality and blend semantics during compilation, including exact IDs, bounded scalar channels,
+  physical Height units, imported vector normals, alpha, and exposed-metal-only Metallic changes.
 - Remove any raw-effect direct render path or universal normalized grunge texture.
 - Add effect-route/occupancy/LOD/supersampling QA views and docs/phase-reports/algorithm-stage-18.md.
 
@@ -1201,6 +1305,8 @@ Acceptance:
 - No isotropic physical effect becomes non-uniformly stretched.
 - Resolution may promote LOD without moving seeded features.
 - Clean compiles to a valid empty effect plan; incompatible effects are reported, never hidden.
+- Layer-order fixtures prove that a stamp below a lip, a decal above a flat panel, and dirt conforming to a groove
+  resolve differently but deterministically; deferred operations never appear in the reusable atlas.
 
 Verification — run exactly:
 cargo test -p hot-trimmer-effect-compiler algorithm_stage_18_effect_compilation
@@ -1209,6 +1315,7 @@ Stop conditions:
 - Stop if one universal weathering evaluator handles all roles.
 - Stop if raw recipe parameters can reach render-core without CompiledEffect.
 - Stop if a fallback changes topology or silently changes physical scale.
+- Stop if painter's-order pixels replace the typed operation/dependency plan.
 ```
 
 ---
@@ -1228,9 +1335,14 @@ PBR channels with explicit provenance.
 Scope:
 - Implement physical Height composition with explicit amplitudes, material-class ranges, clamps, and contribution
   provenance. Do not add unrestricted normalized maps.
+- Compose in declared semantic layer order. Structural profiles, SDF details, stamp relief, decals, and weathering may
+  mask or conform to one another only through the Stage 18 plan; Stage 17 does not infer order from pixels.
 - Generate normals from physical Height using Scharr derivatives divided by meters-per-pixel X/Y.
 - Decode imported normals, combine them with generated/compiled contributions through reoriented or equivalent
   vector-correct normal mapping, renormalize, and re-encode in selected convention.
+- Derive normals after all physical Height contributions are resolved, then vector-compose explicitly imported normal
+  details. Never alpha-blend encoded normal RGB. Respect premultiplied/unpremultiplied color decal policy separately
+  from linear scalar, exact ID, and vector channels.
 - Prefer imported Roughness; otherwise estimate from class/base/contrast/high-frequency evidence and compiled effects
   with Estimated provenance and bounded ranges.
 - Keep Metallic zero unless imported, explicitly labeled metal/material-ID-driven, or changed by exposed-metal effect.
@@ -1244,6 +1356,8 @@ Acceptance:
 - Normal composition passes vector fixtures and contains no RGB-average path.
 - Metallic never appears from Base Color alone without explicit allowed intent.
 - Base-Color-only outputs label estimated channels and remain deterministic.
+- Stamp/decal fixtures preserve registration, physical size, layer order, mask polarity, exact IDs, and normal-vector
+  length across output resolutions.
 
 Verification — run exactly:
 cargo test -p hot-trimmer-sheet-compiler algorithm_stage_17_pbr_composition
@@ -1321,6 +1435,14 @@ Scope — desktop workflow:
   effect route/occupancy/LOD/supersampling, mip warnings, plan/provenance, and Blender status.
 - Every slot inspector shows selected source/domain/crop/transform/mode/cost, confidence, route, and fallback. UI does
   not recompute compiler truth.
+- Integrate the Prompt LIB management window and browser into profile/detail/effect authoring. Provide stamp/splat
+  tools that create typed Stage 16 operations with undo/redo, physical size, pivot, rotate/mirror, opacity, spacing,
+  deterministic scatter/jitter, channel contribution preview, and explicit reusable-atlas versus asset-specific scope.
+- Support 2D atlas placement and compatible 3D surface placement. Screen coordinates are transient input only; commit
+  operations in atlas/slot physical coordinates or Blender geometry/UV anchors with a declared reprojection policy.
+- Keep real silhouette rounding in geometry or a Blender bevel/displacement policy. Texture profiles may represent
+  grooves, lips, seams, relief, and shading detail, but Hot Trimmer must never claim an atlas-allocation border has
+  physically beveled the mesh.
 
 Scope — preview/export:
 - Preview Plane, Cube, Cylinder, Beveled Block, Wall Module, Archway, Radial Disc, and Mechanical Prop, including
@@ -1335,9 +1457,13 @@ Scope — Blender companion:
   non-uniform distortion, preserve locked assignments, and report insufficiency/topology mismatch.
 - Material/effect/resolution updates reload maps without remapping unchanged topology; topology changes require an
   explicit compatibility decision.
+- Apply asset-specific deferred stamps as versioned Blender-side operations/decals or bake targets with stable anchors,
+  explicit reproject/orphan diagnostics, and no contamination of the reusable material atlas.
 - Add one root `check:algorithm-stage-20` script that runs the focused desktop Stage 20 tests and Blender companion
   fixture tests as one command. Do not hide unrelated workspace tests behind it.
 - Add docs/phase-reports/algorithm-stage-20.md and user-facing workflow/diagnostic documentation.
+- Add `CompiledTrimPackage` publishing to the library only after atomic Stage 20 export succeeds. Published packages
+  pin the complete manifest/checksums and source recipe lineage; they never alias a mutable build directory.
 
 Acceptance:
 - The universal corpus can be compiled through the UI without material-specific workflows.
@@ -1346,6 +1472,10 @@ Acceptance:
 - Blender fixtures map rectangular, strip, and radial semantics without non-uniform UV distortion; locks survive
   updates and map-only revisions reload without remapping.
 - Failed/cancelled jobs and exports publish no partial result.
+- Library-authored stamps round-trip through save, preview, export manifest, and Blender application; reusable and
+  asset-specific scopes remain visibly distinct throughout.
+- A successfully exported trim package can be published, searched, reopened, and applied from the Library without
+  changing its pinned manifest or source asset versions.
 
 Verification — run exactly:
 npm run check:algorithm-stage-20
@@ -1354,6 +1484,7 @@ Stop conditions:
 - Stop if enabled UI controls are not command-backed.
 - Stop if preview has a shortcut renderer different from final/export.
 - Stop if Blender only calculates fit values without authoring and validating UV/material state.
+- Stop if interactive splats are stored as flattened preview pixels or if screen coordinates become authoritative.
 ```
 
 ---

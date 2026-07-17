@@ -1370,6 +1370,74 @@ Render narrow profiles analytically where possible. Otherwise render at the comp
 
 Do not solve sub-pixel geometry by widening it in final pixels, because that changes its physical scale.
 
+## 15.8 Structural occupancy and edge authority
+
+Stage 15 publishes more than a rendered profile preview. Its typed output retains:
+
+```text
+signed distance and inside/outside fields
+flat-center and profile-exclusion masks
+raised, recessed, cap, groove, and border occupancy
+physical Height and analytic derivative contributions
+profile identity, LOD, fallback, and physical dimensions
+```
+
+Later details and effects use those fields to declare `Above`, `Below`, `Conform`, `ClipInside`, `ClipOutside`, or
+`Accumulate` relationships. They must not infer structure by reading flattened normal pixels.
+
+An authored profile boundary is semantic material structure. An atlas allocation rectangle is only storage topology:
+it is never automatically a bevel, seam, cavity, or wear edge. Real silhouette rounding remains geometry, displacement,
+or an explicit Blender bevel policy; a texture profile cannot claim to alter the mesh silhouette.
+
+
+# Reusable source and authoring library integration milestone (Prompt LIB)
+
+The reusable library is product infrastructure between Stage 15 and Stage 16, not a new image-algorithm stage. It
+provides stable source evidence, authored patches, and presets to the compiler without becoming a second compiler or a
+pixel-composition path.
+
+## LIB.1 Asset identity and kinds
+
+Every project reference resolves through an immutable asset ID, version, and content digest. The initial asset kinds are:
+
+```text
+MaterialSourceSet
+SourcePatchPreset
+StampMask
+RegisteredStampChannels
+StampSheet
+ProfilePreset
+EffectRecipe
+```
+
+Material sources retain registered PBR channel identities and import settings. Patch presets retain authored crop,
+rectification, registration, and calibration lineage. All assets retain provenance/license, tags/category/author,
+source evidence, mask polarity where applicable, channel semantics, pivot, orientation, tileability, allowed physical
+size/range, aspect policy, defaults, and preview metadata. User-global and project-local libraries share the same
+contract. A project may embed a content-addressed snapshot for portability.
+
+Filenames, absolute paths, thumbnails, and a mutable `latest` pointer are discovery conveniences, never compiler
+authority. Editing creates a version; referenced content cannot silently change. Delete/replace is dependency-aware,
+and an unresolved reference remains a typed, actionable failure rather than an empty substitute.
+
+## LIB.2 Import and management window
+
+Hot Trimmer imports a registered material set, single asset, folder, or atlas/stencil sheet. Import supports channel
+association plus bounded automatic component/alpha segmentation, editable manual rectangles, shared registered-channel
+crops, physical calibration and pivot authoring, and explicit color/scalar/vector/exact-ID roles. Scalar masks stay
+linear and normal maps require a declared convention.
+
+The Library window provides search/filter, thumbnail grid, type/tag/category views, registered-channel inspection,
+physical/pivot defaults, provenance/license, version history, project usage, and dependency-safe import/edit/tag/
+duplicate/replace/delete commands. Every mutation is a typed transactional command with cancellation and revision
+guards. Thumbnail generation and segmentation are resource-bounded.
+
+Stage 16 consumes only immutable `StampAssetRef`/preset references. Interactive painting, scattering, final PBR
+composition, cloud synchronization, and marketplace behavior are outside this milestone.
+
+After Stage 20 completes an atomic export, its exact manifest/checksum-pinned result may be published as a
+`CompiledTrimPackage`. A mutable export folder or incomplete preview can never masquerade as a library package.
+
 
 # 21. Stage 16: scale-constrained detail and pattern synthesis
 
@@ -1408,6 +1476,26 @@ fallback policy
 seed
 ```
 
+Library-backed operations add:
+
+```text
+immutable asset ID/version/content digest
+reusable-atlas or asset-specific-deferred scope
+target slot/region
+physical transform and pivot
+rotation and mirror policy
+opacity and channel-specific blend policy
+clipping and profile-occupancy relationship
+layer/dependency order
+deterministic seed, spacing, scatter, and jitter
+per-channel contributions and provenance
+```
+
+A `StampOperation` or `StampStroke` stores these deterministic parameters or committed physical samples, not pasted
+display pixels. Screen coordinates may help author a stroke but never become authoritative placement coordinates.
+Reusable-atlas stamps become part of the shared material. Asset-specific-deferred stamps remain manifest operations
+for Stage 20/Blender and must not be baked into every object using that material.
+
 Example:
 
 ```json
@@ -1440,6 +1528,10 @@ This produces coherent Height and Normal contributions for:
 - Circular drains.
 - Stamped panels.
 - Decorative borders.
+
+The output remains a registered mask/SDF, physical Height contribution, vector-normal input, scalar/color/ID
+contribution, and lineage. It is not flattened into final PBR pixels at Stage 16. Material IDs are exact categorical
+writes; Metallic changes require explicit legal intent; normal assets retain their declared convention.
 
 ## 16.4 Repeating motif
 
@@ -1488,6 +1580,12 @@ Disabled
 
 The selected level is deterministic for slot geometry, output resolution, settings, and seed.
 
+## 16.7 Radial stamps and mapping
+
+A planar stamp on a radial cap remains planar by default, preserving circles and physical aspect. An explicitly polar
+stamp may use radius/angle coordinates to wrap a ring or annulus. Polar/conformal mapping is an authored operation with
+visible provenance; it is never introduced as an automatic fisheye effect to make a rectangular stamp fit.
+
 
 # 22. Stage 17: PBR estimation and composition from compiled effects
 
@@ -1520,6 +1618,8 @@ final_height =
 ```
 
 Use explicit physical amplitudes, material-class ranges, and clamps. Do not add unrestricted 0-1 maps blindly.
+Resolve profile, detail, stamp-relief, and weathering Height in the Stage 18 dependency order before deriving the final
+generated normal. Stage 17 never guesses layer order from raster overlap.
 
 ## 17.3 Normal from height
 
@@ -1538,6 +1638,10 @@ Use Scharr gradients for rotational symmetry.
 Decode vectors, combine using reoriented normal mapping or another vector-correct method, renormalize, and re-encode.
 
 Never average normal RGB values.
+
+Imported normal details are vector-composed only after Height-derived normals are available. Encoded normal RGB is
+never alpha-blended. Color/alpha decals follow their declared straight/premultiplied policy separately from linear
+scalar maps, exact IDs, and vector channels.
 
 ## 17.5 Roughness
 
@@ -1658,6 +1762,10 @@ pub struct CompiledEffect {
 }
 ```
 
+Library-backed effects also retain their immutable asset version/content digest, declared scope, layer dependencies,
+mask polarity, and channel-specific blend semantics. `EffectPlan` is an ordered dependency plan, not painter's-order
+pixels.
+
 ## 18.2 Compilation order
 
 ```text
@@ -1672,6 +1780,13 @@ Resolve scale space
 -> choose supersampling
 -> emit CompiledEffect or explicit failure
 ```
+
+Compilation resolves `Above`, `Below`, `Conform`, `ClipInside`, `ClipOutside`, and `Accumulate` relationships against
+Stage 15 occupancy. It validates physical Height units, bounded scalar operations, vector-normal convention, alpha,
+exact IDs, and explicit Metallic legality. Conflicts, suppression, and fallbacks are diagnostic facts.
+
+Reusable-atlas operations may render into the material sheet. Asset-specific-deferred operations are preserved for
+Stage 20/Blender and never enter the shared atlas compositor.
 
 Conceptual function:
 
@@ -2028,6 +2143,17 @@ Mechanical prop
 
 At least several fixtures use authored hotspot UVs.
 
+## Library-backed stamp authoring
+
+Stage 20 integrates the Prompt LIB window and browser into profile/detail/effect authoring. The stamp/splat tool creates
+typed Stage 16 operations with undo/redo, physical size, pivot, rotate/mirror, opacity, channel targeting, layer order,
+and deterministic spacing/scatter/jitter. It can author reusable-atlas operations in 2D or asset-specific operations on
+compatible 3D preview geometry.
+
+Screen coordinates are transient. A committed 2D operation uses slot/atlas physical coordinates; a committed 3D
+operation uses stable geometry/UV anchors with an explicit reprojection policy. Missing or changed geometry produces
+reproject/orphan diagnostics instead of silently moving a stamp.
+
 ## Blender companion
 
 The companion:
@@ -2041,6 +2167,9 @@ The companion:
 - Preserves locked assignments.
 - Updates textures when material revision changes.
 - Reports topology changes.
+- Applies asset-specific deferred stamps as versioned decal/bake operations with stable anchors.
+- Keeps real silhouette beveling in geometry/modifier/displacement policy rather than claiming texture allocation
+  borders changed the mesh.
 
 ## QA views
 

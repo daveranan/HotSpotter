@@ -14,7 +14,7 @@ import {
   type MaterialClassificationCommand,
   type MaterialCalibrationCommand,
   type CompiledMapView,
-  type CompiledSheetProjection,
+  type IntermediateAtlasProjection,
   type NormalizedBounds,
   type NormalConvention,
   type Patch,
@@ -166,7 +166,7 @@ function failure(reason: unknown): CommandFailure {
 function App() {
   const native = isNativeRuntime();
   const [project, setProject] = useState<ProjectProjection | null>(null);
-  const [artifact, setArtifact] = useState<CompiledSheetProjection | null>(null);
+  const [artifact, setArtifact] = useState<IntermediateAtlasProjection | null>(null);
   const [preview, setPreview] = useState<PreviewSheetProjection | null>(null);
   const [templateId, setTemplateId] = useState<string>(templates[0][0]);
   const [selectedSourceSetId, setSelectedSourceSetId] = useState<string>("");
@@ -191,6 +191,7 @@ function App() {
   const started = useRef(false);
   const previewDraftId = useRef(0);
   const dirtyPreviewRegion = useRef<string | null>(null);
+  const suppressAutomaticPreviewRevision = useRef<number | null>(null);
   const patchPreviewRequestId = useRef(0);
   const lastTransientPreviewAt = useRef(0);
   const transientPreviewInFlight = useRef(false);
@@ -237,10 +238,14 @@ function App() {
 
   useEffect(() => {
     if (!native || !project?.document) return;
+    if (suppressAutomaticPreviewRevision.current === project.document.documentRevision) {
+      suppressAutomaticPreviewRevision.current = null;
+      return;
+    }
     const dirtyRegion = dirtyPreviewRegion.current;
     dirtyPreviewRegion.current = null;
     void requestPreview(dirtyRegion ?? undefined);
-  }, [native, mapView, project?.document?.documentRevision]);
+  }, [native, project?.document?.documentRevision]);
 
   useEffect(() => {
     if (!native || !activePatchId) {
@@ -625,9 +630,12 @@ function App() {
       let current = project;
       if (current.document?.primaryMaterial !== primaryMaterial) {
         current = await applyCommand({ type: "set_primary_material", materialId: primaryMaterial });
+        suppressAutomaticPreviewRevision.current = current.document!.documentRevision;
         setProject(current);
       }
-      const compiled = await invoke<CompiledSheetProjection>("compile_trim_sheet_document", { request: protocol });
+      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+        request: { ...protocol, revision: current.document!.documentRevision },
+      });
       previewDraftId.current += 1;
       setPreview(null);
       setArtifact(compiled);
@@ -654,14 +662,13 @@ function App() {
       }
       previewDraftId.current += 1;
       setPreview(null);
+      suppressAutomaticPreviewRevision.current = current.document!.documentRevision;
       setProject(current);
-      setArtifact(null);
-      setSelectedRegionId(null);
-      setProblem({
-        code: "unsupported_stage",
-        message: "Material compilation is not available in the engine skeleton.",
-        recovery: "Keep preparing registered sources; Stage 1 will install the first executable route.",
+      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+        request: { ...protocol, revision: current.document!.documentRevision },
       });
+      setArtifact(compiled);
+      setSelectedRegionId(null);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -692,10 +699,13 @@ function App() {
     if (!native || !project?.document) return;
     const draftId = ++previewDraftId.current;
     try {
-      const next = await invoke<PreviewSheetProjection>("preview_trim_sheet_document", {
-        request: { ...protocol, draftId, mapView, regionId, projection, maxEdge: 1024 },
+      const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+        request: { ...protocol, revision: project.document.documentRevision },
       });
-      if (next.draftId === previewDraftId.current) setPreview(next);
+      if (draftId === previewDraftId.current) {
+        setArtifact(next);
+        setPreview(null);
+      }
     } catch (reason) {
       if (failure(reason).code !== "operation_cancelled") setProblem(failure(reason));
     }
@@ -1634,7 +1644,7 @@ function PaneSplitter(props: {
 
 function SheetWorkbench(props: {
   project: ProjectProjection | null;
-  artifact: CompiledSheetProjection | null;
+  artifact: IntermediateAtlasProjection | null;
   preview: PreviewSheetProjection | null;
   preparedPatchPreview: PreparedPatchPreviewProjection | null;
   mapView: CompiledMapView;
@@ -1683,8 +1693,8 @@ function SheetWorkbench(props: {
         <option value={2048}>2048</option>
         <option value={4096}>4096</option>
       </select>
-      <button className="primary" onClick={props.build} disabled title="Unavailable until Stage 1 installs the first engine route">
-        Engine unavailable
+      <button className="primary" onClick={props.build} disabled={!props.project?.document || props.activity !== "idle"}>
+        Preview through Stage 14
       </button>
     </section>
     <section
@@ -1749,16 +1759,16 @@ function SheetWorkbench(props: {
     {props.artifact ? <footer className="artifact-footer">
       <span>{props.artifact.width} x {props.artifact.height}</span>
       <span>{props.artifact.regions.length} regions</span>
-      <span>{props.artifact.rendererVersion}</span>
-      <span>topology {props.artifact.topologyHash.slice(0, 10)}</span>
-      <span>appearance {props.artifact.appearanceHash.slice(0, 10)}</span>
+      <span>{props.artifact.label}</span>
+      <span>incomplete after Stage {props.artifact.incompleteAfterStage} · non-exportable</span>
+      <span>pending: {props.artifact.pending.join(", ")}</span>
     </footer> : null}
   </section>;
 }
 
 function Inspector(props: {
   project: ProjectProjection | null;
-  artifact: CompiledSheetProjection | null;
+  artifact: IntermediateAtlasProjection | null;
   sourceAnalysis: PreparedPatchPreviewProjection | null;
   selectedRegion: ResolvedRegion | null;
   mapView: CompiledMapView;
@@ -1771,6 +1781,7 @@ function Inspector(props: {
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
 }) {
   const binding = props.selectedRegion && props.project?.document?.regionBindings[props.selectedRegion.regionId];
+  const stage14Slot = props.selectedRegion && props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegion!.regionId);
   const analyzedSource = props.sourceAnalysis
     ? props.project?.materialSources.find((source) => source.id === props.sourceAnalysis!.materialSourceId)
     : undefined;
@@ -1778,8 +1789,22 @@ function Inspector(props: {
     <header className="inspector-actions"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument}>Redo</button></header>
     <section className="inspector-section">
       <span>MAP VIEW</span>
-      <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact}>{label}</button>)}</div>
+      <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact?.maps[id]} title={props.artifact && !props.artifact.maps[id] ? "Unavailable through Stage 14" : undefined}>{label}</button>)}</div>
     </section>
+    {stage14Slot ? <section className="inspector-section">
+      <span>AUTHORITATIVE STAGE 14 SLOT</span>
+      <dl>
+        <dt>Slot</dt><dd>{stage14Slot.displayName}</dd>
+        <dt>Mapping</dt><dd>{stage14Slot.mappingMode}</dd>
+        <dt>Validity</dt><dd>{stage14Slot.validity}</dd>
+        <dt>Correspondence</dt><dd>{stage14Slot.correspondence}</dd>
+        <dt>Patch</dt><dd>{stage14Slot.patchId ?? "whole registered source"}</dd>
+        <dt>Domain</dt><dd>{stage14Slot.domainId.slice(0, 12)}</dd>
+        <dt>Candidate</dt><dd>{stage14Slot.candidateId.slice(0, 12)}</dd>
+        <dt>SamplingPlan</dt><dd>{stage14Slot.samplingPlanId.slice(0, 12)}</dd>
+        <dt>Stage 14 result</dt><dd>{stage14Slot.stage14ResultId.slice(0, 12)}</dd>
+      </dl>
+    </section> : null}
     <section className="inspector-section">
       <span>SOURCE QUALITY &amp; BEHAVIOR</span>
       {props.sourceAnalysis ? <>
@@ -1965,14 +1990,14 @@ function LockedSection({ title, reason }: { title: string; reason: string }) {
   return <section className="locked"><strong>{title}</strong><span>{reason}</span></section>;
 }
 
-function buildStatus(project: ProjectProjection | null, artifact: CompiledSheetProjection | null, activity: Activity, problem: CommandFailure | null, stale: boolean) {
+function buildStatus(project: ProjectProjection | null, artifact: IntermediateAtlasProjection | null, activity: Activity, problem: CommandFailure | null, stale: boolean) {
   if (activity === "importing") return "Importing";
   if (activity === "compiling") return `Compiling revision ${project?.document?.documentRevision ?? 1}`;
   if (problem) return "Region error";
   if (!project?.materialSources.some((source) => source.registeredChannels?.channels.some((channel) => channel.channel === "base_color"))) return "Empty";
   if (!project.document) return "Ready";
   if (stale || !artifact) return "Stale";
-  return `Ready rev ${artifact.documentRevision}`;
+  return `Intermediate Stage 14 rev ${artifact.documentRevision}`;
 }
 
 function channelLabel(channel: SourceChannel): string {
@@ -1997,7 +2022,7 @@ function cropLabel(projection?: { type: string; bounds?: { x: number; y: number;
   return `${b.x.toFixed(2)}, ${b.y.toFixed(2)} / ${b.width.toFixed(2)} x ${b.height.toFixed(2)}`;
 }
 
-function overlayStyle(region: ResolvedRegion, artifact: Pick<CompiledSheetProjection, "width" | "height">, scale = 1): React.CSSProperties {
+function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasProjection, "width" | "height">, scale = 1): React.CSSProperties {
   const bounds = region.allocationBounds;
   return {
     left: `${bounds.x / artifact.width * 100}%`,

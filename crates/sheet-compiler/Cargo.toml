@@ -13,6 +13,7 @@ hot-trimmer-image-io = { path = "../image-io" }
 hot-trimmer-material-analysis.workspace = true
 hot-trimmer-material-synthesis.workspace = true
 hot-trimmer-placement-solver.workspace = true
+hot-trimmer-project-store = { path = "../project-store" }
 hot-trimmer-render-core = { path = "../render-core" }
 serde.workspace = true
 serde_json.workspace = true

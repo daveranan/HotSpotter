@@ -345,6 +345,11 @@ fn legality_rejections<S: SlotDemandView>(slot: &S, c: &CropCandidate) -> Vec<St
         reasons.push("strip cross-axis thickness is not preserved".into());
     }
     if c.eligibility.lattice_aligned == Some(false) { reasons.push("required lattice alignment failed".into()); }
+    if matches!(c.mapping_mode, hot_trimmer_domain::SamplingMode::PeriodicTile
+        | hot_trimmer_domain::SamplingMode::RepeatX | hot_trimmer_domain::SamplingMode::RepeatY)
+        && c.period_pixels.is_none() {
+        reasons.push("repeat mapping lacks the executable Stage 14 period".into());
+    }
     reasons
 }
 

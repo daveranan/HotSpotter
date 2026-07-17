@@ -252,10 +252,11 @@ Iteration order, tie-breaking, candidate truncation, parallel reductions, and ra
 | 14 | Registered per-slot material synthesis | Phase 5 | material-synthesis/sheet-compiler |
 | 14P-A | First visible authoritative intermediate atlas | Phase 5.5A | sheet-compiler/desktop |
 | 14P-B | Intermediate-preview QA and cache hardening | Phase 5.5B | sheet-compiler/desktop |
-| 15 | Legal scale-constrained structural profiles | Phase 6 | effect-compiler/render-core |
-| 16 | Legal scale-constrained details and motifs | Phase 6 | effect-compiler/render-core |
+| 15 | Legal scale-constrained structural profiles | Phase 6A | effect-compiler/render-core |
+| LIB | Versioned reusable source/patch/stamp/profile library and management window | Phase 6L | domain/project-store/desktop |
+| 16 | Legal scale-constrained details and motifs | Phase 6B | effect-compiler/render-core |
 | 17 | Vector-correct, provenance-aware PBR composition | Phase 7 | sheet-compiler/render-core |
-| 18 | Role-specific compiled material state/effects | Phase 6 | effect-compiler |
+| 18 | Role-specific compiled material state/effects | Phase 6B | effect-compiler |
 | 19 | Channel-correct atlas, mips, exact IDs, manifest data | Phase 7 | sheet-compiler/export |
 | 20 | Preview, Blender synchronization, and QA views | Phase 8 | desktop/Blender |
 
@@ -497,28 +498,88 @@ Targeted verification:
 cargo test -p hot-trimmer-desktop algorithm_stage_14_preview_b
 ```
 
-### Phase 6 - Effect-capacity compiler, profiles, details, and material state (Stages 15, 16, and 18)
+### Phase 6A - Structural profiles and semantic occupancy (Stage 15)
 
 Deliverables:
 
-- Implement the complete profile set: Flat, convex/concave/rounded/double bevel, raised lip, recessed seam, panel frame, fully rounded strip, merged opposing bevel, radial disc, annulus, and custom profile curve.
+- Implement the complete profile set: Flat, convex/concave/rounded/double bevel, raised lip, recessed seam, panel
+  frame, fully rounded strip, merged opposing bevel, radial disc, annulus, and custom profile curve.
 - Resolve profile widths and amplitudes in physical units; test opposing-profile legality and required flat center.
 - Implement declared profile fallbacks and record every decision.
+- Publish semantic profile occupancy, SDF, flat-center, raised/recessed/cap/groove, physical Height, and derivative
+  contributions. Allocation rectangles are not semantic edges and receive no implicit bevel.
+
+Acceptance gate:
+
+- Broad panel, extreme strip, radial, cap, sub-pixel, and opposing-profile fixtures remain physically stable at all
+  four output sizes.
+- Opposing profiles never overlap accidentally, and a boundary without an authored profile remains flat.
+- Stage 16 and Stage 18 can query occupancy without reverse-engineering flattened pixels.
+
+Targeted verification:
+
+```powershell
+cargo test -p hot-trimmer-effect-compiler algorithm_stage_15_profiles
+```
+
+### Phase 6L - Reusable source and authoring library with management window (Prompt LIB)
+
+This is a cross-cutting product milestone, not a new numbered image-algorithm stage. It runs after Stage 15 so profile
+presets can use the same library model, and before Stage 16 so stamps and decals begin with stable assets rather than
+filesystem paths or pasted pixels.
+
+Deliverables:
+
+- Add versioned content-addressed assets for registered material source sets, authored source-patch presets, stamp
+  masks, registered stamp channel sets, stamp sheets, profile presets, and effect recipes, with immutable IDs/versions,
+  provenance/license, tags, pivot, physical/calibration defaults, channel semantics, and global/project-local ownership.
+- Add bounded registered-set, single-file, folder, and atlas-sheet import; channel association and shared registered-
+  channel slicing; content deduplication; mask polarity and normal-convention authoring; transactional metadata/version
+  updates; portable embedded snapshots; and dependency-safe replace/delete behavior.
+- Add a command-backed Library window with search/filter/grid/detail views, channel preview, atlas-slice editing,
+  physical/pivot defaults, version history, project usage, and unresolved-reference recovery.
+- Define `StampAssetRef` as the only library-to-compiler boundary. Defer brush strokes and scattering to Stage 20,
+  and do not allow thumbnails, filenames, latest-version pointers, or absolute paths to become compiler authority.
+
+Acceptance gate:
+
+- Library fixtures round-trip pixels, registration, channel semantics, metadata, versions, and content digests.
+- Embedded project assets reopen without original files; unresolved external items fail explicitly and recoverably.
+- Referenced assets cannot be silently mutated or destructively removed.
+- Every enabled Library control invokes a typed native command and persists transactionally.
+
+Targeted verification:
+
+```powershell
+cargo test -p hot-trimmer-desktop reusable_asset_library
+```
+
+### Phase 6B - Details and material-state compilation (Stages 16 and 18)
+
+Deliverables:
+
 - Implement semantic repeating strips, unique/radial details, trim caps, bolt groups, vents, stamps, grooves, decals, and procedural motifs.
 - Convert masks to SDFs for coherent Height/Normal contributions.
+- Store library-backed stamps as non-destructive typed operations with immutable asset version, physical transform,
+  pivot, rotation/mirror, layer order, occupancy relation, seed/scatter, channel targets, and reusable-atlas versus
+  asset-specific-deferred scope.
 - Implement world, minor-relative, major-relative, area-relative, and pixel scale spaces.
 - Build structural masks in physical coordinates.
 - Compile surface, horizontal-strip, vertical-strip, radial, unique, and trim-cap weathering variants.
 - Implement micro/meso/macro/structural material-state recipes.
 - Select deterministic feature LOD and 1x/2x/4x/8x supersampling from physical and raster constraints.
+- Compile profile/detail/stamp/weathering dependencies and blend legality into one ordered `EffectPlan`; never use
+  flattened painter's-order pixels as routing authority, and never bake asset-specific operations into a shared atlas.
 
 Acceptance gate:
 
-- Golden fixtures cover the required panel, extreme strips, radial, cap, sub-pixel, and opposing-bevel cases at all four output sizes.
-- Opposing profiles never overlap accidentally.
+- Golden fixtures cover panels, extreme strips, radial slots, caps, sub-pixel details, and conflicting effects at all
+  four output sizes.
 - Isotropic physical effects never become ellipses in extreme slots.
 - Resolution promotes LOD without moving features or changing seeds.
 - Unfit effects are rejected or use a declared fallback visible in `EffectPlan` diagnostics.
+- Resolution changes preserve stamp physical placement, scope, library version, and deterministic seed; layer-order
+  fixtures distinguish below-profile, above-surface, and conforming effects.
 
 Targeted verification:
 
@@ -531,6 +592,8 @@ cargo test -p hot-trimmer-effect-compiler scale_aware_effect_goldens
 Deliverables:
 
 - Compose Height with explicit physical amplitudes and material-class clamps.
+- Resolve all ordered physical Height contributions before deriving normals; then vector-compose imported normal
+  details. Apply color/alpha, scalar, vector, and exact-ID blend semantics independently.
 - Generate normals from physical Height using Scharr gradients and per-axis meters per pixel.
 - Combine imported and generated normals with vector-correct reoriented normal mapping.
 - Prefer imported Roughness; otherwise estimate it with explicit Estimated provenance.
@@ -565,6 +628,9 @@ UI deliverables:
 - Add source class, physical-scale calibration, orientation, preparation, synthesis policy, quality/confidence, and seed controls.
 - Add per-slot automatic/manual status, candidate comparison, selected crop, recovery choices, and explicit Stretch override.
 - Add material-state recipe and effect fallback controls.
+- Integrate the reusable Library browser and management window. Add non-destructive stamp/splat authoring with
+  physical transform, pivot, rotate/mirror, opacity, channel targeting, undo/redo, deterministic scatter, and explicit
+  reusable-atlas versus asset-specific scope.
 - Add all QA views from Stage 20, including crop usage/repetition, seam energy, texel density, effect route/occupancy/LOD/supersampling, mip warnings, and Blender status.
 - Run analysis, placement, compile, and export as cancellable revision-guarded jobs with bounded preview refinement.
 
@@ -576,6 +642,11 @@ Preview/export/Blender deliverables:
 - Describe selected UV islands, classify compatible slots, and fit rectangular, strip, unique, cap, and radial semantics without non-uniform distortion.
 - Preserve locked assignments across material/effect/resolution updates.
 - Reload maps without remapping when topology is unchanged; report topology mismatch explicitly.
+- Persist 2D stamp operations in slot/atlas physical coordinates and 3D operations with stable geometry/UV anchors;
+  screen coordinates remain transient. Apply deferred asset-specific stamps in Blender with explicit reproject/orphan
+  handling, while real silhouette bevels remain geometry/modifier policy rather than atlas pixels.
+- After atomic export succeeds, allow the exact manifest/checksum-pinned `CompiledTrimPackage` to be published to and
+  reopened from the Library. Do not treat a mutable export folder as a reusable package.
 
 Acceptance gate:
 

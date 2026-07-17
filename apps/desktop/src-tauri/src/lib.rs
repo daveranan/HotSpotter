@@ -93,7 +93,7 @@ pub fn run() {
             commands::undo_document_command,
             commands::redo_document_command,
             commands::compile_trim_sheet_document,
-            commands::preview_trim_sheet_document,
+            commands::preview_through_stage_14,
             commands::save_project,
             commands::save_project_as,
             commands::close_project,

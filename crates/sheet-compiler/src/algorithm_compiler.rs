@@ -4,8 +4,10 @@ use hot_trimmer_domain::{
 };
 use thiserror::Error;
 
+use crate::{IntermediateAtlasArtifact, IntermediateAtlasError, IntermediateAtlasRequest, compose_intermediate_atlas};
+
 pub const COMPILER_FACADE_ALGORITHM_ID: &str = "hot-trimmer.algorithm-stack";
-pub const COMPILER_FACADE_VERSION: &str = "0.0.0-skeleton";
+pub const COMPILER_FACADE_VERSION: &str = "14.1.0-intermediate";
 
 /// The only facade allowed to produce an authoritative compiled sheet.
 ///
@@ -32,6 +34,10 @@ pub enum CompilerFacadeError {
     Cancelled { report: CompilationReport },
     #[error("algorithm stage {stage} is unsupported")]
     UnsupportedStage { stage: u8, report: CompilationReport },
+    #[error(transparent)]
+    Intermediate(#[from] IntermediateAtlasError),
+    #[error("persisted Stage 1-14 pipeline failed: {0}")]
+    Pipeline(String),
 }
 
 impl AlgorithmCompiler {
@@ -64,6 +70,18 @@ impl AlgorithmCompiler {
             stage: 1,
             report: report(request, request_key, diagnostic, Some(1)),
         })
+    }
+
+    /// Executes the explicitly incomplete Stage 14 publication route on the sole compiler facade.
+    /// The executable request carries the artifacts which the header-only Prompt 00 contract lacks.
+    pub fn compile_intermediate_atlas(
+        &self,
+        request: &IntermediateAtlasRequest<'_>,
+        cancellation: &CancellationToken,
+        current_revision: impl Fn() -> u64,
+    ) -> Result<IntermediateAtlasArtifact, CompilerFacadeError> {
+        compose_intermediate_atlas(request, || cancellation.is_cancelled(), current_revision)
+            .map_err(CompilerFacadeError::from)
     }
 }
 

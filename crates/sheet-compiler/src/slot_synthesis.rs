@@ -109,8 +109,15 @@ pub fn synthesize_slot_material(
     request: SlotSynthesisRequest<'_>,
     cancellation: &RenderCancellationToken,
 ) -> Result<SynthesizedSlotMaterial, SlotSynthesisError> {
+    synthesize_slot_material_with_guard(request, &|| cancellation.is_cancelled())
+}
+
+pub fn synthesize_slot_material_with_guard(
+    request: SlotSynthesisRequest<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SynthesizedSlotMaterial, SlotSynthesisError> {
     validate(&request)?;
-    if cancellation.is_cancelled() { return Err(SlotSynthesisError::Cancelled); }
+    if cancelled() { return Err(SlotSynthesisError::Cancelled); }
     let [width, height] = request.output_dimensions;
     let pixels = u64::from(width).checked_mul(u64::from(height)).ok_or(SlotSynthesisError::ResourceLimitExceeded)?;
     let channel_count = u64::try_from(request.domain.registered_channels().len()).unwrap_or(u64::MAX);
@@ -122,7 +129,7 @@ pub fn synthesize_slot_material(
     let mut positions = Vec::with_capacity(usize::try_from(pixels).map_err(|_| SlotSynthesisError::ResourceLimitExceeded)?);
     let mut validity = Vec::with_capacity(positions.capacity());
     for y in 0..height {
-        if cancellation.is_cancelled() { return Err(SlotSynthesisError::Cancelled); }
+        if cancelled() { return Err(SlotSynthesisError::Cancelled); }
         for x in 0..width {
             let q = [(f64::from(x) + 0.5) / f64::from(width), (f64::from(y) + 0.5) / f64::from(height)];
             let position = map_position(&request, q);
@@ -136,9 +143,9 @@ pub fn synthesize_slot_material(
     let validity = plane(width, height, request.limits.tile_edge, &validity)?;
     let mut channels = Vec::with_capacity(request.domain.registered_channels().len());
     for channel in request.domain.registered_channels() {
-        channels.push(sample_channel(channel, &positions, width, height, &request, cancellation)?);
+        channels.push(sample_channel(channel, &positions, width, height, &request, cancelled)?);
     }
-    if cancellation.is_cancelled() { return Err(SlotSynthesisError::Cancelled); }
+    if cancelled() { return Err(SlotSynthesisError::Cancelled); }
     let algorithm = AlgorithmProvenance { algorithm_id: STAGE_14_ALGORITHM_ID.into(), version: STAGE_14_ALGORITHM_VERSION.into() };
     let settings_hash = ContentDigest::sha256(format!("{:?}|{:?}|{:?}|{:?}|{:?}", request.plan.candidate.mapping_mode,
         request.plan.sampling_policy, request.output_dimensions, request.plan.slot_physical_size, request.plan.candidate.transform).as_bytes());
@@ -398,28 +405,28 @@ fn sample_validity(domain: &PreparedMaterialDomain, x: f64, y: f64) -> bool {
 }
 
 fn sample_channel(channel: &PreparedExemplarChannel, positions: &[[f32; 2]], width: u32, height: u32,
-    r: &SlotSynthesisRequest<'_>, cancellation: &RenderCancellationToken) -> Result<PreparedExemplarChannel, SlotSynthesisError> {
+    r: &SlotSynthesisRequest<'_>, cancelled: &dyn Fn() -> bool) -> Result<PreparedExemplarChannel, SlotSynthesisError> {
     let edge = r.limits.tile_edge; let linear = r.plan.sampling_policy.filter != SourceSamplingMode::Nearest;
     Ok(match channel {
         PreparedExemplarChannel::BaseColor { plane: src, alpha_mode } => PreparedExemplarChannel::BaseColor {
-            plane: plane(width, height, edge, &rasterize(positions, width, cancellation, |p| sample_color(src, p, linear))?)?, alpha_mode: *alpha_mode },
+            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| sample_color(src, p, linear))?)?, alpha_mode: *alpha_mode },
         PreparedExemplarChannel::Scalar { role, plane: src } => PreparedExemplarChannel::Scalar { role: *role,
-            plane: plane(width, height, edge, &rasterize(positions, width, cancellation, |p| LinearScalar(sample_f32(src, p, linear, |v| v.0)))?)? },
+            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| LinearScalar(sample_f32(src, p, linear, |v| v.0)))?)? },
         PreparedExemplarChannel::Normal { plane: src, source_convention, canonical_convention, alpha_policy } => PreparedExemplarChannel::Normal {
-            plane: plane(width, height, edge, &rasterize(positions, width, cancellation, |p| transform_normal(sample_normal(src, p, linear), r))?)?,
+            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| transform_normal(sample_normal(src, p, linear), r))?)?,
             source_convention: *source_convention, canonical_convention: *canonical_convention, alpha_policy: *alpha_policy },
         PreparedExemplarChannel::MaterialId { plane: src } => PreparedExemplarChannel::MaterialId {
-            plane: plane(width, height, edge, &rasterize(positions, width, cancellation, |p| sample_nearest(src, p))?)? },
+            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| sample_nearest(src, p))?)? },
         PreparedExemplarChannel::Mask { role, plane: src } => PreparedExemplarChannel::Mask { role: *role,
-            plane: plane(width, height, edge, &rasterize(positions, width, cancellation, |p| MaskValue(sample_f32(src, p, linear, |v| v.0)))?)? },
+            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| MaskValue(sample_f32(src, p, linear, |v| v.0)))?)? },
     })
 }
 
-fn rasterize<T>(positions: &[[f32; 2]], width: u32, cancellation: &RenderCancellationToken,
+fn rasterize<T>(positions: &[[f32; 2]], width: u32, cancelled: &dyn Fn() -> bool,
     mut sample: impl FnMut([f32; 2]) -> T) -> Result<Vec<T>, SlotSynthesisError> {
     let mut values = Vec::with_capacity(positions.len());
     for row in positions.chunks_exact(usize::try_from(width).map_err(|_| SlotSynthesisError::ResourceLimitExceeded)?) {
-        if cancellation.is_cancelled() { return Err(SlotSynthesisError::Cancelled); }
+        if cancelled() { return Err(SlotSynthesisError::Cancelled); }
         values.extend(row.iter().copied().map(&mut sample));
     }
     Ok(values)
@@ -628,7 +635,7 @@ mod tests {
 
         // Cancellation is observed between channel rows, not only during correspondence construction.
         let cancel=RenderCancellationToken::new(); let mut samples=0_usize;
-        let raster=rasterize(&vec![[0.0,0.0];16],4,&cancel,|p|{samples+=1;if samples==4{cancel.cancel();}p});
+        let raster=rasterize(&vec![[0.0,0.0];16],4,&|| cancel.is_cancelled(),|p|{samples+=1;if samples==4{cancel.cancel();}p});
         assert_eq!(raster.unwrap_err(),SlotSynthesisError::Cancelled);
 
         // Public/deserialized plans cannot smuggle malformed crop, period, slice, or seam geometry into rasterization.

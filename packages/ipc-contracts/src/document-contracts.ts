@@ -276,6 +276,47 @@ export interface CompiledSheetProjection {
   regions: readonly ResolvedRegion[];
 }
 
+export interface Stage14SlotProjection {
+  regionId: string;
+  slotKey: string;
+  displayName: string;
+  allocationBounds: PixelBounds;
+  hotspotBounds: PixelBounds;
+  mappingMode: string;
+  validity: string;
+  correspondence: string;
+  sourceId: string;
+  patchId?: string;
+  domainId: string;
+  candidateId: string;
+  samplingPlanId: string;
+  stage14ResultId: string;
+  sourceCrop?: PixelBounds;
+}
+
+export interface IntermediateAtlasProjection {
+  label: "Intermediate Stage 14 material-placement preview";
+  nonExportable: true;
+  incompleteAfterStage: 14;
+  revision: number;
+  documentRevision: number;
+  topologyHash: string;
+  appearanceHash: string;
+  rendererVersion: "intermediate-stage-14";
+  width: number;
+  height: number;
+  topology: unknown;
+  placementPlanId: string;
+  maps: Partial<Record<CompiledMapView, string>>;
+  regions: readonly ResolvedRegion[];
+  unavailableChannels: readonly string[];
+  slots: readonly Stage14SlotProjection[];
+  pending: readonly string[];
+  finalCompileAvailable: false;
+  exportAvailable: false;
+  blenderAvailable: false;
+}
+
 export interface PreviewSheetProjection {
   draftId: number;
   documentRevision: number;
