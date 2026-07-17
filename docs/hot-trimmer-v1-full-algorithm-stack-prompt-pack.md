@@ -119,6 +119,8 @@ renderer, or an unrelated synthesis engine.
 | 01-07 | One prompt per source-preparation/analysis stage | 1-7 |
 | 08A-08F | Domain engines and router | 8 |
 | 09-16 | One prompt per topology, placement, synthesis, profile, and detail stage | 9-16 |
+| 14P-A | First visible authoritative atlas integration | Through Stage 14 |
+| 14P-B | Intermediate-preview QA and cache hardening | Through Stage 14 |
 | 18 | Effect compilation | 18 |
 | 17 | PBR composition from compiled effects | 17 |
 | 19 | Finishing and metadata | 19 |
@@ -956,6 +958,124 @@ Stop conditions:
 - Stop if SamplingPolicy is declared but ignored by the raster path.
 - Stop if imported normals are sampled as color.
 - Stop if a failed plan falls back to center-cover or Stretch.
+```
+
+---
+
+## Prompt 14P-A — First visible authoritative atlas through Stage 14
+
+```text
+Implement Prompt 14P-A, the first visible authoritative atlas integration gate, from the full algorithm-stack
+prompt pack.
+
+Read the common rules, revised Stages 9-14, and every Stage 9-14 phase report. Consume only authoritative artifacts
+from the installed Stage 1-14 pipeline. No subagents.
+
+Prerequisite:
+- Finish the remaining Stage 14 review corrections, especially selected-seam execution and the slice-center
+  synthesis route. Rerun Stage 14's own focused gate under its prompt before starting this integration prompt.
+- Do not make the compositor compensate for, reinterpret, or hide a known-invalid Stage 14 slot result.
+
+Current integration reality:
+Stages 1-14 are implemented as authoritative typed algorithms, but the Prompt 00 AlgorithmCompiler facade still
+rejects Stage 1 and CompilerRequestHeader does not carry sufficient executable inputs. Installing the single
+Stage 1-14 orchestration path inside AlgorithmCompiler is in scope. Reuse the installed stage implementations;
+do not reimplement their algorithms, bypass their artifacts, or treat the request header alone as executable input.
+
+Objective:
+Get the first truthful atlas on screen quickly: run one real persisted project through the installed Stage 1-14
+algorithms, compose actual Stage 14 slot outputs into Stage 9 topology, and display the explicitly incomplete result.
+
+Scope:
+- Add a typed `IntermediateAtlasArtifact` distinct from final `CompiledSheet`. It must carry the Stage 9 topology,
+  Stage 13 PlacementPlan identity, Stage 14 slot-result identities, concise source/patch lineage, revision,
+  algorithm versions, diagnostics, and explicit `incomplete_after_stage: 14` status.
+- Connect the sole `AlgorithmCompiler` authority through the installed Stage 1-14 path. Remove the Prompt 00
+  unconditional Stage 1 rejection for this intermediate route; do not create a second compiler facade.
+- Start with one representative persisted project and its authored patches. Execute the existing Stage 1-14
+  implementations required by the selected template without broad corpus or cache-matrix hardening.
+- Composite each successful allocation-local Stage 14 channel into its exact Stage 9 allocation/hotspot rectangle.
+  Use the Stage 14 validity/correspondence result and channel semantics. Do not center-cover the whole source,
+  stretch a failed slot, call the legacy renderer, or substitute placeholder pixels.
+- Permit an intermediate Base Color view and only those imported/Stage 14 registered channel views that actually
+  exist. Missing generated Height/Normal/Roughness/Metallic/AO remain explicitly unavailable; Stage 15-19 work is
+  not simulated.
+- Add only the essential authoritative inspection: slot boundaries/names, mapping mode, validity, correspondence,
+  and concise selected patch/domain/candidate/SamplingPlan lineage for the clicked slot.
+- Replace the desktop's hard-coded preview-unavailable command with a cancellable, revision-guarded native command
+  backed by `IntermediateAtlasArtifact`. Enable a clearly labeled `Preview through Stage 14` action when inputs are
+  sufficient.
+- Label the canvas `Intermediate Stage 14 material-placement preview`. It is non-exportable and must list profiles,
+  semantic details, effects, final PBR composition, finishing, mips, metadata, and Blender application as pending.
+- Enforce cancellation, revision supersession, and required-slot atomicity. No failure publishes a partial atlas.
+- Keep final compile, export, and Blender actions disabled. Do not add the full invalidation matrix, heatmaps, rich
+  decision explorer, broad corpus qualification, or cache/performance hardening; Prompt 14P-B owns those.
+- Keep Stage 20 responsible for production preview fixtures, complete QA, atomic export, and Blender synchronization.
+- Add docs/phase-reports/algorithm-stage-14-preview-a.md.
+
+Acceptance:
+- One representative persisted material produces a visible atlas whose required regions are composed from the exact
+  Stage 14 slot outputs and whose topology matches Stage 9 byte-for-byte.
+- Every visible slot can identify its selected source patch, domain, candidate, SamplingPlan, mapping mode, and
+  Stage 14 result. Correspondence and validity views align with Base Color boundaries.
+- Imported registered channels remain aligned. Unavailable later-generated channels are labeled unavailable rather
+  than filled with constants or estimates.
+- A failed required slot, cancellation, or revision supersession publishes no partial atlas. No preview call edge
+  reaches the removed legacy renderer or an implicit Stretch/center-cover fallback.
+- The desktop displays the intermediate artifact and its incomplete-through-Stage-14 label while final compile,
+  export, and Blender actions remain unavailable.
+
+Verification — run exactly:
+cargo test -p hot-trimmer-desktop algorithm_stage_14_preview_a
+
+Stop conditions:
+- Stop if the preview is made by covering the atlas with one source image instead of composing Stage 14 slots.
+- Stop if an unimplemented Stage 15-19 feature is represented by plausible placeholder pixels.
+- Stop if the UI recomputes crop, correspondence, validity, or mapping diagnostics independently of artifacts.
+- Stop if intermediate preview can be mistaken for, saved as, or exported as a final compiled sheet.
+```
+
+---
+
+## Prompt 14P-B — Intermediate-preview QA and cache hardening
+
+```text
+Implement Prompt 14P-B, the Stage 14 intermediate-preview hardening gate, from the full algorithm-stack prompt pack.
+
+Read the common rules, Prompt 14P-A report, and revised Stage 14 integration checkpoint. Consume the working
+`IntermediateAtlasArtifact` path from 14P-A. No subagents.
+
+Objective:
+Harden the truthful Stage 14 preview after it is already visible, without widening it into final Stage 20 preview,
+export, or Blender integration.
+
+Scope:
+- Complete the cache-key and invalidation matrix for sources, patches, preparation, calibration, classification,
+  material domains, topology, slot demand, candidates, scoring, placement, SamplingPlans, output, versions, and seed.
+- Add authoritative source-usage/repetition heatmaps, crop overlays, mapping-mode views, registered-channel alignment,
+  required-slot failures, and a rich per-slot Stage 11-14 decision explorer. UI views consume artifact data only.
+- Expand representative coverage across the universal corpus and every Stage 14 mapping family without changing
+  the algorithms or adding special cases.
+- Measure and bound preview memory, execution time, cache reuse, cancellation latency, and revision supersession.
+- Preserve 14P-A's non-exportable incomplete label and keep Stage 15-19 output explicitly pending.
+- Add docs/phase-reports/algorithm-stage-14-preview-b.md.
+
+Acceptance:
+- Patch, scale/orientation, classification, domain, placement, resolution, version, and seed changes invalidate the
+  correct key; identical complete inputs yield byte-identical pixels, lineage, QA data, and diagnostics.
+- Every corpus behavior class reaches either an honest intermediate atlas or a typed insufficiency recovery.
+- QA views align with the exact Stage 9/13/14 artifacts and contain no duplicated UI calculations.
+- Bounded cancellation and stale revisions publish no partial artifact; cache hits cannot return stale lineage.
+- Final compile, export, and Blender remain unavailable and no Stage 15-19 placeholder content appears.
+
+Verification — run exactly:
+cargo test -p hot-trimmer-desktop algorithm_stage_14_preview_b
+
+Stop conditions:
+- Stop if QA hardening delays or replaces the working 14P-A Base Color preview.
+- Stop if a cache hit survives any authoritative input or version change.
+- Stop if a heatmap or decision explanation is reconstructed from UI-side math.
+- Stop if this prompt begins implementing profiles, effects, final finishing, export, or Blender.
 ```
 
 ---

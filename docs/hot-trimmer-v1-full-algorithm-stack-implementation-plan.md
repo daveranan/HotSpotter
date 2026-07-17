@@ -250,6 +250,8 @@ Iteration order, tie-breaking, candidate truncation, parallel reductions, and ra
 | 12 | Complete unary candidate costs | Phase 4 | placement-solver |
 | 13 | Globally diverse deterministic assignment | Phase 4 | placement-solver |
 | 14 | Registered per-slot material synthesis | Phase 5 | material-synthesis/sheet-compiler |
+| 14P-A | First visible authoritative intermediate atlas | Phase 5.5A | sheet-compiler/desktop |
+| 14P-B | Intermediate-preview QA and cache hardening | Phase 5.5B | sheet-compiler/desktop |
 | 15 | Legal scale-constrained structural profiles | Phase 6 | effect-compiler/render-core |
 | 16 | Legal scale-constrained details and motifs | Phase 6 | effect-compiler/render-core |
 | 17 | Vector-correct, provenance-aware PBR composition | Phase 7 | sheet-compiler/render-core |
@@ -427,6 +429,72 @@ Targeted verification:
 
 ```powershell
 cargo test -p hot-trimmer-sheet-compiler slot_synthesis_acceptance
+```
+
+### Phase 5.5A - First visible intermediate atlas (through Stage 14)
+
+This is an integration checkpoint, not a new product-stage number. It exists so crop, synthesis, scale,
+orientation, placement, and mapping behavior can receive visual feedback before profiles and effects are built.
+
+Before integration, close the remaining Stage 14 selected-seam and slice-center synthesis review findings. The
+compositor must expose Stage 14 output, not compensate for a known-invalid result.
+
+Current integration reality: Stages 1-14 exist as typed algorithms, while the Prompt 00 `AlgorithmCompiler` still
+rejects Stage 1 and its header is not an executable request. Phase 5.5A installs one Stage 1-14 orchestration path
+inside that sole facade using the existing implementations; it does not reimplement or bypass them.
+
+Deliverables:
+
+- Connect the sole compiler facade from persisted sources and authored patches through every installed Stage 1-14
+  artifact; remove its unconditional Prompt 00 rejection for this explicitly intermediate route.
+- Introduce `IntermediateAtlasArtifact`, distinct from final `CompiledSheet`, with topology, PlacementPlan,
+  per-slot Stage 14 identities, source-patch lineage, versions, revision, seed, diagnostics, and an explicit
+  incomplete-after-Stage-14 marker.
+- Composite real allocation-local Stage 14 outputs into exact Stage 9 regions without a whole-sheet source cover,
+  legacy renderer, implicit Stretch, missing-slot substitution, or fabricated later-stage channels.
+- Add Base Color and available imported registered-channel views plus essential authoritative slot boundaries,
+  mapping mode, correspondence, validity, failure, and concise selected-decision lineage.
+- Enable a cancellable, revision-guarded desktop `Preview through Stage 14` command and clearly label the result as
+  non-exportable intermediate material placement.
+- Enforce cancellation, stale-revision protection, and required-slot atomicity. Defer the full invalidation matrix,
+  broad QA, corpus qualification, and performance/cache hardening to Phase 5.5B.
+
+Acceptance gate:
+
+- A representative corpus material produces a visible atlas composed pixel-for-pixel from its Stage 14 slot
+  results with byte-identical Stage 9 topology.
+- Every visible region exposes concise selected patch, domain, candidate, SamplingPlan, mapping mode, and synthesis
+  lineage; all registered views remain aligned.
+- Missing Stage 15-19 work remains visibly pending rather than represented by plausible constants or estimates.
+- Final compile, export, and Blender application remain unavailable, and no legacy/Stretch fallback is reachable.
+
+Targeted verification:
+
+```powershell
+cargo test -p hot-trimmer-desktop algorithm_stage_14_preview_a
+```
+
+### Phase 5.5B - Intermediate-preview QA and cache hardening
+
+Deliverables:
+
+- Complete cache keys and invalidation for every Stage 1-14 authoritative input, setting, version, output, and seed.
+- Add source-usage/repetition heatmaps, crop views, mapping QA, registered-channel alignment, failure inspection, and
+  the rich per-slot Stage 11-14 decision explorer from authoritative artifact data.
+- Qualify the intermediate route across the universal corpus and all Stage 14 mapping families.
+- Bound memory, preview latency, cache reuse, cancellation latency, and revision supersession.
+
+Acceptance gate:
+
+- Identical inputs are byte-identical, every authoritative change invalidates the correct lineage, and cache hits
+  cannot return stale results.
+- Every corpus behavior produces either an honest intermediate atlas or typed insufficiency.
+- QA views use no duplicated UI math, and final/export/Blender actions remain unavailable.
+
+Targeted verification:
+
+```powershell
+cargo test -p hot-trimmer-desktop algorithm_stage_14_preview_b
 ```
 
 ### Phase 6 - Effect-capacity compiler, profiles, details, and material state (Stages 15, 16, and 18)

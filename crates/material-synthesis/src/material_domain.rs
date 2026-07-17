@@ -290,6 +290,71 @@ impl PreparedMaterialDomain {
             _ => None,
         })
     }
+
+    /// Rehydrates an already validated registered domain for downstream slot-local execution.
+    /// All planes must have identical non-zero dimensions; no channel is resampled here.
+    pub fn from_registered_channels(
+        cache_key: ContentDigest,
+        prepared_source_digest: ContentDigest,
+        channels: Vec<PreparedExemplarChannel>,
+    ) -> Result<Self, DomainError> {
+        Self::from_registered_channels_with_seams(cache_key, prepared_source_digest, channels, Vec::new())
+    }
+
+    /// Rehydrates registered channels together with already selected Stage 8 seam paths.
+    pub fn from_registered_channels_with_seams(
+        cache_key: ContentDigest,
+        prepared_source_digest: ContentDigest,
+        channels: Vec<PreparedExemplarChannel>,
+        seams: Vec<SelectedSeam>,
+    ) -> Result<Self, DomainError> {
+        Self::from_registered_channels_with_route_and_seams(
+            cache_key, prepared_source_digest, channels, DomainRoute::DirectSource, seams,
+        )
+    }
+
+    /// Rehydrates a validated routed domain and its selected seams for downstream execution.
+    pub fn from_registered_channels_with_route_and_seams(
+        cache_key: ContentDigest,
+        prepared_source_digest: ContentDigest,
+        channels: Vec<PreparedExemplarChannel>,
+        route: DomainRoute,
+        seams: Vec<SelectedSeam>,
+    ) -> Result<Self, DomainError> {
+        let dimensions = channels.first().map(channel_dimensions).ok_or(DomainError::RegistrationDrift)?;
+        if dimensions.0 == 0 || dimensions.1 == 0
+            || channels.iter().any(|channel| channel_dimensions(channel) != dimensions) {
+            return Err(DomainError::RegistrationDrift);
+        }
+        let (width, height) = dimensions;
+        let pixel_count = usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| DomainError::ResourceLimitExceeded)?;
+        let validity = plane(width, height, 128, vec![MaskValue(1.0); pixel_count])?;
+        let provenance = plane(width, height, 128, vec![ProvenanceValue::Original; pixel_count])?;
+        let algorithm = AlgorithmProvenance { algorithm_id: STAGE_08A_DIRECT_ALGORITHM_ID.into(), version: STAGE_08A_ALGORITHM_VERSION.into() };
+        Ok(Self {
+            cache_key: cache_key.clone(), prepared_source_digest, analysis_digest: cache_key.clone(),
+            route, width, height, channels: DomainChannelStorage::Generated(channels),
+            correspondence: CorrespondenceField::Identity { width, height },
+            operations: OperationField::Identity { width, height }, validity, provenance, seams,
+            quilting: None, patch_match: None,
+            diagnostics: DomainDiagnostics { selected_route: route, cache_key,
+                available_seam_terms: BTreeSet::new(), normalized_weight_milli: BTreeMap::new(), pass_through: None,
+                seams: Vec::new(), boundary_cost_before_milli: (0, 0), boundary_cost_after_milli: (0, 0),
+                messages: vec!["validated registered domain rehydrated for Stage 14".into()] },
+            qa_views: vec![DomainQaView::RegisteredChannels, DomainQaView::Correspondence, DomainQaView::Validity],
+            stage_result: StageResult::Executed { algorithm, settings_hash: ContentDigest::sha256(b"registered-domain-rehydration"), diagnostics: Vec::new() },
+        })
+    }
+}
+
+fn channel_dimensions(channel: &PreparedExemplarChannel) -> (u32, u32) {
+    match channel {
+        PreparedExemplarChannel::BaseColor { plane, .. } => (plane.width(), plane.height()),
+        PreparedExemplarChannel::Scalar { plane, .. } => (plane.width(), plane.height()),
+        PreparedExemplarChannel::Normal { plane, .. } => (plane.width(), plane.height()),
+        PreparedExemplarChannel::MaterialId { plane } => (plane.width(), plane.height()),
+        PreparedExemplarChannel::Mask { plane, .. } => (plane.width(), plane.height()),
+    }
 }
 
 #[derive(Clone, Debug, Default)]

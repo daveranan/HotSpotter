@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CancellationToken, CompilationDiagnostic, ContentDigest, DiagnosticCode,
-    MaterialBehaviorClass, RecoveryChoice, RegionId, StageResult, TemplateSlotRole,
+    MaterialBehaviorClass, RecoveryChoice, RegionId, SamplingPolicy, StageResult,
+    TemplateSlotRole,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +44,36 @@ pub struct PlacementSlotInput {
     pub prepared_domain_id: ContentDigest,
     pub prepared_domain_dimensions: [u32; 2],
     pub registered_correspondence_reference: ContentDigest,
+    /// Authoritative Stage 10 physical extent in meters (or the declared relative physical unit).
+    pub slot_physical_size: [f64; 2],
+    /// Stage 10/6 conversion before the Stage 11 dimensionless scale-ladder multiplier.
+    pub base_source_pixels_per_physical_unit: f64,
+    pub sampling_policy: SamplingPolicy,
+    pub stretch_override: StretchOverrideProvenance,
+    pub slice_geometry: SliceGeometry,
+    /// Maximum accepted cost for every selected Stage 8 seam used by this slot.
+    pub maximum_seam_cost_milli: u16,
     pub reuse_permissions: ReusePermissions,
     pub candidates: ScoredCandidateSet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SliceCenterPolicy { Repeat, Synthesize, ExplicitStretch }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SliceGeometry {
+    None,
+    Three { leading_cap_pixels: u32, trailing_cap_pixels: u32, center: SliceCenterPolicy },
+    Nine { left_pixels: u32, right_pixels: u32, top_pixels: u32, bottom_pixels: u32, center: SliceCenterPolicy },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum StretchOverrideProvenance {
+    NotAuthorized,
+    UserOverride { settings_revision: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +159,15 @@ pub struct SamplingPlan {
     pub variation_group: String,
     pub prepared_domain_dimensions: [u32; 2],
     pub candidate: CropCandidate,
+    pub slot_physical_size: [f64; 2],
+    /// Complete physical-to-domain coefficient. This is not the Stage 11 scale-ladder value.
+    pub source_pixels_per_physical_unit: f64,
+    /// Authoritative raster policy. Stage 14 must consume this value for every channel.
+    pub sampling_policy: SamplingPolicy,
+    /// Visible provenance for the only route allowed to use non-uniform scale.
+    pub stretch_override: StretchOverrideProvenance,
+    pub slice_geometry: SliceGeometry,
+    pub maximum_seam_cost_milli: u16,
     pub unary_cost: f64,
 }
 
@@ -342,6 +380,12 @@ fn validate_inputs(
             || slot.variation_group.trim().is_empty()
             || slot.prepared_domain_dimensions[0] == 0
             || slot.prepared_domain_dimensions[1] == 0
+            || slot.maximum_seam_cost_milli > 1000
+            || slot.slot_physical_size.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            || !slot.base_source_pixels_per_physical_unit.is_finite()
+            || slot.base_source_pixels_per_physical_unit <= 0.0
+            || !slot.sampling_policy.scale.is_finite()
+            || slot.sampling_policy.scale <= 0.0
         {
             return Err(PlacementError::MalformedInput(format!(
                 "slot {} has malformed placement metadata",
@@ -369,6 +413,12 @@ fn validate_inputs(
                 || !candidate.eligibility.isotropic_scale
                 || candidate.domain_id != slot.prepared_domain_id
                 || candidate.correspondence_reference != slot.registered_correspondence_reference
+                || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::ExplicitStretch
+                    && !matches!(slot.stretch_override, StretchOverrideProvenance::UserOverride { .. }))
+                || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::ThreeSliceCap
+                    && !matches!(slot.slice_geometry, SliceGeometry::Three { .. }))
+                || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::NineSlicePanel
+                    && !matches!(slot.slice_geometry, SliceGeometry::Nine { .. }))
                 || candidate.crop.is_some_and(|crop| {
                     crop.width == 0
                         || crop.height == 0
@@ -833,6 +883,13 @@ fn build_plan(
                 variation_group: context.slots[slot].variation_group.clone(),
                 prepared_domain_dimensions: context.slots[slot].prepared_domain_dimensions,
                 candidate: scored.candidate.clone(),
+                slot_physical_size: context.slots[slot].slot_physical_size,
+                source_pixels_per_physical_unit: context.slots[slot].base_source_pixels_per_physical_unit
+                    * scored.candidate.isotropic_scale,
+                sampling_policy: context.slots[slot].sampling_policy,
+                stretch_override: context.slots[slot].stretch_override,
+                slice_geometry: context.slots[slot].slice_geometry,
+                maximum_seam_cost_milli: context.slots[slot].maximum_seam_cost_milli,
                 unary_cost: scored.breakdown.total_cost,
             }
         })
@@ -1002,7 +1059,7 @@ fn unit(value: u16) -> f64 { f64::from(value.min(1000)) / 1000.0 }
 
 #[cfg(test)]
 mod tests {
-    use hot_trimmer_domain::{QuarterTurn, SamplingMode};
+    use hot_trimmer_domain::{QuarterTurn, SamplingMode, SourceSamplingMode};
 
     use super::*;
     use crate::{
@@ -1066,6 +1123,12 @@ mod tests {
             prepared_domain_id: ContentDigest::sha256(b"registered-domain"),
             prepared_domain_dimensions: [500, 500],
             registered_correspondence_reference: ContentDigest::sha256(b"registered-domain"),
+            slot_physical_size: [2.0, 2.0],
+            base_source_pixels_per_physical_unit: 50.0,
+            sampling_policy: SamplingPolicy { filter: SourceSamplingMode::Nearest, scale: 1.25, correct_tangent_normals: false },
+            stretch_override: StretchOverrideProvenance::NotAuthorized,
+            slice_geometry: SliceGeometry::None,
+            maximum_seam_cost_milli: 450,
             reuse_permissions: ReusePermissions::default(),
             candidates: ScoredCandidateSet {
                 stage_result: StageResult::Executed {
@@ -1115,6 +1178,9 @@ mod tests {
         assert!(first.validation.isotropic_scale_only);
         assert!(first.validation.registered_mapping_only);
         assert_ne!(first.placements[0].candidate.crop, first.placements[1].candidate.crop);
+        assert_eq!(first.placements[0].sampling_policy, slots[0].sampling_policy);
+        assert_eq!(first.placements[0].source_pixels_per_physical_unit, 50.0);
+        assert_eq!(first.placements[0].stretch_override, StretchOverrideProvenance::NotAuthorized);
         assert!(first.pairwise_decisions.iter().any(|decision| {
             decision.outcome == PairwiseDecisionOutcome::RejectedByPolicy
                 && decision.reason.contains("unique salient")

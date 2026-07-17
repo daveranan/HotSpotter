@@ -1203,6 +1203,49 @@ Map radial and angular coordinates into a procedural or authored radial source.
 
 ---
 
+## Stage 14 integration checkpoint: intermediate atlas preview
+
+Stage 14 is the first point at which the installed stack has both a fixed destination topology and actual
+allocation-local material pixels. Before Stage 15 begins, Hot Trimmer composes those slot outputs into a typed,
+non-exportable `IntermediateAtlasArtifact` so source selection, crop, scale, orientation, synthesis, and placement
+can be evaluated visually.
+
+The checkpoint is delivered in two gates so visibility is not delayed by production hardening:
+
+1. **14P-A — first visible atlas.** Close known Stage 14 seam/slice correctness findings, install the single
+   Stage 1-14 orchestration path in `AlgorithmCompiler`, compose one real persisted project, and display Base Color,
+   available registered channels, slot boundaries, mapping mode, validity, correspondence, and concise lineage.
+2. **14P-B — QA/cache hardening.** Complete invalidation, corpus coverage, heatmaps, rich decision inspection,
+   performance bounds, cancellation latency, and cache qualification after truthful pixels are already visible.
+
+Current integration reality is part of 14P-A's scope: the Prompt 00 facade still rejects Stage 1 and its
+`CompilerRequestHeader` alone cannot execute the installed algorithms. The integration gate supplies sufficient
+typed executable inputs to the sole facade and reuses Stages 1-14; it does not create another authority,
+reimplement algorithms, or bypass their artifacts.
+
+This artifact is not a partial `CompiledSheet`. It records:
+
+- exact Stage 9 topology;
+- Stage 13 PlacementPlan and per-slot SamplingPlan identity;
+- exact Stage 14 slot-result identity and validity/correspondence;
+- selected source patch and material-domain lineage;
+- installed algorithm versions, settings, output, seed, revision, and diagnostics;
+- `incomplete_after_stage = 14`.
+
+Only channels genuinely available from registered Stage 14 material are shown. Profiles, semantic details,
+effects, generated PBR content, finishing, mips, metadata, export, and Blender application remain pending and may
+not be represented with plausible placeholder pixels.
+
+The desktop exposes this as **Intermediate Stage 14 material-placement preview** with authoritative slot,
+source-usage, mapping, correspondence, validity, and failure views. It is cancellable and revision-guarded. A
+failed required slot, cancellation, or superseded revision publishes no partial atlas. The compositor may not use
+a whole-sheet source cover, the removed legacy renderer, implicit Stretch, or center-cover recovery.
+
+Stage 20 still owns production preview fixtures, complete QA, atomic export, and Blender synchronization. It
+extends this feedback path; it does not introduce the first visual access to compiled material.
+
+---
+
 # 20. Stage 15: scale-constrained structural profile synthesis
 
 Structural trim edges are generated mathematically from signed-distance fields, but a profile is evaluated only after a constraint solver resolves a legal representation for the slot.

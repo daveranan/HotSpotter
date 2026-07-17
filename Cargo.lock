@@ -1684,6 +1684,7 @@ dependencies = [
  "hot-trimmer-domain",
  "hot-trimmer-effect-compiler",
  "hot-trimmer-geometry",
+ "hot-trimmer-image-io",
  "hot-trimmer-material-analysis",
  "hot-trimmer-material-synthesis",
  "hot-trimmer-placement-solver",

@@ -2,12 +2,14 @@
 
 mod algorithm_compiler;
 mod document_compiler;
+mod slot_synthesis;
 
 pub use algorithm_compiler::*;
 pub use document_compiler::{
     CompiledMapSet, CompiledPreviewMap, PreviewMapKind, RegisteredMaterialMap, ResolvedRegion,
     SheetCompileError, compile_preview_map, compile_preview_map_incremental, resolve_compile_plan,
 };
+pub use slot_synthesis::*;
 
 #[cfg(any())]
 mod removed_legacy {
