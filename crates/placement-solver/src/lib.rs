@@ -3,9 +3,11 @@
 use hot_trimmer_domain::{CompilationDiagnostic, RecoveryChoice, StageResult};
 
 mod candidates;
+mod optimizer;
 mod scoring;
 
 pub use candidates::*;
+pub use optimizer::*;
 pub use scoring::*;
 
 #[must_use]

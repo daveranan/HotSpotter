@@ -10,6 +10,7 @@ hot-trimmer-domain.workspace = true
 hot-trimmer-material-analysis.workspace = true
 hot-trimmer-material-synthesis.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

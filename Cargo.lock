@@ -1638,6 +1638,7 @@ dependencies = [
  "hot-trimmer-material-analysis",
  "hot-trimmer-material-synthesis",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
