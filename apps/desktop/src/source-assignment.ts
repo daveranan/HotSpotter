@@ -1,4 +1,11 @@
-import type { SourceChannel } from "@hot-trimmer/ipc-contracts";
+import type { AssignmentProvenance, SourceChannel } from "@hot-trimmer/ipc-contracts";
+
+export interface SourceFileAssignment {
+  path: string;
+  channel: SourceChannel;
+  assignmentProvenance: AssignmentProvenance;
+  confidenceMilli: number;
+}
 
 const channelOrder: readonly SourceChannel[] = [
   "base_color", "normal", "height", "roughness", "metallic", "ambient_occlusion",
@@ -25,24 +32,31 @@ export function suggestedChannel(path: string): SourceChannel | null {
 export function assignSourceFiles(
   paths: string[],
   occupiedChannels: readonly SourceChannel[],
-): Array<{ path: string; channel: SourceChannel }> {
+): SourceFileAssignment[] {
   const openChannels = channelOrder.filter((channel) => !occupiedChannels.includes(channel));
   const assigned = new Set<SourceChannel>();
   const remaining = [...paths];
-  const result: Array<{ path: string; channel: SourceChannel }> = [];
+  const result: SourceFileAssignment[] = [];
   if (openChannels.includes("base_color")) {
     const baseIndex = remaining.findIndex((path) => suggestedChannel(path) === "base_color");
     const unknownIndex = remaining.findIndex((path) => suggestedChannel(path) === null);
     const selectedIndex = baseIndex >= 0 ? baseIndex : unknownIndex;
     if (selectedIndex >= 0) {
       const [basePath] = remaining.splice(selectedIndex, 1);
-      if (basePath) { result.push({ path: basePath, channel: "base_color" }); assigned.add("base_color"); }
+      if (basePath) {
+        result.push({
+          path: basePath, channel: "base_color",
+          assignmentProvenance: baseIndex >= 0 ? "filename_suggested" : "user_assigned",
+          confidenceMilli: baseIndex >= 0 ? 700 : 500,
+        });
+        assigned.add("base_color");
+      }
     }
   }
   for (let index = 0; index < remaining.length;) {
     const channel = suggestedChannel(remaining[index]!);
     if (channel && openChannels.includes(channel) && !assigned.has(channel)) {
-      result.push({ path: remaining[index]!, channel });
+      result.push({ path: remaining[index]!, channel, assignmentProvenance: "filename_suggested", confidenceMilli: 700 });
       assigned.add(channel); remaining.splice(index, 1);
     } else index += 1;
   }

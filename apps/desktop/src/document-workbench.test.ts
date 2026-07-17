@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CompiledSheetProjection, TrimSheetDocumentCommand } from "@hot-trimmer/ipc-contracts";
-import { adjustCrop, anchoredZoom, resizePanes } from "./source-workbench-geometry.ts";
+import { adjustCrop, anchoredZoom, movePatch, normalizePatchToRectangle, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
 
 test("document command wire shapes are typed and carry exact stable IDs", () => {
   const regionId = "764f7fc0-5091-47f8-878f-1e926b0c9f66";
@@ -77,4 +77,29 @@ test("source viewport zoom is anchored to the cursor and pane splitters resize b
     source: 400,
     inspector: 420,
   });
+});
+
+test("patch selection moves, resizes, rotates, and normalizes without leaving source bounds", () => {
+  const rectangle = [
+    { x: 0.2, y: 0.25 }, { x: 0.5, y: 0.25 },
+    { x: 0.5, y: 0.55 }, { x: 0.2, y: 0.55 },
+  ] as const;
+  assert.deepEqual(movePatch(rectangle, 0.8, -0.5), [
+    { x: 0.7, y: 0 }, { x: 1, y: 0 },
+    { x: 1, y: 0.3 }, { x: 0.7, y: 0.3 },
+  ]);
+  assert.deepEqual(resizePatch(rectangle, 2, { x: 0.8, y: 0.75 }), [
+    { x: 0.2, y: 0.25 }, { x: 0.8, y: 0.25 },
+    { x: 0.8, y: 0.75 }, { x: 0.2, y: 0.75 },
+  ]);
+  const rotated = rotatePatch(rectangle, { x: 0.35, y: 0.4 }, Math.PI / 2, { width: 1000, height: 1000 });
+  assert.ok(Math.abs(rotated[0].x - 0.5) < 0.000001);
+  assert.ok(Math.abs(rotated[0].y - 0.25) < 0.000001);
+  const normalized = normalizePatchToRectangle([
+    { x: 0.2, y: 0.2 }, { x: 0.6, y: 0.22 },
+    { x: 0.64, y: 0.7 }, { x: 0.18, y: 0.62 },
+  ], { width: 1000, height: 1000 });
+  const top = { x: normalized[1].x - normalized[0].x, y: normalized[1].y - normalized[0].y };
+  const side = { x: normalized[3].x - normalized[0].x, y: normalized[3].y - normalized[0].y };
+  assert.ok(Math.abs(top.x * side.x + top.y * side.y) < 0.000001);
 });

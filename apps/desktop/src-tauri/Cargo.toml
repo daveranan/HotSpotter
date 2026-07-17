@@ -17,6 +17,7 @@ base64.workspace = true
 hot-trimmer-domain.workspace = true
 hot-trimmer-geometry = { path = "../../../crates/geometry" }
 hot-trimmer-image-io = { path = "../../../crates/image-io" }
+hot-trimmer-material-analysis.workspace = true
 hot-trimmer-project-store = { path = "../../../crates/project-store" }
 hot-trimmer-render-core = { path = "../../../crates/render-core" }
 hot-trimmer-sheet-compiler = { path = "../../../crates/sheet-compiler" }

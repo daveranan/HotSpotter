@@ -1,8 +1,31 @@
-export const IPC_PROTOCOL_VERSION = 1 as const;
+export const IPC_PROTOCOL_VERSION = 2 as const;
+
+export type EngineAvailability =
+  | { state: "unsupported_stage"; stage: number; diagnosticCode: "unsupported_stage" }
+  | { state: "available"; compilerVersion: string };
+
+export interface AlgorithmJobHeader {
+  protocolVersion: typeof IPC_PROTOCOL_VERSION;
+  revision: number;
+  seed: number;
+  requestKey: string;
+}
+
+export type AlgorithmJobEvent =
+  | { type: "started"; header: AlgorithmJobHeader }
+  | { type: "stage"; stage: number; state: "executed" | "pass_through" | "skipped_because_unused" | "failed_with_recovery" }
+  | { type: "cancelled"; revision: number }
+  | { type: "superseded"; revision: number; currentRevision: number }
+  | { type: "completed"; revision: number; reportKey: string };
 
 export type SourceChannel =
   | "base_color" | "normal" | "height" | "roughness" | "metallic"
   | "ambient_occlusion" | "specular" | "opacity" | "edge_mask" | "material_id";
+export type ChannelInterpretation = "color_managed_base_color" | "tangent_space_normal" | "linear_scalar"
+  | "linear_opacity" | "binary_mask" | "categorical_id";
+export type NormalConvention = "not_applicable" | "open_gl" | "direct_x" | "unspecified";
+export type SourceOwnership = "owned_copy" | "verified_external_reference";
+export type AssignmentProvenance = "user_assigned" | "filename_suggested" | "embedded_metadata";
 
 export interface PixelSize { width: number; height: number }
 export interface PixelBounds { x: number; y: number; width: number; height: number }
@@ -67,13 +90,67 @@ export interface TrimSheetDocument {
 
 export interface SourceProjection {
   id: string;
-  sourceSetId: string;
   channel: SourceChannel;
   displayName: string;
-  sourcePath: string;
-  width: number;
-  height: number;
+  original: { path: string; immutableDigest: string; encodedBytes: number };
+  storage: { ownership: SourceOwnership; externalPath: string | null };
+  orientedSize: PixelSize;
+  orientation: number;
+  interpretation: ChannelInterpretation;
+  normalConvention: NormalConvention;
+  assignmentProvenance: AssignmentProvenance;
+  confidenceMilli: number;
   thumbnailDataUrl: string;
+}
+
+export interface RegisteredChannelSetProjection {
+  orientedSize: PixelSize;
+  orientation: number;
+  channels: readonly SourceProjection[];
+}
+
+export type DelightingPassThroughReason =
+  | "default_new_or_unclassified"
+  | "authored_texture_or_pbr_set"
+  | "user_disabled";
+
+export type DelightingRadius =
+  | { pixels: number }
+  | { relative_basis_points: number }
+  | { physical_millimeters: { millimeters_milli: number; pixels_per_meter_milli: number } };
+
+export type DelightingRouteIntent =
+  | { route: "pass_through"; reason: DelightingPassThroughReason }
+  | { route: "classical_low_frequency" }
+  | { route: "local_intrinsic_provider"; provider_id: string; fallback: "none" | "pass_through" | "classical_low_frequency" };
+
+export interface DelightingIntent {
+  route: DelightingRouteIntent;
+  classical: {
+    strengthMilli: number;
+    shadowRecoveryMilli: number;
+    highlightRecoveryMilli: number;
+    colorPreservationMilli: number;
+    edgePreservationMilli: number;
+    radius: DelightingRadius;
+    analyzeMasks: boolean;
+  };
+}
+
+export interface MaterialSourceProjection {
+  id: string;
+  name: string;
+  exemplarGroup: string | null;
+  sourceRevision: number;
+  registrationDigest: string;
+  delighting: DelightingIntent;
+  registeredChannels: RegisteredChannelSetProjection | null;
+}
+
+export interface SetExemplarGroupRequest {
+  protocolVersion: typeof IPC_PROTOCOL_VERSION;
+  materialSourceId: string;
+  exemplarGroup: string | null;
 }
 
 export interface ProjectProjection {
@@ -83,8 +160,7 @@ export interface ProjectProjection {
   schemaVersion: number;
   dirty: boolean;
   isDraft: boolean;
-  sources: readonly SourceProjection[];
-  sourceSets: readonly { id: string; name: string }[];
+  materialSources: readonly MaterialSourceProjection[];
   patches: readonly Patch[];
   document: TrimSheetDocument | null;
   legacyLayoutDiscarded: boolean;

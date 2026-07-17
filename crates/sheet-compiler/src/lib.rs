@@ -1,8 +1,13 @@
-#![doc = "Authoritative `TrimSheetDocument` compilation."]
+#![doc = "Sole orchestration boundary for the twenty-stage material compiler."]
 
+mod algorithm_compiler;
 mod document_compiler;
 
-pub use document_compiler::*;
+pub use algorithm_compiler::*;
+pub use document_compiler::{
+    CompiledMapSet, CompiledPreviewMap, PreviewMapKind, RegisteredMaterialMap, ResolvedRegion,
+    SheetCompileError, compile_preview_map, compile_preview_map_incremental, resolve_compile_plan,
+};
 
 #[cfg(any())]
 mod removed_legacy {

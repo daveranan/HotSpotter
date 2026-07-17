@@ -47,8 +47,10 @@ function App() {
   const [activity, setActivity] = useState<Activity>("idle");
   const [problem, setProblem] = useState<CommandFailure | null>(null);
 
-  const baseSources = project?.sources.filter((source) => source.channel === "base_color") ?? [];
-  const effectivePrimary = primaryMaterial || project?.document?.primaryMaterial || baseSources[0]?.sourceSetId || "";
+  const baseSources = project?.materialSources.flatMap((material) =>
+    material.registeredChannels?.channels.filter((source) => source.channel === "base_color") ?? []) ?? [];
+  const effectivePrimary = primaryMaterial || project?.document?.primaryMaterial
+    || project?.materialSources.find((material) => material.registeredChannels?.channels.some((source) => source.channel === "base_color"))?.id || "";
   const selectedRegion = artifact?.regions.find((region) => region.regionId === selectedRegionId) ?? null;
   const stale = !!project?.document && artifact?.documentRevision !== project.document.documentRevision;
   const buildLabel = activity === "compiling"
@@ -79,7 +81,7 @@ function App() {
 
   function reset(next: ProjectProjection) {
     setProject(next); setArtifact(null); setSelectedRegionId(null); setProblem(null);
-    setPrimaryMaterial(next.document?.primaryMaterial ?? next.sources.find((source) => source.channel === "base_color")?.sourceSetId ?? "");
+    setPrimaryMaterial(next.document?.primaryMaterial ?? next.materialSources.find((material) => material.registeredChannels?.channels.some((source) => source.channel === "base_color"))?.id ?? "");
   }
 
   async function importBaseColor() {
@@ -88,9 +90,12 @@ function App() {
     if (typeof path !== "string") return;
     setActivity("importing"); setProblem(null);
     try {
-      const sourceSetId = project.sourceSets[0]?.id;
+      const sourceSetId = project.materialSources[0]?.id;
       if (!sourceSetId) throw new Error("This project has no material source set.");
-      const next = await invoke<ProjectProjection>("import_source", { request: { ...protocol, path, ownership: "owned_copy", channel: "base_color", sourceSetId } });
+      const next = await invoke<ProjectProjection>("import_source", { request: {
+        ...protocol, path, ownership: "owned_copy", channel: "base_color", sourceSetId,
+        assignmentProvenance: "user_assigned", confidenceMilli: 1000, normalConvention: "not_applicable",
+      } });
       setProject(next); setPrimaryMaterial(sourceSetId); setArtifact(null);
     } catch (reason) { setProblem(failure(reason)); }
     finally { setActivity("idle"); }
@@ -225,13 +230,14 @@ function Inspector(props: {
 }) {
   const document = props.project.document;
   const binding = props.selectedRegion && document?.regionBindings[props.selectedRegion.regionId];
-  const materialOptions = useMemo(() => props.project.sourceSets.filter((set) => props.project.sources.some((source) => source.sourceSetId === set.id && source.channel === "base_color")), [props.project]);
+  const materialOptions = useMemo(() => props.project.materialSources.filter((material) =>
+    material.registeredChannels?.channels.some((source) => source.channel === "base_color")), [props.project]);
   return <aside className="inspector"><PaneHeading index="03" title="Context Inspector" />
     <div className="inspector-body">
       <label>Template<select value={props.templateId} onChange={(event) => props.setTemplateId(event.target.value)} disabled={!!document}>{templates.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label>
       <label>Primary Material<select value={props.primaryMaterial} onChange={(event) => props.setPrimaryMaterial(event.target.value)} disabled={!materialOptions.length}>{materialOptions.map((set) => <option key={set.id} value={set.id}>{set.name}</option>)}</select></label>
       <label>Resolution<select value={document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => props.setResolution(Number(event.target.value))} disabled={!document}><option value={1024}>1024</option><option value={2048}>2048</option><option value={4096}>4096</option></select></label>
-      <button className="primary build" onClick={props.build} disabled={!props.primaryMaterial || props.activity !== "idle"}>{props.activity === "compiling" ? "Building…" : document ? "Build Trim Sheet" : "Create & Build"}</button>
+      <button className="primary build" onClick={props.build} disabled title="Unavailable until Stage 1 installs the first engine route">Engine unavailable</button>
       <div className="divider" />
       <span className="eyebrow">OUTPUT VIEW</span><div className="map-grid">{mapViews.map(([id, name]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact}>{name}</button>)}</div>
       <div className="divider" />

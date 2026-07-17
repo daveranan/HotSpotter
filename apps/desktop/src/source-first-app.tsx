@@ -9,9 +9,11 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   IPC_PROTOCOL_VERSION,
   type CommandFailure,
+  type DelightingIntent,
   type CompiledMapView,
   type CompiledSheetProjection,
   type NormalizedBounds,
+  type NormalConvention,
   type Patch,
   type PatchCommand,
   type PatchGeometry,
@@ -26,7 +28,7 @@ import {
   type TrimSheetDocumentCommand,
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
-import { adjustCrop, anchoredZoom, clamp01, fitView, resizePanes, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState } from "./source-workbench-geometry";
+import { adjustCrop, anchoredZoom, clamp01, fitView, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
@@ -66,6 +68,16 @@ const mapViews: readonly [CompiledMapView, string][] = [
 type Activity = "starting" | "idle" | "importing" | "compiling" | "saving" | "opening";
 type CropProjection = Extract<RegionMapping["projection"], { type: "crop" }>;
 type PaneLayoutMode = "full" | "without-inspector" | "without-library" | "sheet-only";
+
+interface PreparedPatchPreviewProjection {
+  patchId: string;
+  width: number;
+  height: number;
+  dataUrl: string;
+  perspectiveConfidenceMilli: number;
+  delightingRoute: string;
+  delightingStrengthMilli: number;
+}
 
 function paneLayoutMode(width: number): PaneLayoutMode {
   if (width >= 998) return "full";
@@ -128,6 +140,9 @@ function App() {
   const [templateId, setTemplateId] = useState<string>(templates[0][0]);
   const [selectedSourceSetId, setSelectedSourceSetId] = useState<string>("");
   const [selectedChannel, setSelectedChannel] = useState<SourceChannel>("base_color");
+  const [normalConvention, setNormalConvention] = useState<Extract<NormalConvention, "open_gl" | "direct_x">>("open_gl");
+  const [draftPreviewFps, setDraftPreviewFps] = useState<10 | 30 | 60>(30);
+  const [actualDraftPreviewFps, setActualDraftPreviewFps] = useState<number | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [mapView, setMapView] = useState<CompiledMapView>("baseColor");
   const [activity, setActivity] = useState<Activity>("starting");
@@ -139,20 +154,30 @@ function App() {
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [activePatchId, setActivePatchId] = useState<string | null>(null);
+  const [preparedPatchPreview, setPreparedPatchPreview] = useState<PreparedPatchPreviewProjection | null>(null);
+  const [draftPatchPreview, setDraftPatchPreview] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
   const [patchTool, setPatchTool] = useState<"rectangle" | "four-point" | null>(null);
   const started = useRef(false);
   const previewDraftId = useRef(0);
   const dirtyPreviewRegion = useRef<string | null>(null);
+  const patchPreviewRequestId = useRef(0);
+  const lastTransientPreviewAt = useRef(0);
+  const transientPreviewInFlight = useRef(false);
+  const transientPreviewPending = useRef(false);
+  const lastTransientCompletionAt = useRef(0);
+  const smoothedTransientFps = useRef(0);
+  const [transientPreviewTick, setTransientPreviewTick] = useState(0);
   const paneDrag = useRef<{ kind: PaneDragKind; start: PaneState } | null>(null);
   const workbenchRef = useRef<HTMLElement | null>(null);
 
-  const sourceSets = project?.sourceSets ?? [];
+  const sourceSets = project?.materialSources ?? [];
   const activeSourceSetId = selectedSourceSetId || sourceSets[0]?.id || "";
   const activeSources = useMemo(
-    () => project?.sources.filter((source) => source.sourceSetId === activeSourceSetId) ?? [],
-    [project?.sources, activeSourceSetId],
+    () => project?.materialSources.find((source) => source.id === activeSourceSetId)?.registeredChannels?.channels ?? [],
+    [project?.materialSources, activeSourceSetId],
   );
-  const baseSources = project?.sources.filter((source) => source.channel === "base_color") ?? [];
+  const baseSources = project?.materialSources.flatMap((source) =>
+    source.registeredChannels?.channels.filter((channel) => channel.channel === "base_color") ?? []) ?? [];
   const selectedSource = activeSources.find((source) => source.channel === selectedChannel)
     ?? activeSources.find((source) => source.channel === "base_color")
     ?? activeSources[0]
@@ -185,6 +210,66 @@ function App() {
     dirtyPreviewRegion.current = null;
     void requestPreview(dirtyRegion ?? undefined);
   }, [native, mapView, project?.document?.documentRevision]);
+
+  useEffect(() => {
+    if (!native || !activePatchId) {
+      setPreparedPatchPreview(null);
+      return;
+    }
+    const transient = draftPatchPreview?.patchId === activePatchId ? draftPatchPreview : null;
+    if (!transient) transientPreviewPending.current = false;
+    if (transient && transientPreviewInFlight.current) {
+      transientPreviewPending.current = true;
+      return;
+    }
+    const frameInterval = 1000 / draftPreviewFps;
+    const delay = transient ? Math.max(0, frameInterval - (performance.now() - lastTransientPreviewAt.current)) : 0;
+    let current = true;
+    const timer = window.setTimeout(() => {
+      const requestId = ++patchPreviewRequestId.current;
+      if (transient) {
+        lastTransientPreviewAt.current = performance.now();
+        transientPreviewInFlight.current = true;
+        transientPreviewPending.current = false;
+      }
+      void invoke<PreparedPatchPreviewProjection>("prepare_patch_preview", {
+        request: {
+          ...protocol,
+          patchId: activePatchId,
+          maxEdge: transient ? 256 : 512,
+          geometry: transient?.geometry,
+        },
+      }).then((value) => {
+        if ((transient || current) && requestId === patchPreviewRequestId.current && value.patchId === activePatchId) {
+          setPreparedPatchPreview(value);
+          if (transient) {
+            const completedAt = performance.now();
+            if (lastTransientCompletionAt.current > 0) {
+              const sample = 1000 / Math.max(1, completedAt - lastTransientCompletionAt.current);
+              smoothedTransientFps.current = smoothedTransientFps.current
+                ? smoothedTransientFps.current * 0.7 + sample * 0.3
+                : sample;
+              setActualDraftPreviewFps(Math.round(smoothedTransientFps.current));
+            }
+            lastTransientCompletionAt.current = completedAt;
+          } else {
+            setProblem(null);
+          }
+        }
+      }).catch((reason) => {
+        if (current && requestId === patchPreviewRequestId.current && !transient) setProblem(failure(reason));
+      }).finally(() => {
+        if (transient) {
+          transientPreviewInFlight.current = false;
+          if (transientPreviewPending.current) {
+            transientPreviewPending.current = false;
+            setTransientPreviewTick((tick) => tick + 1);
+          }
+        }
+      });
+    }, delay);
+    return () => { current = false; window.clearTimeout(timer); };
+  }, [native, activePatchId, project?.patches, draftPatchPreview, draftPreviewFps, transientPreviewTick]);
 
   useEffect(() => {
     const element = workbenchRef.current;
@@ -317,7 +402,7 @@ function App() {
     setPreview(null);
     setProblem(null);
     setSelectedRegionId(null);
-    setSelectedSourceSetId(next.document?.primaryMaterial ?? next.sourceSets[0]?.id ?? "");
+    setSelectedSourceSetId(next.document?.primaryMaterial ?? next.materialSources[0]?.id ?? "");
     setSelectedChannel("base_color");
     setTemplateId(templates[0][0]);
     setShowRecents(false);
@@ -341,9 +426,9 @@ function App() {
 
   async function importImages(paths: string[], sourceSetId = activeSourceSetId) {
     if (!project || !sourceSetId) return;
-    const occupied = project.sources
-      .filter((source) => source.sourceSetId === sourceSetId)
-      .map((source) => source.channel);
+    const occupied = project.materialSources
+      .find((source) => source.id === sourceSetId)?.registeredChannels?.channels
+      .map((source) => source.channel) ?? [];
     const assignments = assignSourceFiles(paths, occupied);
     if (!assignments.length) {
       setProblem({
@@ -365,6 +450,9 @@ function App() {
             ownership: "owned_copy",
             channel: assignment.channel,
             sourceSetId,
+            assignmentProvenance: assignment.assignmentProvenance,
+            confidenceMilli: assignment.confidenceMilli,
+            normalConvention: assignment.channel === "normal" ? normalConvention : "not_applicable",
           },
         });
       }
@@ -388,7 +476,11 @@ function App() {
     setProblem(null);
     try {
       const next = await invoke<ProjectProjection>("import_source", {
-        request: { ...protocol, path, ownership: "owned_copy", channel, sourceSetId },
+        request: {
+          ...protocol, path, ownership: "owned_copy", channel, sourceSetId,
+          assignmentProvenance: "user_assigned", confidenceMilli: 1000,
+          normalConvention: channel === "normal" ? normalConvention : "not_applicable",
+        },
       });
       setProject(next);
       setArtifact(null);
@@ -408,6 +500,34 @@ function App() {
     const id = crypto.randomUUID();
     setSelectedSourceSetId(id);
     await chooseImages("base_color", id);
+  }
+
+  async function setExemplarGroup(materialSourceId: string, exemplarGroup: string | null) {
+    if (!project) return;
+    try {
+      const next = await invoke<ProjectProjection>("set_exemplar_group", {
+        request: { ...protocol, materialSourceId, exemplarGroup },
+      });
+      setProject(next);
+      setArtifact(null);
+      setProblem(null);
+    } catch (reason) {
+      setProblem(failure(reason));
+    }
+  }
+
+  async function setDelightingIntent(materialSourceId: string, delighting: DelightingIntent) {
+    if (!project) return;
+    try {
+      const next = await invoke<ProjectProjection>("set_delighting_intent", {
+        request: { ...protocol, materialSourceId, delighting },
+      });
+      setProject(next);
+      setArtifact(null);
+      setProblem(null);
+    } catch (reason) {
+      setProblem(failure(reason));
+    }
   }
 
   async function command(commandValue: TrimSheetDocumentCommand): Promise<ProjectProjection> {
@@ -454,7 +574,7 @@ function App() {
   }
 
   async function createDocumentAndCompile(seed: ProjectProjection, materialId: string) {
-    setActivity("compiling");
+    setActivity("importing");
     setProblem(null);
     try {
       let current = seed;
@@ -466,12 +586,16 @@ function App() {
       if (current.document?.primaryMaterial !== materialId) {
         current = await applyCommand({ type: "set_primary_material", materialId });
       }
-      const compiled = await invoke<CompiledSheetProjection>("compile_trim_sheet_document", { request: protocol });
       previewDraftId.current += 1;
       setPreview(null);
       setProject(current);
-      setArtifact(compiled);
-      setSelectedRegionId((selected) => compiled.regions.some((region) => region.regionId === selected) ? selected : null);
+      setArtifact(null);
+      setSelectedRegionId(null);
+      setProblem({
+        code: "unsupported_stage",
+        message: "Material compilation is not available in the engine skeleton.",
+        recovery: "Keep preparing registered sources; Stage 1 will install the first executable route.",
+      });
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -622,6 +746,7 @@ function App() {
   }
 
   async function deletePatch(patchId: string) {
+    setDraftPatchPreview((draft) => draft?.patchId === patchId ? null : draft);
     setActivePatchId((active) => active === patchId ? null : active);
     setPatchTool(null);
     try {
@@ -635,6 +760,7 @@ function App() {
   async function replacePatchGeometry(patchId: string, geometry: PatchGeometry) {
     try { await patchCommand({ type: "replace_geometry", patchId, geometry }, Date.now()); }
     catch (reason) { setProblem(failure(reason)); }
+    finally { setDraftPatchPreview((draft) => draft?.patchId === patchId ? null : draft); }
   }
 
   async function setResolution(size: number) {
@@ -740,6 +866,8 @@ function App() {
           selectedSource={selectedSource}
           onSelect={chooseSource}
           onAddSourceSet={() => void addSourceSet()}
+          onSetExemplarGroup={(id, group) => void setExemplarGroup(id, group)}
+          onSetDelightingIntent={(id, intent) => void setDelightingIntent(id, intent)}
         /> : null}
         {paneMode === "full" || paneMode === "without-inspector" ? <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         {paneMode !== "sheet-only" ? <section className="source-workspace">
@@ -754,6 +882,22 @@ function App() {
             <button className={patchTool === "rectangle" ? "active" : ""} onClick={() => setPatchTool((tool) => tool === "rectangle" ? null : "rectangle")} disabled={!selectedSource}>Rectangle</button>
             <button className={patchTool === "four-point" ? "active" : ""} onClick={() => setPatchTool((tool) => tool === "four-point" ? null : "four-point")} disabled={!selectedSource}>Four Point</button>
             <button onClick={() => activePatchId && void deletePatch(activePatchId)} disabled={!activePatchId}>Delete Patch</button>
+            <label className="normal-setting" title="Applied explicitly when importing or replacing a tangent-space Normal map.">
+              Normal convention
+              <select value={normalConvention} onChange={(event) => setNormalConvention(event.currentTarget.value as "open_gl" | "direct_x")}>
+                <option value="open_gl">OpenGL (+Y)</option>
+                <option value="direct_x">DirectX (-Y)</option>
+              </select>
+            </label>
+            <label title="Maximum transient rectification rate. Actual rate is limited by available CPU time.">
+              Draft preview
+              <select value={draftPreviewFps} onChange={(event) => setDraftPreviewFps(Number(event.currentTarget.value) as 10 | 30 | 60)}>
+                <option value={10}>10 FPS</option>
+                <option value={30}>30 FPS</option>
+                <option value={60}>60 FPS</option>
+              </select>
+              <output className="draft-preview-actual">{actualDraftPreviewFps ? `~${actualDraftPreviewFps} actual` : "idle"}</output>
+            </label>
           </div>
           <SourceCanvas
             source={selectedSource}
@@ -767,7 +911,9 @@ function App() {
             activePatchId={activePatchId}
             onEditPatch={setActivePatchId}
             onCommitPatch={(patchId, geometry) => void replacePatchGeometry(patchId, geometry)}
-            onExitPatch={() => setActivePatchId(null)}
+            onDraftPatch={setDraftPatchPreview}
+            onDeletePatch={(patchId) => void deletePatch(patchId)}
+            onExitPatch={() => { setDraftPatchPreview(null); setActivePatchId(null); }}
             tool={patchTool}
             onCreatePatch={(geometry, fourPoint) => void createPatch(geometry, fourPoint)}
             onCancelTool={() => setPatchTool(null)}
@@ -778,6 +924,7 @@ function App() {
           project={project}
           artifact={artifact}
           preview={preview}
+          preparedPatchPreview={activePatchId ? preparedPatchPreview : null}
           mapView={mapView}
           selectedRegionId={selectedRegionId}
           setSelectedRegionId={setSelectedRegionId}
@@ -809,7 +956,7 @@ function App() {
       <footer className="statusbar">
         <span>{project?.name ?? "Untitled"}</span>
         <span>{buildState}</span>
-        <span>{selectedSource ? `${channelLabel(selectedSource.channel)} / ${selectedSource.width} x ${selectedSource.height}` : "No source selected"}</span>
+        <span>{selectedSource ? `${channelLabel(selectedSource.channel)} / ${selectedSource.orientedSize.width} x ${selectedSource.orientedSize.height}` : "No source selected"}</span>
       </footer>
       {activity === "starting" ? <div className="busy-corner">Starting untitled draft...</div> : null}
       {problem ? <div className="global-error" role="alert"><strong>{problem.message}</strong><span>{problem.recovery}</span></div> : null}
@@ -824,18 +971,67 @@ function SourceLibrary(props: {
   selectedSource: SourceProjection | null;
   onSelect: (sourceSetId: string, channel: SourceChannel) => void;
   onAddSourceSet: () => void;
+  onSetExemplarGroup: (materialSourceId: string, exemplarGroup: string | null) => void;
+  onSetDelightingIntent: (materialSourceId: string, delighting: DelightingIntent) => void;
 }) {
-  const sourceSets = props.project?.sourceSets ?? [];
+  const sourceSets = props.project?.materialSources ?? [];
   return <aside className="source-library">
     <header className="panel-title"><span>WORKPLACE</span></header>
     <section className="library-section"><div className="section-head"><span>SOURCES</span><b>{sourceSets.length}</b></div>
       {sourceSets.map((set) => {
-        const base = props.project?.sources.find((source) => source.sourceSetId === set.id && source.channel === "base_color");
-        const count = props.project?.sources.filter((source) => source.sourceSetId === set.id).length ?? 0;
-        return <button key={set.id} className={`source-set ${set.id === props.activeSourceSetId ? "active" : ""}`} onClick={() => props.onSelect(set.id, base?.channel ?? "base_color")}>
-          <span className="thumb">{base ? <img src={base.thumbnailDataUrl} alt="" /> : "+"}</span>
-          <span><strong>{base?.displayName ?? set.name}</strong><small>{count} map{count === 1 ? "" : "s"}</small></span>
-        </button>;
+        const channels = set.registeredChannels?.channels ?? [];
+        const base = channels.find((source) => source.channel === "base_color");
+        const count = channels.length;
+        return <div key={set.id} className="source-set-entry">
+          <button className={`source-set ${set.id === props.activeSourceSetId ? "active" : ""}`} onClick={() => props.onSelect(set.id, base?.channel ?? "base_color")}>
+            <span className="thumb">{base ? <img src={base.thumbnailDataUrl} alt="" /> : "+"}</span>
+            <span><strong>{base?.displayName ?? set.name}</strong><small>{count} map{count === 1 ? "" : "s"} · rev {set.sourceRevision}</small></span>
+          </button>
+          <input
+            key={`${set.id}:${set.sourceRevision}`}
+            className="exemplar-group"
+            aria-label={`Exemplar group for ${set.name}`}
+            defaultValue={set.exemplarGroup ?? ""}
+            placeholder="Exemplar group"
+            onBlur={(event) => {
+              const value = event.currentTarget.value.trim() || null;
+              if (value !== set.exemplarGroup) props.onSetExemplarGroup(set.id, value);
+            }}
+            onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+          />
+          <label className="delighting-control">
+            <span>De-lighting</span>
+            <select
+              aria-label={`De-lighting route for ${set.name}`}
+              value={set.delighting.route.route}
+              onChange={(event) => {
+                const route = event.currentTarget.value;
+                const nextRoute: DelightingIntent["route"] = route === "classical_low_frequency"
+                  ? { route: "classical_low_frequency" }
+                  : route === "local_intrinsic_provider"
+                    ? { route: "local_intrinsic_provider", provider_id: "local-intrinsic-v1", fallback: "none" }
+                    : { route: "pass_through", reason: "user_disabled" };
+                props.onSetDelightingIntent(set.id, { ...set.delighting, route: nextRoute });
+              }}
+            >
+              <option value="pass_through">Off / PassThrough</option>
+              <option value="classical_low_frequency">Classical low frequency</option>
+              <option value="local_intrinsic_provider">Local intrinsic (unavailable)</option>
+            </select>
+          </label>
+          <label className="delighting-strength">
+            <span>Strength {Math.round(set.delighting.classical.strengthMilli / 10)}%</span>
+            <input
+              type="range" min="0" max="1000" step="10"
+              value={set.delighting.classical.strengthMilli}
+              disabled={set.delighting.route.route !== "classical_low_frequency"}
+              onChange={(event) => props.onSetDelightingIntent(set.id, {
+                ...set.delighting,
+                classical: { ...set.delighting.classical, strengthMilli: Number(event.currentTarget.value) },
+              })}
+            />
+          </label>
+        </div>;
       })}
       <button className="new-source" onClick={props.onAddSourceSet}>+ New source</button>
     </section>
@@ -863,7 +1059,7 @@ function MapSlots(props: {
         key={option.value}
         className={`map-slot ${props.selectedChannel === option.value ? "active" : ""} ${source ? "filled" : ""}`}
         disabled={blocked}
-        title={blocked ? "Add Base Color to anchor this source set first." : source?.sourcePath ?? `Add ${option.label}`}
+        title={blocked ? "Add Base Color to anchor this source set first." : source?.original.path ?? `Add ${option.label}`}
         onClick={() => {
           props.onSelect(option.value);
           if (!source) props.onOpen(option.value);
@@ -936,22 +1132,34 @@ function SourceCanvas(props: {
   activePatchId: string | null;
   onEditPatch: (patchId: string) => void;
   onCommitPatch: (patchId: string, geometry: PatchGeometry) => void;
+  onDraftPatch: (draft: { patchId: string; geometry: PatchGeometry } | null) => void;
+  onDeletePatch: (patchId: string) => void;
   onExitPatch: () => void;
   tool: "rectangle" | "four-point" | null;
   onCreatePatch: (geometry: PatchGeometry, fourPoint: boolean) => void;
   onCancelTool: () => void;
 }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const viewport = useViewportController(props.source ? { width: props.source.width, height: props.source.height } : null);
+  const viewport = useViewportController(props.source?.orientedSize ?? null);
   const cropDrag = useRef<{ pointerId: number; action: CropDragAction; origin: NormalizedBounds; x: number; y: number } | null>(null);
   const [draftCrop, setDraftCrop] = useState<NormalizedBounds | null>(null);
   const draftCropRef = useRef<NormalizedBounds | null>(null);
   const previewFrame = useRef<number | null>(null);
-  const patchDrag = useRef<{ pointerId: number; patchId: string; corner: number; corners: PatchGeometry["corners"] } | null>(null);
+  const patchDrag = useRef<
+    | { kind: "corner"; pointerId: number; patchId: string; corner: number; corners: PatchGeometry["corners"] }
+    | { kind: "move"; pointerId: number; patchId: string; start: { x: number; y: number }; corners: PatchGeometry["corners"] }
+    | { kind: "resize"; pointerId: number; patchId: string; handle: PatchResizeHandle; corners: PatchGeometry["corners"] }
+    | { kind: "rotate"; pointerId: number; patchId: string; center: { x: number; y: number }; startAngle: number; corners: PatchGeometry["corners"] }
+    | null
+  >(null);
   const patchCreate = useRef<{ pointerId: number; start: { x: number; y: number } } | null>(null);
   const [draftPatch, setDraftPatch] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
+  const draftPatchRef = useRef<{ patchId: string; geometry: PatchGeometry } | null>(null);
   const [draftRectangle, setDraftRectangle] = useState<PatchGeometry | null>(null);
   const [fourPointDraft, setFourPointDraft] = useState<Array<{ x: number; y: number }>>([]);
+  const [pointEditPatchId, setPointEditPatchId] = useState<string | null>(null);
+  const [loupePoint, setLoupePoint] = useState<{ x: number; y: number; corner: number; clientX: number; clientY: number } | null>(null);
+  const [patchMenu, setPatchMenu] = useState<{ patchId: string; clientX: number; clientY: number } | null>(null);
   const effectiveCrop = draftCrop ?? props.crop?.bounds ?? null;
 
   useEffect(() => {
@@ -963,6 +1171,35 @@ function SourceCanvas(props: {
     setDraftRectangle(null);
     setFourPointDraft([]);
   }, [props.tool]);
+
+  useEffect(() => {
+    if (pointEditPatchId !== props.activePatchId) setPointEditPatchId(null);
+  }, [props.activePatchId]);
+
+  useEffect(() => {
+    function keyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      if (patchMenu) setPatchMenu(null);
+      else if (pointEditPatchId) setPointEditPatchId(null);
+      else props.onExitPatch();
+    }
+    window.addEventListener("keydown", keyDown);
+    return () => window.removeEventListener("keydown", keyDown);
+  }, [patchMenu, pointEditPatchId, props.onExitPatch]);
+
+  useEffect(() => {
+    if (!patchMenu) return;
+    function dismiss(event: PointerEvent) {
+      if (!(event.target as Element | null)?.closest(".patch-context-menu")) setPatchMenu(null);
+    }
+    function dismissBlur() { setPatchMenu(null); }
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("blur", dismissBlur);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("blur", dismissBlur);
+    };
+  }, [patchMenu]);
 
   function point(event: React.PointerEvent): { x: number; y: number } {
     const rect = stageRef.current?.getBoundingClientRect();
@@ -983,9 +1220,27 @@ function SourceCanvas(props: {
     const activePoint = patchDrag.current;
     if (activePoint?.pointerId === event.pointerId) {
       const target = point(event);
-      const corners = [...activePoint.corners] as unknown as [typeof target, typeof target, typeof target, typeof target];
-      corners[activePoint.corner] = target;
-      setDraftPatch({ patchId: activePoint.patchId, geometry: { corners } });
+      let corners: PatchGeometry["corners"];
+      if (activePoint.kind === "corner") {
+        const next = [...activePoint.corners] as unknown as [typeof target, typeof target, typeof target, typeof target];
+        next[activePoint.corner] = target;
+        corners = next;
+        setLoupePoint({ ...target, corner: activePoint.corner, clientX: event.clientX, clientY: event.clientY });
+      } else if (activePoint.kind === "move") {
+        corners = movePatch(activePoint.corners, target.x - activePoint.start.x, target.y - activePoint.start.y);
+      } else if (activePoint.kind === "resize") {
+        corners = resizePatch(activePoint.corners, activePoint.handle, target, {
+          proportional: event.shiftKey,
+          fromCenter: event.altKey,
+        });
+      } else {
+        const angle = patchPointerAngle(target, activePoint.center, props.source!.orientedSize);
+        corners = rotatePatch(activePoint.corners, activePoint.center, angle - activePoint.startAngle, props.source!.orientedSize);
+      }
+      const draft = { patchId: activePoint.patchId, geometry: { corners } };
+      draftPatchRef.current = draft;
+      setDraftPatch(draft);
+      props.onDraftPatch(draft);
       return;
     }
     const activeCrop = cropDrag.current;
@@ -1018,7 +1273,9 @@ function SourceCanvas(props: {
     if (patchDrag.current?.pointerId === event.pointerId) {
       const patchId = patchDrag.current.patchId;
       patchDrag.current = null;
-      if (draftPatch?.patchId === patchId) props.onCommitPatch(patchId, draftPatch.geometry);
+      setLoupePoint(null);
+      if (draftPatchRef.current?.patchId === patchId) props.onCommitPatch(patchId, draftPatchRef.current.geometry);
+      draftPatchRef.current = null;
     }
     const activeCrop = cropDrag.current;
     if (activeCrop?.pointerId === event.pointerId) {
@@ -1037,10 +1294,40 @@ function SourceCanvas(props: {
   }
 
   function beginPatchPoint(event: React.PointerEvent<Element>, patch: Patch, corner: number) {
+    if (event.button !== 0) return;
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
-    patchDrag.current = { pointerId: event.pointerId, patchId: patch.id, corner, corners: geometry.corners };
+    patchDrag.current = { kind: "corner", pointerId: event.pointerId, patchId: patch.id, corner, corners: geometry.corners };
+    setLoupePoint({ ...geometry.corners[corner]!, corner, clientX: event.clientX, clientY: event.clientY });
+  }
+
+  function beginPatchMove(event: React.PointerEvent<Element>, patch: Patch) {
+    if (event.button !== 0 || props.tool) return;
+    event.stopPropagation();
+    props.onEditPatch(patch.id);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
+    patchDrag.current = { kind: "move", pointerId: event.pointerId, patchId: patch.id, start: point(event), corners: geometry.corners };
+  }
+
+  function beginPatchResize(event: React.PointerEvent<Element>, patch: Patch, handle: PatchResizeHandle) {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
+    patchDrag.current = { kind: "resize", pointerId: event.pointerId, patchId: patch.id, handle, corners: geometry.corners };
+  }
+
+  function beginPatchRotate(event: React.PointerEvent<Element>, patch: Patch, center: { x: number; y: number }) {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
+    patchDrag.current = {
+      kind: "rotate", pointerId: event.pointerId, patchId: patch.id, center,
+      startAngle: patchPointerAngle(point(event), center, props.source!.orientedSize), corners: geometry.corners,
+    };
   }
 
   function beginPatchCreate(event: React.PointerEvent<HTMLDivElement>) {
@@ -1063,6 +1350,27 @@ function SourceCanvas(props: {
     });
   }
 
+  function openPatchMenu(event: React.MouseEvent<Element>, patch: Patch) {
+    event.preventDefault();
+    event.stopPropagation();
+    props.onEditPatch(patch.id);
+    setPointEditPatchId(null);
+    setPatchMenu({ patchId: patch.id, clientX: event.clientX, clientY: event.clientY });
+  }
+
+  function normalizePatch(patchId: string) {
+    const patch = props.patches.find((candidate) => candidate.id === patchId);
+    if (!patch || !props.source) return;
+    const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
+    const normalizedGeometry = { corners: normalizePatchToRectangle(geometry.corners, props.source.orientedSize) };
+    const normalizedDraft = { patchId: patch.id, geometry: normalizedGeometry };
+    setPatchMenu(null);
+    draftPatchRef.current = normalizedDraft;
+    setDraftPatch(normalizedDraft);
+    props.onDraftPatch(normalizedDraft);
+    props.onCommitPatch(patch.id, normalizedGeometry);
+  }
+
   const previewGeometry = props.tool === "four-point" && fourPointDraft.length
     ? { corners: [...fourPointDraft, ...Array.from({ length: 4 - fourPointDraft.length }, () => fourPointDraft.at(-1)!)] as unknown as PatchGeometry["corners"] }
     : draftRectangle;
@@ -1075,19 +1383,20 @@ function SourceCanvas(props: {
     onPointerMove={movePointer}
     onPointerUp={endPointer}
     onPointerCancel={endPointer}
-    onClick={(event) => { if (event.target === event.currentTarget && !props.tool) props.onExitPatch(); }}
+    onContextMenu={(event) => event.preventDefault()}
+    onClick={(event) => { if (event.target === event.currentTarget && !props.tool) { setPointEditPatchId(null); props.onExitPatch(); } }}
   >
     {props.source ? <div
       ref={stageRef}
       className="source-stage"
-      style={{ width: props.source.width, height: props.source.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
+      style={{ width: props.source.orientedSize.width, height: props.source.orientedSize.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
       onPointerDown={beginPatchCreate}
     >
       <img
         src={props.source.thumbnailDataUrl}
         alt={`${channelLabel(props.source.channel)} source ${props.source.displayName}`}
         draggable={false}
-        onClick={() => { if (!props.tool) props.onExitPatch(); }}
+        onClick={() => { if (!props.tool) { setPointEditPatchId(null); props.onExitPatch(); } }}
       />
       {effectiveCrop ? <button
         className="source-crop"
@@ -1108,26 +1417,94 @@ function SourceCanvas(props: {
     </div>}
     {props.source ? <svg
       className="patch-overlay"
-      style={{ left: viewport.view.x, top: viewport.view.y, width: props.source.width * viewport.view.scale, height: props.source.height * viewport.view.scale }}
-      viewBox={`0 0 ${props.source.width} ${props.source.height}`}
+      style={{ left: viewport.view.x, top: viewport.view.y, width: props.source.orientedSize.width * viewport.view.scale, height: props.source.orientedSize.height * viewport.view.scale }}
+      viewBox={`0 0 ${props.source.orientedSize.width} ${props.source.orientedSize.height}`}
       aria-label="Editable patch outlines"
     >
       {props.patches.map((patch) => {
         const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
         const active = props.activePatchId === patch.id;
-        const points = geometry.corners.map((corner) => `${corner.x * props.source!.width},${corner.y * props.source!.height}`).join(" ");
+        const pointEditing = pointEditPatchId === patch.id;
+        const points = geometry.corners.map((corner) => `${corner.x * props.source!.orientedSize.width},${corner.y * props.source!.orientedSize.height}`).join(" ");
         const handleRadius = 8 / viewport.view.scale;
         const hitRadius = 15 / viewport.view.scale;
-        return <g key={patch.id} className={`patch-outline ${active ? "active" : ""}`}>
-          <polygon points={points} onDoubleClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); }} />
-          {active ? geometry.corners.map((corner, index) => <g key={index} className="patch-point">
-            <circle className="patch-point-hit" cx={corner.x * props.source!.width} cy={corner.y * props.source!.height} r={hitRadius} onPointerDown={(event) => beginPatchPoint(event, patch, index)} />
-            <circle className="patch-point-visible" cx={corner.x * props.source!.width} cy={corner.y * props.source!.height} r={handleRadius} />
-          </g>) : null}
+        const bounds = patchBounds(geometry.corners);
+        const box = {
+          left: bounds.left * props.source!.orientedSize.width,
+          right: bounds.right * props.source!.orientedSize.width,
+          top: bounds.top * props.source!.orientedSize.height,
+          bottom: bounds.bottom * props.source!.orientedSize.height,
+        };
+        const boxHandles: ReadonlyArray<{ handle: PatchResizeHandle; x: number; y: number }> = [
+          { handle: "nw", x: box.left, y: box.top },
+          { handle: "n", x: (box.left + box.right) * 0.5, y: box.top },
+          { handle: "ne", x: box.right, y: box.top },
+          { handle: "e", x: box.right, y: (box.top + box.bottom) * 0.5 },
+          { handle: "se", x: box.right, y: box.bottom },
+          { handle: "s", x: (box.left + box.right) * 0.5, y: box.bottom },
+          { handle: "sw", x: box.left, y: box.bottom },
+          { handle: "w", x: box.left, y: (box.top + box.bottom) * 0.5 },
+        ];
+        const transformHandle = 10 / viewport.view.scale;
+        const rotationInset = 15 / viewport.view.scale;
+        const center = { x: (bounds.left + bounds.right) * 0.5, y: (bounds.top + bounds.bottom) * 0.5 };
+        return <g key={patch.id} className={`patch-outline ${active ? "active" : ""} ${pointEditing ? "point-editing" : ""}`} onContextMenu={(event) => openPatchMenu(event, patch)}>
+          <polygon
+            points={points}
+            onPointerDown={(event) => beginPatchMove(event, patch)}
+            onClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); }}
+            onDoubleClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); setPointEditPatchId(patch.id); }}
+          />
+          {active && !pointEditing ? <g className="patch-transform">
+            <rect className="rotation-guide" x={box.left - rotationInset} y={box.top - rotationInset} width={box.right - box.left + rotationInset * 2} height={box.bottom - box.top + rotationInset * 2} />
+            <rect className="rotation-hit" x={box.left - rotationInset} y={box.top - rotationInset} width={box.right - box.left + rotationInset * 2} height={box.bottom - box.top + rotationInset * 2} onPointerDown={(event) => beginPatchRotate(event, patch, center)}>
+              <title>Drag the outer frame to rotate</title>
+            </rect>
+            {boxHandles.map(({ handle, x, y }) => <rect
+              key={handle}
+              x={x - transformHandle * 0.5}
+              y={y - transformHandle * 0.5}
+              width={transformHandle}
+              height={transformHandle}
+              className={`resize-handle resize-${handle}`}
+              onPointerDown={(event) => beginPatchResize(event, patch, handle)}
+            />)}
+          </g> : null}
+          {pointEditing ? geometry.corners.map((corner, index) => {
+            const cx = corner.x * props.source!.orientedSize.width;
+            const cy = corner.y * props.source!.orientedSize.height;
+            return <g key={index} className="patch-point">
+              <circle className="patch-point-hit" cx={cx} cy={cy} r={hitRadius} onPointerDown={(event) => beginPatchPoint(event, patch, index)} />
+              <circle className="patch-point-visible" cx={cx} cy={cy} r={handleRadius} />
+              <line className="patch-point-crosshair" x1={cx - handleRadius * 1.5} y1={cy} x2={cx + handleRadius * 1.5} y2={cy} />
+              <line className="patch-point-crosshair" x1={cx} y1={cy - handleRadius * 1.5} x2={cx} y2={cy + handleRadius * 1.5} />
+            </g>;
+          }) : null}
         </g>;
       })}
-      {previewGeometry ? <polygon className="patch-outline draft" points={previewGeometry.corners.map((corner) => `${corner.x * props.source!.width},${corner.y * props.source!.height}`).join(" ")} /> : null}
+      {previewGeometry ? <polygon className="patch-outline draft" points={previewGeometry.corners.map((corner) => `${corner.x * props.source!.orientedSize.width},${corner.y * props.source!.orientedSize.height}`).join(" ")} /> : null}
     </svg> : null}
+    {props.source && loupePoint ? <div
+      className="corner-loupe"
+      style={cornerLoupeStyle(props.source, loupePoint, viewport.view.scale)}
+      aria-live="off"
+    >
+      <span>Corner {loupePoint.corner + 1}</span>
+      <i /><b />
+    </div> : null}
+    {patchMenu ? <div
+      className="patch-context-menu"
+      role="menu"
+      style={{ left: Math.max(8, Math.min(patchMenu.clientX, window.innerWidth - 194)), top: Math.max(8, Math.min(patchMenu.clientY, window.innerHeight - 92)) }}
+    >
+      <button role="menuitem" onClick={() => normalizePatch(patchMenu.patchId)}>
+        <span>Normalize to rectangle</span><small>Make edges square</small>
+      </button>
+      <hr />
+      <button role="menuitem" className="danger" onClick={() => { const id = patchMenu.patchId; setPatchMenu(null); props.onDeletePatch(id); }}>
+        <span>Delete patch</span><small>Delete</small>
+      </button>
+    </div> : null}
     {props.importing ? <div className="canvas-state">Importing source...</div> : null}
     {props.source ? <div className="viewport-tools">
       <button onClick={() => viewport.zoom(0.8)}>-</button>
@@ -1158,6 +1535,21 @@ function rectangleGeometry(start: { x: number; y: number }, end: { x: number; y:
 function rectangleArea(geometry: PatchGeometry): number {
   const [topLeft, topRight, bottomRight] = geometry.corners;
   return Math.abs((topRight.x - topLeft.x) * (bottomRight.y - topLeft.y));
+}
+
+function cornerLoupeStyle(source: SourceProjection, point: { x: number; y: number; clientX: number; clientY: number }, viewportScale: number): React.CSSProperties {
+  const magnification = Math.min(6, Math.max(1, viewportScale * 6));
+  const width = source.orientedSize.width * magnification;
+  const height = source.orientedSize.height * magnification;
+  const left = point.clientX + 258 > window.innerWidth ? point.clientX - 258 : point.clientX + 18;
+  const top = point.clientY + 198 > window.innerHeight ? point.clientY - 198 : point.clientY + 18;
+  return {
+    left: Math.max(8, left),
+    top: Math.max(8, top),
+    backgroundImage: `url(${source.thumbnailDataUrl})`,
+    backgroundSize: `${width}px ${height}px`,
+    backgroundPosition: `${120 - point.x * width}px ${90 - point.y * height}px`,
+  };
 }
 
 function PaneSplitter(props: {
@@ -1197,6 +1589,7 @@ function SheetWorkbench(props: {
   project: ProjectProjection | null;
   artifact: CompiledSheetProjection | null;
   preview: PreviewSheetProjection | null;
+  preparedPatchPreview: PreparedPatchPreviewProjection | null;
   mapView: CompiledMapView;
   selectedRegionId: string | null;
   setSelectedRegionId: (id: string | null) => void;
@@ -1223,7 +1616,12 @@ function SheetWorkbench(props: {
   const sheet = validPreview ?? artifact;
   const imageUrl = validPreview?.dataUrl ?? artifact?.maps[props.mapView];
   const sheetMatchesDocument = !!sheet && sheet.topologyHash === topologyHash;
-  const viewport = useViewportController(sheet ? { width: sheet.width, height: sheet.height } : null);
+  const workpieceSize = sheet
+    ? { width: sheet.width, height: sheet.height }
+    : props.preparedPatchPreview
+      ? { width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height }
+      : null;
+  const viewport = useViewportController(workpieceSize);
   return <section className="sheet-workbench">
     <header className="sheet-header">
       <div><strong>HOTSPOT SHEET</strong></div>
@@ -1246,8 +1644,8 @@ function SheetWorkbench(props: {
       <select aria-label="Region padding" title="Mip-safe padding between usable trim regions" value={props.project?.document?.layoutGrid.padding ?? 8} onChange={(event) => void props.setLayoutPadding(Number(event.target.value))} disabled={!props.project?.document}>
         {[0, 2, 4, 8, 16, 32].map((padding) => <option key={padding} value={padding}>{padding}px padding</option>)}
       </select>
-      <button className="primary" onClick={props.build} disabled={!props.primaryMaterial || props.activity !== "idle"}>
-        {props.activity === "compiling" ? "Compiling..." : props.project?.document ? "Update sheet" : "Build trim sheet"}
+      <button className="primary" onClick={props.build} disabled title="Unavailable until Stage 1 installs the first engine route">
+        Engine unavailable
       </button>
     </section>
     <section
@@ -1262,7 +1660,13 @@ function SheetWorkbench(props: {
       onPointerUp={viewport.endPan}
       onPointerCancel={viewport.endPan}
     >
-      {!sheet || !imageUrl ? <div className="empty-sheet">
+      {!sheet || !imageUrl ? props.preparedPatchPreview ? <div
+        className="rectified-workpiece"
+        style={{ width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
+      >
+        <img src={props.preparedPatchPreview.dataUrl} alt="Selected Stage 3 rectified patch" />
+        <span>Rectified patch</span>
+      </div> : <div className="empty-sheet">
         <strong>{props.project?.legacyLayoutDiscarded ? "No trim sheet yet" : "No compiled sheet"}</strong>
         <span>{props.project?.legacyLayoutDiscarded ? "Sources, maps, and patches were preserved. Old layout state is not shown or converted." : "Build from the current Base Color when ready."}</span>
       </div> : <div
@@ -1286,7 +1690,7 @@ function SheetWorkbench(props: {
           onClick={(event) => { event.stopPropagation(); props.setSelectedRegionId(region.regionId === props.selectedRegionId ? null : region.regionId); }}
         ><span>{region.displayName}</span></button>)}</div>
       </div>}
-      {sheet ? <div className="viewport-tools">
+      {workpieceSize ? <div className="viewport-tools">
         <button onClick={() => viewport.zoom(0.8)}>-</button>
         <output>{Math.round(viewport.view.scale * 100)}%</output>
         <button onClick={() => viewport.zoom(1.25)}>+</button>
@@ -1409,7 +1813,7 @@ function buildStatus(project: ProjectProjection | null, artifact: CompiledSheetP
   if (activity === "importing") return "Importing";
   if (activity === "compiling") return `Compiling revision ${project?.document?.documentRevision ?? 1}`;
   if (problem) return "Region error";
-  if (!project?.sources.some((source) => source.channel === "base_color")) return "Empty";
+  if (!project?.materialSources.some((source) => source.registeredChannels?.channels.some((channel) => channel.channel === "base_color"))) return "Empty";
   if (!project.document) return "Ready";
   if (stale || !artifact) return "Stale";
   return `Ready rev ${artifact.documentRevision}`;

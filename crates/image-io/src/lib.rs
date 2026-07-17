@@ -1,5 +1,9 @@
 #![doc = "Bounded, color-aware raster inspection and thumbnail decode boundary."]
 
+mod normalization;
+
+pub use normalization::*;
+
 use std::{
     fs,
     io::{Cursor, Read, Seek},

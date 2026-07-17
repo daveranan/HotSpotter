@@ -198,7 +198,7 @@ pub fn resolve_compile_plan(
 }
 
 /// The sole compiler entry point. Its returned regions are the overlay plan used for its pixels.
-pub fn compile_document(
+pub(crate) fn compile_document(
     document: &TrimSheetDocument,
     registered_maps: &[RegisteredMaterialMap],
 ) -> Result<CompiledSheet, SheetCompileError> {

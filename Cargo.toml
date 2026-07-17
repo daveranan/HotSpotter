@@ -6,6 +6,10 @@ members = [
   "crates/export",
   "crates/geometry",
   "crates/image-io",
+  "crates/material-analysis",
+  "crates/material-synthesis",
+  "crates/placement-solver",
+  "crates/effect-compiler",
   "crates/preview",
   "crates/project-store",
   "crates/render-core",
@@ -21,6 +25,10 @@ license = "LicenseRef-Proprietary"
 [workspace.dependencies]
 base64 = "0.22"
 hot-trimmer-domain = { path = "crates/domain" }
+hot-trimmer-material-analysis = { path = "crates/material-analysis" }
+hot-trimmer-material-synthesis = { path = "crates/material-synthesis" }
+hot-trimmer-placement-solver = { path = "crates/placement-solver" }
+hot-trimmer-effect-compiler = { path = "crates/effect-compiler" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 kamadak-exif = "0.6"
 moxcms = "0.8"

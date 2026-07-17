@@ -7,9 +7,14 @@ license.workspace = true
 
 [dependencies]
 hot-trimmer-domain.workspace = true
+hot-trimmer-effect-compiler.workspace = true
 hot-trimmer-geometry = { path = "../geometry" }
+hot-trimmer-material-analysis.workspace = true
+hot-trimmer-material-synthesis.workspace = true
+hot-trimmer-placement-solver.workspace = true
 hot-trimmer-render-core = { path = "../render-core" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

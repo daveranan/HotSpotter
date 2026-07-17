@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::Cursor,
     path::{Path, PathBuf},
@@ -9,22 +9,35 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hot_trimmer_domain::{
-    ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, MaterialMapKind, PatchCommand,
-    Projection, RegionId, SourceId,
+    ALGORITHM_STACK_CONTRACT_VERSION, AlgorithmProvenance, AssignmentProvenance,
+    CancellationToken as EngineCancellationToken, ChannelRegistration,
+    CompilerRequestHeader, ContentDigest, ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION,
+    DelightingIntent,
+    MaterialMapKind, MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
+    NormalConvention, OriginalAssetProvenance, OrientedPixelSize, Projection, RegisteredChannel,
+    RegisteredChannelSet, RegionId, SourceId, SourceOwnershipIntent, SourceSetId,
     TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, decode_rgba8_bytes_cancellable,
-    inspect_bytes_with_policy, inspect_path_with_policy,
+    inspect_bytes_with_policy, inspect_path_with_policy, prepare_registered_channel_set,
+    NormalizationSettings, PreparedChannelSet,
 };
+use hot_trimmer_material_analysis::prepare_delit_exemplar;
 use hot_trimmer_project_store::{
     ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
 };
 use hot_trimmer_sheet_compiler::{
-    CompiledMapSet, PreviewMapKind, RegisteredMaterialMap, ResolvedRegion, compile_document,
+    AlgorithmCompiler, CompiledMapSet, PreviewMapKind, RegisteredMaterialMap, ResolvedRegion,
     CompiledPreviewMap, compile_preview_map_incremental,
 };
 use image::{DynamicImage, ImageFormat, RgbaImage};
+use hot_trimmer_render_core::{
+    ExemplarMaskIntent, PlanarArea, PreparedExemplar, PreparedExemplarCache,
+    PreparedExemplarRequest, PreparedExemplarScope,
+    RectificationQuality, RectificationWorkLimits, RenderCancellationToken,
+    prepare_registered_exemplar,
+};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -46,7 +59,9 @@ pub struct ProjectSession {
     app_data_dir: PathBuf,
     recovery_dir: PathBuf,
     draft_dir: PathBuf,
-    source_projection_cache: Mutex<HashMap<(String, String), SourceProjection>>,
+    source_projection_cache: Mutex<HashMap<(String, String, String), SourceProjection>>,
+    preview_prepared_sources: HashMap<(String, u64), Arc<PreparedChannelSet>>,
+    prepared_exemplars: PreparedExemplarCache,
 }
 
 impl ProjectSession {
@@ -60,6 +75,8 @@ impl ProjectSession {
             recovery_dir: paths.recovery.clone(),
             draft_dir: paths.drafts.clone(),
             source_projection_cache: Mutex::new(HashMap::new()),
+            preview_prepared_sources: HashMap::new(),
+            prepared_exemplars: PreparedExemplarCache::default(),
         }
     }
 
@@ -75,6 +92,8 @@ impl ProjectSession {
             .join(format!("baseline-{}.hottrimmer", Uuid::new_v4()));
         store.backup_atomic(&baseline).map_err(store_error)?;
         self.store = Some(store);
+        self.preview_prepared_sources.clear();
+        self.prepared_exemplars = PreparedExemplarCache::default();
         self.baseline = Some(baseline);
         self.dirty = false;
         self.is_draft = is_draft;
@@ -92,7 +111,11 @@ impl ProjectSession {
         &self,
         source: &StoredSource,
     ) -> Result<SourceProjection, UserFacingError> {
-        let key = (source.input.id.to_string(), source.input.sha256.clone());
+        let key = (
+            source.input.id.to_string(),
+            source.input.sha256.clone(),
+            serde_json::to_string(&source.registration).map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?,
+        );
         if let Some(projection) = self.source_projection_cache.lock().map_err(|_| poisoned())?
             .get(&key).cloned()
         {
@@ -144,13 +167,49 @@ pub struct RecentProject {
 #[serde(rename_all = "camelCase")]
 pub struct SourceProjection {
     id: String,
-    source_set_id: String,
     channel: SourceChannel,
     display_name: String,
-    source_path: String,
-    width: u32,
-    height: u32,
+    original: OriginalSourceProjection,
+    storage: SourceStorageProjection,
+    oriented_size: OrientedSizeProjection,
+    orientation: u16,
+    interpretation: hot_trimmer_domain::ChannelInterpretation,
+    normal_convention: NormalConvention,
+    assignment_provenance: AssignmentProvenance,
+    confidence_milli: u16,
     thumbnail_data_url: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OriginalSourceProjection { path: String, immutable_digest: String, encoded_bytes: u64 }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceStorageProjection { ownership: SourceOwnership, external_path: Option<String> }
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrientedSizeProjection { width: u32, height: u32 }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisteredChannelSetProjection {
+    oriented_size: OrientedSizeProjection,
+    orientation: u16,
+    channels: Vec<SourceProjection>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MaterialSourceProjection {
+    id: String,
+    name: String,
+    exemplar_group: Option<String>,
+    source_revision: u64,
+    registration_digest: String,
+    delighting: DelightingIntent,
+    registered_channels: Option<RegisteredChannelSetProjection>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -162,8 +221,7 @@ pub struct ProjectProjection {
     schema_version: u32,
     dirty: bool,
     is_draft: bool,
-    sources: Vec<SourceProjection>,
-    source_sets: Vec<hot_trimmer_project_store::SourceSetSnapshot>,
+    material_sources: Vec<MaterialSourceProjection>,
     patches: Vec<hot_trimmer_domain::Patch>,
     document: Option<TrimSheetDocument>,
     legacy_layout_discarded: bool,
@@ -196,6 +254,9 @@ pub struct ImportSourceRequest {
     ownership: SourceOwnership,
     channel: SourceChannel,
     source_set_id: Uuid,
+    assignment_provenance: AssignmentProvenance,
+    confidence_milli: u16,
+    normal_convention: NormalConvention,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +265,22 @@ pub struct SourceSlotRequest {
     protocol_version: u16,
     channel: SourceChannel,
     source_set_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetExemplarGroupRequest {
+    protocol_version: u16,
+    material_source_id: Uuid,
+    exemplar_group: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDelightingIntentRequest {
+    protocol_version: u16,
+    material_source_id: Uuid,
+    delighting: DelightingIntent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +311,28 @@ pub struct PatchCommandRequest {
     protocol_version: u16,
     command: PatchCommand,
     coalescing_group: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedPatchPreviewRequest {
+    protocol_version: u16,
+    patch_id: PatchId,
+    max_edge: u32,
+    #[serde(default)]
+    geometry: Option<PatchGeometry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedPatchPreviewProjection {
+    patch_id: PatchId,
+    width: u32,
+    height: u32,
+    data_url: String,
+    perspective_confidence_milli: u16,
+    delighting_route: String,
+    delighting_strength_milli: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,9 +481,16 @@ pub fn import_source(
     let mut session = session.lock().map_err(|_| poisoned())?;
     let store = session.store.as_mut().ok_or_else(no_project)?;
     store
-        .replace_source_in_set(request.source_set_id, request.channel, &input)
-        .map_err(store_error)?;
+        .replace_registered_source_in_set(request.source_set_id, &input, ChannelRegistration {
+            role: request.channel.material_role(),
+            interpretation: request.channel.material_role().required_interpretation(),
+            normal_convention: request.normal_convention,
+            assignment_provenance: request.assignment_provenance,
+            confidence_milli: request.confidence_milli,
+        })
+        .map_err(|failure| source_registration_error(failure, request.channel))?;
     store.refresh_document_assets().map_err(store_error)?;
+    session.prepared_exemplars.invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
     session.mark_mutated();
     *import_job.lock().map_err(|_| poisoned())? = None;
     project_projection(&session)
@@ -414,6 +520,35 @@ pub fn remove_source(
         .as_mut()
         .ok_or_else(no_project)?
         .remove_source_in_set(request.source_set_id, request.channel)
+        .map_err(store_error)?;
+    session.prepared_exemplars.invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn set_exemplar_group(
+    request: SetExemplarGroupRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session.store.as_mut().ok_or_else(no_project)?
+        .set_exemplar_group(request.material_source_id, request.exemplar_group.as_deref())
+        .map_err(store_error)?;
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn set_delighting_intent(
+    request: SetDelightingIntentRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session.store.as_mut().ok_or_else(no_project)?
+        .set_delighting_intent(request.material_source_id, &request.delighting)
         .map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
@@ -477,9 +612,13 @@ pub fn apply_patch_command(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    let store = session.store.as_mut().ok_or_else(no_project)?;
-    store.execute_patch_command(&request.command, request.coalescing_group).map_err(store_error)?;
-    store.refresh_document_assets().map_err(store_error)?;
+    let invalidated = {
+        let store = session.store.as_mut().ok_or_else(no_project)?;
+        let outcome = store.execute_patch_command(&request.command, request.coalescing_group).map_err(store_error)?;
+        store.refresh_document_assets().map_err(store_error)?;
+        outcome.invalidated_patch_ids
+    };
+    for patch_id in invalidated { session.prepared_exemplars.invalidate_patch(patch_id); }
     session.mark_mutated();
     project_projection(&session)
 }
@@ -491,9 +630,13 @@ pub fn undo_patch_command(
 ) -> Result<ProjectProjection, UserFacingError> {
     request.validate().map_err(UserFacingError::from)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    let store = session.store.as_mut().ok_or_else(no_project)?;
-    store.undo_patch_command().map_err(store_error)?;
-    store.refresh_document_assets().map_err(store_error)?;
+    let invalidated = {
+        let store = session.store.as_mut().ok_or_else(no_project)?;
+        let outcome = store.undo_patch_command().map_err(store_error)?;
+        store.refresh_document_assets().map_err(store_error)?;
+        outcome.invalidated_patch_ids
+    };
+    for patch_id in invalidated { session.prepared_exemplars.invalidate_patch(patch_id); }
     session.mark_mutated();
     project_projection(&session)
 }
@@ -505,11 +648,112 @@ pub fn redo_patch_command(
 ) -> Result<ProjectProjection, UserFacingError> {
     request.validate().map_err(UserFacingError::from)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    let store = session.store.as_mut().ok_or_else(no_project)?;
-    store.redo_patch_command().map_err(store_error)?;
-    store.refresh_document_assets().map_err(store_error)?;
+    let invalidated = {
+        let store = session.store.as_mut().ok_or_else(no_project)?;
+        let outcome = store.redo_patch_command().map_err(store_error)?;
+        store.refresh_document_assets().map_err(store_error)?;
+        outcome.invalidated_patch_ids
+    };
+    for patch_id in invalidated { session.prepared_exemplars.invalidate_patch(patch_id); }
     session.mark_mutated();
     project_projection(&session)
+}
+
+#[tauri::command]
+pub fn prepare_patch_preview(
+    request: PreparedPatchPreviewRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<PreparedPatchPreviewProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    if !(64..=2048).contains(&request.max_edge) {
+        return Err(error(ErrorCode::InvalidInput, "Patch preview edge must be between 64 and 2048 pixels."));
+    }
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    let summary = session.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?;
+    let patch = summary.patches.iter().find(|patch| patch.id == request.patch_id)
+        .ok_or_else(|| error(ErrorCode::InvalidInput, "The selected patch no longer exists."))?;
+    let transient = request.geometry.is_some();
+    let geometry = request.geometry.as_ref().unwrap_or(&patch.geometry);
+    let anchor = summary.sources.iter().find(|source| source.input.id == patch.source_id)
+        .ok_or_else(|| error(ErrorCode::ProjectInvalid, "The patch source no longer exists."))?;
+    let source_set_id = SourceSetId::from_bytes(*anchor.source_set_id.as_bytes());
+    let source_set = summary.source_sets.iter().find(|source_set| source_set.id == source_set_id)
+        .ok_or_else(|| error(ErrorCode::ProjectInvalid, "The patch material source no longer exists."))?;
+    let prepared_source_key = (source_set_id.to_string(), source_set.source_revision);
+    let prepared = if let Some(prepared) = session.preview_prepared_sources.get(&prepared_source_key) {
+        Arc::clone(prepared)
+    } else {
+        let (registered, encoded_sources) = preview_registered_channel_set(
+            &session,
+            &summary.sources,
+            anchor.source_set_id,
+        )?;
+        let normalization_settings = NormalizationSettings {
+            max_levels: 1,
+            max_memory_bytes: 268_435_456,
+            ..NormalizationSettings::default()
+        };
+        let prepared = Arc::new(prepare_registered_channel_set(
+            &registered,
+            &encoded_sources,
+            &normalization_settings,
+            &CancellationToken::new(),
+        ).map_err(|failure| error(ErrorCode::ImageImportFailed, &format!("Source preparation failed: {failure}")))?);
+        if session.preview_prepared_sources.len() >= 8 { session.preview_prepared_sources.clear(); }
+        session.preview_prepared_sources.insert(prepared_source_key, Arc::clone(&prepared));
+        prepared
+    };
+    let patch_bytes = serde_json::to_vec(&(patch.id, geometry, patch.rectification))
+        .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+    let revision_digest = ContentDigest::sha256(&patch_bytes);
+    let patch_revision = u64::from_str_radix(&revision_digest.0[..16], 16)
+        .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+    let exemplar_request = PreparedExemplarRequest {
+        exemplar_id: patch.id.to_string(),
+        area: PlanarArea::FourPoint { corners: geometry.corners },
+        lens_correction: None,
+        mask: ExemplarMaskIntent {
+            crop_polygon: geometry.assistance_mask.clone(),
+            minimum_alpha: Some(1.0 / 255.0),
+        },
+        rectification: patch.rectification,
+        physical_aspect_ratio: None,
+        quality: RectificationQuality::Preview,
+        limits: RectificationWorkLimits {
+            preview_max_edge: request.max_edge,
+            authoritative_max_edge: 8_192,
+            max_pixels: 67_108_864,
+            tile_edge: 128,
+        },
+        scope: PreparedExemplarScope {
+            source_set_id,
+            source_revision: source_set.source_revision,
+            patch_id: Some(patch.id),
+            patch_revision,
+        },
+    };
+    let key = hot_trimmer_render_core::exemplar_cache_key(&prepared.cache_key, &exemplar_request);
+    let cached = (!transient).then(|| session.prepared_exemplars.get(&key)).flatten().cloned();
+    let exemplar = if let Some(cached) = cached {
+        cached
+    } else {
+        let value = prepare_registered_exemplar(&prepared, &exemplar_request, &RenderCancellationToken::new())
+            .map_err(|failure| error(ErrorCode::PatchGeometryInvalid, &failure.to_string()))?;
+        if !transient { session.prepared_exemplars.insert_complete(value.clone()); }
+        value
+    };
+    let stage_four = prepare_delit_exemplar(
+        &exemplar,
+        &source_set.delighting,
+        None,
+        &RenderCancellationToken::new(),
+    ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 4 source preparation failed: {failure}")))?;
+    prepared_preview_projection(
+        &exemplar,
+        stage_four.base_color(),
+        &format!("{:?}", stage_four.route_execution),
+        source_set.delighting.classical.strength_milli,
+    )
 }
 
 #[tauri::command]
@@ -564,7 +808,7 @@ pub async fn compile_trim_sheet_document(
 
 fn compile_trim_sheet_document_impl(
     session: &SharedProjectSession,
-    preview_service: &PreviewService,
+    _preview_service: &PreviewService,
 ) -> Result<CompiledSheetProjection, UserFacingError> {
     let summary = {
         let session = session.lock().map_err(|_| poisoned())?;
@@ -572,63 +816,50 @@ fn compile_trim_sheet_document_impl(
     };
     let document = summary.document.as_ref()
         .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
-    let maps = summary
-        .sources
-        .iter()
-        .map(|source| registered_map_cached(source, &preview_service))
-        .collect::<Result<Vec<_>, _>>()?;
-    let compiled = compile_document(document, &maps).map_err(|compile| {
-        error(
+    let request = CompilerRequestHeader {
+        contract_version: ALGORITHM_STACK_CONTRACT_VERSION,
+        source_digests: summary.sources.iter()
+            .map(|source| ContentDigest(source.input.sha256.clone()))
+            .collect(),
+        settings_hash: ContentDigest(hash_hex(document.appearance_hash().map_err(|invalid| {
+            error(ErrorCode::LayoutInvalid, &invalid.to_string())
+        })?)),
+        algorithm_versions: (1_u8..=20).map(|stage| (stage, AlgorithmProvenance {
+            algorithm_id: format!("stage-{stage:02}"),
+            version: String::from("0.0.0-unsupported"),
+        })).collect::<BTreeMap<_, _>>(),
+        template_topology_hash: ContentDigest(hash_hex(document.topology.topology_hash)),
+        output: OutputSpecHeader {
+            width: document.render_settings.output_size.width,
+            height: document.render_settings.output_size.height,
+            mip_count: 1,
+        },
+        seed: 0,
+        revision: document.document_revision,
+    };
+    match AlgorithmCompiler::new().compile(&request, &EngineCancellationToken::new()) {
+        Ok(_) => Err(error(
+            ErrorCode::Internal,
+            "No authoritative output projection is installed for the algorithm stack.",
+        )),
+        Err(unsupported) => Err(error(
             ErrorCode::LayoutInvalid,
-            &format!("Build failed: {compile}"),
-        )
-    })?;
-    let topology_hash = hash_hex(compiled.topology_hash);
-    let appearance_hash = hash_hex(compiled.appearance_hash);
-    let mut session = session.lock().map_err(|_| poisoned())?;
-    let store = session.store.as_mut().ok_or_else(no_project)?;
-    let current_revision = store.summary().map_err(store_error)?.document
-        .map(|document| document.document_revision);
-    if current_revision != Some(compiled.document_revision) {
-        return Err(error(ErrorCode::OperationCancelled, "A newer edit superseded this build."));
+            &format!("Build unavailable: {unsupported}"),
+        )),
     }
-    store
-        .record_compiled_artifact(
-            compiled.document_revision,
-            &topology_hash,
-            &appearance_hash,
-            &compiled.renderer_version,
-        )
-        .map_err(store_error)?;
-    let width = compiled.dimensions.width;
-    let height = compiled.dimensions.height;
-    Ok(CompiledSheetProjection {
-        document_revision: compiled.document_revision,
-        topology_hash,
-        appearance_hash,
-        renderer_version: compiled.renderer_version,
-        width,
-        height,
-        maps: encode_maps(width, height, compiled.maps)?,
-        regions: compiled.regions,
-    })
 }
 
 #[tauri::command]
 pub async fn preview_trim_sheet_document(
     request: PreviewDocumentRequest,
-    session: State<'_, SharedProjectSession>,
-    preview_service: State<'_, SharedPreviewService>,
+    _session: State<'_, SharedProjectSession>,
+    _preview_service: State<'_, SharedPreviewService>,
 ) -> Result<PreviewSheetProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
-    let session = Arc::clone(session.inner());
-    let preview_service = Arc::clone(preview_service.inner());
-    preview_service.latest_draft_id.store(request.draft_id, Ordering::Release);
-    tauri::async_runtime::spawn_blocking(move || {
-        preview_trim_sheet_document_impl(request, &session, &preview_service)
-    })
-    .await
-    .map_err(|join| error(ErrorCode::Internal, &format!("Preview worker failed: {join}")))?
+    Err(error(
+        ErrorCode::LayoutInvalid,
+        "Preview is unavailable until the algorithm stack installs its first source route.",
+    ))
 }
 
 fn preview_trim_sheet_document_impl(
@@ -787,6 +1018,32 @@ pub fn take_pending_project_path(
 fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, UserFacingError> {
     let store = session.store.as_ref().ok_or_else(no_project)?;
     let summary = store.summary().map_err(store_error)?;
+    let material_sources = summary.source_sets.iter().map(|material| {
+        let channels = summary.sources.iter()
+            .filter(|source| source.source_set_id.to_string() == material.id.to_string())
+            .map(|source| session.source_projection_cached(source))
+            .collect::<Result<Vec<_>, _>>()?;
+        let registered_channels = if channels.is_empty() {
+            None
+        } else {
+            let anchor = channels.iter().find(|source| source.channel == SourceChannel::BaseColor)
+                .ok_or_else(|| error(ErrorCode::ProjectInvalid, "A registered channel set has no Base Color anchor."))?;
+            Some(RegisteredChannelSetProjection {
+                oriented_size: anchor.oriented_size,
+                orientation: anchor.orientation,
+                channels,
+            })
+        };
+        Ok(MaterialSourceProjection {
+            id: material.id.to_string(),
+            name: material.name.clone(),
+            exemplar_group: material.exemplar_group.clone(),
+            source_revision: material.source_revision,
+            registration_digest: material.registration_digest.0.clone(),
+            delighting: material.delighting.clone(),
+            registered_channels,
+        })
+    }).collect::<Result<Vec<_>, UserFacingError>>()?;
     Ok(ProjectProjection {
         id: summary.id.to_string(),
         name: summary.name,
@@ -794,12 +1051,7 @@ fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, Use
         schema_version: hot_trimmer_project_store::CURRENT_SCHEMA_VERSION,
         dirty: session.dirty,
         is_draft: session.is_draft,
-        sources: summary
-            .sources
-            .iter()
-            .map(|source| session.source_projection_cached(source))
-            .collect::<Result<Vec<_>, _>>()?,
-        source_sets: summary.source_sets,
+        material_sources,
         patches: summary.patches,
         document: summary.document,
         legacy_layout_discarded: summary.legacy_layout_discarded,
@@ -814,15 +1066,26 @@ fn source_projection(source: &StoredSource) -> Result<SourceProjection, UserFaci
     let inspected = inspect_stored(source)?;
     Ok(SourceProjection {
         id: source.input.id.to_string(),
-        source_set_id: source.source_set_id.to_string(),
         channel: source.channel,
         display_name: source.input.origin_path.file_name().map_or_else(
             || source.input.origin_path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         ),
-        source_path: source.input.origin_path.display().to_string(),
-        width: inspected.info.width,
-        height: inspected.info.height,
+        original: OriginalSourceProjection {
+            path: source.input.origin_path.display().to_string(),
+            immutable_digest: source.input.sha256.clone(),
+            encoded_bytes: source.input.encoded_bytes,
+        },
+        storage: SourceStorageProjection {
+            ownership: source.input.ownership,
+            external_path: source.input.external_path.as_ref().map(|path| path.display().to_string()),
+        },
+        oriented_size: OrientedSizeProjection { width: inspected.info.width, height: inspected.info.height },
+        orientation: source.input.exif_orientation,
+        interpretation: source.registration.interpretation,
+        normal_convention: source.registration.normal_convention,
+        assignment_provenance: source.registration.assignment_provenance,
+        confidence_milli: source.registration.confidence_milli,
         thumbnail_data_url: format!(
             "data:image/png;base64,{}",
             STANDARD.encode(inspected.thumbnail_png)
@@ -906,6 +1169,93 @@ fn source_bytes(source: &StoredSource) -> Result<Vec<u8>, UserFacingError> {
             fs::read(path).map_err(io_error)
         }
     }
+}
+
+fn preview_registered_channel_set(
+    session: &ProjectSession,
+    sources: &[StoredSource],
+    source_set_id: Uuid,
+) -> Result<(RegisteredChannelSet, BTreeMap<SourceId, Vec<u8>>), UserFacingError> {
+    let mut selected: Vec<_> = sources.iter()
+        .filter(|source| source.source_set_id == source_set_id)
+        .collect();
+    selected.sort_by_key(|source| source.registration.role);
+    if !selected.iter().any(|source| source.registration.role == MaterialChannelRole::BaseColor) {
+        return Err(error(ErrorCode::ProjectInvalid, "A prepared patch requires Base Color."));
+    }
+    let mut encoded_sources = BTreeMap::new();
+    let mut channels = Vec::with_capacity(selected.len());
+    let mut oriented_size = None;
+    for source in selected {
+        let projection = session.source_projection_cached(source)?;
+        let (_, payload) = projection.thumbnail_data_url.split_once(',')
+            .ok_or_else(|| error(ErrorCode::Internal, "The cached source preview is malformed."))?;
+        let bytes = STANDARD.decode(payload)
+            .map_err(|failure| error(ErrorCode::Internal, &format!("The cached source preview is invalid: {failure}")))?;
+        let image = image::load_from_memory(&bytes)
+            .map_err(|failure| error(ErrorCode::ImageImportFailed, &format!("The cached source preview could not be decoded: {failure}")))?;
+        let dimensions = OrientedPixelSize { width: image.width(), height: image.height() };
+        if oriented_size.is_some_and(|expected| expected != dimensions) {
+            return Err(error(ErrorCode::SourceRegistrationFailed, "Registered preview channels no longer share dimensions."));
+        }
+        oriented_size = Some(dimensions);
+        channels.push(RegisteredChannel {
+            source_id: source.input.id,
+            registration: source.registration.clone(),
+            oriented_size: dimensions,
+            orientation: 1,
+            original: OriginalAssetProvenance {
+                original_path: source.input.origin_path.display().to_string(),
+                immutable_digest: ContentDigest::sha256(&bytes),
+                encoded_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            },
+            ownership: SourceOwnershipIntent::OwnedCopy,
+        });
+        encoded_sources.insert(source.input.id, bytes);
+    }
+    let registered = RegisteredChannelSet {
+        oriented_size: oriented_size.ok_or_else(|| error(ErrorCode::ProjectInvalid, "A prepared patch requires registered channels."))?,
+        orientation: 1,
+        channels,
+    };
+    Ok((registered, encoded_sources))
+}
+
+fn prepared_preview_projection(
+    exemplar: &PreparedExemplar,
+    base: &hot_trimmer_image_io::ImagePlane<hot_trimmer_image_io::LinearColor>,
+    delighting_route: &str,
+    delighting_strength_milli: u16,
+) -> Result<PreparedPatchPreviewProjection, UserFacingError> {
+    let mask = exemplar.usable_mask.as_ref();
+    let mut rgba = Vec::with_capacity(
+        usize::try_from(u64::from(exemplar.width) * u64::from(exemplar.height) * 4)
+            .map_err(|_| error(ErrorCode::Internal, "Prepared patch preview is too large."))?,
+    );
+    for y in 0..exemplar.height {
+        for x in 0..exemplar.width {
+            let pixel = base.pixel(x, y);
+            let coverage = mask.map_or(1.0, |plane| plane.pixel(x, y).0);
+            for value in pixel.rgb {
+                let encoded = if value <= 0.003_130_8 {
+                    value * 12.92
+                } else {
+                    1.055 * value.powf(1.0 / 2.4) - 0.055
+                };
+                rgba.push((encoded.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            rgba.push((pixel.alpha.mul_add(coverage, 0.0).clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    Ok(PreparedPatchPreviewProjection {
+        patch_id: exemplar.scope.patch_id.ok_or_else(|| error(ErrorCode::Internal, "Prepared patch scope is missing."))?,
+        width: exemplar.width,
+        height: exemplar.height,
+        data_url: png_data_url(exemplar.width, exemplar.height, rgba)?,
+        perspective_confidence_milli: exemplar.perspective_confidence_milli,
+        delighting_route: delighting_route.to_owned(),
+        delighting_strength_milli,
+    })
 }
 
 fn encode_maps(
@@ -1078,6 +1428,22 @@ fn validate_protocol(received: u16) -> Result<(), UserFacingError> {
 
 fn store_error(error_value: StoreError) -> UserFacingError {
     error(ErrorCode::ProjectInvalid, &error_value.to_string())
+}
+
+fn source_registration_error(error_value: StoreError, channel: SourceChannel) -> UserFacingError {
+    let Some(diagnostic) = error_value.registration_diagnostic(channel) else {
+        return store_error(error_value);
+    };
+    let detail = serde_json::to_string(&diagnostic).ok();
+    UserFacingError {
+        code: ErrorCode::SourceRegistrationFailed,
+        message: diagnostic.message,
+        recovery: diagnostic.recovery_choices.iter()
+            .map(|choice| format!("{choice:?}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        detail,
+    }
 }
 
 fn image_error(error_value: hot_trimmer_image_io::ImageIoError) -> UserFacingError {

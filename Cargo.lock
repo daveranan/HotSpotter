@@ -1533,6 +1533,7 @@ dependencies = [
  "hot-trimmer-domain",
  "hot-trimmer-geometry",
  "hot-trimmer-image-io",
+ "hot-trimmer-material-analysis",
  "hot-trimmer-project-store",
  "hot-trimmer-render-core",
  "hot-trimmer-sheet-compiler",
@@ -1560,6 +1561,15 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "hot-trimmer-effect-compiler"
+version = "0.1.0"
+dependencies = [
+ "hot-trimmer-domain",
+ "hot-trimmer-placement-solver",
+ "hot-trimmer-render-core",
 ]
 
 [[package]]
@@ -1596,6 +1606,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "hot-trimmer-material-analysis"
+version = "0.1.0"
+dependencies = [
+ "hot-trimmer-domain",
+ "hot-trimmer-geometry",
+ "hot-trimmer-image-io",
+ "hot-trimmer-render-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hot-trimmer-material-synthesis"
+version = "0.1.0"
+dependencies = [
+ "hot-trimmer-domain",
+ "hot-trimmer-material-analysis",
+ "hot-trimmer-render-core",
+]
+
+[[package]]
+name = "hot-trimmer-placement-solver"
+version = "0.1.0"
+dependencies = [
+ "hot-trimmer-domain",
+ "hot-trimmer-material-analysis",
+ "hot-trimmer-material-synthesis",
+]
+
+[[package]]
 name = "hot-trimmer-preview"
 version = "0.1.0"
 dependencies = [
@@ -1608,6 +1647,8 @@ version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
  "hot-trimmer-geometry",
+ "hot-trimmer-image-io",
+ "image",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1622,6 +1663,7 @@ version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
  "hot-trimmer-geometry",
+ "hot-trimmer-image-io",
  "serde",
  "serde_json",
  "sha2",
@@ -1633,9 +1675,14 @@ name = "hot-trimmer-sheet-compiler"
 version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
+ "hot-trimmer-effect-compiler",
  "hot-trimmer-geometry",
+ "hot-trimmer-material-analysis",
+ "hot-trimmer-material-synthesis",
+ "hot-trimmer-placement-solver",
  "hot-trimmer-render-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

@@ -1,5 +1,5 @@
 [package]
-name = "hot-trimmer-project-store"
+name = "hot-trimmer-material-analysis"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +9,8 @@ license.workspace = true
 hot-trimmer-domain.workspace = true
 hot-trimmer-geometry = { path = "../geometry" }
 hot-trimmer-image-io = { path = "../image-io" }
-rusqlite.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+hot-trimmer-render-core = { path = "../render-core" }
 thiserror.workspace = true
-uuid.workspace = true
-sysinfo.workspace = true
-
-[dev-dependencies]
-image.workspace = true
 
 [lints]
 workspace = true

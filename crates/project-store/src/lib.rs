@@ -8,18 +8,23 @@ use std::{
 };
 
 use hot_trimmer_domain::{
-    LayoutId, MaterialMapContent, MaterialMapKind, MaterialSourceSet, Patch, PatchCommand,
+    AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ContentDigest, LayoutId,
+    DelightingIntent, MaterialChannelRole, MaterialMapContent, MaterialMapKind, MaterialSourceSet,
+    NormalConvention,
+    Patch, PatchCommand, RegistrationDiagnostic, RegistrationDiagnosticCode,
+    RegistrationRecoveryChoice,
     PatchCommandError, PatchEditOutcome, PatchSet, ProjectId, SourceId, SourceSetId,
     TemplateRegistry, TrimSheetDocument, TrimSheetDocumentCommand,
 };
 use hot_trimmer_geometry::Quadrilateral;
+use hot_trimmer_image_io::{ColorPolicy, DecodeLimits, inspect_path_with_policy};
 use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 pub const MAX_RECOVERY_SNAPSHOTS: usize = 5;
 const MAX_PROJECT_HISTORY: usize = 256;
 
@@ -74,6 +79,22 @@ impl SourceChannel {
             .find(|channel| channel.as_db_value() == value)
             .ok_or_else(|| StoreError::InvalidData(format!("unknown source channel: {value}")))
     }
+
+    #[must_use]
+    pub const fn material_role(self) -> MaterialChannelRole {
+        match self {
+            Self::BaseColor => MaterialChannelRole::BaseColor,
+            Self::Normal => MaterialChannelRole::Normal,
+            Self::Height => MaterialChannelRole::Height,
+            Self::Roughness => MaterialChannelRole::Roughness,
+            Self::Metallic => MaterialChannelRole::Metallic,
+            Self::AmbientOcclusion => MaterialChannelRole::AmbientOcclusion,
+            Self::Specular => MaterialChannelRole::Specular,
+            Self::Opacity => MaterialChannelRole::Opacity,
+            Self::EdgeMask => MaterialChannelRole::EdgeMask,
+            Self::MaterialId => MaterialChannelRole::MaterialId,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -124,6 +145,7 @@ pub struct SourceInput {
 pub struct StoredSource {
     pub source_set_id: Uuid,
     pub channel: SourceChannel,
+    pub registration: ChannelRegistration,
     pub input: SourceInput,
 }
 
@@ -132,6 +154,10 @@ pub struct StoredSource {
 pub struct SourceSetSnapshot {
     pub id: SourceSetId,
     pub name: String,
+    pub exemplar_group: Option<String>,
+    pub source_revision: u64,
+    pub registration_digest: ContentDigest,
+    pub delighting: DelightingIntent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +215,28 @@ pub enum StoreError {
         actual_width: u32,
         actual_height: u32,
     },
+    #[error(
+        "the {channel} source uses orientation {actual_orientation}; registered sources require orientation {expected_orientation}"
+    )]
+    OrientationMismatch {
+        channel: &'static str,
+        expected_orientation: u16,
+        actual_orientation: u16,
+    },
+    #[error("the {channel} source has an invalid interpretation for its assigned role")]
+    ChannelInterpretationMismatch { channel: &'static str },
+    #[error("only a Normal channel may carry a tangent-space normal convention")]
+    NormalConventionOnScalar,
+    #[error("channel assignment confidence must be between 0 and 1000")]
+    InvalidAssignmentConfidence,
+    #[error("owned source bytes do not match their immutable SHA-256 digest")]
+    ImmutableDigestMismatch,
+    #[error("owned source byte count does not match the registered encoded byte count")]
+    EncodedByteCountMismatch,
+    #[error("the verified external source could not be re-inspected at registration: {0}")]
+    ExternalSourceVerification(String),
+    #[error("the verified external source changed between inspection and registration: {field}")]
+    ExternalSourceChanged { field: &'static str },
     #[error("the source is used by one or more patches")]
     SourceInUseByPatches,
     #[error("the trim-sheet document command is invalid: {0}")]
@@ -197,6 +245,46 @@ pub enum StoreError {
     PatchCommand(#[from] PatchCommandError),
     #[error("patch data could not be serialized: {0}")]
     PatchSerialization(#[from] serde_json::Error),
+}
+
+impl StoreError {
+    /// Projects registration failures into the typed Stage 1 diagnostic contract.
+    #[must_use]
+    pub fn registration_diagnostic(&self, channel: SourceChannel) -> Option<RegistrationDiagnostic> {
+        let (code, recovery_choices) = match self {
+            Self::BaseColorRequired => (
+                RegistrationDiagnosticCode::BaseColorRequired,
+                vec![RegistrationRecoveryChoice::AssignBaseColor],
+            ),
+            Self::RegistrationMismatch { .. } => (
+                RegistrationDiagnosticCode::OrientedDimensionMismatch,
+                vec![RegistrationRecoveryChoice::ChooseMatchingDimensions],
+            ),
+            Self::OrientationMismatch { .. } => (
+                RegistrationDiagnosticCode::OrientationMismatch,
+                vec![RegistrationRecoveryChoice::ReorientCompanionExternally],
+            ),
+            Self::ChannelInterpretationMismatch { .. } => (
+                RegistrationDiagnosticCode::ChannelInterpretationMismatch,
+                vec![RegistrationRecoveryChoice::ReassignChannelRole],
+            ),
+            Self::NormalConventionOnScalar => (
+                RegistrationDiagnosticCode::NormalConventionOnScalar,
+                vec![RegistrationRecoveryChoice::ReassignChannelRole],
+            ),
+            Self::InvalidAssignmentConfidence => (
+                RegistrationDiagnosticCode::InvalidConfidence,
+                vec![RegistrationRecoveryChoice::ReassignChannelRole],
+            ),
+            _ => return None,
+        };
+        Some(RegistrationDiagnostic {
+            code,
+            channel: channel.material_role(),
+            message: self.to_string(),
+            recovery_choices,
+        })
+    }
 }
 
 pub struct ProjectStore {
@@ -249,8 +337,9 @@ impl ProjectStore {
             params![project_id.to_string(), name, now],
         )?;
         transaction.execute(
-            "INSERT INTO source_sets (id, name, ordinal) VALUES (?1, 'Material 1', 0)",
-            [project_id.to_string()],
+            "INSERT INTO source_sets (id, name, ordinal, exemplar_group, source_revision, registration_digest)
+             VALUES (?1, 'Material 1', 0, NULL, 0, ?2)",
+            params![project_id.to_string(), ContentDigest::sha256(b"empty-registered-channel-set").0],
         )?;
         transaction.commit()?;
         checkpoint(&connection)?;
@@ -313,8 +402,10 @@ impl ProjectStore {
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        if version < 1 {
-            return Err(StoreError::InvalidData("project schema version".into()));
+        if version != CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::InvalidData(format!(
+                "project schema {version} is not the current Stage 1 schema {CURRENT_SCHEMA_VERSION}"
+            )));
         }
         verify_integrity(&connection)?;
         summary_from_connection(&connection, path, false)
@@ -363,8 +454,34 @@ impl ProjectStore {
         channel: SourceChannel,
         source: &SourceInput,
     ) -> Result<(), StoreError> {
+        self.replace_registered_source_in_set(
+            source_set_id,
+            source,
+            ChannelRegistration::explicit(channel.material_role()),
+        )
+    }
+
+    /// Replaces a registered channel while preserving its explicit interpretation and provenance.
+    pub fn replace_registered_source_in_set(
+        &mut self,
+        source_set_id: Uuid,
+        source: &SourceInput,
+        registration: ChannelRegistration,
+    ) -> Result<(), StoreError> {
+        let channel = SourceChannel::ALL
+            .into_iter()
+            .find(|candidate| candidate.material_role() == registration.role)
+            .expect("every domain material role has a persisted source channel");
         validate_source_ownership(source)?;
-        self.validate_registration(source_set_id, channel, source.width, source.height)?;
+        verify_external_source(source, channel)?;
+        validate_channel_registration(channel, &registration)?;
+        self.validate_registration(
+            source_set_id,
+            channel,
+            source.width,
+            source.height,
+            source.exif_orientation,
+        )?;
         let previous_source_id = self
             .connection
             .query_row(
@@ -397,7 +514,9 @@ impl ProjectStore {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO source_sets (id, name, ordinal) VALUES (?1, ?2, ?3)
+            "INSERT INTO source_sets (
+                id, name, ordinal, exemplar_group, source_revision, registration_digest
+             ) VALUES (?1, ?2, ?3, NULL, 0, ?4)
              ON CONFLICT(id) DO NOTHING",
             params![
                 source_set_id.to_string(),
@@ -405,7 +524,8 @@ impl ProjectStore {
                     || "Material".into(),
                     |name| name.to_string_lossy().into_owned(),
                 ),
-                next_ordinal
+                next_ordinal,
+                ContentDigest::sha256(b"empty-registered-channel-set").0,
             ],
         )?;
         transaction.execute(
@@ -416,8 +536,12 @@ impl ProjectStore {
         transaction.execute(
             "INSERT INTO sources (
                 id, source_set_id, channel, ownership, external_path, sha256, width, height, format, color_type,
-                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path,
+                interpretation, normal_convention, assignment_provenance, confidence_milli
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20
+             )",
             params![
                 source.id.to_string(),
                 source_set_id.to_string(),
@@ -442,8 +566,13 @@ impl ProjectStore {
                 })?,
                 source.owned_bytes,
                 source.origin_path.to_string_lossy(),
+                interpretation_db(registration.interpretation),
+                normal_convention_db(registration.normal_convention),
+                assignment_provenance_db(registration.assignment_provenance),
+                i64::from(registration.confidence_milli),
             ],
         )?;
+        advance_source_authority(&transaction, source_set_id)?;
         let payload = format!(
             "{{\"sourceSetId\":\"{}\",\"channel\":\"{}\",\"sourceId\":\"{}\",\"sha256\":\"{}\"}}",
             source_set_id,
@@ -527,6 +656,7 @@ impl ProjectStore {
                 channel.as_db_value()
             )));
         }
+        advance_source_authority(&transaction, source_set_id)?;
         let payload = format!(
             "{{\"sourceSetId\":\"{}\",\"channel\":\"{}\"}}",
             source_set_id,
@@ -538,6 +668,56 @@ impl ProjectStore {
             params![now, payload],
         )?;
         transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+        transaction.commit()?;
+        self.clear_history();
+        checkpoint(&self.connection)
+    }
+
+    /// Groups independently registered exemplars without assigning a material behavior class.
+    pub fn set_exemplar_group(
+        &mut self,
+        source_set_id: Uuid,
+        exemplar_group: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let exemplar_group = exemplar_group.map(str::trim).filter(|value| !value.is_empty());
+        if exemplar_group.is_some_and(|value| value.len() > 255) {
+            return Err(StoreError::InvalidData(
+                "exemplar group must contain at most 255 bytes".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE source_sets SET exemplar_group = ?2 WHERE id = ?1",
+            params![source_set_id.to_string(), exemplar_group],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::InvalidData("material source does not exist".into()));
+        }
+        advance_source_authority(&transaction, source_set_id)?;
+        transaction.commit()?;
+        self.clear_history();
+        checkpoint(&self.connection)
+    }
+
+    /// Persists explicit Stage 4 route intent without deriving it from source metadata.
+    pub fn set_delighting_intent(
+        &mut self,
+        source_set_id: Uuid,
+        intent: &DelightingIntent,
+    ) -> Result<(), StoreError> {
+        let encoded = serde_json::to_string(intent)?;
+        let transaction = self.connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE source_sets SET delighting_json = ?2 WHERE id = ?1",
+            params![source_set_id.to_string(), encoded],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::InvalidData("material source does not exist".into()));
+        }
+        transaction.execute(
+            "DELETE FROM source_derived_cache WHERE source_set_id = ?1",
+            [source_set_id.to_string()],
+        )?;
         transaction.commit()?;
         self.clear_history();
         checkpoint(&self.connection)
@@ -955,53 +1135,69 @@ impl ProjectStore {
         channel: SourceChannel,
         width: u32,
         height: u32,
+        orientation: u16,
     ) -> Result<(), StoreError> {
         let base_dimensions = self
             .connection
             .query_row(
-                "SELECT width, height FROM sources
+                "SELECT width, height, exif_orientation FROM sources
                  WHERE source_set_id = ?1 AND channel = 'base_color'",
                 [source_set_id.to_string()],
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u16>(2)?,
+                    ))
+                },
             )
             .optional()?;
         if channel == SourceChannel::BaseColor {
-            let mismatch: Option<String> = self
+            let mismatch: Option<(String, u32, u32, u16)> = self
                 .connection
                 .query_row(
-                    "SELECT channel FROM sources
+                    "SELECT channel, width, height, exif_orientation FROM sources
                      WHERE source_set_id = ?1 AND channel <> 'base_color'
-                       AND (width <> ?2 OR height <> ?3) LIMIT 1",
-                    params![source_set_id.to_string(), width, height],
-                    |row| row.get(0),
+                       AND (width <> ?2 OR height <> ?3 OR exif_orientation <> ?4) LIMIT 1",
+                    params![source_set_id.to_string(), width, height, orientation],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            if let Some(mismatch) = mismatch {
-                let (expected_width, expected_height) = base_dimensions.unwrap_or((width, height));
+            if let Some((mismatch, companion_width, companion_height, companion_orientation)) = mismatch {
+                if companion_orientation != orientation {
+                    return Err(StoreError::OrientationMismatch {
+                        channel: SourceChannel::from_db_value(&mismatch)?.as_db_value(),
+                        expected_orientation: companion_orientation,
+                        actual_orientation: orientation,
+                    });
+                }
                 return Err(StoreError::RegistrationMismatch {
                     channel: SourceChannel::from_db_value(&mismatch)?.as_db_value(),
-                    expected_width,
-                    expected_height,
+                    expected_width: companion_width,
+                    expected_height: companion_height,
                     actual_width: width,
                     actual_height: height,
                 });
             }
             return Ok(());
         }
-        let Some((expected_width, expected_height)) = base_dimensions else {
+        let Some((expected_width, expected_height, expected_orientation)) = base_dimensions else {
             return Err(StoreError::BaseColorRequired);
         };
-        if (width, height) == (expected_width, expected_height) {
-            Ok(())
-        } else {
-            Err(StoreError::RegistrationMismatch {
+        if orientation != expected_orientation {
+            return Err(StoreError::OrientationMismatch {
                 channel: channel.as_db_value(),
-                expected_width,
-                expected_height,
-                actual_width: width,
-                actual_height: height,
-            })
+                expected_orientation,
+                actual_orientation: orientation,
+            });
         }
+        if (width, height) != (expected_width, expected_height) {
+            return Err(StoreError::RegistrationMismatch {
+                channel: channel.as_db_value(), expected_width, expected_height,
+                actual_width: width, actual_height: height,
+            });
+        }
+        Ok(())
     }
 
     fn push_history(&mut self, entry: ProjectHistoryEntry) {
@@ -1158,17 +1354,32 @@ fn load_source_sets(connection: &Connection) -> Result<Vec<SourceSetSnapshot>, S
         return Ok(vec![SourceSetSnapshot {
             id: value.parse().map_err(|_| StoreError::InvalidId(value))?,
             name: "Material 1".into(),
+            exemplar_group: None,
+            source_revision: 0,
+            registration_digest: ContentDigest::sha256(b"legacy-source-set"),
+            delighting: DelightingIntent::default(),
         }]);
     }
-    let mut statement = connection.prepare("SELECT id, name FROM source_sets ORDER BY ordinal")?;
+    let mut statement = connection.prepare(
+        "SELECT id, name, exemplar_group, source_revision, registration_digest, delighting_json
+         FROM source_sets ORDER BY ordinal",
+    )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?, row.get::<_, u64>(3)?, row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
     })?;
     rows.map(|row| {
-        let (id, name) = row?;
+        let (id, name, exemplar_group, source_revision, registration_digest, delighting_json) = row?;
         Ok(SourceSetSnapshot {
             id: id.parse().map_err(|_| StoreError::InvalidId(id))?,
             name,
+            exemplar_group,
+            source_revision,
+            registration_digest: ContentDigest(registration_digest),
+            delighting: serde_json::from_str(&delighting_json)?,
         })
     })
     .collect()
@@ -1237,25 +1448,15 @@ fn load_document(connection: &Connection) -> Result<Option<TrimSheetDocument>, S
 }
 
 fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError> {
-    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let sql = if version >= 6 {
-        "SELECT sources.id, sources.source_set_id, sources.channel, sources.ownership,
+    let sql = "SELECT sources.id, sources.source_set_id, sources.channel, sources.ownership,
                 sources.external_path, sources.sha256, sources.width, sources.height, sources.format, sources.color_type,
-                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
+                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path,
+                interpretation, normal_convention, assignment_provenance, confidence_milli
          FROM sources JOIN source_sets ON source_sets.id = sources.source_set_id
          ORDER BY source_sets.ordinal, CASE channel
             WHEN 'base_color' THEN 0 WHEN 'normal' THEN 1 WHEN 'height' THEN 2
             WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 WHEN 'ambient_occlusion' THEN 5
-            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END"
-    } else {
-        "SELECT sources.id, (SELECT id FROM project LIMIT 1), sources.channel, sources.ownership,
-                sources.external_path, sources.sha256, sources.width, sources.height, sources.format, sources.color_type,
-                has_alpha, exif_orientation, has_icc_profile, encoded_bytes, owned_bytes, origin_path
-         FROM sources ORDER BY CASE channel
-            WHEN 'base_color' THEN 0 WHEN 'normal' THEN 1 WHEN 'height' THEN 2
-            WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 WHEN 'ambient_occlusion' THEN 5
-            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END"
-    };
+            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END";
     let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -1275,6 +1476,10 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
             row.get::<_, u64>(13)?,
             row.get::<_, Option<Vec<u8>>>(14)?,
             row.get::<_, String>(15)?,
+            row.get::<_, String>(16)?,
+            row.get::<_, String>(17)?,
+            row.get::<_, String>(18)?,
+            row.get::<_, u16>(19)?,
         ))
     })?;
     let mut sources = Vec::new();
@@ -1296,6 +1501,10 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
             encoded_bytes,
             owned_bytes,
             origin_path,
+            interpretation,
+            normal_convention,
+            assignment_provenance,
+            confidence_milli,
         ) = row?;
         let input = SourceInput {
             id: id_text
@@ -1316,10 +1525,20 @@ fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError
             owned_bytes,
         };
         validate_source_ownership(&input)?;
+        let channel = SourceChannel::from_db_value(&channel_text)?;
+        let registration = ChannelRegistration {
+            role: channel.material_role(),
+            interpretation: interpretation_from_db(&interpretation)?,
+            normal_convention: normal_convention_from_db(&normal_convention)?,
+            assignment_provenance: assignment_provenance_from_db(&assignment_provenance)?,
+            confidence_milli,
+        };
+        validate_channel_registration(channel, &registration)?;
         sources.push(StoredSource {
             source_set_id: Uuid::parse_str(&source_set_id_text)
                 .map_err(|_| StoreError::InvalidId(source_set_id_text))?,
-            channel: SourceChannel::from_db_value(&channel_text)?,
+            channel,
+            registration,
             input,
         });
     }
@@ -1470,6 +1689,11 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             supported: CURRENT_SCHEMA_VERSION,
         });
     }
+    if version != 0 && version < CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidData(format!(
+            "legacy project schema {version} is not supported by the Stage 1 source-contract cutover; create a new project"
+        )));
+    }
     if version == 0 {
         let transaction = connection.transaction()?;
         migrate_to_v1(&transaction)?;
@@ -1538,7 +1762,57 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         migrate_to_v10(&transaction)?;
         transaction.pragma_update(None, "user_version", 10_u32)?;
         transaction.commit()?;
+        version = 10;
     }
+    if version == 10 {
+        let transaction = connection.transaction()?;
+        migrate_to_v11(&transaction)?;
+        transaction.pragma_update(None, "user_version", 11_u32)?;
+        transaction.commit()?;
+        version = 11;
+    }
+    if version == 11 {
+        let transaction = connection.transaction()?;
+        migrate_to_v12(&transaction)?;
+        transaction.pragma_update(None, "user_version", 12_u32)?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn migrate_to_v12(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let default_intent = serde_json::to_string(&DelightingIntent::default())?;
+    transaction.execute(
+        "ALTER TABLE source_sets ADD COLUMN delighting_json TEXT NOT NULL DEFAULT '{}'",
+        [],
+    )?;
+    transaction.execute("UPDATE source_sets SET delighting_json = ?1", [default_intent])?;
+    Ok(())
+}
+
+fn migrate_to_v11(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute_batch(
+        "ALTER TABLE source_sets ADD COLUMN exemplar_group TEXT;
+         ALTER TABLE source_sets ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0 CHECK(source_revision >= 0);
+         ALTER TABLE source_sets ADD COLUMN registration_digest TEXT NOT NULL DEFAULT '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a' CHECK(length(registration_digest) = 64);
+         ALTER TABLE sources ADD COLUMN interpretation TEXT NOT NULL DEFAULT 'color_managed_base_color' CHECK(interpretation IN (
+             'color_managed_base_color', 'tangent_space_normal', 'linear_scalar', 'linear_opacity', 'binary_mask', 'categorical_id'
+         ));
+         ALTER TABLE sources ADD COLUMN normal_convention TEXT NOT NULL DEFAULT 'not_applicable' CHECK(normal_convention IN (
+             'not_applicable', 'open_gl', 'direct_x', 'unspecified'
+         ));
+         ALTER TABLE sources ADD COLUMN assignment_provenance TEXT NOT NULL DEFAULT 'user_assigned' CHECK(assignment_provenance IN (
+             'user_assigned', 'filename_suggested', 'embedded_metadata'
+         ));
+         ALTER TABLE sources ADD COLUMN confidence_milli INTEGER NOT NULL DEFAULT 1000 CHECK(confidence_milli BETWEEN 0 AND 1000);
+         CREATE TABLE source_derived_cache (
+             source_set_id TEXT NOT NULL,
+             registration_digest TEXT NOT NULL CHECK(length(registration_digest) = 64),
+             cache_key TEXT NOT NULL,
+             PRIMARY KEY(source_set_id, cache_key),
+             FOREIGN KEY(source_set_id) REFERENCES source_sets(id) ON DELETE CASCADE
+         );",
+    )?;
     Ok(())
 }
 
@@ -1702,13 +1976,188 @@ fn validate_source_ownership(source: &SourceInput) -> Result<(), StoreError> {
             source.owned_bytes.is_none() && source.external_path.is_some()
         }
     };
-    if valid {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidData(
+    if !valid {
+        return Err(StoreError::InvalidData(
             "source bytes do not match the explicit ownership mode".into(),
-        ))
+        ));
     }
+    if let Some(bytes) = &source.owned_bytes {
+        if u64::try_from(bytes.len()).ok() != Some(source.encoded_bytes) {
+            return Err(StoreError::EncodedByteCountMismatch);
+        }
+        if ContentDigest::sha256(bytes).0 != source.sha256 {
+            return Err(StoreError::ImmutableDigestMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn verify_external_source(source: &SourceInput, channel: SourceChannel) -> Result<(), StoreError> {
+    if source.ownership != SourceOwnership::VerifiedExternalReference {
+        return Ok(());
+    }
+    let path = source.external_path.as_deref().ok_or_else(|| {
+        StoreError::InvalidData("verified external source path is missing".into())
+    })?;
+    let policy = if channel == SourceChannel::BaseColor {
+        ColorPolicy::ConvertToSrgb
+    } else {
+        ColorPolicy::PreserveLinearData
+    };
+    let inspected = inspect_path_with_policy(path, DecodeLimits::default(), policy)
+        .map_err(|failure| StoreError::ExternalSourceVerification(failure.to_string()))?;
+    let info = inspected.info;
+    let changed = if info.sha256 != source.sha256 {
+        Some("sha256")
+    } else if (info.width, info.height) != (source.width, source.height) {
+        Some("oriented_dimensions")
+    } else if info.exif_orientation != source.exif_orientation {
+        Some("orientation")
+    } else if info.encoded_bytes != source.encoded_bytes {
+        Some("encoded_bytes")
+    } else if info.format != source.format {
+        Some("format")
+    } else if info.color_type != source.color_type {
+        Some("color_type")
+    } else if info.has_alpha != source.has_alpha {
+        Some("alpha_metadata")
+    } else if info.has_embedded_icc_profile != source.has_embedded_icc_profile {
+        Some("icc_metadata")
+    } else {
+        None
+    };
+    changed.map_or(Ok(()), |field| Err(StoreError::ExternalSourceChanged { field }))
+}
+
+fn validate_channel_registration(
+    channel: SourceChannel,
+    registration: &ChannelRegistration,
+) -> Result<(), StoreError> {
+    if registration.role != channel.material_role()
+        || registration.interpretation != registration.role.required_interpretation()
+    {
+        return Err(StoreError::ChannelInterpretationMismatch {
+            channel: channel.as_db_value(),
+        });
+    }
+    if registration.confidence_milli > 1000 {
+        return Err(StoreError::InvalidAssignmentConfidence);
+    }
+    if channel == SourceChannel::Normal {
+        if registration.normal_convention == NormalConvention::NotApplicable {
+            return Err(StoreError::ChannelInterpretationMismatch {
+                channel: channel.as_db_value(),
+            });
+        }
+    } else if registration.normal_convention != NormalConvention::NotApplicable {
+        return Err(StoreError::NormalConventionOnScalar);
+    }
+    Ok(())
+}
+
+const fn interpretation_db(value: ChannelInterpretation) -> &'static str {
+    match value {
+        ChannelInterpretation::ColorManagedBaseColor => "color_managed_base_color",
+        ChannelInterpretation::TangentSpaceNormal => "tangent_space_normal",
+        ChannelInterpretation::LinearScalar => "linear_scalar",
+        ChannelInterpretation::LinearOpacity => "linear_opacity",
+        ChannelInterpretation::BinaryMask => "binary_mask",
+        ChannelInterpretation::CategoricalId => "categorical_id",
+    }
+}
+
+fn interpretation_from_db(value: &str) -> Result<ChannelInterpretation, StoreError> {
+    match value {
+        "color_managed_base_color" => Ok(ChannelInterpretation::ColorManagedBaseColor),
+        "tangent_space_normal" => Ok(ChannelInterpretation::TangentSpaceNormal),
+        "linear_scalar" => Ok(ChannelInterpretation::LinearScalar),
+        "linear_opacity" => Ok(ChannelInterpretation::LinearOpacity),
+        "binary_mask" => Ok(ChannelInterpretation::BinaryMask),
+        "categorical_id" => Ok(ChannelInterpretation::CategoricalId),
+        _ => Err(StoreError::InvalidData(format!("unknown channel interpretation: {value}"))),
+    }
+}
+
+const fn normal_convention_db(value: NormalConvention) -> &'static str {
+    match value {
+        NormalConvention::NotApplicable => "not_applicable",
+        NormalConvention::OpenGl => "open_gl",
+        NormalConvention::DirectX => "direct_x",
+        NormalConvention::Unspecified => "unspecified",
+    }
+}
+
+fn normal_convention_from_db(value: &str) -> Result<NormalConvention, StoreError> {
+    match value {
+        "not_applicable" => Ok(NormalConvention::NotApplicable),
+        "open_gl" => Ok(NormalConvention::OpenGl),
+        "direct_x" => Ok(NormalConvention::DirectX),
+        "unspecified" => Ok(NormalConvention::Unspecified),
+        _ => Err(StoreError::InvalidData(format!("unknown normal convention: {value}"))),
+    }
+}
+
+const fn assignment_provenance_db(value: AssignmentProvenance) -> &'static str {
+    match value {
+        AssignmentProvenance::UserAssigned => "user_assigned",
+        AssignmentProvenance::FilenameSuggested => "filename_suggested",
+        AssignmentProvenance::EmbeddedMetadata => "embedded_metadata",
+    }
+}
+
+fn assignment_provenance_from_db(value: &str) -> Result<AssignmentProvenance, StoreError> {
+    match value {
+        "user_assigned" => Ok(AssignmentProvenance::UserAssigned),
+        "filename_suggested" => Ok(AssignmentProvenance::FilenameSuggested),
+        "embedded_metadata" => Ok(AssignmentProvenance::EmbeddedMetadata),
+        _ => Err(StoreError::InvalidData(format!("unknown assignment provenance: {value}"))),
+    }
+}
+
+fn advance_source_authority(
+    transaction: &Transaction<'_>,
+    source_set_id: Uuid,
+) -> Result<(), StoreError> {
+    let exemplar_group: Option<String> = transaction.query_row(
+        "SELECT exemplar_group FROM source_sets WHERE id = ?1",
+        [source_set_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT id, channel, sha256, width, height, exif_orientation, interpretation,
+                normal_convention, assignment_provenance, confidence_milli, origin_path
+         FROM sources WHERE source_set_id = ?1 ORDER BY CASE channel
+            WHEN 'base_color' THEN 0 WHEN 'normal' THEN 1 WHEN 'height' THEN 2
+            WHEN 'roughness' THEN 3 WHEN 'metallic' THEN 4 WHEN 'ambient_occlusion' THEN 5
+            WHEN 'specular' THEN 6 WHEN 'opacity' THEN 7 WHEN 'edge_mask' THEN 8 ELSE 9 END",
+    )?;
+    let rows = statement.query_map([source_set_id.to_string()], |row| {
+        Ok(format!(
+            "{}|{}|{}|{}x{}|{}|{}|{}|{}|{}|{}",
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, u32>(3)?, row.get::<_, u32>(4)?, row.get::<_, u16>(5)?,
+            row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+            row.get::<_, u16>(9)?, row.get::<_, String>(10)?,
+        ))
+    })?;
+    let canonical = format!(
+        "exemplar_group={};\n{}",
+        exemplar_group.as_deref().unwrap_or(""),
+        rows.collect::<Result<Vec<_>, _>>()?.join("\n"),
+    );
+    drop(statement);
+    let digest = ContentDigest::sha256(canonical.as_bytes());
+    transaction.execute(
+        "DELETE FROM source_derived_cache WHERE source_set_id = ?1",
+        [source_set_id.to_string()],
+    )?;
+    transaction.execute(
+        "UPDATE source_sets
+         SET source_revision = source_revision + 1, registration_digest = ?2
+         WHERE id = ?1",
+        params![source_set_id.to_string(), digest.0],
+    )?;
+    Ok(())
 }
 
 fn unix_timestamp() -> Result<i64, StoreError> {
@@ -2052,12 +2501,13 @@ mod tests {
     }
 
     fn source(width: u32, height: u32) -> SourceInput {
+        let owned_bytes = vec![1, 2, 3];
         SourceInput {
             id: SourceId::new(),
             ownership: SourceOwnership::OwnedCopy,
             external_path: None,
             origin_path: PathBuf::from("fixture.png"),
-            sha256: "a".repeat(64),
+            sha256: ContentDigest::sha256(&owned_bytes).0,
             width,
             height,
             format: "PNG".into(),
@@ -2066,7 +2516,7 @@ mod tests {
             exif_orientation: 1,
             has_embedded_icc_profile: false,
             encoded_bytes: 3,
-            owned_bytes: Some(vec![1, 2, 3]),
+            owned_bytes: Some(owned_bytes),
         }
     }
 
@@ -3226,5 +3676,203 @@ mod tests {
             recovered.summary().expect("summary").patches,
             vec![authored]
         );
+    }
+}
+
+#[cfg(test)]
+mod algorithm_stage_01_tests {
+    use std::{fs, path::PathBuf};
+
+    use hot_trimmer_domain::{
+        AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ContentDigest,
+        MaterialChannelRole, NormalConvention, RegistrationDiagnosticCode,
+        RegistrationRecoveryChoice, SourceId,
+    };
+    use uuid::Uuid;
+
+    use super::{ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError};
+
+    fn input(label: u8, width: u32, height: u32, orientation: u16) -> SourceInput {
+        let owned_bytes = vec![label, width as u8, height as u8, orientation as u8];
+        SourceInput {
+            id: SourceId::new(),
+            ownership: SourceOwnership::OwnedCopy,
+            external_path: None,
+            origin_path: PathBuf::from(format!("capture-{label}.png")),
+            sha256: ContentDigest::sha256(&owned_bytes).0,
+            width,
+            height,
+            format: "PNG".into(),
+            color_type: "Rgba8".into(),
+            has_alpha: true,
+            exif_orientation: orientation,
+            has_embedded_icc_profile: false,
+            encoded_bytes: owned_bytes.len() as u64,
+            owned_bytes: Some(owned_bytes),
+        }
+    }
+
+    #[test]
+    fn algorithm_stage_01_registration() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-stage-01-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("registration.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Stage 1").expect("create current schema");
+        let primary = Uuid::from_bytes(store.summary().expect("empty summary").source_sets[0].id.to_bytes());
+
+        let missing_base = store
+            .replace_source_in_set(primary, SourceChannel::Normal, &input(1, 8, 4, 1))
+            .expect_err("companions require Base Color");
+        let diagnostic = missing_base
+            .registration_diagnostic(SourceChannel::Normal)
+            .expect("typed registration diagnostic");
+        assert_eq!(diagnostic.code, RegistrationDiagnosticCode::BaseColorRequired);
+        assert_eq!(diagnostic.recovery_choices, vec![RegistrationRecoveryChoice::AssignBaseColor]);
+
+        let base = input(2, 8, 4, 1);
+        let original_bytes = base.owned_bytes.clone().expect("owned bytes");
+        store.replace_source_in_set(primary, SourceChannel::BaseColor, &base).expect("Base-Color-only is valid");
+        let base_only = store.summary().expect("base-only summary");
+        assert_eq!(base_only.source_sets[0].source_revision, 1);
+        assert_eq!(base_only.sources[0].input.owned_bytes.as_deref(), Some(original_bytes.as_slice()));
+        assert_eq!(base_only.sources[0].input.sha256, ContentDigest::sha256(&original_bytes).0);
+        assert_eq!(base_only.sources[0].registration.interpretation, ChannelInterpretation::ColorManagedBaseColor);
+
+        let dimension_error = store
+            .replace_source_in_set(primary, SourceChannel::Roughness, &input(3, 4, 8, 1))
+            .expect_err("no implicit resize or rotate");
+        assert!(matches!(dimension_error, StoreError::RegistrationMismatch { .. }));
+        assert_eq!(
+            dimension_error.registration_diagnostic(SourceChannel::Roughness).unwrap().code,
+            RegistrationDiagnosticCode::OrientedDimensionMismatch,
+        );
+        let orientation_error = store
+            .replace_source_in_set(primary, SourceChannel::Roughness, &input(4, 8, 4, 6))
+            .expect_err("orientation transforms cannot drift");
+        assert!(matches!(orientation_error, StoreError::OrientationMismatch { .. }));
+
+        let invalid_normal = ChannelRegistration {
+            role: MaterialChannelRole::Normal,
+            interpretation: ChannelInterpretation::ColorManagedBaseColor,
+            normal_convention: NormalConvention::OpenGl,
+            assignment_provenance: AssignmentProvenance::UserAssigned,
+            confidence_milli: 1000,
+        };
+        assert!(matches!(
+            store.replace_registered_source_in_set(primary, &input(5, 8, 4, 1), invalid_normal),
+            Err(StoreError::ChannelInterpretationMismatch { .. })
+        ));
+
+        for (index, channel) in SourceChannel::ALL.into_iter().enumerate().skip(1) {
+            let mut registration = ChannelRegistration::explicit(channel.material_role());
+            registration.assignment_provenance = if index % 2 == 0 {
+                AssignmentProvenance::FilenameSuggested
+            } else {
+                AssignmentProvenance::UserAssigned
+            };
+            registration.confidence_milli = if registration.assignment_provenance == AssignmentProvenance::FilenameSuggested { 700 } else { 1000 };
+            if channel == SourceChannel::Normal {
+                registration.normal_convention = NormalConvention::OpenGl;
+            }
+            store
+                .replace_registered_source_in_set(primary, &input(10 + index as u8, 8, 4, 1), registration)
+                .expect("full PBR and auxiliary roles register through one path");
+        }
+        let full = store.summary().expect("full registered source");
+        assert_eq!(full.sources.iter().filter(|source| source.source_set_id == primary).count(), 10);
+        assert_eq!(full.source_sets[0].source_revision, 10);
+        assert!(full.sources.iter().filter(|source| source.channel != SourceChannel::BaseColor)
+            .all(|source| source.registration.interpretation != ChannelInterpretation::ColorManagedBaseColor));
+
+        store.connection.execute(
+            "INSERT INTO source_derived_cache (source_set_id, registration_digest, cache_key) VALUES (?1, ?2, 'stale')",
+            rusqlite::params![primary.to_string(), full.source_sets[0].registration_digest.0],
+        ).expect("seed derived cache");
+        let before_replace = full.source_sets[0].clone();
+        store.replace_source_in_set(primary, SourceChannel::Roughness, &input(40, 8, 4, 1)).expect("replace channel");
+        let after_replace = store.summary().expect("replacement summary").source_sets[0].clone();
+        assert_eq!(after_replace.source_revision, before_replace.source_revision + 1);
+        assert_ne!(after_replace.registration_digest, before_replace.registration_digest);
+        let stale_count: u32 = store.connection.query_row(
+            "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
+            [primary.to_string()], |row| row.get(0),
+        ).expect("cache count");
+        assert_eq!(stale_count, 0, "replacement must invalidate all derived entries");
+
+        store.connection.execute(
+            "INSERT INTO source_derived_cache (source_set_id, registration_digest, cache_key) VALUES (?1, ?2, 'stale-remove')",
+            rusqlite::params![primary.to_string(), after_replace.registration_digest.0],
+        ).expect("seed removal cache");
+        store.remove_source_in_set(primary, SourceChannel::Specular).expect("remove companion");
+        let after_remove = store.summary().unwrap().source_sets[0].clone();
+        assert_eq!(after_remove.source_revision, after_replace.source_revision + 1);
+        let removal_cache_count: u32 = store.connection.query_row(
+            "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
+            [primary.to_string()], |row| row.get(0),
+        ).expect("removal cache count");
+        assert_eq!(removal_cache_count, 0, "removal must invalidate all derived entries");
+
+        let exemplar = Uuid::new_v4();
+        store.replace_source_in_set(exemplar, SourceChannel::BaseColor, &input(50, 16, 16, 1)).expect("independent exemplar");
+        store.connection.execute(
+            "INSERT INTO source_derived_cache (source_set_id, registration_digest, cache_key) VALUES (?1, ?2, 'stale-group')",
+            rusqlite::params![primary.to_string(), after_remove.registration_digest.0],
+        ).expect("seed grouping cache");
+        store.set_exemplar_group(primary, Some("related-captures")).expect("group primary exemplar");
+        let grouping_cache_count: u32 = store.connection.query_row(
+            "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
+            [primary.to_string()], |row| row.get(0),
+        ).expect("grouping cache count");
+        assert_eq!(grouping_cache_count, 0, "grouping must invalidate all derived entries");
+        store.set_exemplar_group(exemplar, Some("related-captures")).expect("group second exemplar");
+        let grouped = store.summary().expect("grouped exemplars");
+        assert_eq!(grouped.source_sets.iter().filter(|source| source.exemplar_group.as_deref() == Some("related-captures")).count(), 2);
+
+        let mut tampered = input(60, 8, 4, 1);
+        tampered.sha256 = "0".repeat(64);
+        assert!(matches!(
+            store.replace_source_in_set(primary, SourceChannel::Opacity, &tampered),
+            Err(StoreError::ImmutableDigestMismatch)
+        ));
+
+        let external_path = root.join("external.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255])).save(&external_path).expect("write external fixture");
+        let inspected = hot_trimmer_image_io::inspect_path(&external_path, hot_trimmer_image_io::DecodeLimits::default())
+            .expect("desktop-style external inspection");
+        let info = inspected.info;
+        let external = SourceInput {
+            id: SourceId::new(), ownership: SourceOwnership::VerifiedExternalReference,
+            external_path: Some(external_path.clone()), origin_path: external_path.clone(),
+            sha256: info.sha256, width: info.width, height: info.height, format: info.format,
+            color_type: info.color_type, has_alpha: info.has_alpha,
+            exif_orientation: info.exif_orientation,
+            has_embedded_icc_profile: info.has_embedded_icc_profile,
+            encoded_bytes: info.encoded_bytes, owned_bytes: None,
+        };
+        store.replace_source_in_set(Uuid::new_v4(), SourceChannel::BaseColor, &external)
+            .expect("store re-verifies a stable external reference");
+
+        let raced_path = root.join("external-race.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])).save(&raced_path).expect("write race fixture");
+        let inspected = hot_trimmer_image_io::inspect_path(&raced_path, hot_trimmer_image_io::DecodeLimits::default())
+            .expect("initial race inspection");
+        let info = inspected.info;
+        let raced = SourceInput {
+            id: SourceId::new(), ownership: SourceOwnership::VerifiedExternalReference,
+            external_path: Some(raced_path.clone()), origin_path: raced_path.clone(),
+            sha256: info.sha256, width: info.width, height: info.height, format: info.format,
+            color_type: info.color_type, has_alpha: info.has_alpha,
+            exif_orientation: info.exif_orientation,
+            has_embedded_icc_profile: info.has_embedded_icc_profile,
+            encoded_bytes: info.encoded_bytes, owned_bytes: None,
+        };
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([9, 8, 7, 255])).save(&raced_path).expect("mutate external before persistence");
+        assert!(matches!(
+            store.replace_source_in_set(Uuid::new_v4(), SourceChannel::BaseColor, &raced),
+            Err(StoreError::ExternalSourceChanged { .. })
+        ));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("remove fixture directory");
     }
 }

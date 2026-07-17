@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 hot-trimmer-domain.workspace = true
 hot-trimmer-geometry = { path = "../geometry" }
+hot-trimmer-image-io = { path = "../image-io" }
 thiserror.workspace = true
 
 [dev-dependencies]

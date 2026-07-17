@@ -312,24 +312,36 @@ Implement Prompt 04 / Stage 4 from the full algorithm-stack prompt pack.
 Read the common rules and revised Stage 4. Consume only Stage 3 PreparedExemplars. No subagents.
 
 Objective:
-Separate approximate reflectance from captured illumination when appropriate while safely preserving already
-de-lit sources and uncertainty.
+Provide de-lighting as an explicit, reversible source-preparation capability for photographs while making exact
+PassThrough the default Stage 4 route. Stage 4 must always produce its typed downstream contract, but it must not
+modify Base Color unless the user explicitly selects a de-lighting route. Preserve already de-lit sources and
+uncertainty.
 
 Scope:
+- Define persisted typed route intent: PassThrough, ClassicalLowFrequency, or LocalIntrinsicProvider. New and
+  unclassified sources default to PassThrough. Existing authored textures/PBR sets also use documented PassThrough.
+  Do not infer permission to de-light from filenames, Base-Color-only registration, or missing companion maps.
 - Implement a deterministic classical low-frequency route in linear/log luminance with bounded edge-preserving
   filtering, epsilon protection, color preservation, strength, shadow/highlight recovery, and radius in physical or
-  scale-aware units.
-- Produce highlight, shadow, clipping, and confidence masks for later usability/scoring stages.
-- Implement a typed PassThrough policy for authored textures/PBR sets and user-disabled de-lighting.
+  scale-aware units. Execute it only when ClassicalLowFrequency is explicitly selected.
+- Produce highlight, shadow, clipping, and confidence masks for later usability/scoring stages when analysis is
+  requested. PassThrough forwards existing Stage 2/3 diagnostics and coverage without inventing inferred lighting.
+- Implement byte-stable typed PassThrough for the default, authored textures/PBR sets, and user-disabled
+  de-lighting. Record the specific reason.
 - Define a versioned local intrinsic-image provider interface and deterministic result contract. Until a model is
-  installed, return explicit unavailable and use the selected classical/pass-through fallback; do not fake ML.
+  installed, keep the route unavailable. If the user explicitly selects it, return explicit unavailable and use only
+  the fallback they explicitly chose; do not fake ML or silently activate the classical route.
 - Record Estimated provenance for all inferred reflectance and retain original prepared Base Color.
-- Add bounded preview controls and authoritative commands without applying de-lighting to scalar/normal/ID maps.
+- Add bounded opt-in preview controls and authoritative commands. The control is Off/PassThrough by default, makes
+  the selected route and strength visible, and can restore the original without recomputation ambiguity. Never apply
+  de-lighting to scalar/normal/ID maps.
 - Add docs/phase-reports/algorithm-stage-04.md.
 
 Acceptance:
+- A new source with no Stage 4 override takes byte-stable PassThrough and performs no de-lighting work.
 - Uneven-light fixtures reduce low-frequency illumination without erasing structural edges beyond tolerance.
 - Clean authored textures take a documented pass-through route.
+- Disabling an enabled route restores the original prepared Base Color and records user-disabled PassThrough.
 - Dark pigment and cast-shadow ambiguity remains represented by confidence/masks.
 - Same input/settings/version produce deterministic output and diagnostics.
 
@@ -338,8 +350,10 @@ cargo test -p hot-trimmer-material-analysis algorithm_stage_04_delighting
 
 Stop conditions:
 - Stop if every Base Color is automatically de-lit.
+- Stop if de-lighting is activated from filenames, Base-Color-only status, missing maps, or an unconfirmed heuristic.
 - Stop if scalar or ID channels are altered.
 - Stop if unavailable learned inference is reported as executed.
+- Stop if unavailable learned inference silently enables a fallback the user did not select.
 ```
 
 ---

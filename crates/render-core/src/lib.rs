@@ -12,6 +12,9 @@ use hot_trimmer_geometry::{GeometryError, Homography, Point, Quadrilateral};
 use thiserror::Error;
 
 mod structural_profile;
+mod registered_rectification;
+
+pub use registered_rectification::*;
 
 pub use structural_profile::{
     NormalConvention, ProfileKind, StructuralProfile, StructuralProfileError,

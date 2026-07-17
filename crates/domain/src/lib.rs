@@ -2,7 +2,9 @@ mod channel;
 mod document;
 mod error;
 mod id;
+mod algorithm_stack;
 mod layout;
+mod material_source;
 mod patch;
 mod protocol;
 mod templates;
@@ -23,6 +25,7 @@ pub use document::{
 };
 pub use error::{DomainError, ErrorCode, UserFacingError};
 pub use id::{LayerId, LayoutId, MapId, PatchId, ProjectId, RegionId, SourceId, SourceSetId};
+pub use algorithm_stack::*;
 pub use layout::{
     AutoPackSettings, DecorationBinding, FillBehavior, FixedRegionSize, IdColor, Layout,
     LayoutContractError, LayoutItem, LayoutKind, LayoutOrder, LayoutPreset, LayoutRegion,
@@ -33,6 +36,14 @@ pub use layout::{
     SourceMapping, SourceRectification, SourceRectificationMode, SourceSampling,
     SourceSamplingMode, SourceWarp, StyleRecipe, TemplateIdentity, TemplateLayoutContract,
     TemplateSnapshot, TrimAxis, TrimCaps,
+};
+pub use material_source::{
+    AssignmentProvenance, ChannelInterpretation, ChannelRegistration, MaterialChannelRole,
+    ClassicalDelightingSettings, DelightingIntent, DelightingPassThroughReason,
+    DelightingRadius, DelightingRouteIntent, IntrinsicProviderFallback, MaterialSource,
+    NormalConvention, OrientedPixelSize, OriginalAssetProvenance,
+    RegisteredChannel, RegisteredChannelSet, RegistrationDiagnostic, RegistrationDiagnosticCode,
+    RegistrationRecoveryChoice, SourceOwnershipIntent,
 };
 pub use patch::{
     MapParticipation, Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchGeometry,

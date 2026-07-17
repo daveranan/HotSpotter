@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "behaviorClasses": [
+    { "id": "already_tileable", "expectedProperties": ["opposite boundaries agree", "registered channels remain aligned"] },
+    { "id": "stochastic_isotropic", "expectedProperties": ["orientation neutral statistics", "stationary fine structure"] },
+    { "id": "stochastic_directional", "expectedProperties": ["dominant orientation is measurable", "cross-axis scale is preserved"] },
+    { "id": "periodic_lattice_structured", "expectedProperties": ["two-dimensional periods are measurable", "complete lattice cells are preserved"] },
+    { "id": "layered_banded", "expectedProperties": ["band orientation is measurable", "boundaries remain coherent"] },
+    { "id": "organic_directional", "expectedProperties": ["local orientation may vary", "directional continuity is preserved"] },
+    { "id": "manufactured_pattern", "expectedProperties": ["motif period is measurable", "motif physical size is preserved"] },
+    { "id": "unique_detail", "expectedProperties": ["salient content is localized", "contain and cover remain distinct"] },
+    { "id": "radial_detail", "expectedProperties": ["circular proportion is preserved", "radial and planar routes remain distinct"] },
+    { "id": "mixed_unknown", "expectedProperties": ["classification uncertainty is explicit", "unsupported routing cannot fabricate output"] }
+  ],
+  "sourceConditions": [
+    { "id": "clean_planar", "expectedProperties": ["no correction is required"] },
+    { "id": "perspective", "expectedProperties": ["one registered homography applies to all channels"] },
+    { "id": "unevenly_lit", "expectedProperties": ["lighting confidence remains explicit"] },
+    { "id": "clipped", "expectedProperties": ["clipping is reported as unusable or low confidence"] },
+    { "id": "low_resolution", "expectedProperties": ["resolution insufficiency is reported"] },
+    { "id": "transparent", "expectedProperties": ["transparent pixels are excluded from usable area"] },
+    { "id": "salient_logo", "expectedProperties": ["generic slots avoid the salient region unless explicitly requested"] },
+    { "id": "deliberately_misregistered", "expectedProperties": ["registration failure is detected before synthesis"] }
+  ],
+  "registeredMapCombinations": [
+    { "id": "base_color_only", "channels": ["base_color"], "expectedProperties": ["derived PBR remains labeled estimated"] },
+    { "id": "base_color_normal", "channels": ["base_color", "normal"], "expectedProperties": ["normal is treated as vector data"] },
+    { "id": "base_color_scalar_set", "channels": ["base_color", "height", "roughness", "metallic", "ambient_occlusion"], "expectedProperties": ["scalar maps remain linear"] },
+    { "id": "registered_pbr", "channels": ["base_color", "normal", "height", "roughness", "metallic", "ambient_occlusion"], "expectedProperties": ["one correspondence field controls every channel"] },
+    { "id": "registered_extended", "channels": ["base_color", "normal", "height", "roughness", "metallic", "ambient_occlusion", "specular", "opacity", "edge_mask", "material_id"], "expectedProperties": ["IDs remain categorical", "opacity and edge validity constrain usability"] }
+  ],
+  "semanticSlotRoles": [
+    { "id": "broad_panel", "expectedProperties": ["two-dimensional physical scale is preserved"] },
+    { "id": "square_panel", "expectedProperties": ["exact-aspect sampling precedes resampling"] },
+    { "id": "horizontal_strip", "expectedProperties": ["cross-axis thickness is preserved", "major-axis repetition is legal"] },
+    { "id": "vertical_strip", "expectedProperties": ["cross-axis thickness is preserved", "major-axis repetition is legal"] },
+    { "id": "unique_detail", "expectedProperties": ["salient content is not globally duplicated"] },
+    { "id": "trim_cap", "expectedProperties": ["cap borders and center transitions are preserved"] },
+    { "id": "radial", "expectedProperties": ["circular proportion is preserved"] }
+  ],
+  "syntheticFixtures": [
+    { "id": "structure_cross", "generator": "structure", "seed": 1, "width": 64, "height": 64, "provenance": { "generatorId": "integer_field", "generatorVersion": 1, "generatedNotCaptured": true }, "expectedProperties": { "lineX": 17, "lineY": 41 } },
+    { "id": "orientation_oblique", "generator": "orientation", "seed": 2, "width": 64, "height": 64, "provenance": { "generatorId": "integer_field", "generatorVersion": 1, "generatedNotCaptured": true }, "expectedProperties": { "rise": 1, "run": 3 } },
+    { "id": "periodic_lattice", "generator": "periodicity", "seed": 3, "width": 64, "height": 64, "provenance": { "generatorId": "integer_field", "generatorVersion": 1, "generatedNotCaptured": true }, "expectedProperties": { "periodX": 8, "periodY": 13 } },
+    { "id": "salient_mark", "generator": "saliency", "seed": 4, "width": 64, "height": 64, "provenance": { "generatorId": "integer_field", "generatorVersion": 1, "generatedNotCaptured": true }, "expectedProperties": { "centerX": 23, "centerY": 37, "radius": 5 } },
+    { "id": "registered_channels", "generator": "registration", "seed": 5, "width": 64, "height": 64, "provenance": { "generatorId": "integer_field", "generatorVersion": 1, "generatedNotCaptured": true }, "expectedProperties": { "sharedOffsetX": 0, "sharedOffsetY": 0 } }
+  ]
+}

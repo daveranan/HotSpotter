@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::DomainError;
 
-pub const IPC_PROTOCOL_VERSION: u16 = 1;
+/// Clean algorithm-stack IPC baseline. Version 1 projects and commands are intentionally not adapted.
+pub const IPC_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
