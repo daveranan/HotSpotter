@@ -22,6 +22,12 @@ pub use quilting::*;
 #[path = "patchmatch.rs"]
 mod patchmatch;
 pub use patchmatch::*;
+#[path = "procedural.rs"]
+mod procedural;
+pub use procedural::*;
+#[path = "router.rs"]
+mod router;
+pub use router::*;
 
 pub const STAGE_08A_DIRECT_ALGORITHM_ID: &str = "hot_trimmer.direct_source_domain";
 pub const STAGE_08A_GRAPHCUT_ALGORITHM_ID: &str = "hot_trimmer.multichannel_graphcut_periodic_closure";
@@ -44,6 +50,9 @@ pub enum DomainRoute {
     GraphCutPeriodicClosure,
     TextureQuilting,
     PatchMatch,
+    StatisticalSynthesis,
+    ProceduralReconstruction,
+    LearnedProvider,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +152,12 @@ pub enum DomainOperation {
     QuiltPatch { patch_index: u32 },
     /// A sample selected by the one registered PatchMatch nearest-neighbor field.
     PatchMatch { preserved: bool },
+    /// A deterministic sample from the classical statistical route.
+    StatisticalSample,
+    /// A value evaluated from one registered fitted procedural coordinate field.
+    ProceduralSample,
+    /// A value returned through the validated local learned-provider boundary.
+    LearnedSample,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +167,7 @@ pub enum OperationField {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProvenanceValue { Original, SeamComposed }
+pub enum ProvenanceValue { Original, SeamComposed, ClassicalSynthesized, ProceduralEstimated, LearnedEstimated }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeamAxis { X, Y }
@@ -179,6 +194,12 @@ pub enum DomainQaView {
     SourceUsage,
     NearestNeighborField,
     Coherence,
+    RouteComparison,
+    Applicability,
+    Scale,
+    Determinism,
+    CacheProvenance,
+    LearnedProvider,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,6 +340,8 @@ pub enum DomainError {
     PatchMatchNonConverged { iterations: u16, changed_pixels: u64 },
     #[error("Stage 8C PatchMatch boundary error {horizontal_milli}/1000 x {vertical_milli}/1000 exceeds {maximum_milli}/1000")]
     UnacceptablePatchMatchBoundary { horizontal_milli: u16, vertical_milli: u16, maximum_milli: u16 },
+    #[error("statistical, procedural, and learned Stage 8 routes are reachable only through the authoritative material-domain router")]
+    RouterRequired,
 }
 
 impl DomainError {
@@ -338,7 +361,7 @@ impl DomainError {
                 (DiagnosticCode::InsufficientInput, vec![RecoveryChoice::ChooseAnotherSource, RecoveryChoice::AdjustSettings]),
             Self::UnacceptablePatchMatchBoundary { .. } =>
                 (DiagnosticCode::InsufficientInput, vec![RecoveryChoice::ChooseAnotherSource, RecoveryChoice::AdjustSettings]),
-            Self::InvalidSettings | Self::RegistrationDrift | Self::PlaneConstruction => (DiagnosticCode::MalformedInput, vec![RecoveryChoice::AdjustSettings]),
+            Self::InvalidSettings | Self::RegistrationDrift | Self::PlaneConstruction | Self::RouterRequired => (DiagnosticCode::MalformedInput, vec![RecoveryChoice::AdjustSettings]),
         };
         StageResult::FailedWithRecovery {
             reason: CompilationDiagnostic { code, stage: Some(8), message: self.to_string(), context: BTreeMap::new() },
@@ -362,6 +385,8 @@ pub fn prepare_material_domain(
         DomainRoute::GraphCutPeriodicClosure => graph_cut_domain(request, key, cancellation)?,
         DomainRoute::TextureQuilting => quilted_domain(request, key, cancellation)?,
         DomainRoute::PatchMatch => patchmatch_domain(request, key, cancellation)?,
+        DomainRoute::StatisticalSynthesis | DomainRoute::ProceduralReconstruction
+        | DomainRoute::LearnedProvider => return Err(DomainError::RouterRequired),
         DomainRoute::Auto => unreachable!("route selection resolves Auto"),
     };
     cache.insert_complete(domain.clone());
@@ -1071,6 +1096,8 @@ mod tests {
         let scale_orientation = Arc::new(ScaleOrientationReport {
             cache_key: ContentDigest::sha256(b"scale-orientation"),
             downstream_footprint_key: ContentDigest::sha256(b"scale-footprint"),
+            prepared_source_digest: prepared.clone(),
+            stage_five_cache_key: hot_trimmer_material_analysis::SourceAnalysisCacheKey(ContentDigest::sha256(b"stage-five")),
             scale: hot_trimmer_domain::PhysicalScaleEvidence::default(), scale_diagnostics: Vec::new(),
             global_orientation: GlobalOrientation { axis_millidegrees: None, measured_axis_millidegrees: None,
                 anisotropy_milli: 0, confidence_milli: 0, authority: OrientationAuthority::UnavailableLowConfidence,
@@ -1089,6 +1116,7 @@ mod tests {
         let analysis = FeatureFieldReport {
             cache_key: ContentDigest::sha256(b"analysis"),
             prepared_source_digest: prepared.clone(),
+            stage_six_cache_key: scale_orientation.cache_key.clone(),
             registration_digest: registered,
             saliency: pyramid(scalar_plane(width, height, zeros.clone())),
             structure,
@@ -1467,5 +1495,177 @@ mod tests {
             Err(DomainError::ResourceLimitExceeded), "preflight must reject before allocating a descriptor pyramid over budget");
         let cancelled = RenderCancellationToken::new(); cancelled.cancel();
         assert_eq!(prepare_material_domain(&stochastic, &mut MaterialDomainCache::default(), &cancelled), Err(DomainError::Cancelled));
+    }
+
+    fn router_fixture(behavior: hot_trimmer_domain::MaterialBehaviorClass) -> Stage8RouterRequest {
+        let cancellation = RenderCancellationToken::new();
+        let mut domain = fixture(12, 10, 20);
+        domain.quilting = QuiltingSettings {
+            output_width: 12, output_height: 10,
+            patch_size: QuiltingPatchSize::RelativeMilli { width: 500, height: 500 },
+            pyramid_levels: 1, candidate_count: 4, near_best_count: 2,
+            max_candidate_count: 8, max_patch_count: 32, max_iterations: 32,
+            max_operations: 1_000_000, max_working_bytes: 4_000_000,
+            ..QuiltingSettings::default()
+        };
+        domain.patch_match = PatchMatchSettings {
+            output_width: 12, output_height: 10, patch_radius: 1,
+            pyramid_levels: 1, iterations_per_level: 1, random_search_radius: 4,
+            random_candidates_per_radius: 1, max_iterations: 4,
+            max_operations: 1_000_000, max_working_bytes: 4_000_000,
+            ..PatchMatchSettings::default()
+        };
+        let mut stage_five = analyze_source(&domain.source, &AnalysisSettings::default(), None, &cancellation).unwrap();
+        stage_five.classification.analyzed_class = behavior;
+        stage_five.classification.confidence_milli = 900;
+        Arc::make_mut(&mut domain.scale_orientation).stage_five_cache_key = stage_five.cache_key.clone();
+        Stage8RouterRequest { domain, stage_five: Arc::new(stage_five),
+            policy: MaterialDomainRoutePolicy::default(), procedural_override: None,
+            procedural_settings: ProceduralFitSettings { limits: ProceduralLimits {
+                max_output_pixels: 65_536, max_working_bytes: 16_000_000,
+                max_operations: 100_000_000, max_fit_samples: 4096,
+            }, ..ProceduralFitSettings::default() }, output_width: 12, output_height: 10 }
+    }
+
+    struct TestLearnedProvider { device: LearnedExecutionDevice, include_estimated_maps: bool }
+    impl LocalLearnedMaterialProvider for TestLearnedProvider {
+        fn descriptor(&self) -> LearnedProviderDescriptor { LearnedProviderDescriptor {
+            provider_id: "approved-test-provider".into(), provider_version: "1.0.0".into(),
+            interface_version: LEARNED_PROVIDER_INTERFACE_VERSION,
+            model_digest: ContentDigest::sha256(b"approved-test-model"),
+            capabilities: if self.include_estimated_maps { BTreeSet::from([LearnedCapability::SeamlessExpansion,
+                LearnedCapability::EstimatedHeight, LearnedCapability::EstimatedNormal]) }
+                else { BTreeSet::from([LearnedCapability::SeamlessExpansion]) },
+            device_policy: LearnedDevicePolicy::CpuOnly, deterministic: true,
+            maximum_input_pixels: 1024, maximum_output_pixels: 1024, maximum_working_bytes: 1_000_000,
+        }}
+        fn infer(&self, request: &LearnedMaterialRequest<'_>, _: &RenderCancellationToken)
+            -> Result<LearnedMaterialOutput, LearnedProviderError>
+        {
+            if !self.include_estimated_maps && request.requested.iter().any(|capability|
+                matches!(capability, LearnedCapability::EstimatedHeight | LearnedCapability::EstimatedNormal))
+            { return Err(LearnedProviderError::UnsupportedCapability); }
+            let count = (request.output_width * request.output_height) as usize;
+            let channels = request.source.channels.iter().map(|channel| match channel {
+                PreparedExemplarChannel::BaseColor { plane, alpha_mode } => PreparedExemplarChannel::BaseColor {
+                    plane: ImagePlane::from_row_major(request.output_width, request.output_height, 4,
+                        &vec![*plane.pixel(0, 0); count]).unwrap(), alpha_mode: *alpha_mode },
+                PreparedExemplarChannel::Scalar { role, plane } => PreparedExemplarChannel::Scalar { role: *role,
+                    plane: ImagePlane::from_row_major(request.output_width, request.output_height, 4,
+                        &vec![*plane.pixel(0, 0); count]).unwrap() },
+                PreparedExemplarChannel::Normal { plane, source_convention, canonical_convention, alpha_policy } => PreparedExemplarChannel::Normal {
+                    plane: ImagePlane::from_row_major(request.output_width, request.output_height, 4,
+                        &vec![*plane.pixel(0, 0); count]).unwrap(), source_convention: *source_convention,
+                    canonical_convention: *canonical_convention, alpha_policy: *alpha_policy },
+                PreparedExemplarChannel::MaterialId { plane } => PreparedExemplarChannel::MaterialId {
+                    plane: ImagePlane::from_row_major(request.output_width, request.output_height, 4,
+                        &vec![*plane.pixel(0, 0); count]).unwrap() },
+                PreparedExemplarChannel::Mask { role, plane } => PreparedExemplarChannel::Mask { role: *role,
+                    plane: ImagePlane::from_row_major(request.output_width, request.output_height, 4,
+                        &vec![*plane.pixel(0, 0); count]).unwrap() },
+            }).collect::<Vec<_>>();
+            Ok(LearnedMaterialOutput { output_digest: canonical_learned_output_digest(&channels), channels,
+                confidence_milli: 800, model_digest: ContentDigest::sha256(b"approved-test-model"),
+                deterministic: true, device: self.device, diagnostics: vec!["fixture provider".into()] })
+        }
+    }
+
+    #[test]
+    fn algorithm_stage_08_router_domain_route_goldens() {
+        let cancellation = RenderCancellationToken::new();
+        for behavior in hot_trimmer_domain::MaterialBehaviorClass::ALL {
+            let request = router_fixture(behavior);
+            let first = prepare_stage_08_material_domain(&request, None, &mut MaterialDomainCache::default(), &cancellation);
+            match first {
+                Ok(result) => {
+                    let allowed: &[DomainRoute] = match behavior {
+                        hot_trimmer_domain::MaterialBehaviorClass::AlreadyTileable => &[DomainRoute::DirectSource, DomainRoute::GraphCutPeriodicClosure],
+                        hot_trimmer_domain::MaterialBehaviorClass::StochasticIsotropic => &[DomainRoute::TextureQuilting, DomainRoute::StatisticalSynthesis, DomainRoute::ProceduralReconstruction],
+                        hot_trimmer_domain::MaterialBehaviorClass::StochasticDirectional => &[DomainRoute::TextureQuilting, DomainRoute::ProceduralReconstruction],
+                        hot_trimmer_domain::MaterialBehaviorClass::LayeredBanded => &[DomainRoute::ProceduralReconstruction],
+                        hot_trimmer_domain::MaterialBehaviorClass::OrganicDirectional => &[DomainRoute::TextureQuilting, DomainRoute::ProceduralReconstruction],
+                        hot_trimmer_domain::MaterialBehaviorClass::UniqueDetail | hot_trimmer_domain::MaterialBehaviorClass::RadialDetail => &[DomainRoute::DirectSource],
+                        hot_trimmer_domain::MaterialBehaviorClass::MixedUnknown => &[DomainRoute::GraphCutPeriodicClosure, DomainRoute::TextureQuilting, DomainRoute::PatchMatch],
+                        hot_trimmer_domain::MaterialBehaviorClass::PeriodicLatticeStructured
+                        | hot_trimmer_domain::MaterialBehaviorClass::ManufacturedPattern => panic!("structured fixture without period evidence must be insufficient"),
+                    };
+                    assert!(allowed.contains(&result.domain.route), "unexpected {behavior:?} route {:?}", result.domain.route);
+                    if behavior == hot_trimmer_domain::MaterialBehaviorClass::AlreadyTileable {
+                        assert_eq!(result.domain.route, DomainRoute::GraphCutPeriodicClosure,
+                            "one discontinuous registered channel must reject direct periodic publication");
+                    }
+                    assert!(result.diagnostics.registration_valid && result.diagnostics.seam_or_period_valid
+                        && result.diagnostics.correspondence_valid && result.diagnostics.deterministic
+                        && result.diagnostics.cache_provenance_valid);
+                    let replay = prepare_stage_08_material_domain(&request, None, &mut MaterialDomainCache::default(), &cancellation).unwrap();
+                    assert_eq!(result.domain, replay.domain, "{behavior:?} must replay byte-identically");
+                }
+                Err(Stage8RouterError::ActionableInsufficiency(diagnostics)) => {
+                    assert!(matches!(behavior, hot_trimmer_domain::MaterialBehaviorClass::PeriodicLatticeStructured
+                        | hot_trimmer_domain::MaterialBehaviorClass::ManufacturedPattern
+                        | hot_trimmer_domain::MaterialBehaviorClass::StochasticDirectional
+                        | hot_trimmer_domain::MaterialBehaviorClass::LayeredBanded
+                        | hot_trimmer_domain::MaterialBehaviorClass::OrganicDirectional));
+                    assert!(!diagnostics.messages.is_empty());
+                    if matches!(behavior, hot_trimmer_domain::MaterialBehaviorClass::PeriodicLatticeStructured
+                        | hot_trimmer_domain::MaterialBehaviorClass::ManufacturedPattern) {
+                        assert!(diagnostics.compared_routes.iter().any(|route| route.route == DomainRoute::DirectSource
+                            && !route.applicable && route.rejection.as_deref().is_some_and(|reason| reason.contains("period"))));
+                    }
+                }
+                Err(error) => panic!("unexpected router contract failure for {behavior:?}: {error}"),
+            }
+        }
+
+        let mut statistical = router_fixture(hot_trimmer_domain::MaterialBehaviorClass::StochasticIsotropic);
+        statistical.policy.pinned_route = Some(DomainRoute::StatisticalSynthesis);
+        let statistical_result = prepare_stage_08_material_domain(&statistical, None,
+            &mut MaterialDomainCache::default(), &cancellation).unwrap();
+        assert_eq!(statistical_result.domain.route, DomainRoute::StatisticalSynthesis);
+        let CorrespondenceField::Registered(field) = &statistical_result.domain.correspondence else { panic!("registered statistical field") };
+        let coherent = (0..field.height()).flat_map(|y| (0..field.width() - 1).map(move |x| {
+            let a = field.pixel(x, y).sources[0].unwrap().coordinate;
+            let b = field.pixel(x + 1, y).sources[0].unwrap().coordinate;
+            a.x.abs_diff(b.x) <= 3 || a.x.abs_diff(b.x) >= field.width() - 3
+        })).filter(|value| *value).count();
+        assert!(coherent * 2 > (field.width() as usize - 1) * field.height() as usize,
+            "statistical synthesis must retain local neighborhoods, not independently resample pixels");
+        let mut transposed = statistical.clone(); transposed.output_width = 10; transposed.output_height = 12;
+        let transposed_result = prepare_stage_08_material_domain(&transposed, None,
+            &mut MaterialDomainCache::default(), &cancellation).unwrap();
+        assert_ne!(statistical_result.domain.cache_key, transposed_result.domain.cache_key,
+            "statistical cache provenance must distinguish transposed dimensions");
+
+        let mut pinned = router_fixture(hot_trimmer_domain::MaterialBehaviorClass::StochasticIsotropic);
+        pinned.policy.pinned_route = Some(DomainRoute::DirectSource);
+        let Err(Stage8RouterError::ActionableInsufficiency(pinned_diagnostics)) = prepare_stage_08_material_domain(
+            &pinned, None, &mut MaterialDomainCache::default(), &cancellation) else { panic!("inapplicable pin must fail closed") };
+        assert!(pinned_diagnostics.messages[0].contains("fail-closed"));
+        assert!(pinned_diagnostics.compared_routes.iter().all(|route| !route.attempted));
+
+        let mut learned = router_fixture(hot_trimmer_domain::MaterialBehaviorClass::RadialDetail);
+        learned.policy.source_class_override = Some(MaterialSourceClass::WoodEndGrain);
+        learned.policy.pinned_route = Some(DomainRoute::LearnedProvider);
+        let provider = TestLearnedProvider { device: LearnedExecutionDevice::Cpu, include_estimated_maps: true };
+        let learned_result = prepare_stage_08_material_domain(&learned, Some(&provider),
+            &mut MaterialDomainCache::default(), &cancellation).unwrap();
+        assert_eq!(learned_result.domain.route, DomainRoute::LearnedProvider);
+        assert!(matches!(learned_result.diagnostics.learned_provider, LearnedProviderState::Used { .. }));
+        let expansion_only = TestLearnedProvider { device: LearnedExecutionDevice::Cpu, include_estimated_maps: false };
+        let expansion_result = prepare_stage_08_material_domain(&learned, Some(&expansion_only),
+            &mut MaterialDomainCache::default(), &cancellation).unwrap();
+        assert_eq!(expansion_result.domain.route, DomainRoute::LearnedProvider,
+            "estimated PBR maps are optional for a seamless-expansion provider");
+        let wrong_device = TestLearnedProvider { device: LearnedExecutionDevice::Gpu, include_estimated_maps: true };
+        let Err(Stage8RouterError::ActionableInsufficiency(device_diagnostics)) = prepare_stage_08_material_domain(
+            &learned, Some(&wrong_device), &mut MaterialDomainCache::default(), &cancellation) else { panic!("device mismatch must fail closed") };
+        assert!(device_diagnostics.compared_routes.iter().any(|route| route.route == DomainRoute::LearnedProvider
+            && route.rejection.as_deref().is_some_and(|reason| reason.contains("device-policy"))));
+
+        let mut policy = MaterialDomainRoutePolicy::default();
+        policy.apply(RoutePolicyCommand::Override(DomainRoute::GraphCutPeriodicClosure));
+        policy.apply(RoutePolicyCommand::Pin(DomainRoute::DirectSource));
+        policy.apply(RoutePolicyCommand::ResetRoute);
+        assert_eq!(policy, MaterialDomainRoutePolicy::default());
     }
 }

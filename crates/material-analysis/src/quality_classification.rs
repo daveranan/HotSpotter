@@ -197,6 +197,8 @@ pub struct SourceInspectorEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceAnalysisReport {
     pub cache_key: SourceAnalysisCacheKey,
+    /// Immutable Stage 3/4 prepared-source lineage consumed by this report.
+    pub prepared_source_digest: ContentDigest,
     pub quality: SourceQualityReport,
     pub warnings: Vec<QualityWarning>,
     pub classification: MaterialClassification,
@@ -328,6 +330,7 @@ pub fn analyze_source(
     let diagnostics = warnings.iter().map(warning_diagnostic).collect();
     Ok(SourceAnalysisReport {
         cache_key,
+        prepared_source_digest: source.prepared_source_digest.clone(),
         quality,
         warnings,
         classification: MaterialClassification {

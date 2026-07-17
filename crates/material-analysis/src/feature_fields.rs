@@ -137,6 +137,8 @@ pub struct FeatureFieldReport {
     pub cache_key: ContentDigest,
     /// Exact Stage 3 prepared-source lineage; Stage 8 must require an exact match.
     pub prepared_source_digest: ContentDigest,
+    /// Exact Stage 6 authority used to construct every registered feature field.
+    pub stage_six_cache_key: ContentDigest,
     /// All field planes and source channels are registered to this immutable digest.
     pub registration_digest: ContentDigest,
     pub saliency: ResolutionPyramid<LinearScalar>,
@@ -243,6 +245,7 @@ pub fn extract_feature_fields(
     Ok(FeatureFieldReport {
         cache_key,
         prepared_source_digest: source.prepared_source_digest.clone(),
+        stage_six_cache_key: stage_six.cache_key.clone(),
         registration_digest,
         saliency,
         structure: StructureFields { edge, line, boundary, grid, fiber, intersection },

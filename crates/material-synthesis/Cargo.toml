@@ -10,6 +10,7 @@ hot-trimmer-domain.workspace = true
 hot-trimmer-image-io = { path = "../image-io" }
 hot-trimmer-material-analysis.workspace = true
 hot-trimmer-render-core = { path = "../render-core" }
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, ContentDigest, DiagnosticCode,
-    MaterialCalibrationIntent, PhysicalScaleEvidence, ScaleProvenance, StageResult,
+    MaterialCalibrationIntent, PhysicalScaleEvidence, StageResult,
     WorldScaleAvailability,
 };
 use hot_trimmer_render_core::RenderCancellationToken;
@@ -104,6 +104,9 @@ pub struct OrientationOverlay {
 pub struct ScaleOrientationReport {
     pub cache_key: ContentDigest,
     pub downstream_footprint_key: ContentDigest,
+    /// Immutable source and Stage 5 keys prevent cross-source evidence composition.
+    pub prepared_source_digest: ContentDigest,
+    pub stage_five_cache_key: crate::SourceAnalysisCacheKey,
     pub scale: PhysicalScaleEvidence,
     pub scale_diagnostics: Vec<ScaleDiagnostic>,
     pub global_orientation: GlobalOrientation,
@@ -236,6 +239,8 @@ pub fn calibrate_scale_orientation(
     Ok(ScaleOrientationReport {
         cache_key,
         downstream_footprint_key,
+        prepared_source_digest: source.prepared_source_digest.clone(),
+        stage_five_cache_key: stage_five.cache_key.clone(),
         scale,
         scale_diagnostics,
         global_orientation,

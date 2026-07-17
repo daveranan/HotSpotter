@@ -1625,6 +1625,7 @@ dependencies = [
  "hot-trimmer-image-io",
  "hot-trimmer-material-analysis",
  "hot-trimmer-render-core",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
