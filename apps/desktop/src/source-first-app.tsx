@@ -24,7 +24,6 @@ import {
   type PreviewSheetProjection,
   type RecentProject,
   type RegionMapping,
-  type RegionDefinition,
   type ResolvedRegion,
   type SourceChannel,
   type SourceProjection,
@@ -42,6 +41,9 @@ const templates = [
   ["ht.vertical_trim", "Vertical Trim"],
   ["ht.wood_board_moulding", "Wood Board & Moulding"],
   ["ht.detail_ribbon_microtrim", "Detail Ribbon & Microtrim"],
+  ["ht.hard_surface_panel", "Hard Surface & Panels"],
+  ["ht.detail_heavy_props", "Detail-heavy Props"],
+  ["ht.radial_accents", "Radial Accents"],
 ] as const;
 
 const channelOptions: ReadonlyArray<{ value: SourceChannel; label: string; short: string; tone: string }> = [
@@ -836,20 +838,6 @@ function App() {
     }
   }
 
-  async function setLayoutGrid(size: number) {
-    if (!project?.document) return;
-    try {
-      await command({ type: "set_layout_grid", settings: { columns: size, rows: size, padding: project.document.layoutGrid.padding } });
-    } catch (reason) { setProblem(failure(reason)); }
-  }
-
-  async function setLayoutPadding(padding: number) {
-    if (!project?.document) return;
-    try {
-      await command({ type: "set_layout_grid", settings: { columns: project.document.layoutGrid.columns, rows: project.document.layoutGrid.rows, padding } });
-    } catch (reason) { setProblem(failure(reason)); }
-  }
-
   async function setRegionCrop(regionId: string, bounds: NormalizedBounds) {
     dirtyPreviewRegion.current = regionId;
     try {
@@ -868,11 +856,6 @@ function App() {
     dirtyPreviewRegion.current = regionId;
     try { await command({ type: "set_region_radial", regionId, radial }); }
     catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
-  }
-
-  async function setRegionDestination(regionId: string, allocationRect: { x: number; y: number; width: number; height: number }, padding: number) {
-    try { await command({ type: "set_region_destination", regionId, allocationRect, padding }); }
-    catch (reason) { setProblem(failure(reason)); }
   }
 
   function chooseSource(sourceSetId: string, channel: SourceChannel) {
@@ -1000,8 +983,6 @@ function App() {
           build={build}
           activity={activity}
           setResolution={setResolution}
-          setLayoutGrid={setLayoutGrid}
-          setLayoutPadding={setLayoutPadding}
         />
         {paneMode === "full" ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         {paneMode === "full" ? <Inspector
@@ -1015,7 +996,6 @@ function App() {
           onRedo={() => void history(true)}
           onClassify={(materialSourceId, classificationCommand) => void applyMaterialClassificationCommand(materialSourceId, classificationCommand)}
           onCalibrate={(materialSourceId, calibrationCommand) => void applyMaterialCalibrationCommand(materialSourceId, calibrationCommand)}
-          onSetDestination={(regionId, rect, padding) => void setRegionDestination(regionId, rect, padding)}
           onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
           onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
         /> : null}
@@ -1668,8 +1648,6 @@ function SheetWorkbench(props: {
   build: () => void;
   activity: Activity;
   setResolution: (size: number) => void;
-  setLayoutGrid: (size: number) => void;
-  setLayoutPadding: (padding: number) => void;
 }) {
   const artifact = props.artifact;
   const topologyHash = props.project?.document ? hashBytes(props.project.document.topology.topologyHash) : null;
@@ -1704,12 +1682,6 @@ function SheetWorkbench(props: {
         <option value={1024}>1024</option>
         <option value={2048}>2048</option>
         <option value={4096}>4096</option>
-      </select>
-      <select aria-label="Snap grid" title="Snapping precision; the semantic layout recipe controls the arrangement" value={props.project?.document?.layoutGrid.columns ?? 32} onChange={(event) => void props.setLayoutGrid(Number(event.target.value))} disabled={!props.project?.document}>
-        {[16, 24, 32, 48, 64].map((size) => <option key={size} value={size}>{size} x {size} snap</option>)}
-      </select>
-      <select aria-label="Region padding" title="Mip-safe padding between usable trim regions" value={props.project?.document?.layoutGrid.padding ?? 8} onChange={(event) => void props.setLayoutPadding(Number(event.target.value))} disabled={!props.project?.document}>
-        {[0, 2, 4, 8, 16, 32].map((padding) => <option key={padding} value={padding}>{padding}px padding</option>)}
       </select>
       <button className="primary" onClick={props.build} disabled title="Unavailable until Stage 1 installs the first engine route">
         Engine unavailable
@@ -1757,7 +1729,7 @@ function SheetWorkbench(props: {
         {sheetMatchesDocument ? <div
           className="sheet-grid"
           style={{
-            backgroundSize: `${100 / (props.project?.document?.layoutGrid.columns ?? 32)}% ${100 / (props.project?.document?.layoutGrid.rows ?? 32)}%`,
+            backgroundSize: "6.25% 6.25%",
           }}
         /> : null}
         <div className="overlays">{sheet.regions.map((region) => <button
@@ -1795,7 +1767,6 @@ function Inspector(props: {
   onRedo: () => void;
   onClassify: (materialSourceId: string, command: MaterialClassificationCommand) => void;
   onCalibrate: (materialSourceId: string, command: MaterialCalibrationCommand) => void;
-  onSetDestination: (regionId: string, rect: { x: number; y: number; width: number; height: number }, padding: number) => void;
   onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
 }) {
@@ -1859,12 +1830,6 @@ function Inspector(props: {
           <dt>Bounds</dt><dd>{boundsLabel(props.selectedRegion.allocationBounds)}</dd>
           <dt>Material</dt><dd>{props.selectedRegion.materialId.slice(0, 8)}</dd>
         </dl>
-        <DestinationEditor
-          key={props.selectedRegion.regionId}
-          region={props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegion!.regionId) ?? null}
-          padding={props.project?.document?.layoutGrid.padding ?? 8}
-          onApply={props.onSetDestination}
-        />
         {binding?.mapping.projection.type === "crop" ? <CropEditor
           key={`${props.selectedRegion.regionId}-crop`}
           regionId={props.selectedRegion.regionId}
@@ -1970,25 +1935,6 @@ function CalibrationEditor(props: {
     </div>
     <button onClick={apply}>Apply calibration</button>
     <small>Coordinates are authoritative source pixels; viewport zoom is ignored.</small>
-  </div>;
-}
-
-function DestinationEditor(props: {
-  region: RegionDefinition | null;
-  padding: number;
-  onApply: (regionId: string, rect: { x: number; y: number; width: number; height: number }, padding: number) => void;
-}) {
-  const [rect, setRect] = useState(props.region?.allocationRect ?? { x: 0, y: 0, width: 512, height: 512 });
-  if (!props.region) return null;
-  const squareLocked = props.region.role === "radial";
-  return <div className="destination-editor">
-    <strong>DESTINATION GRID BOUNDS</strong>
-    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={4096} value={rect[field]} disabled={squareLocked && field === "height"} onChange={(event) => {
-      const value = Number(event.target.value);
-      setRect((current) => squareLocked && field === "width" ? { ...current, width: value, height: value } : { ...current, [field]: value });
-    }} /></label>)}
-    {squareLocked ? <small>Square locked for radial mapping</small> : null}
-    <button onClick={() => props.onApply(props.region!.id, rect, props.padding)}>Apply bounds</button>
   </div>;
 }
 

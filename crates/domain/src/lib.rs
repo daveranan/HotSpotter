@@ -14,7 +14,7 @@ pub use channel::{Channel, ChannelDataKind};
 pub use document::{
     AcceptedTopology, AddressMode, AppearanceHashInputs, BlendPolicy, ChangeClassification,
     ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, FitAxis,
-    GeneratorProvenance, LayoutGridSettings, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
+    GeneratorProvenance, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, ProceduralMaterial, Projection, QuarterTurn,
     RadialMappingSettings, RegionAppearanceHashInput, RegionBinding, RegionDefinition, RegionMapping, RegionOrientation,
     RegionTopologyHashInput, RenderSettings, SamplingPolicy, SheetFraming, SolidChannelValues,
@@ -54,9 +54,10 @@ pub use patch::{
 };
 pub use protocol::{FoundationStatusRequest, IPC_PROTOCOL_VERSION};
 pub use templates::{
-    CANONICAL_TEMPLATE_EDGE, CanonicalRect, Hotspot, RadialParameters, StructuralProfile,
-    TemplateDefinition, TemplateRegistry, TemplateRegistryError, TemplateSlot, TemplateSlotRole,
-    TemplatePackingIntent, TemplateSourceAddressMode, TemplateSourceMapping, TemplateSourceRect,
-    WorldPlacement,
+    CANONICAL_TEMPLATE_EDGE, CanonicalRect, CompiledTemplateSlot, CompiledTemplateTopology,
+    RadialParameters, StructuralProfile, TemplateCompatibilityDiagnostic, TemplateDefinition,
+    TemplateFitSemantics, TemplateRegistry, TemplateRegistryError, TemplateSlot, TemplateSlotRole,
+    TemplateSourceAddressMode, TemplateSourceMapping, TemplateSourceRect, WeightedTemplateGrammar,
+    WorldPlacement, compile_weighted_grammar,
 };
 pub use units::{NormalizedPoint, NormalizedScalar};

@@ -1758,8 +1758,6 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::SetRegionProjection { .. } => "set_region_projection",
         TrimSheetDocumentCommand::SetRegionRadial { .. } => "set_region_radial",
         TrimSheetDocumentCommand::SetOutputResolution { .. } => "set_output_resolution",
-        TrimSheetDocumentCommand::SetLayoutGrid { .. } => "set_layout_grid",
-        TrimSheetDocumentCommand::SetRegionDestination { .. } => "set_region_destination",
     }
 }
 

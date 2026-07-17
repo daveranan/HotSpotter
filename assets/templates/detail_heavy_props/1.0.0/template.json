@@ -1,0 +1,31 @@
+{
+  "templates": [
+    {
+      "identity": { "templateId": "ht.detail_heavy_props", "templateVersion": "1.0.0", "compatibilityKey": "ht.detail_heavy_props.topology.v1" },
+      "schemaVersion": 1, "canonicalWidth": 4096, "canonicalHeight": 4096,
+      "stableOrder": ["hero_detail", "label_detail", "secondary_detail", "micro_strip"],
+      "slots": [
+        {
+          "slotKey": "hero_detail", "compatibilityKey": "ht.detail_heavy_props.hero_detail.v1", "materialGroup": "prop_detail", "variationGroup": "hero", "role": "uniqueDetail", "fit": "uniqueContain", "structuralProfile": "panelFrame",
+          "allocation": { "x": 0, "y": 0, "width": 2560, "height": 3072 }, "hotspot": { "x": 16, "y": 16, "width": 2528, "height": 3040 }, "idColor": [70, 100, 130],
+          "worldPlacement": { "width": 2.5, "height": 3.0, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.0, "y": 0.0, "width": 0.625, "height": 0.75 }, "addressMode": "clamp" }
+        },
+        {
+          "slotKey": "label_detail", "compatibilityKey": "ht.detail_heavy_props.label_detail.v1", "materialGroup": "prop_detail", "variationGroup": "label", "role": "uniqueDetail", "fit": "uniqueContain", "structuralProfile": "flat",
+          "allocation": { "x": 2560, "y": 0, "width": 1536, "height": 1536 }, "hotspot": { "x": 2576, "y": 16, "width": 1504, "height": 1504 }, "idColor": [96, 124, 152],
+          "worldPlacement": { "width": 1.5, "height": 1.5, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.625, "y": 0.0, "width": 0.375, "height": 0.375 }, "addressMode": "clamp" }
+        },
+        {
+          "slotKey": "secondary_detail", "compatibilityKey": "ht.detail_heavy_props.secondary_detail.v1", "materialGroup": "prop_detail", "variationGroup": "secondary", "role": "uniqueDetail", "fit": "uniqueContain", "structuralProfile": "bevel",
+          "allocation": { "x": 2560, "y": 1536, "width": 1536, "height": 1536 }, "hotspot": { "x": 2576, "y": 1552, "width": 1504, "height": 1504 }, "idColor": [122, 148, 174],
+          "worldPlacement": { "width": 1.5, "height": 1.5, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.625, "y": 0.375, "width": 0.375, "height": 0.375 }, "addressMode": "clamp" }
+        },
+        {
+          "slotKey": "micro_strip", "compatibilityKey": "ht.detail_heavy_props.micro_strip.v1", "materialGroup": "prop_detail", "variationGroup": "micro", "role": "repeatingStrip", "fit": "horizontalStrip", "structuralProfile": "groove",
+          "allocation": { "x": 0, "y": 3072, "width": 4096, "height": 512 }, "hotspot": { "x": 16, "y": 3088, "width": 4064, "height": 480 }, "idColor": [148, 172, 196],
+          "worldPlacement": { "width": 4.0, "height": 0.5, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.0, "y": 0.75, "width": 1.0, "height": 0.125 }, "addressMode": "repeat" }
+        }
+      ]
+    }
+  ]
+}

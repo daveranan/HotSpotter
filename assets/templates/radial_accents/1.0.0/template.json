@@ -1,0 +1,35 @@
+{
+  "templates": [
+    {
+      "identity": { "templateId": "ht.radial_accents", "templateVersion": "1.0.0", "compatibilityKey": "ht.radial_accents.topology.v1" },
+      "schemaVersion": 1, "canonicalWidth": 4096, "canonicalHeight": 4096,
+      "stableOrder": ["disc_large", "ring_large", "disc_small", "ring_small"],
+      "slots": [
+        {
+          "slotKey": "disc_large", "compatibilityKey": "ht.radial_accents.disc_large.v1", "materialGroup": "radial", "variationGroup": "large", "role": "radial", "fit": "radial", "structuralProfile": "radialDisc",
+          "allocation": { "x": 0, "y": 0, "width": 2048, "height": 2048 }, "hotspot": { "x": 16, "y": 16, "width": 2016, "height": 2016 }, "idColor": [74, 104, 134],
+          "worldPlacement": { "width": 2.0, "height": 2.0, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.0, "y": 0.0, "width": 0.5, "height": 0.5 }, "addressMode": "clamp" },
+          "radialParameters": { "centerX": 0.5, "centerY": 0.5, "innerRadius": 0.0, "outerRadius": 1.0 }
+        },
+        {
+          "slotKey": "ring_large", "compatibilityKey": "ht.radial_accents.ring_large.v1", "materialGroup": "radial", "variationGroup": "large", "role": "radial", "fit": "radial", "structuralProfile": "annulus",
+          "allocation": { "x": 2048, "y": 0, "width": 2048, "height": 2048 }, "hotspot": { "x": 2064, "y": 16, "width": 2016, "height": 2016 }, "idColor": [100, 128, 156],
+          "worldPlacement": { "width": 2.0, "height": 2.0, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.5, "y": 0.0, "width": 0.5, "height": 0.5 }, "addressMode": "clamp" },
+          "radialParameters": { "centerX": 0.5, "centerY": 0.5, "innerRadius": 0.35, "outerRadius": 1.0 }
+        },
+        {
+          "slotKey": "disc_small", "compatibilityKey": "ht.radial_accents.disc_small.v1", "materialGroup": "radial", "variationGroup": "small", "role": "radial", "fit": "radial", "structuralProfile": "radialDisc",
+          "allocation": { "x": 0, "y": 2048, "width": 1024, "height": 1024 }, "hotspot": { "x": 16, "y": 2064, "width": 992, "height": 992 }, "idColor": [126, 152, 178],
+          "worldPlacement": { "width": 1.0, "height": 1.0, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.0, "y": 0.5, "width": 0.25, "height": 0.25 }, "addressMode": "clamp" },
+          "radialParameters": { "centerX": 0.5, "centerY": 0.5, "innerRadius": 0.0, "outerRadius": 1.0 }
+        },
+        {
+          "slotKey": "ring_small", "compatibilityKey": "ht.radial_accents.ring_small.v1", "materialGroup": "radial", "variationGroup": "small", "role": "radial", "fit": "radial", "structuralProfile": "annulus",
+          "allocation": { "x": 1024, "y": 2048, "width": 1024, "height": 1024 }, "hotspot": { "x": 1040, "y": 2064, "width": 992, "height": 992 }, "idColor": [152, 176, 200],
+          "worldPlacement": { "width": 1.0, "height": 1.0, "rotationDegrees": 0.0 }, "sourceMapping": { "crop": { "x": 0.25, "y": 0.5, "width": 0.25, "height": 0.25 }, "addressMode": "clamp" },
+          "radialParameters": { "centerX": 0.5, "centerY": 0.5, "innerRadius": 0.4, "outerRadius": 1.0 }
+        }
+      ]
+    }
+  ]
+}

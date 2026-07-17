@@ -85,6 +85,9 @@ export const templateOptions: ReadonlyArray<{ identity: TemplateIdentity; label:
   { identity: { templateId: "ht.vertical_trim", templateVersion: "1.0.0", compatibilityKey: "ht.vertical_trim.topology.v1" }, label: "Vertical Trim", description: "Tall jambs, stiles, reveals, and an end cap." },
   { identity: { templateId: "ht.wood_board_moulding", templateVersion: "1.0.0", compatibilityKey: "ht.wood_board_moulding.topology.v1" }, label: "Wood Board", description: "Board widths, grooves, and radial end-grain slots." },
   { identity: { templateId: "ht.detail_ribbon_microtrim", templateVersion: "1.0.0", compatibilityKey: "ht.detail_ribbon_microtrim.topology.v1" }, label: "Detail Ribbon", description: "Compact micro-trim and detail-ribbon topology." },
+  { identity: { templateId: "ht.hard_surface_panel", templateVersion: "1.0.0", compatibilityKey: "ht.hard_surface_panel.topology.v1" }, label: "Hard Surface Panels", description: "Fixed panels, access details, and authored edge banks." },
+  { identity: { templateId: "ht.detail_heavy_props", templateVersion: "1.0.0", compatibilityKey: "ht.detail_heavy_props.topology.v1" }, label: "Detail-heavy Props", description: "Pinned unique-detail cells for prop vocabulary." },
+  { identity: { templateId: "ht.radial_accents", templateVersion: "1.0.0", compatibilityKey: "ht.radial_accents.topology.v1" }, label: "Radial Accents", description: "Square radial disc and annulus allocations." },
 ];
 
 export const layoutPreviewMapOptions: ReadonlyArray<{ key: CompiledLayoutPreviewMap; label: string }> = [

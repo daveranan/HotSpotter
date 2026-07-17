@@ -85,7 +85,6 @@ export interface TrimSheetDocument {
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
   regionBindings: Record<string, RegionBinding>;
   renderSettings: { outputSize: PixelSize; rendererVersion: string };
-  layoutGrid: { columns: number; rows: number; padding: number };
 }
 
 export interface SourceProjection {
@@ -295,9 +294,7 @@ export type TrimSheetDocumentCommand =
   | { type: "set_sheet_framing"; framing: unknown }
   | { type: "set_region_projection"; regionId: string; projection: RegionMapping["projection"] }
   | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }
-  | { type: "set_output_resolution"; outputSize: PixelSize }
-  | { type: "set_layout_grid"; settings: { columns: number; rows: number; padding: number } }
-  | { type: "set_region_destination"; regionId: string; allocationRect: PixelBounds; padding: number };
+  | { type: "set_output_resolution"; outputSize: PixelSize };
 
 export interface CommandFailure {
   code: string;

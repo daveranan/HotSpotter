@@ -20,6 +20,9 @@ const templates = [
   ["ht.vertical_trim", "Vertical Trim"],
   ["ht.wood_board_moulding", "Wood Board & Moulding"],
   ["ht.detail_ribbon_microtrim", "Detail Ribbon & Microtrim"],
+  ["ht.hard_surface_panel", "Hard Surface & Panels"],
+  ["ht.detail_heavy_props", "Detail-heavy Props"],
+  ["ht.radial_accents", "Radial Accents"],
 ] as const;
 const mapViews: readonly [CompiledMapView, string][] = [
   ["baseColor", "Base Color"], ["normal", "Normal"], ["height", "Height"],

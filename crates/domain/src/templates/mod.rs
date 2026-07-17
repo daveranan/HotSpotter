@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{IdColor, TemplateIdentity, TemplateSnapshot};
+use crate::{IdColor, PixelSize, TemplateIdentity, TemplateSnapshot};
 
 pub const CANONICAL_TEMPLATE_EDGE: u32 = 4_096;
 
@@ -16,14 +16,6 @@ pub struct CanonicalRect {
     pub y: u32,
     pub width: u32,
     pub height: u32,
-}
-
-/// A canonical anchor point used by optional template hotspots.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Hotspot {
-    pub x: u32,
-    pub y: u32,
 }
 
 /// Renderer-neutral physical placement metadata for a template slot.
@@ -94,15 +86,16 @@ pub enum StructuralProfile {
     Annulus,
 }
 
-/// Optional destination-packing guidance. Source mapping remains a separate, immutable concern.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Authored geometry-fit vocabulary consumed by Blender and the later placement stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TemplatePackingIntent {
-    pub preferred_aspect: f64,
-    pub area_weight: f64,
-    pub minimum_size: [u32; 2],
-    pub allow_rotation: bool,
-    pub padding: u32,
+pub enum TemplateFitSemantics {
+    Planar,
+    HorizontalStrip,
+    VerticalStrip,
+    UniqueContain,
+    TrimCap,
+    Radial,
 }
 
 /// One fixed slot in a versioned layout template.
@@ -114,17 +107,52 @@ pub struct TemplateSlot {
     pub material_group: String,
     pub variation_group: String,
     pub role: TemplateSlotRole,
+    pub fit: TemplateFitSemantics,
     pub structural_profile: StructuralProfile,
     pub allocation: CanonicalRect,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hotspot: Option<Hotspot>,
+    pub hotspot: CanonicalRect,
     pub id_color: IdColor,
     pub world_placement: WorldPlacement,
     pub source_mapping: TemplateSourceMapping,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packing_intent: Option<TemplatePackingIntent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radial_parameters: Option<RadialParameters>,
+}
+
+/// A template rectangle scaled to one requested output resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledTemplateSlot {
+    pub slot_key: String,
+    pub allocation: CanonicalRect,
+    pub hotspot: CanonicalRect,
+}
+
+/// Resolution-specific topology whose shared boundaries were compiled exactly once.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledTemplateTopology {
+    pub identity: TemplateIdentity,
+    pub output_size: PixelSize,
+    pub slots: Vec<CompiledTemplateSlot>,
+}
+
+/// Recursive authored split grammar. Released templates persist the resulting integer rectangles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WeightedTemplateGrammar {
+    Slot { slot_key: String },
+    Horizontal { weights: Vec<u32>, children: Vec<Self> },
+    Vertical { weights: Vec<u32>, children: Vec<Self> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TemplateCompatibilityDiagnostic {
+    Compatible,
+    ExplicitTopologyChange {
+        from: TemplateIdentity,
+        to: TemplateIdentity,
+        reasons: Vec<String>,
+    },
 }
 
 /// A self-contained template definition loaded from the registry catalog.
@@ -156,6 +184,52 @@ impl TemplateDefinition {
             canonical_height: self.canonical_height,
             snapshot_json,
             snapshot_hash,
+        })
+    }
+
+    /// Scales every distinct authored boundary once, then reuses it for allocation and hotspot edges.
+    pub fn compile_for_output(
+        &self,
+        output_size: PixelSize,
+    ) -> Result<CompiledTemplateTopology, TemplateRegistryError> {
+        self.validate()?;
+        if !output_size.is_nonzero() {
+            return Err(TemplateRegistryError::InvalidOutputSize);
+        }
+        let mut x_boundaries = BTreeSet::new();
+        let mut y_boundaries = BTreeSet::new();
+        for slot in &self.slots {
+            insert_rect_boundaries(slot.allocation, &mut x_boundaries, &mut y_boundaries);
+            insert_rect_boundaries(slot.hotspot, &mut x_boundaries, &mut y_boundaries);
+        }
+        let scaled_x: BTreeMap<_, _> = x_boundaries
+            .into_iter()
+            .map(|boundary| (boundary, scale_boundary(boundary, output_size.width)))
+            .collect();
+        let scaled_y: BTreeMap<_, _> = y_boundaries
+            .into_iter()
+            .map(|boundary| (boundary, scale_boundary(boundary, output_size.height)))
+            .collect();
+        let slots = self
+            .stable_order
+            .iter()
+            .map(|slot_key| {
+                let slot = self
+                    .slots
+                    .iter()
+                    .find(|slot| &slot.slot_key == slot_key)
+                    .expect("validated stable order references every slot");
+                CompiledTemplateSlot {
+                    slot_key: slot.slot_key.clone(),
+                    allocation: scale_rect(slot.allocation, &scaled_x, &scaled_y),
+                    hotspot: scale_rect(slot.hotspot, &scaled_x, &scaled_y),
+                }
+            })
+            .collect();
+        Ok(CompiledTemplateTopology {
+            identity: self.identity.clone(),
+            output_size,
+            slots,
         })
     }
 
@@ -255,12 +329,7 @@ impl TemplateDefinition {
                     slot.slot_key.clone(),
                 ));
             }
-            if let Some(hotspot) = slot.hotspot
-                && (hotspot.x < slot.allocation.x
-                    || hotspot.x >= right
-                    || hotspot.y < slot.allocation.y
-                    || hotspot.y >= bottom)
-            {
+            if !rect_contains(slot.allocation, slot.hotspot) {
                 return Err(TemplateRegistryError::InvalidHotspot(slot.slot_key.clone()));
             }
             if !slot.world_placement.width.is_finite()
@@ -278,14 +347,17 @@ impl TemplateDefinition {
                     slot.slot_key.clone(),
                 ));
             }
-            if let Some(intent) = slot.packing_intent
-                && (!intent.preferred_aspect.is_finite()
-                    || intent.preferred_aspect <= 0.0
-                    || !intent.area_weight.is_finite()
-                    || intent.area_weight <= 0.0
-                    || intent.minimum_size.contains(&0))
-            {
-                return Err(TemplateRegistryError::InvalidPackingIntent(slot.slot_key.clone()));
+            let fit_matches_role = matches!(
+                (slot.role, slot.fit),
+                (TemplateSlotRole::Planar, TemplateFitSemantics::Planar)
+                    | (TemplateSlotRole::RepeatingStrip, TemplateFitSemantics::HorizontalStrip)
+                    | (TemplateSlotRole::RepeatingStrip, TemplateFitSemantics::VerticalStrip)
+                    | (TemplateSlotRole::UniqueDetail, TemplateFitSemantics::UniqueContain)
+                    | (TemplateSlotRole::TrimCap, TemplateFitSemantics::TrimCap)
+                    | (TemplateSlotRole::Radial, TemplateFitSemantics::Radial)
+            );
+            if !fit_matches_role {
+                return Err(TemplateRegistryError::InvalidFitSemantics(slot.slot_key.clone()));
             }
             match (slot.role, slot.radial_parameters) {
                 (TemplateSlotRole::Radial, Some(radial)) => {
@@ -320,6 +392,16 @@ impl TemplateDefinition {
         if order != slot_keys {
             return Err(TemplateRegistryError::InvalidStableOrder);
         }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if self.slots[index + 1..]
+                .iter()
+                .any(|other| rects_overlap(slot.allocation, other.allocation))
+            {
+                return Err(TemplateRegistryError::OverlappingAllocation(
+                    slot.slot_key.clone(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -336,7 +418,7 @@ impl TemplateRegistry {
     /// tooling; this registry is the desktop-facing catalog for choosing a
     /// family by stable template ID.
     pub fn built_in() -> Result<Self, TemplateRegistryError> {
-        const BUILTIN_MANIFESTS: [&str; 5] = [
+        const BUILTIN_MANIFESTS: [&str; 8] = [
             include_str!("../../../../assets/templates/generic_architecture/1.0.0/template.json"),
             include_str!("../../../../assets/templates/horizontal_moulding/1.0.0/template.json"),
             include_str!("../../../../assets/templates/vertical_trim/1.0.0/template.json"),
@@ -344,6 +426,9 @@ impl TemplateRegistry {
             include_str!(
                 "../../../../assets/templates/detail_ribbon_microtrim/1.0.0/template.json"
             ),
+            include_str!("../../../../assets/templates/hard_surface_panel/1.0.0/template.json"),
+            include_str!("../../../../assets/templates/detail_heavy_props/1.0.0/template.json"),
+            include_str!("../../../../assets/templates/radial_accents/1.0.0/template.json"),
         ];
 
         let mut definitions = BTreeMap::new();
@@ -395,6 +480,41 @@ impl TemplateRegistry {
         self.definitions
             .get(&(template_id.to_owned(), template_version.to_owned()))
     }
+
+    /// Stable registry iteration for an explicit workbench/manifest topology selector.
+    pub fn definitions(&self) -> impl Iterator<Item = &TemplateDefinition> {
+        self.definitions.values()
+    }
+
+    #[must_use]
+    pub fn diagnose_compatibility(
+        from: &TemplateDefinition,
+        to: &TemplateDefinition,
+    ) -> TemplateCompatibilityDiagnostic {
+        if from.identity == to.identity && from.snapshot().ok() == to.snapshot().ok() {
+            return TemplateCompatibilityDiagnostic::Compatible;
+        }
+        let mut reasons = Vec::new();
+        if from.identity.compatibility_key != to.identity.compatibility_key {
+            reasons.push("compatibility_key_changed".into());
+        }
+        if from.stable_order != to.stable_order {
+            reasons.push("stable_slot_order_changed".into());
+        }
+        if from.slots.iter().map(|slot| (&slot.slot_key, slot.allocation, slot.hotspot))
+            .ne(to.slots.iter().map(|slot| (&slot.slot_key, slot.allocation, slot.hotspot)))
+        {
+            reasons.push("pinned_geometry_changed".into());
+        }
+        if reasons.is_empty() {
+            reasons.push("template_version_or_semantics_changed".into());
+        }
+        TemplateCompatibilityDiagnostic::ExplicitTopologyChange {
+            from: from.identity.clone(),
+            to: to.identity.clone(),
+            reasons,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -434,6 +554,10 @@ pub enum TemplateRegistryError {
     InvalidSourceMapping(String),
     #[error("template slot packing intent is invalid: {0}")]
     InvalidPackingIntent(String),
+    #[error("template slot fit semantics are incompatible with its role: {0}")]
+    InvalidFitSemantics(String),
+    #[error("template allocations overlap at slot: {0}")]
+    OverlappingAllocation(String),
     #[error("template radial parameters are invalid: {0}")]
     InvalidRadialParameters(String),
     #[error("template is duplicated: {template_id}@{template_version}")]
@@ -441,6 +565,88 @@ pub enum TemplateRegistryError {
         template_id: String,
         template_version: String,
     },
+    #[error("template output dimensions must be nonzero")]
+    InvalidOutputSize,
+    #[error("weighted template grammar is malformed")]
+    InvalidWeightedGrammar,
+}
+
+/// Compiles an authored weighted split grammar with exact largest-remainder allocation.
+/// The returned rectangles are authoring output and must be persisted before material compilation.
+pub fn compile_weighted_grammar(
+    grammar: &WeightedTemplateGrammar,
+) -> Result<BTreeMap<String, CanonicalRect>, TemplateRegistryError> {
+    let mut output = BTreeMap::new();
+    compile_grammar_node(
+        grammar,
+        CanonicalRect { x: 0, y: 0, width: CANONICAL_TEMPLATE_EDGE, height: CANONICAL_TEMPLATE_EDGE },
+        0,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+fn compile_grammar_node(
+    grammar: &WeightedTemplateGrammar,
+    rect: CanonicalRect,
+    depth: usize,
+    output: &mut BTreeMap<String, CanonicalRect>,
+) -> Result<(), TemplateRegistryError> {
+    if depth > 32 || output.len() > 4_096 {
+        return Err(TemplateRegistryError::InvalidWeightedGrammar);
+    }
+    match grammar {
+        WeightedTemplateGrammar::Slot { slot_key } => {
+            if slot_key.trim().is_empty() || output.insert(slot_key.clone(), rect).is_some() {
+                return Err(TemplateRegistryError::InvalidWeightedGrammar);
+            }
+        }
+        WeightedTemplateGrammar::Horizontal { weights, children }
+        | WeightedTemplateGrammar::Vertical { weights, children } => {
+            if weights.len() != children.len() || weights.is_empty() || weights.contains(&0) {
+                return Err(TemplateRegistryError::InvalidWeightedGrammar);
+            }
+            let horizontal = matches!(grammar, WeightedTemplateGrammar::Horizontal { .. });
+            let lengths = largest_remainder(if horizontal { rect.width } else { rect.height }, weights)?;
+            let mut cursor = if horizontal { rect.x } else { rect.y };
+            for (child, length) in children.iter().zip(lengths) {
+                let child_rect = if horizontal {
+                    CanonicalRect { x: cursor, width: length, ..rect }
+                } else {
+                    CanonicalRect { y: cursor, height: length, ..rect }
+                };
+                cursor = cursor.saturating_add(length);
+                compile_grammar_node(child, child_rect, depth + 1, output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn largest_remainder(total: u32, weights: &[u32]) -> Result<Vec<u32>, TemplateRegistryError> {
+    let weight_sum: u64 = weights.iter().map(|weight| u64::from(*weight)).sum();
+    if total == 0 || weight_sum == 0 {
+        return Err(TemplateRegistryError::InvalidWeightedGrammar);
+    }
+    let mut allocations = Vec::with_capacity(weights.len());
+    let mut assigned = 0_u32;
+    let mut remainders = Vec::with_capacity(weights.len());
+    for (index, weight) in weights.iter().copied().enumerate() {
+        let numerator = u64::from(total) * u64::from(weight);
+        let base = u32::try_from(numerator / weight_sum)
+            .map_err(|_| TemplateRegistryError::InvalidWeightedGrammar)?;
+        allocations.push(base);
+        assigned += base;
+        remainders.push((numerator % weight_sum, index));
+    }
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, index) in remainders.into_iter().take((total - assigned) as usize) {
+        allocations[index] += 1;
+    }
+    if allocations.contains(&0) {
+        return Err(TemplateRegistryError::InvalidWeightedGrammar);
+    }
+    Ok(allocations)
 }
 
 fn valid_source_mapping(mapping: TemplateSourceMapping) -> bool {
@@ -457,6 +663,54 @@ fn valid_source_mapping(mapping: TemplateSourceMapping) -> bool {
         && crop.y + crop.height <= 1.0 + f64::EPSILON
 }
 
+fn insert_rect_boundaries(
+    rect: CanonicalRect,
+    x_boundaries: &mut BTreeSet<u32>,
+    y_boundaries: &mut BTreeSet<u32>,
+) {
+    x_boundaries.insert(rect.x);
+    x_boundaries.insert(rect.x + rect.width);
+    y_boundaries.insert(rect.y);
+    y_boundaries.insert(rect.y + rect.height);
+}
+
+fn scale_boundary(boundary: u32, output_edge: u32) -> u32 {
+    u32::try_from(
+        (u64::from(boundary) * u64::from(output_edge)
+            + u64::from(CANONICAL_TEMPLATE_EDGE / 2))
+            / u64::from(CANONICAL_TEMPLATE_EDGE),
+    )
+    .expect("scaled u32 boundary remains u32")
+}
+
+fn scale_rect(
+    rect: CanonicalRect,
+    x_boundaries: &BTreeMap<u32, u32>,
+    y_boundaries: &BTreeMap<u32, u32>,
+) -> CanonicalRect {
+    let left = x_boundaries[&rect.x];
+    let right = x_boundaries[&(rect.x + rect.width)];
+    let top = y_boundaries[&rect.y];
+    let bottom = y_boundaries[&(rect.y + rect.height)];
+    CanonicalRect { x: left, y: top, width: right - left, height: bottom - top }
+}
+
+fn rect_contains(outer: CanonicalRect, inner: CanonicalRect) -> bool {
+    inner.width > 0
+        && inner.height > 0
+        && inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width
+        && inner.y + inner.height <= outer.y + outer.height
+}
+
+fn rects_overlap(left: CanonicalRect, right: CanonicalRect) -> bool {
+    left.x < right.x + right.width
+        && right.x < left.x + left.width
+        && left.y < right.y + right.height
+        && right.y < left.y + left.height
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,17 +725,18 @@ mod tests {
         "slots": [
           {
             "slotKey": "wall",
-            "compatibilityKey": "wall-v1",             "materialGroup": "architecture",             "variationGroup": "neutral",             "role": "planar",             "structuralProfile": "flat",
+            "compatibilityKey": "wall-v1",             "materialGroup": "architecture",             "variationGroup": "neutral",             "role": "planar", "fit": "planar",             "structuralProfile": "flat",
             "allocation": {"x": 0, "y": 0, "width": 2048, "height": 4096},
-            "hotspot": {"x": 1024, "y": 2048},
+            "hotspot": {"x": 8, "y": 8, "width": 2032, "height": 4080},
             "idColor": [64, 65, 66],
             "worldPlacement": {"width": 4.0, "height": 3.0, "rotationDegrees": 0.0},
             "sourceMapping": {"crop": {"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0}, "addressMode": "clamp"}
           },
           {
             "slotKey": "floor",
-            "compatibilityKey": "floor-v1",             "materialGroup": "architecture",             "variationGroup": "radial_fixture",             "role": "radial",             "structuralProfile": "radialDisc",
+            "compatibilityKey": "floor-v1",             "materialGroup": "architecture",             "variationGroup": "radial_fixture",             "role": "radial", "fit": "radial",             "structuralProfile": "radialDisc",
             "allocation": {"x": 2048, "y": 0, "width": 2048, "height": 2048},
+            "hotspot": {"x": 2056, "y": 8, "width": 2032, "height": 2032},
             "idColor": [67, 68, 69],
             "worldPlacement": {"width": 4.0, "height": 4.0, "rotationDegrees": 90.0},
             "sourceMapping": {"crop": {"x": 0.5, "y": 0.0, "width": 0.5, "height": 0.5}, "addressMode": "clamp"},
@@ -536,6 +791,9 @@ mod tests {
             "ht.vertical_trim",
             "ht.wood_board_moulding",
             "ht.detail_ribbon_microtrim",
+            "ht.hard_surface_panel",
+            "ht.detail_heavy_props",
+            "ht.radial_accents",
         ] {
             assert!(
                 registry.get(template_id, "1.0.0").is_some(),

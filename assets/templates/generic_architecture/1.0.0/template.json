@@ -79,8 +79,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 2048,
-            "y": 96
+            "x": 40,
+            "y": 40,
+            "width": 4016,
+            "height": 112
           },
           "idColor": [
             64,
@@ -100,7 +102,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "crown_bevel",
@@ -116,8 +119,10 @@
             "height": 96
           },
           "hotspot": {
-            "x": 2048,
-            "y": 240
+            "x": 40,
+            "y": 200,
+            "width": 4016,
+            "height": 80
           },
           "idColor": [
             93,
@@ -137,7 +142,8 @@
               "height": 0.023438
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "reveal_groove",
@@ -153,8 +159,10 @@
             "height": 64
           },
           "hotspot": {
-            "x": 2048,
-            "y": 352
+            "x": 40,
+            "y": 328,
+            "width": 4016,
+            "height": 48
           },
           "idColor": [
             122,
@@ -174,7 +182,8 @@
               "height": 0.015625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "header_left",
@@ -190,8 +199,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 1024,
-            "y": 480
+            "x": 40,
+            "y": 424,
+            "width": 1968,
+            "height": 112
           },
           "idColor": [
             151,
@@ -211,7 +222,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "header_right",
@@ -227,8 +239,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 3056,
-            "y": 480
+            "x": 2056,
+            "y": 424,
+            "width": 2000,
+            "height": 112
           },
           "idColor": [
             180,
@@ -248,7 +262,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "fine_strip_a",
@@ -264,8 +279,10 @@
             "height": 64
           },
           "hotspot": {
-            "x": 512,
-            "y": 608
+            "x": 40,
+            "y": 584,
+            "width": 944,
+            "height": 48
           },
           "idColor": [
             209,
@@ -285,7 +302,8 @@
               "height": 0.015625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "fine_strip_b",
@@ -301,8 +319,10 @@
             "height": 64
           },
           "hotspot": {
-            "x": 1504,
-            "y": 608
+            "x": 1032,
+            "y": 584,
+            "width": 944,
+            "height": 48
           },
           "idColor": [
             238,
@@ -322,7 +342,8 @@
               "height": 0.015625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "fine_strip_c",
@@ -338,8 +359,10 @@
             "height": 64
           },
           "hotspot": {
-            "x": 2496,
-            "y": 608
+            "x": 2024,
+            "y": 584,
+            "width": 944,
+            "height": 48
           },
           "idColor": [
             75,
@@ -359,7 +382,8 @@
               "height": 0.015625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "fine_strip_d",
@@ -375,8 +399,10 @@
             "height": 64
           },
           "hotspot": {
-            "x": 3536,
-            "y": 608
+            "x": 3016,
+            "y": 584,
+            "width": 1040,
+            "height": 48
           },
           "idColor": [
             104,
@@ -396,7 +422,8 @@
               "height": 0.015625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "wall_primary",
@@ -412,8 +439,10 @@
             "height": 1024
           },
           "hotspot": {
-            "x": 480,
-            "y": 1184
+            "x": 40,
+            "y": 680,
+            "width": 880,
+            "height": 1008
           },
           "idColor": [
             133,
@@ -433,7 +462,8 @@
               "height": 0.25
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "wall_secondary",
@@ -449,8 +479,10 @@
             "height": 1024
           },
           "hotspot": {
-            "x": 1408,
-            "y": 1184
+            "x": 968,
+            "y": 680,
+            "width": 880,
+            "height": 1008
           },
           "idColor": [
             162,
@@ -470,7 +502,8 @@
               "height": 0.25
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "door_panel",
@@ -486,8 +519,10 @@
             "height": 1024
           },
           "hotspot": {
-            "x": 2336,
-            "y": 1184
+            "x": 1896,
+            "y": 680,
+            "width": 880,
+            "height": 1008
           },
           "idColor": [
             191,
@@ -507,7 +542,8 @@
               "height": 0.25
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "window_panel",
@@ -523,8 +559,10 @@
             "height": 1024
           },
           "hotspot": {
-            "x": 3264,
-            "y": 1184
+            "x": 2824,
+            "y": 680,
+            "width": 880,
+            "height": 1008
           },
           "idColor": [
             220,
@@ -544,7 +582,8 @@
               "height": 0.25
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_a",
@@ -560,8 +599,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 268,
-            "y": 1808
+            "x": 40,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             249,
@@ -581,7 +622,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_b",
@@ -597,8 +639,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 772,
-            "y": 1808
+            "x": 544,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             86,
@@ -618,7 +662,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_c",
@@ -634,8 +679,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 1276,
-            "y": 1808
+            "x": 1048,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             115,
@@ -655,7 +702,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_d",
@@ -671,8 +719,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 1780,
-            "y": 1808
+            "x": 1552,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             144,
@@ -692,7 +742,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_e",
@@ -708,8 +759,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 2284,
-            "y": 1808
+            "x": 2056,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             173,
@@ -729,7 +782,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_f",
@@ -745,8 +799,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 2788,
-            "y": 1808
+            "x": 2560,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             202,
@@ -766,7 +822,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_g",
@@ -782,8 +839,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 3292,
-            "y": 1808
+            "x": 3064,
+            "y": 1736,
+            "width": 456,
+            "height": 144
           },
           "idColor": [
             231,
@@ -803,7 +862,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "detail_cell_h",
@@ -819,8 +879,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 3812,
-            "y": 1808
+            "x": 3568,
+            "y": 1736,
+            "width": 488,
+            "height": 144
           },
           "idColor": [
             68,
@@ -840,7 +902,8 @@
               "height": 0.039063
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "radial_fixture_a",
@@ -856,8 +919,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 256,
-            "y": 2144
+            "x": 40,
+            "y": 1928,
+            "width": 432,
+            "height": 432
           },
           "idColor": [
             97,
@@ -883,7 +948,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "radial"
         },
         {
           "slotKey": "radial_fixture_b",
@@ -899,8 +965,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 736,
-            "y": 2144
+            "x": 520,
+            "y": 1928,
+            "width": 432,
+            "height": 432
           },
           "idColor": [
             126,
@@ -926,7 +994,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "radial"
         },
         {
           "slotKey": "radial_fixture_c",
@@ -942,8 +1011,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 1216,
-            "y": 2144
+            "x": 1000,
+            "y": 1928,
+            "width": 432,
+            "height": 432
           },
           "idColor": [
             155,
@@ -969,7 +1040,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "radial"
         },
         {
           "slotKey": "radial_fixture_d",
@@ -985,8 +1057,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 1696,
-            "y": 2144
+            "x": 1480,
+            "y": 1928,
+            "width": 432,
+            "height": 432
           },
           "idColor": [
             184,
@@ -1012,7 +1086,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "radial"
         },
         {
           "slotKey": "trim_cap_left",
@@ -1028,8 +1103,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 2208,
-            "y": 2144
+            "x": 1960,
+            "y": 1928,
+            "width": 496,
+            "height": 432
           },
           "idColor": [
             213,
@@ -1049,7 +1126,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "trimCap"
         },
         {
           "slotKey": "trim_cap_inner_left",
@@ -1065,8 +1143,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 2752,
-            "y": 2144
+            "x": 2504,
+            "y": 1928,
+            "width": 496,
+            "height": 432
           },
           "idColor": [
             242,
@@ -1086,7 +1166,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "trimCap"
         },
         {
           "slotKey": "trim_cap_inner_right",
@@ -1102,8 +1183,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 3296,
-            "y": 2144
+            "x": 3048,
+            "y": 1928,
+            "width": 496,
+            "height": 432
           },
           "idColor": [
             79,
@@ -1123,7 +1206,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "trimCap"
         },
         {
           "slotKey": "trim_cap_right",
@@ -1139,8 +1223,10 @@
             "height": 448
           },
           "hotspot": {
-            "x": 3824,
-            "y": 2144
+            "x": 3592,
+            "y": 1928,
+            "width": 464,
+            "height": 432
           },
           "idColor": [
             108,
@@ -1160,7 +1246,8 @@
               "height": 0.109375
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "trimCap"
         },
         {
           "slotKey": "sill_long_a",
@@ -1176,8 +1263,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 688,
-            "y": 2464
+            "x": 40,
+            "y": 2408,
+            "width": 1296,
+            "height": 112
           },
           "idColor": [
             137,
@@ -1197,7 +1286,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "sill_long_b",
@@ -1213,8 +1303,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 2032,
-            "y": 2464
+            "x": 1384,
+            "y": 2408,
+            "width": 1296,
+            "height": 112
           },
           "idColor": [
             166,
@@ -1234,7 +1326,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "sill_long_c",
@@ -1250,8 +1343,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 3392,
-            "y": 2464
+            "x": 2728,
+            "y": 2408,
+            "width": 1328,
+            "height": 112
           },
           "idColor": [
             195,
@@ -1271,7 +1366,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "mid_groove_a",
@@ -1287,8 +1383,10 @@
             "height": 96
           },
           "hotspot": {
-            "x": 512,
-            "y": 2608
+            "x": 40,
+            "y": 2568,
+            "width": 944,
+            "height": 80
           },
           "idColor": [
             224,
@@ -1308,7 +1406,8 @@
               "height": 0.023438
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "mid_groove_b",
@@ -1324,8 +1423,10 @@
             "height": 96
           },
           "hotspot": {
-            "x": 1504,
-            "y": 2608
+            "x": 1032,
+            "y": 2568,
+            "width": 944,
+            "height": 80
           },
           "idColor": [
             253,
@@ -1345,7 +1446,8 @@
               "height": 0.023438
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "mid_groove_c",
@@ -1361,8 +1463,10 @@
             "height": 96
           },
           "hotspot": {
-            "x": 2496,
-            "y": 2608
+            "x": 2024,
+            "y": 2568,
+            "width": 944,
+            "height": 80
           },
           "idColor": [
             90,
@@ -1382,7 +1486,8 @@
               "height": 0.023438
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "mid_groove_d",
@@ -1398,8 +1503,10 @@
             "height": 96
           },
           "hotspot": {
-            "x": 3536,
-            "y": 2608
+            "x": 3016,
+            "y": 2568,
+            "width": 1040,
+            "height": 80
           },
           "idColor": [
             119,
@@ -1419,7 +1526,8 @@
               "height": 0.023438
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "lower_detail_a",
@@ -1435,8 +1543,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 268,
-            "y": 2864
+            "x": 40,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             148,
@@ -1456,7 +1566,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_b",
@@ -1472,8 +1583,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 772,
-            "y": 2864
+            "x": 544,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             177,
@@ -1493,7 +1606,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_c",
@@ -1509,8 +1623,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 1276,
-            "y": 2864
+            "x": 1048,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             206,
@@ -1530,7 +1646,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_d",
@@ -1546,8 +1663,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 1780,
-            "y": 2864
+            "x": 1552,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             235,
@@ -1567,7 +1686,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_e",
@@ -1583,8 +1703,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 2284,
-            "y": 2864
+            "x": 2056,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             72,
@@ -1604,7 +1726,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_f",
@@ -1620,8 +1743,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 2788,
-            "y": 2864
+            "x": 2560,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             101,
@@ -1641,7 +1766,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_g",
@@ -1657,8 +1783,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 3292,
-            "y": 2864
+            "x": 3064,
+            "y": 2696,
+            "width": 456,
+            "height": 336
           },
           "idColor": [
             130,
@@ -1678,7 +1806,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "lower_detail_h",
@@ -1694,8 +1823,10 @@
             "height": 352
           },
           "hotspot": {
-            "x": 3812,
-            "y": 2864
+            "x": 3568,
+            "y": 2696,
+            "width": 488,
+            "height": 336
           },
           "idColor": [
             159,
@@ -1715,7 +1846,8 @@
               "height": 0.085938
             },
             "addressMode": "clamp"
-          }
+          },
+          "fit": "uniqueContain"
         },
         {
           "slotKey": "baseboard_a",
@@ -1731,8 +1863,10 @@
             "height": 640
           },
           "hotspot": {
-            "x": 688,
-            "y": 3392
+            "x": 40,
+            "y": 3080,
+            "width": 1296,
+            "height": 624
           },
           "idColor": [
             188,
@@ -1752,7 +1886,8 @@
               "height": 0.15625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "baseboard_b",
@@ -1768,8 +1903,10 @@
             "height": 640
           },
           "hotspot": {
-            "x": 2032,
-            "y": 3392
+            "x": 1384,
+            "y": 3080,
+            "width": 1296,
+            "height": 624
           },
           "idColor": [
             217,
@@ -1789,7 +1926,8 @@
               "height": 0.15625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "baseboard_c",
@@ -1805,8 +1943,10 @@
             "height": 640
           },
           "hotspot": {
-            "x": 3392,
-            "y": 3392
+            "x": 2728,
+            "y": 3080,
+            "width": 1328,
+            "height": 624
           },
           "idColor": [
             246,
@@ -1826,7 +1966,8 @@
               "height": 0.15625
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "footer_groove_a",
@@ -1842,8 +1983,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 688,
-            "y": 3824
+            "x": 40,
+            "y": 3752,
+            "width": 1296,
+            "height": 144
           },
           "idColor": [
             83,
@@ -1863,7 +2006,8 @@
               "height": 0.039063
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "footer_groove_b",
@@ -1879,8 +2023,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 2032,
-            "y": 3824
+            "x": 1384,
+            "y": 3752,
+            "width": 1296,
+            "height": 144
           },
           "idColor": [
             112,
@@ -1900,7 +2046,8 @@
               "height": 0.039063
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "footer_groove_c",
@@ -1916,8 +2063,10 @@
             "height": 160
           },
           "hotspot": {
-            "x": 3392,
-            "y": 3824
+            "x": 2728,
+            "y": 3752,
+            "width": 1328,
+            "height": 144
           },
           "idColor": [
             141,
@@ -1937,7 +2086,8 @@
               "height": 0.039063
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "plinth_a",
@@ -1953,8 +2103,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 688,
-            "y": 4000
+            "x": 40,
+            "y": 3944,
+            "width": 1296,
+            "height": 112
           },
           "idColor": [
             170,
@@ -1974,7 +2126,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "plinth_b",
@@ -1990,8 +2143,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 2032,
-            "y": 4000
+            "x": 1384,
+            "y": 3944,
+            "width": 1296,
+            "height": 112
           },
           "idColor": [
             199,
@@ -2011,7 +2166,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         },
         {
           "slotKey": "plinth_c",
@@ -2027,8 +2183,10 @@
             "height": 128
           },
           "hotspot": {
-            "x": 3392,
-            "y": 4000
+            "x": 2728,
+            "y": 3944,
+            "width": 1328,
+            "height": 112
           },
           "idColor": [
             228,
@@ -2048,7 +2206,8 @@
               "height": 0.03125
             },
             "addressMode": "repeat"
-          }
+          },
+          "fit": "horizontalStrip"
         }
       ]
     }

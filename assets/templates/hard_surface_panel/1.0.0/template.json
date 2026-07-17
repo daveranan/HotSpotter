@@ -1,0 +1,49 @@
+{
+  "templates": [
+    {
+      "identity": { "templateId": "ht.hard_surface_panel", "templateVersion": "1.0.0", "compatibilityKey": "ht.hard_surface_panel.topology.v1" },
+      "schemaVersion": 1,
+      "canonicalWidth": 4096,
+      "canonicalHeight": 4096,
+      "stableOrder": ["hero_panel", "service_panel", "edge_strip", "access_detail"],
+      "slots": [
+        {
+          "slotKey": "hero_panel", "compatibilityKey": "ht.hard_surface_panel.hero_panel.v1",
+          "materialGroup": "hard_surface", "variationGroup": "primary_panel", "role": "planar", "fit": "planar", "structuralProfile": "flat",
+          "allocation": { "x": 0, "y": 0, "width": 2560, "height": 2560 },
+          "hotspot": { "x": 16, "y": 16, "width": 2528, "height": 2528 },
+          "idColor": [64, 96, 128],
+          "worldPlacement": { "width": 2.5, "height": 2.5, "rotationDegrees": 0.0 },
+          "sourceMapping": { "crop": { "x": 0.0, "y": 0.0, "width": 0.625, "height": 0.625 }, "addressMode": "clamp" }
+        },
+        {
+          "slotKey": "service_panel", "compatibilityKey": "ht.hard_surface_panel.service_panel.v1",
+          "materialGroup": "hard_surface", "variationGroup": "secondary_panel", "role": "uniqueDetail", "fit": "uniqueContain", "structuralProfile": "panelFrame",
+          "allocation": { "x": 2560, "y": 0, "width": 1536, "height": 2560 },
+          "hotspot": { "x": 2576, "y": 16, "width": 1504, "height": 2528 },
+          "idColor": [88, 118, 148],
+          "worldPlacement": { "width": 1.5, "height": 2.5, "rotationDegrees": 0.0 },
+          "sourceMapping": { "crop": { "x": 0.625, "y": 0.0, "width": 0.375, "height": 0.625 }, "addressMode": "clamp" }
+        },
+        {
+          "slotKey": "edge_strip", "compatibilityKey": "ht.hard_surface_panel.edge_strip.v1",
+          "materialGroup": "hard_surface", "variationGroup": "edge", "role": "repeatingStrip", "fit": "horizontalStrip", "structuralProfile": "bevel",
+          "allocation": { "x": 0, "y": 2560, "width": 4096, "height": 512 },
+          "hotspot": { "x": 16, "y": 2576, "width": 4064, "height": 480 },
+          "idColor": [112, 140, 168],
+          "worldPlacement": { "width": 4.0, "height": 0.5, "rotationDegrees": 0.0 },
+          "sourceMapping": { "crop": { "x": 0.0, "y": 0.625, "width": 1.0, "height": 0.125 }, "addressMode": "repeat" }
+        },
+        {
+          "slotKey": "access_detail", "compatibilityKey": "ht.hard_surface_panel.access_detail.v1",
+          "materialGroup": "hard_surface", "variationGroup": "unique_access", "role": "uniqueDetail", "fit": "uniqueContain", "structuralProfile": "panelFrame",
+          "allocation": { "x": 0, "y": 3072, "width": 1024, "height": 1024 },
+          "hotspot": { "x": 16, "y": 3088, "width": 992, "height": 992 },
+          "idColor": [136, 162, 188],
+          "worldPlacement": { "width": 1.0, "height": 1.0, "rotationDegrees": 0.0 },
+          "sourceMapping": { "crop": { "x": 0.0, "y": 0.75, "width": 0.25, "height": 0.25 }, "addressMode": "clamp" }
+        }
+      ]
+    }
+  ]
+}

@@ -7,11 +7,12 @@ use thiserror::Error;
 use crate::{
     Channel, DecorationBinding, IdColor, LayerId, LayoutId, NormalizedBounds, NormalizedPoint,
     NormalizedScalar, Patch, PatchId, PixelSize, RegionId, SourceBlend, SourceSamplingMode,
-    SourceSetId, SourceWarp, StructuralProfile, TemplateDefinition, TemplateSlotRole,
+    SourceSetId, SourceWarp, StructuralProfile, TemplateDefinition, TemplateFitSemantics, TemplateRegistry,
+    TemplateSlotRole,
     TemplateSnapshot,
     layout::source_warp_is_valid,
     templates::{
-        CanonicalRect, RadialParameters, TemplateSlot, TemplateSourceAddressMode, TemplateSourceMapping,
+        CanonicalRect, RadialParameters, TemplateSourceAddressMode, TemplateSourceMapping,
         TemplateSourceRect,
     },
 };
@@ -343,6 +344,8 @@ pub struct RegionDefinition {
     pub structural_profile: StructuralProfile,
     pub material_group: String,
     pub weathering_group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radial_parameters: Option<RadialParameters>,
     pub enabled: bool,
 }
 
@@ -378,6 +381,10 @@ pub struct RegionTopologyHashInput {
     pub role: TemplateSlotRole,
     pub orientation: RegionOrientation,
     pub uv_fit: UvFitPolicy,
+    pub structural_profile: StructuralProfile,
+    pub material_group: String,
+    pub variation_group: String,
+    pub radial_parameters: Option<RadialParameters>,
     pub enabled: bool,
 }
 
@@ -438,6 +445,10 @@ impl AcceptedTopology {
                     role: region.role,
                     orientation: region.orientation,
                     uv_fit: region.uv_fit.clone(),
+                    structural_profile: region.structural_profile,
+                    material_group: region.material_group.clone(),
+                    variation_group: region.weathering_group.clone(),
+                    radial_parameters: region.radial_parameters,
                     enabled: region.enabled,
                 })
                 .collect(),
@@ -453,20 +464,6 @@ pub struct GeneratorProvenance {
     pub recipe_version: u16,
     pub recipe_hash: DocumentHash,
     pub seed: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LayoutGridSettings {
-    pub columns: u16,
-    pub rows: u16,
-    pub padding: u32,
-}
-
-impl Default for LayoutGridSettings {
-    fn default() -> Self {
-        Self { columns: 32, rows: 32, padding: 8 }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -640,8 +637,6 @@ pub struct TrimSheetDocument {
     pub sheet_framing: SheetFraming,
     pub render_settings: RenderSettings,
     pub generator_provenance: Option<GeneratorProvenance>,
-    #[serde(default)]
-    pub layout_grid: LayoutGridSettings,
 }
 
 impl TrimSheetDocument {
@@ -749,6 +744,30 @@ impl TrimSheetDocument {
         let expected_hash = hash_serializable(&self.topology.topology_hash_inputs())?;
         if expected_hash != self.topology.topology_hash {
             return Err(TrimSheetDocumentError::TopologyHashMismatch);
+        }
+        if matches!(self.topology.kind, TopologyKind::StandardTemplate | TopologyKind::CustomTemplate) {
+            let snapshot = self.topology.snapshot.template.as_ref()
+                .ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+            let template: TemplateDefinition = serde_json::from_str(&snapshot.snapshot_json)
+                .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+            let canonical_snapshot = template.snapshot()
+                .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+            if &canonical_snapshot != snapshot
+                || self.topology.compatibility_key != template.identity.compatibility_key
+                || self.topology.regions != regions_from_template(&template)?
+            {
+                return Err(TrimSheetDocumentError::TemplateTopologyMutation);
+            }
+            if self.topology.kind == TopologyKind::StandardTemplate {
+                let registry = TemplateRegistry::built_in()
+                    .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+                let built_in = registry
+                    .get(&template.identity.template_id, &template.identity.template_version)
+                    .ok_or(TrimSheetDocumentError::StandardTemplateRegistryMismatch)?;
+                if built_in != &template {
+                    return Err(TrimSheetDocumentError::StandardTemplateRegistryMismatch);
+                }
+            }
         }
 
         let mut material_ids = BTreeSet::new();
@@ -884,12 +903,6 @@ impl TrimSheetDocument {
         {
             return Err(TrimSheetDocumentError::InvalidGeneratorProvenance);
         }
-        if !(8..=64).contains(&self.layout_grid.columns)
-            || !(8..=64).contains(&self.layout_grid.rows)
-            || self.layout_grid.padding > self.topology.snapshot.canonical_size.width / 4
-        {
-            return Err(TrimSheetDocumentError::InvalidLayoutGrid);
-        }
         Ok(())
     }
 
@@ -900,77 +913,39 @@ impl TrimSheetDocument {
         materials: Vec<MaterialSourceSet>,
         patches: Vec<Patch>,
     ) -> Result<Self, TrimSheetDocumentError> {
+        let registry = TemplateRegistry::built_in()
+            .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+        let built_in = registry
+            .get(&template.identity.template_id, &template.identity.template_version)
+            .ok_or(TrimSheetDocumentError::StandardTemplateRegistryMismatch)?;
+        if built_in != template {
+            return Err(TrimSheetDocumentError::StandardTemplateRegistryMismatch);
+        }
+        Self::from_pinned_template(id, template, materials, patches, TopologyKind::StandardTemplate)
+    }
+
+    fn from_pinned_template(
+        id: TrimSheetId,
+        template: &TemplateDefinition,
+        materials: Vec<MaterialSourceSet>,
+        patches: Vec<Patch>,
+        kind: TopologyKind,
+    ) -> Result<Self, TrimSheetDocumentError> {
         let template_snapshot = template
             .snapshot()
             .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-        let mut regions = Vec::with_capacity(template.slots.len());
+        let regions = regions_from_template(template)?;
         let mut bindings = BTreeMap::new();
-        let layout_grid = LayoutGridSettings::default();
-        let packed = semantic_pack_template(template, layout_grid);
         for slot_key in &template.stable_order {
             let slot = template
                 .slots
                 .iter()
                 .find(|slot| &slot.slot_key == slot_key)
                 .ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-            let rect = packed.get(slot_key).copied().unwrap_or(slot.allocation);
-            let requested_padding = slot.packing_intent.map_or(layout_grid.padding, |intent| intent.padding);
-            let padding = requested_padding.min(rect.width.saturating_sub(1) / 2)
-                .min(rect.height.saturating_sub(1) / 2);
-            let hotspot_rect = CanonicalRect {
-                x: rect.x + padding,
-                y: rect.y + padding,
-                width: rect.width - padding * 2,
-                height: rect.height - padding * 2,
-            };
             let region_id = deterministic_region_id(
                 &template.identity.compatibility_key,
                 &slot.compatibility_key,
             );
-            let (uv_kind, fit_axis) = match slot.role {
-                TemplateSlotRole::Planar => (UvFitKind::Rectangular, FitAxis::Automatic),
-                TemplateSlotRole::RepeatingStrip => (
-                    UvFitKind::Strip,
-                    if rect.width >= rect.height {
-                        FitAxis::Vertical
-                    } else {
-                        FitAxis::Horizontal
-                    },
-                ),
-                TemplateSlotRole::UniqueDetail => (UvFitKind::Unique, FitAxis::None),
-                TemplateSlotRole::TrimCap => (UvFitKind::Cap, FitAxis::Automatic),
-                TemplateSlotRole::Radial => (UvFitKind::Radial, FitAxis::None),
-            };
-            let orientation = if rect.width > rect.height {
-                RegionOrientation::Horizontal
-            } else if rect.height > rect.width {
-                RegionOrientation::Vertical
-            } else {
-                RegionOrientation::Unspecified
-            };
-            regions.push(RegionDefinition {
-                id: region_id,
-                display_name: title_from_key(&slot.slot_key),
-                id_color: slot.id_color,
-                allocation_rect: rect,
-                hotspot_rect,
-                role: slot.role,
-                orientation,
-                uv_fit: UvFitPolicy {
-                    kind: uv_kind,
-                    fit_axis,
-                    keep_proportion: true,
-                    allowed_rotations: vec![QuarterTurn::Zero],
-                    mirror_allowed: !matches!(slot.role, TemplateSlotRole::Radial),
-                    world_size_meters: [slot.world_placement.width, slot.world_placement.height],
-                    classification_tags: Vec::new(),
-                },
-                structural_profile: slot.structural_profile,
-                material_group: slot.material_group.clone(),
-                weathering_group: slot.variation_group.clone(),
-                enabled: true,
-            });
-
             bindings.insert(
                 region_id,
                 RegionBinding {
@@ -987,7 +962,7 @@ impl TrimSheetDocument {
         }
 
         let topology = AcceptedTopology::new(
-            TopologyKind::GeneratedTemplate,
+            kind,
             TopologySnapshot {
                 schema_version: TRIM_SHEET_DOCUMENT_SCHEMA_VERSION,
                 canonical_size: PixelSize {
@@ -1015,10 +990,19 @@ impl TrimSheetDocument {
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
-            layout_grid,
         };
         document.validate()?;
         Ok(document)
+    }
+
+    /// Accepts a custom authored template only after all canonical integer rectangles are pinned.
+    pub fn from_custom_template(
+        id: TrimSheetId,
+        template: &TemplateDefinition,
+        materials: Vec<MaterialSourceSet>,
+        patches: Vec<Patch>,
+    ) -> Result<Self, TrimSheetDocumentError> {
+        Self::from_pinned_template(id, template, materials, patches, TopologyKind::CustomTemplate)
     }
 
     /// Applies one accepted command to a clone, validates it, and advances revisions exactly once.
@@ -1065,48 +1049,9 @@ impl TrimSheetDocument {
             TrimSheetDocumentCommand::SetOutputResolution { output_size } => {
                 next.render_settings.output_size = *output_size;
             }
-            TrimSheetDocumentCommand::SetLayoutGrid { settings } => {
-                if !(8..=64).contains(&settings.columns) || !(8..=64).contains(&settings.rows) {
-                    return Err(TrimSheetDocumentError::InvalidLayoutGrid);
-                }
-                let snapshot = next.topology.snapshot.template.as_ref()
-                    .ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-                let template: TemplateDefinition = serde_json::from_str(&snapshot.snapshot_json)
-                    .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-                let packed = semantic_pack_template(&template, *settings);
-                for region in &mut next.topology.regions {
-                    let slot = template.stable_order.iter().find_map(|key| {
-                        let slot = template.slots.iter().find(|slot| &slot.slot_key == key)?;
-                        (deterministic_region_id(&template.identity.compatibility_key, &slot.compatibility_key) == region.id).then_some(slot)
-                    }).ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-                    let rect = packed.get(&slot.slot_key).copied()
-                        .ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
-                    let padding = settings.padding.min(rect.width.saturating_sub(1) / 2)
-                        .min(rect.height.saturating_sub(1) / 2);
-                    region.allocation_rect = rect;
-                    region.hotspot_rect = inset_rect(rect, padding);
-                }
-                next.layout_grid = *settings;
-                next.topology.kind = TopologyKind::GeneratedTemplate;
-                next.topology.topology_hash = hash_serializable(&next.topology.topology_hash_inputs())?;
-            }
-            TrimSheetDocumentCommand::SetRegionDestination { region_id, allocation_rect, padding } => {
-                let region = next.topology.regions.iter_mut().find(|region| region.id == *region_id)
-                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
-                if region.role == TemplateSlotRole::Radial && allocation_rect.width != allocation_rect.height {
-                    return Err(TrimSheetDocumentError::AspectLockedRegion(*region_id));
-                }
-                region.allocation_rect = *allocation_rect;
-                region.hotspot_rect = inset_rect(*allocation_rect, *padding);
-                next.topology.topology_hash = hash_serializable(&next.topology.topology_hash_inputs())?;
-            }
         }
         next.document_revision = next.document_revision.saturating_add(1);
-        if matches!(command, TrimSheetDocumentCommand::SetLayoutGrid { .. } | TrimSheetDocumentCommand::SetRegionDestination { .. }) {
-            next.topology_revision = next.document_revision;
-        } else {
-            next.appearance_revision = next.document_revision;
-        }
+        next.appearance_revision = next.document_revision;
         next.validate()?;
         Ok(next)
     }
@@ -1125,6 +1070,61 @@ impl TrimSheetDocument {
         next.validate()?;
         Ok(next)
     }
+}
+
+fn regions_from_template(
+    template: &TemplateDefinition,
+) -> Result<Vec<RegionDefinition>, TrimSheetDocumentError> {
+    template
+        .snapshot()
+        .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+    template
+        .stable_order
+        .iter()
+        .map(|slot_key| {
+            let slot = template.slots.iter().find(|slot| &slot.slot_key == slot_key)
+                .ok_or(TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+            let (uv_kind, fit_axis) = match slot.fit {
+                TemplateFitSemantics::Planar => (UvFitKind::Rectangular, FitAxis::Automatic),
+                TemplateFitSemantics::HorizontalStrip => (UvFitKind::Strip, FitAxis::Vertical),
+                TemplateFitSemantics::VerticalStrip => (UvFitKind::Strip, FitAxis::Horizontal),
+                TemplateFitSemantics::UniqueContain => (UvFitKind::Unique, FitAxis::None),
+                TemplateFitSemantics::TrimCap => (UvFitKind::Cap, FitAxis::Automatic),
+                TemplateFitSemantics::Radial => (UvFitKind::Radial, FitAxis::None),
+            };
+            let rect = slot.allocation;
+            let orientation = if rect.width > rect.height {
+                RegionOrientation::Horizontal
+            } else if rect.height > rect.width {
+                RegionOrientation::Vertical
+            } else {
+                RegionOrientation::Unspecified
+            };
+            Ok(RegionDefinition {
+                id: deterministic_region_id(&template.identity.compatibility_key, &slot.compatibility_key),
+                display_name: title_from_key(&slot.slot_key),
+                id_color: slot.id_color,
+                allocation_rect: slot.allocation,
+                hotspot_rect: slot.hotspot,
+                role: slot.role,
+                orientation,
+                uv_fit: UvFitPolicy {
+                    kind: uv_kind,
+                    fit_axis,
+                    keep_proportion: true,
+                    allowed_rotations: vec![QuarterTurn::Zero],
+                    mirror_allowed: !matches!(slot.role, TemplateSlotRole::Radial),
+                    world_size_meters: [slot.world_placement.width, slot.world_placement.height],
+                    classification_tags: Vec::new(),
+                },
+                structural_profile: slot.structural_profile,
+                material_group: slot.material_group.clone(),
+                weathering_group: slot.variation_group.clone(),
+                radial_parameters: slot.radial_parameters,
+                enabled: true,
+            })
+        })
+        .collect()
 }
 
 fn template_region_mapping(mapping: TemplateSourceMapping) -> RegionMapping {
@@ -1194,14 +1194,6 @@ pub enum TrimSheetDocumentCommand {
     SetOutputResolution {
         output_size: PixelSize,
     },
-    SetLayoutGrid {
-        settings: LayoutGridSettings,
-    },
-    SetRegionDestination {
-        region_id: RegionId,
-        allocation_rect: CanonicalRect,
-        padding: u32,
-    },
 }
 
 fn deterministic_region_id(template_key: &str, region_key: &str) -> RegionId {
@@ -1216,209 +1208,11 @@ fn deterministic_region_id(template_key: &str, region_key: &str) -> RegionId {
     RegionId::from_bytes(bytes)
 }
 
-#[derive(Clone, Copy)]
-struct SemanticPackItem<'a> {
-    slot: &'a TemplateSlot,
-    stable_index: usize,
-    weight: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GridPackRect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-impl GridPackRect {
-    fn area(self) -> u32 {
-        self.width.saturating_mul(self.height)
-    }
-}
-
-/// Builds a coverage-guaranteed semantic mosaic. The grid controls snapping precision only; the
-/// recipe is driven by role, preferred aspect, and area weight. Source crops never participate.
-fn semantic_pack_template(template: &TemplateDefinition, settings: LayoutGridSettings) -> BTreeMap<String, CanonicalRect> {
-    let columns = u32::from(settings.columns);
-    let rows = u32::from(settings.rows);
-    let mut items: Vec<_> = template.stable_order.iter().enumerate().filter_map(|(stable_index, key)| {
-        template.slots.iter().find(|slot| &slot.slot_key == key).map(|slot| SemanticPackItem {
-            slot,
-            stable_index,
-            weight: slot.packing_intent.map_or(
-                f64::from(slot.allocation.width) * f64::from(slot.allocation.height),
-                |intent| intent.area_weight,
-            ),
-        })
-    }).collect();
-    items.sort_by(semantic_item_order);
-
-    let mut radial: Vec<_> = items.iter().copied()
-        .filter(|item| item.slot.role == TemplateSlotRole::Radial).collect();
-    let mut strips: Vec<_> = items.iter().copied()
-        .filter(|item| item.slot.role == TemplateSlotRole::RepeatingStrip).collect();
-    let mut panels: Vec<_> = items.iter().copied()
-        .filter(|item| !matches!(item.slot.role, TemplateSlotRole::Radial | TemplateSlotRole::RepeatingStrip)).collect();
-    radial.sort_by(semantic_item_order);
-    strips.sort_by(semantic_item_order);
-    panels.sort_by(semantic_item_order);
-
-    let mut placements = BTreeMap::new();
-    let full = GridPackRect { x: 0, y: 0, width: columns, height: rows };
-    let radial_edge = (rows / 8).max(1).min(columns / radial.len().max(1) as u32);
-    let radial_width = radial_edge.saturating_mul(radial.len() as u32);
-    let radial_y = rows.saturating_mul(3) / 8;
-    let top = GridPackRect { x: 0, y: 0, width: columns, height: radial_y };
-    let side = GridPackRect {
-        x: radial_width,
-        y: radial_y,
-        width: columns.saturating_sub(radial_width),
-        height: radial_edge,
-    };
-    let bottom = GridPackRect {
-        x: 0,
-        y: radial_y.saturating_add(radial_edge),
-        width: columns,
-        height: rows.saturating_sub(radial_y.saturating_add(radial_edge)),
-    };
-    let special_zones_fit = !radial.is_empty()
-        && !panels.is_empty()
-        && !strips.is_empty()
-        && radial_width <= columns
-        && top.area() >= panels.len() as u32
-        && bottom.area() >= strips.len() as u32;
-
-    if special_zones_fit {
-        for (index, item) in radial.iter().enumerate() {
-            placements.insert(item.slot.slot_key.clone(), GridPackRect {
-                x: index as u32 * radial_edge,
-                y: radial_y,
-                width: radial_edge,
-                height: radial_edge,
-            });
-        }
-        if side.area() > 0 {
-            let hero = panels.remove(0);
-            placements.insert(hero.slot.slot_key.clone(), side);
-        }
-        partition_semantic(&panels, top, &mut placements);
-        partition_semantic(&strips, bottom, &mut placements);
-    } else if radial.is_empty() && !panels.is_empty() && !strips.is_empty() {
-        let strip_share = (total_weight(&strips) / total_weight(&items)).clamp(0.25, 0.75);
-        let mut strip_rows = (f64::from(rows) * strip_share).round() as u32;
-        strip_rows = strip_rows.clamp(strips.len().div_ceil(columns as usize) as u32, rows.saturating_sub(1));
-        let panel_rect = GridPackRect { x: 0, y: 0, width: columns, height: rows - strip_rows };
-        let strip_rect = GridPackRect { x: 0, y: rows - strip_rows, width: columns, height: strip_rows };
-        if panel_rect.area() >= panels.len() as u32 && strip_rect.area() >= strips.len() as u32 {
-            partition_semantic(&panels, panel_rect, &mut placements);
-            partition_semantic(&strips, strip_rect, &mut placements);
-        } else {
-            partition_semantic(&items, full, &mut placements);
-        }
-    } else {
-        partition_semantic(&items, full, &mut placements);
-    }
-
-    placements.into_iter().map(|(key, rect)| (key, grid_rect(
-        rect.x, rect.y, rect.width, rect.height, columns, rows,
-        template.canonical_width, template.canonical_height,
-    ))).collect()
-}
-
-fn semantic_item_order(left: &SemanticPackItem<'_>, right: &SemanticPackItem<'_>) -> std::cmp::Ordering {
-    right.weight.total_cmp(&left.weight)
-        .then_with(|| preferred_aspect(right.slot).total_cmp(&preferred_aspect(left.slot)))
-        .then_with(|| left.stable_index.cmp(&right.stable_index))
-}
-
-fn preferred_aspect(slot: &TemplateSlot) -> f64 {
-    slot.packing_intent.map_or(
-        f64::from(slot.allocation.width) / f64::from(slot.allocation.height),
-        |intent| intent.preferred_aspect,
-    ).clamp(1.0 / 64.0, 64.0)
-}
-
-fn total_weight(items: &[SemanticPackItem<'_>]) -> f64 {
-    items.iter().map(|item| item.weight.max(1.0)).sum::<f64>().max(1.0)
-}
-
-fn aggregate_aspect(items: &[SemanticPackItem<'_>]) -> f64 {
-    let weight = total_weight(items);
-    (items.iter().map(|item| item.weight.max(1.0) * preferred_aspect(item.slot).ln()).sum::<f64>() / weight).exp()
-}
-
-fn partition_semantic(items: &[SemanticPackItem<'_>], rect: GridPackRect, output: &mut BTreeMap<String, GridPackRect>) {
-    if items.is_empty() || rect.area() < items.len() as u32 {
-        return;
-    }
-    if items.len() == 1 {
-        output.insert(items[0].slot.slot_key.clone(), rect);
-        return;
-    }
-    let total = total_weight(items);
-    let mut best: Option<(f64, usize, bool, u32)> = None;
-    for split in 1..items.len() {
-        let left = &items[..split];
-        let right = &items[split..];
-        let ratio = total_weight(left) / total;
-        for vertical in [true, false] {
-            let (edge, cross) = if vertical { (rect.width, rect.height) } else { (rect.height, rect.width) };
-            if edge < 2 || cross == 0 { continue; }
-            let minimum = (left.len() as u32).div_ceil(cross).max(1);
-            let maximum = edge.saturating_sub((right.len() as u32).div_ceil(cross).max(1));
-            if minimum > maximum { continue; }
-            let cut = ((f64::from(edge) * ratio).round() as u32).clamp(minimum, maximum);
-            let (left_aspect, right_aspect) = if vertical {
-                (f64::from(cut) / f64::from(rect.height), f64::from(rect.width - cut) / f64::from(rect.height))
-            } else {
-                (f64::from(rect.width) / f64::from(cut), f64::from(rect.width) / f64::from(rect.height - cut))
-            };
-            let left_weight = total_weight(left);
-            let right_weight = total_weight(right);
-            let aspect_cost = left_weight * (left_aspect / aggregate_aspect(left)).ln().abs()
-                + right_weight * (right_aspect / aggregate_aspect(right)).ln().abs();
-            let area_ratio = f64::from(cut) / f64::from(edge);
-            let score = aspect_cost / total + (area_ratio - ratio).abs() * 0.35;
-            if best.is_none_or(|candidate| score < candidate.0) {
-                best = Some((score, split, vertical, cut));
-            }
-        }
-    }
-    let Some((_, split, vertical, cut)) = best else { return };
-    let (first, second) = if vertical {
-        (
-            GridPackRect { width: cut, ..rect },
-            GridPackRect { x: rect.x + cut, width: rect.width - cut, ..rect },
-        )
-    } else {
-        (
-            GridPackRect { height: cut, ..rect },
-            GridPackRect { y: rect.y + cut, height: rect.height - cut, ..rect },
-        )
-    };
-    partition_semantic(&items[..split], first, output);
-    partition_semantic(&items[split..], second, output);
-}
-
 fn rects_overlap(left: CanonicalRect, right: CanonicalRect) -> bool {
     left.x < right.x.saturating_add(right.width)
         && right.x < left.x.saturating_add(left.width)
         && left.y < right.y.saturating_add(right.height)
         && right.y < left.y.saturating_add(left.height)
-}
-
-fn grid_rect(x: u32, y: u32, width: u32, height: u32, columns: u32, rows: u32, canonical_width: u32, canonical_height: u32) -> CanonicalRect {
-    let left = canonical_width * x / columns;
-    let top = canonical_height * y / rows;
-    let right = canonical_width * (x + width) / columns;
-    let bottom = canonical_height * (y + height) / rows;
-    CanonicalRect { x: left, y: top, width: right - left, height: bottom - top }
-}
-
-fn inset_rect(rect: CanonicalRect, padding: u32) -> CanonicalRect {
-    let padding = padding.min(rect.width.saturating_sub(1) / 2).min(rect.height.saturating_sub(1) / 2);
-    CanonicalRect { x: rect.x + padding, y: rect.y + padding, width: rect.width - padding * 2, height: rect.height - padding * 2 }
 }
 
 fn title_from_key(key: &str) -> String {
@@ -1595,8 +1389,6 @@ pub enum TrimSheetDocumentError {
     InvalidCompatibilityKey,
     #[error("document, topology, and appearance revisions are inconsistent")]
     InvalidRevisions,
-    #[error("layout grid settings are invalid")]
-    InvalidLayoutGrid,
     #[error("stored topology hash does not match topology-only inputs")]
     TopologyHashMismatch,
     #[error("region ID is duplicated: {0}")]
@@ -1609,8 +1401,6 @@ pub enum TrimSheetDocumentError {
     InvalidAllocationRect(RegionId),
     #[error("region allocation rectangle overlaps another region: {0}")]
     OverlappingAllocationRect(RegionId),
-    #[error("region destination aspect is locked and cannot be skewed: {0}")]
-    AspectLockedRegion(RegionId),
     #[error("region hotspot rectangle is invalid: {0}")]
     InvalidHotspotRect(RegionId),
     #[error("region UV-fit metadata is invalid: {0}")]
@@ -1685,12 +1475,19 @@ pub enum TrimSheetDocumentError {
     HashSerialization,
     #[error("the accepted template snapshot is invalid")]
     InvalidTemplateSnapshot,
+    #[error("a pinned standard or custom template topology was mutated")]
+    TemplateTopologyMutation,
+    #[error("standard template does not exactly match its shipped registry definition")]
+    StandardTemplateRegistryMismatch,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PatchGeometry, PatchProperties, RectificationSettings, SourceId, TemplateRegistry};
+    use crate::{
+        PatchGeometry, PatchProperties, RectificationSettings, SourceId, TemplateRegistry,
+        WeightedTemplateGrammar, compile_weighted_grammar,
+    };
 
     fn material(id: SourceSetId) -> MaterialSourceSet {
         MaterialSourceSet {
@@ -1750,6 +1547,7 @@ mod tests {
             structural_profile: StructuralProfile::Flat,
             material_group: "primary".into(),
             weathering_group: "neutral".into(),
+            radial_parameters: None,
             enabled: true,
         }
     }
@@ -1758,7 +1556,7 @@ mod tests {
         let region_id = RegionId::from_bytes([1; 16]);
         let material_id = SourceSetId::from_bytes([2; 16]);
         let topology = AcceptedTopology::new(
-            TopologyKind::StandardTemplate,
+            TopologyKind::CustomAtlas,
             TopologySnapshot {
                 schema_version: 1,
                 canonical_size: PixelSize {
@@ -1796,7 +1594,6 @@ mod tests {
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
-            layout_grid: LayoutGridSettings::default(),
         }
     }
 
@@ -1816,33 +1613,95 @@ mod tests {
     }
 
     #[test]
-    fn semantic_grid_packing_is_total_stable_and_safe_at_every_supported_size() {
+    fn algorithm_stage_09_fixed_topology() {
         let registry = TemplateRegistry::built_in().expect("templates");
-        let template = registry.get("ht.generic_architecture", "1.0.0").expect("generic template");
-        let material_id = SourceSetId::from_bytes([7; 16]);
-        let original = TrimSheetDocument::from_template(
-            LayoutId::from_bytes([8; 16]),
-            template,
-            vec![material(material_id)],
-            Vec::new(),
-        ).expect("generated document");
-        let mappings = original.region_bindings.clone();
+        let family_ids = [
+            "ht.generic_architecture",
+            "ht.horizontal_moulding",
+            "ht.vertical_trim",
+            "ht.hard_surface_panel",
+            "ht.detail_heavy_props",
+            "ht.radial_accents",
+        ];
+        for family_id in family_ids {
+            let template = registry.get(family_id, "1.0.0").expect("fixed family");
+            let first = TrimSheetDocument::from_template(
+                LayoutId::new(), template, vec![material(SourceSetId::from_bytes([7; 16]))], Vec::new(),
+            ).expect("first corpus material");
+            let second = TrimSheetDocument::from_template(
+                LayoutId::new(), template, vec![material(SourceSetId::from_bytes([8; 16]))], Vec::new(),
+            ).expect("second corpus material");
+            assert_eq!(first.topology.topology_hash, second.topology.topology_hash);
+            assert_eq!(first.topology.regions, second.topology.regions);
+            assert_eq!(first.topology.kind, TopologyKind::StandardTemplate);
 
-        for size in [16, 24, 32, 48, 64] {
-            let packed = original.apply_command(&TrimSheetDocumentCommand::SetLayoutGrid {
-                settings: LayoutGridSettings { columns: size, rows: size, padding: 8 },
-            }).expect("supported grid packs every slot");
-            packed.validate().expect("packed document validates");
-            assert_eq!(packed.region_bindings, mappings, "destination packing must not edit source mappings");
-            assert_eq!(packed.topology.regions.len(), template.slots.len());
-            let allocated_area: u64 = packed.topology.regions.iter()
-                .map(|region| u64::from(region.allocation_rect.width) * u64::from(region.allocation_rect.height))
-                .sum();
-            assert_eq!(allocated_area, 4_096_u64 * 4_096_u64, "the atlas must have no unowned cells");
-            for region in packed.topology.regions.iter().filter(|region| region.role == TemplateSlotRole::Radial) {
-                assert_eq!(region.allocation_rect.width, region.allocation_rect.height, "radial destinations stay square");
+            for edge in [1_024, 2_048, 4_096, 8_192] {
+                let compiled = template.compile_for_output(PixelSize { width: edge, height: edge })
+                    .expect("shared boundary compilation");
+                assert_eq!(compiled.slots.len(), template.slots.len());
+                for compiled_slot in &compiled.slots {
+                    let authored = template.slots.iter().find(|slot| slot.slot_key == compiled_slot.slot_key).unwrap();
+                    assert_eq!(compiled_slot.allocation.x, authored.allocation.x * edge / 4_096);
+                    assert_eq!(compiled_slot.allocation.y, authored.allocation.y * edge / 4_096);
+                }
             }
         }
+
+        let generic = registry.get("ht.generic_architecture", "1.0.0").unwrap();
+        let hard_surface = registry.get("ht.hard_surface_panel", "1.0.0").unwrap();
+        assert!(matches!(
+            TemplateRegistry::diagnose_compatibility(generic, hard_surface),
+            crate::TemplateCompatibilityDiagnostic::ExplicitTopologyChange { .. }
+        ));
+
+        let material_id = SourceSetId::from_bytes([9; 16]);
+        let original = TrimSheetDocument::from_template(
+            LayoutId::new(), generic, vec![material(material_id)], Vec::new(),
+        ).unwrap();
+        let mut appearance_changed = original.apply_command(&TrimSheetDocumentCommand::SetOutputResolution {
+            output_size: PixelSize { width: 8_192, height: 8_192 },
+        }).unwrap();
+        appearance_changed.generator_provenance = Some(GeneratorProvenance {
+            generator_id: "source-analysis".into(), generator_version: 1, recipe_version: 1,
+            recipe_hash: DocumentHash([3; 32]), seed: 999,
+        });
+        assert_eq!(original.topology.topology_hash, appearance_changed.topology.topology_hash);
+        assert_eq!(original.topology.regions, appearance_changed.topology.regions);
+
+        let mut mutated = original.clone();
+        mutated.topology.regions[0].allocation_rect.x += 1;
+        mutated.topology.topology_hash = hash_serializable(&mutated.topology.topology_hash_inputs()).unwrap();
+        assert_eq!(mutated.validate(), Err(TrimSheetDocumentError::TemplateTopologyMutation));
+
+        let mut forged = generic.clone();
+        forged.slots[0].hotspot.x += 1;
+        assert_eq!(
+            TrimSheetDocument::from_template(
+                LayoutId::new(), &forged, vec![material(SourceSetId::from_bytes([10; 16]))], Vec::new(),
+            ),
+            Err(TrimSheetDocumentError::StandardTemplateRegistryMismatch),
+        );
+        let mut forged_standard = TrimSheetDocument::from_custom_template(
+            LayoutId::new(), &forged, vec![material(SourceSetId::from_bytes([11; 16]))], Vec::new(),
+        ).expect("custom authoring accepts pinned non-registry geometry");
+        forged_standard.topology.kind = TopologyKind::StandardTemplate;
+        forged_standard.topology.topology_hash =
+            hash_serializable(&forged_standard.topology.topology_hash_inputs()).unwrap();
+        assert_eq!(
+            forged_standard.validate(),
+            Err(TrimSheetDocumentError::StandardTemplateRegistryMismatch),
+        );
+
+        let weighted = WeightedTemplateGrammar::Horizontal {
+            weights: vec![1, 2],
+            children: vec![
+                WeightedTemplateGrammar::Slot { slot_key: "one".into() },
+                WeightedTemplateGrammar::Slot { slot_key: "two".into() },
+            ],
+        };
+        let compiled = compile_weighted_grammar(&weighted).expect("largest remainder grammar");
+        assert_eq!(compiled["one"], CanonicalRect { x: 0, y: 0, width: 1_365, height: 4_096 });
+        assert_eq!(compiled["two"], CanonicalRect { x: 1_365, y: 0, width: 2_731, height: 4_096 });
     }
 
     #[test]
