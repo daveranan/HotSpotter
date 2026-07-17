@@ -196,6 +196,14 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
         && (period.contains(&0) || period[0] > c.width || period[1] > c.height) {
         return Err(SlotSynthesisError::InvalidPlan);
     }
+    if p.radial_mapping.is_some_and(|radial| !radial.center_x.is_finite() || !radial.center_y.is_finite()
+        || !radial.inner_radius.is_finite() || !radial.outer_radius.is_finite()
+        || !radial.falloff.is_finite() || !(0.0..=1.0).contains(&radial.center_x)
+        || !(0.0..=1.0).contains(&radial.center_y) || radial.inner_radius < 0.0
+        || radial.outer_radius <= radial.inner_radius || radial.outer_radius > 2.0
+        || !(0.1..=4.0).contains(&radial.falloff)) {
+        return Err(SlotSynthesisError::InvalidPlan);
+    }
     if matches!(p.candidate.mapping_mode, SamplingMode::PeriodicTile | SamplingMode::RepeatX | SamplingMode::RepeatY)
         && p.candidate.period_pixels.is_none() { return Err(SlotSynthesisError::InvalidPlan); }
     match (p.candidate.mapping_mode, p.slice_geometry) {
@@ -313,10 +321,27 @@ fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
         SamplingMode::ExplicitStretch => Position { x: f64::from(c.x) + m[0] / source_size[0] * cw,
             y: f64::from(c.y) + m[1] / source_size[1] * ch, valid: true },
         SamplingMode::PolarRadial => {
-            let dx = m[0] - source_size[0] * 0.5; let dy = m[1] - source_size[1] * 0.5;
-            let radius = dx.hypot(dy); let max_radius = source_size[0].min(source_size[1]) * 0.5;
+            let (center_x, center_y, inner_radius, outer_radius, falloff) = r.plan.radial_mapping.map_or(
+                (0.5, 0.5, 0.0, 0.5, 1.0), |radial| (radial.center_x, radial.center_y,
+                    radial.inner_radius, radial.outer_radius, radial.falloff));
+            let radial_local = transform_local([q[0] - center_x, q[1] - center_y],
+                transform.rotation, transform.mirror);
+            let dx = radial_local[0]; let dy = radial_local[1];
+            let radius = dx.hypot(dy); let radial_span = (outer_radius - inner_radius).max(f64::EPSILON);
             let theta = dy.atan2(dx).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
-            Position { x: f64::from(c.x) + theta * cw, y: f64::from(c.y) + (radius / max_radius) * ch, valid: radius <= max_radius }
+            Position { x: f64::from(c.x) + theta * cw,
+                y: f64::from(c.y) + ((radius - inner_radius) / radial_span).clamp(0.0, 1.0).powf(falloff) * ch,
+                valid: radius >= inner_radius && radius <= outer_radius }
+        }
+        SamplingMode::PlanarRadial => {
+            let (center_x, center_y, inner_radius, outer_radius) = r.plan.radial_mapping.map_or(
+                (0.5, 0.5, 0.0, f64::INFINITY), |radial| (radial.center_x, radial.center_y, radial.inner_radius, radial.outer_radius));
+            let radius = (q[0] - center_x).hypot(q[1] - center_y);
+            let radial_local = transform_local([(q[0] - center_x) * destination_size[0],
+                (q[1] - center_y) * destination_size[1]], transform.rotation, transform.mirror);
+            Position { x: f64::from(c.x) + center_x * cw + radial_local[0] * scale,
+                y: f64::from(c.y) + center_y * ch + radial_local[1] * scale,
+                valid: radius >= inner_radius && radius <= outer_radius }
         }
         SamplingMode::ThreeSliceCap => three_slice(c, m, source_size, scale, r.plan.slice_geometry),
         SamplingMode::NineSlicePanel => nine_slice(c, m, source_size, scale, r.plan.slice_geometry),
@@ -520,6 +545,7 @@ mod tests {
                     direct_crop_applicable:true,direct_crop_rejection:None,reasons:Vec::new()}},
             slot_physical_size:[1.0,1.0],source_pixels_per_physical_unit:8.0,
             sampling_policy:SamplingPolicy{filter:SourceSamplingMode::Nearest,scale:1.0,correct_tangent_normals:true},
+            radial_mapping:None,
             stretch_override:if mode==SamplingMode::ExplicitStretch { StretchOverrideProvenance::UserOverride{settings_revision:14} }
                 else { StretchOverrideProvenance::NotAuthorized },
             slice_geometry:match mode {

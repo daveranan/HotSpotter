@@ -3,8 +3,8 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1045,8 +1045,8 @@ fn removed_preview_specific_fabrication(
     if document.document_revision != requested_revision {
         return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
     }
-    let primary = document.primary_material.ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
-    let selected = summary.sources.iter().filter(|source| source.source_set_id.to_string() == primary.to_string())
+    document.primary_material.ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
+    let selected = summary.sources.iter()
         .map(|source| registered_map_cached(source, preview_service)).collect::<Result<Vec<_>, _>>()?;
     if !selected.iter().any(|map| map.kind == MaterialMapKind::BaseColor) {
         return Err(error(ErrorCode::InvalidInput, "Preview through Stage 14 requires imported Base Color."));
@@ -1205,15 +1205,31 @@ fn build_stage_14_preview(
     if document.document_revision != requested_revision {
         return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
     }
-    let artifact = AlgorithmCompiler::new().compile_persisted_stage_14_preview(
-        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: requested_revision },
-        &EngineCancellationToken::new(),
-        || {
-            preview_service.latest_draft_id.load(Ordering::Acquire) == job
-                && session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
-                    .map(|document| document.document_revision == requested_revision)).unwrap_or(false)
-        },
-    ).map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
+    let revision_current = AtomicBool::new(true);
+    let monitoring_complete = AtomicBool::new(false);
+    let artifact = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !monitoring_complete.load(Ordering::Acquire) {
+                let live = session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
+                    .map(|document| document.document_revision == requested_revision)).unwrap_or(false);
+                if !live { revision_current.store(false, Ordering::Release); return; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let result = AlgorithmCompiler::new().compile_persisted_stage_14_preview(
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: requested_revision },
+            &EngineCancellationToken::new(),
+            || preview_service.latest_draft_id.load(Ordering::Acquire) == job
+                && revision_current.load(Ordering::Acquire),
+        );
+        monitoring_complete.store(true, Ordering::Release);
+        result
+    }).map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
+    let live_revision = session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
+        .map(|document| document.document_revision)).unwrap_or(0);
+    if live_revision != requested_revision || preview_service.latest_draft_id.load(Ordering::Acquire) != job {
+        return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
+    }
     let primary = document.primary_material.ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
     let selected = summary.sources.iter().filter(|source| source.source_set_id.to_string() == primary.to_string())
         .map(|source| registered_map_cached(source, preview_service)).collect::<Result<Vec<_>, _>>()?;
@@ -1943,7 +1959,7 @@ mod persisted_algorithm_stage_14_preview_a_tests {
     use std::{collections::HashSet, io::Cursor, path::PathBuf, sync::{Arc, Mutex}};
 
     use hot_trimmer_domain::{
-        ContentDigest, MaterialBehaviorClass, MaterialClassificationCommand, NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId,
+        ContentDigest, ContentReference, MaterialBehaviorClass, MaterialClassificationCommand, NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId,
         PatchProperties, PixelSize, RectificationSettings, SourceId, TrimSheetDocumentCommand,
     };
     use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
@@ -1968,26 +1984,31 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         fs::create_dir_all(&root).unwrap();
         let project_path = root.join("persisted.hottrimmer");
         let mut store = ProjectStore::create(&project_path, "Persisted Stage 14").unwrap();
-        let bytes = encoded_source();
+        let supplied_path = std::env::var_os("HOT_TRIMMER_STAGE14_SOURCE").map(PathBuf::from);
+        let bytes = supplied_path.as_ref().map_or_else(encoded_source, |path| fs::read(path).unwrap());
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        let source_width = decoded.width(); let source_height = decoded.height();
         let base_color_source_id = SourceId::new();
         store.replace_source(SourceChannel::BaseColor, &SourceInput {
             id: base_color_source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
-            origin_path: PathBuf::from("authored-brick.png"), sha256: ContentDigest::sha256(&bytes).0,
-            width: 192, height: 128, format: "PNG".into(), color_type: "Rgba8".into(),
-            has_alpha: true, exif_orientation: 1, has_embedded_icc_profile: false,
+            origin_path: supplied_path.clone().unwrap_or_else(|| PathBuf::from("authored-brick.png")),
+            sha256: ContentDigest::sha256(&bytes).0, width: source_width, height: source_height,
+            format: if supplied_path.is_some() { "JPEG".into() } else { "PNG".into() },
+            color_type: if supplied_path.is_some() { "Rgb8".into() } else { "Rgba8".into() },
+            has_alpha: supplied_path.is_none(), exif_orientation: 1, has_embedded_icc_profile: false,
             encoded_bytes: u64::try_from(bytes.len()).unwrap(), owned_bytes: Some(bytes),
         }).unwrap();
-        let roughness_bytes = encoded_source();
-        let patch_source_id = SourceId::new();
-        store.replace_source(SourceChannel::Roughness, &SourceInput {
-            id: patch_source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
-            origin_path: PathBuf::from("authored-brick-roughness.png"),
-            sha256: ContentDigest::sha256(&roughness_bytes).0, width: 192, height: 128,
-            format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
-            exif_orientation: 1, has_embedded_icc_profile: false,
-            encoded_bytes: u64::try_from(roughness_bytes.len()).unwrap(),
-            owned_bytes: Some(roughness_bytes),
-        }).unwrap();
+        let patch_source_id = if supplied_path.is_some() { base_color_source_id } else {
+            let roughness_bytes = encoded_source(); let patch_source_id = SourceId::new();
+            store.replace_source(SourceChannel::Roughness, &SourceInput {
+                id: patch_source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
+                origin_path: PathBuf::from("authored-brick-roughness.png"),
+                sha256: ContentDigest::sha256(&roughness_bytes).0, width: 192, height: 128,
+                format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+                exif_orientation: 1, has_embedded_icc_profile: false,
+                encoded_bytes: u64::try_from(roughness_bytes.len()).unwrap(), owned_bytes: Some(roughness_bytes),
+            }).unwrap(); patch_source_id
+        };
         let primary = store.summary().unwrap().source_sets[0].id;
         store.apply_material_classification_command(Uuid::from_bytes(primary.to_bytes()),
             MaterialClassificationCommand::Override { class: MaterialBehaviorClass::AlreadyTileable }).unwrap();
@@ -1998,6 +2019,10 @@ mod persisted_algorithm_stage_14_preview_a_tests {
             properties: PatchProperties::default(), rectification: RectificationSettings::default() };
         store.execute_patch_command(&PatchCommand::Create { patch: patch.clone(), index: None }, None).unwrap();
         store.create_trim_sheet_document("ht.generic_architecture", "1.0.0").unwrap();
+        let patch_region_id = store.summary().unwrap().document.unwrap().topology.regions[0].id;
+        store.execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
+            region_id: patch_region_id, content: ContentReference::Patch(patch.id),
+        }).unwrap();
         store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
             output_size: PixelSize { width: 128, height: 128 },
         }).unwrap();
@@ -2014,7 +2039,11 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         let artifact = build_stage_14_preview(&session, &service, revision, job).expect("persisted Stage 1-14 preview");
         assert_eq!(artifact.incomplete_after_stage, 14);
         assert!(artifact.non_exportable && !artifact.final_compile_available && !artifact.export_available && !artifact.blender_available);
-        assert!(artifact.slots.iter().all(|slot| slot.patch_id.as_deref() == Some(&patch.id.to_string())));
+        let expected_patch_id = patch.id.to_string();
+        assert_eq!(artifact.slots.iter().find(|slot| slot.region_id == patch_region_id).unwrap()
+            .patch_id.as_deref(), Some(expected_patch_id.as_str()));
+        assert!(artifact.slots.iter().filter(|slot| slot.region_id != patch_region_id)
+            .all(|slot| slot.patch_id.is_none()), "inherited material regions must not claim patch lineage");
         assert!(artifact.maps.contains_key("baseColor"));
         let crops = artifact.slots.iter().filter_map(|slot| slot.source_crop)
             .map(|crop| (crop.x, crop.y, crop.width, crop.height)).collect::<HashSet<_>>();

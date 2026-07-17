@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CancellationToken, CompilationDiagnostic, ContentDigest, DiagnosticCode,
-    MaterialBehaviorClass, RecoveryChoice, RegionId, SamplingPolicy, StageResult,
+    MaterialBehaviorClass, RadialMappingSettings, RecoveryChoice, RegionId, SamplingPolicy, StageResult,
     TemplateSlotRole,
 };
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ pub struct PlacementSlotInput {
     /// Stage 10/6 conversion before the Stage 11 dimensionless scale-ladder multiplier.
     pub base_source_pixels_per_physical_unit: f64,
     pub sampling_policy: SamplingPolicy,
+    pub radial_mapping: Option<RadialMappingSettings>,
     pub stretch_override: StretchOverrideProvenance,
     pub slice_geometry: SliceGeometry,
     /// Maximum accepted cost for every selected Stage 8 seam used by this slot.
@@ -164,6 +165,7 @@ pub struct SamplingPlan {
     pub source_pixels_per_physical_unit: f64,
     /// Authoritative raster policy. Stage 14 must consume this value for every channel.
     pub sampling_policy: SamplingPolicy,
+    pub radial_mapping: Option<RadialMappingSettings>,
     /// Visible provenance for the only route allowed to use non-uniform scale.
     pub stretch_override: StretchOverrideProvenance,
     pub slice_geometry: SliceGeometry,
@@ -887,6 +889,7 @@ fn build_plan(
                 source_pixels_per_physical_unit: context.slots[slot].base_source_pixels_per_physical_unit
                     * scored.candidate.isotropic_scale,
                 sampling_policy: context.slots[slot].sampling_policy,
+                radial_mapping: context.slots[slot].radial_mapping,
                 stretch_override: context.slots[slot].stretch_override,
                 slice_geometry: context.slots[slot].slice_geometry,
                 maximum_seam_cost_milli: context.slots[slot].maximum_seam_cost_milli,
@@ -1126,6 +1129,7 @@ mod tests {
             slot_physical_size: [2.0, 2.0],
             base_source_pixels_per_physical_unit: 50.0,
             sampling_policy: SamplingPolicy { filter: SourceSamplingMode::Nearest, scale: 1.25, correct_tangent_normals: false },
+            radial_mapping: None,
             stretch_override: StretchOverrideProvenance::NotAuthorized,
             slice_geometry: SliceGeometry::None,
             maximum_seam_cost_milli: 450,

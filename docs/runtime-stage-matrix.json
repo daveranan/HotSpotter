@@ -1,0 +1,227 @@
+{
+  "schemaVersion": 1,
+  "auditedPath": "preview_through_stage_14",
+  "auditDate": "2026-07-17",
+  "statuses": [
+    "Fully connected",
+    "Connected but transformed incorrectly",
+    "Connected only in tests",
+    "Partially connected",
+    "Recomputed downstream",
+    "Bypassed",
+    "Dead/unreferenced",
+    "Preview-only approximation",
+    "Blocked by contract mismatch"
+  ],
+  "stages": [
+    {
+      "stage": "Project state / Stage 1",
+      "intendedOutput": "Persisted project snapshot, registered source identity and ownership",
+      "actualRuntimeOutput": "ProjectSummary plus a new RegisteredChannelSet and cloned encoded-byte map per unique source-set/patch domain",
+      "runtimeCaller": "build_stage_14_preview -> ProjectStore::summary; compile_persisted -> registered_inputs",
+      "downstreamConsumer": "Stage 2 and region-content resolver",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "ProjectStore::summary is repeatedly polled for cancellation; source bytes are cloned/read again per domain",
+      "status": "Recomputed downstream",
+      "evidence": ["apps/desktop/src-tauri/src/document_commands.rs:1193-1229", "crates/project-store/src/lib.rs:430-441", "crates/sheet-compiler/src/persisted_pipeline.rs:128-142", "crates/sheet-compiler/src/persisted_pipeline.rs:534-550"]
+    },
+    {
+      "stage": "Stage 2",
+      "intendedOutput": "PreparedChannelSet with oriented, normalized, registered channel pyramids",
+      "actualRuntimeOutput": "PreparedChannelSet capped to a 2048-pixel level-zero edge and five levels",
+      "runtimeCaller": "build_domain",
+      "downstreamConsumer": "Stage 3 prepare_registered_exemplar",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact object is passed to Stage 3, but it is decoded again for each patch/full-source domain and every preview run; computed cache key is not backed by a runtime cache here",
+      "status": "Fully connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:293-315", "crates/image-io/src/normalization.rs:409-450"]
+    },
+    {
+      "stage": "Stage 3",
+      "intendedOutput": "PreparedExemplar with registered rectification and a shared correspondence field",
+      "actualRuntimeOutput": "Authoritative PreparedExemplar for full frame or authored four-point patch",
+      "runtimeCaller": "build_domain",
+      "downstreamConsumer": "Stage 4 prepare_delit_exemplar",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact object is passed; PreparedExemplarCache owned by ProjectSession is not used by this route",
+      "status": "Fully connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:298-318", "apps/desktop/src-tauri/src/document_commands.rs:59-89"]
+    },
+    {
+      "stage": "Stage 4",
+      "intendedOutput": "Prepared de-lit exemplar retaining Stage 3 lineage",
+      "actualRuntimeOutput": "Stage 4 exemplar; often a pass-through when delighting is off",
+      "runtimeCaller": "build_domain",
+      "downstreamConsumer": "Stages 5, 6, 7 and Stage 8 DomainRequest",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact object is passed, but no cross-preview cache is supplied",
+      "status": "Fully connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:316-338"]
+    },
+    {
+      "stage": "Stage 5",
+      "intendedOutput": "SourceAnalysisReport: quality and material behavior",
+      "actualRuntimeOutput": "Fresh SourceAnalysisReport with persisted routing intent overlaid",
+      "runtimeCaller": "build_domain",
+      "downstreamConsumer": "Stages 6 and 8; Stage 11 evidence; Stage 12 scoring context; Stage 13 behavior",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact report is consumed, but ProjectSession.source_analysis_cache is bypassed",
+      "status": "Fully connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:320-333", "apps/desktop/src-tauri/src/document_commands.rs:69-71"]
+    },
+    {
+      "stage": "Stage 6",
+      "intendedOutput": "ScaleOrientationReport",
+      "actualRuntimeOutput": "Fresh calibrated scale/orientation report",
+      "runtimeCaller": "build_domain",
+      "downstreamConsumer": "Stage 7, Stage 8, Stage 10 footprints, Stage 11 evidence and Stage 12 measurements",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact report is consumed, but ProjectSession.scale_orientation_cache is bypassed",
+      "status": "Fully connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:323-336", "apps/desktop/src-tauri/src/document_commands.rs:69-71"]
+    },
+    {
+      "stage": "Stage 7",
+      "intendedOutput": "FeatureFieldReport with saliency, stationarity, structure, seamability and usability",
+      "actualRuntimeOutput": "Fresh registered feature fields",
+      "runtimeCaller": "build_domain",
+      "downstreamConsumer": "Stage 8 router; sampled evidence in Stages 11 and 12",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact report is passed, but average_field/perimeter_field rescan candidate rectangles repeatedly and no feature cache is retained across previews",
+      "status": "Recomputed downstream",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:326-338", "crates/sheet-compiler/src/persisted_pipeline.rs:446-512"]
+    },
+    {
+      "stage": "Stage 8 router (8A-8F)",
+      "intendedOutput": "PreparedMaterialDomain whose route and pixels satisfy source evidence",
+      "actualRuntimeOutput": "PreparedMaterialDomain; measured run selected DirectSource",
+      "runtimeCaller": "build_domain -> prepare_stage_08_material_domain",
+      "downstreamConsumer": "Stages 11 and 14",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "A fresh empty MaterialDomainCache is created per domain. Stage 11 can later select TextureSynthesis even when this domain is DirectSource, and Stage 14 does not execute synthesis for that mismatch",
+      "status": "Blocked by contract mismatch",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:328-340", "crates/sheet-compiler/src/slot_synthesis.rs:267-289", "crates/sheet-compiler/src/slot_synthesis.rs:296-373"]
+    },
+    {
+      "stage": "Stage 9",
+      "intendedOutput": "CompiledTemplateTopology / slot geometry",
+      "actualRuntimeOutput": "Exact persisted template snapshot compiled at requested final output size",
+      "runtimeCaller": "compile_persisted",
+      "downstreamConsumer": "Stage 10 destinations, Stage 14 output dimensions, 14P atlas rectangles",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact topology is passed into 14P; UI overlays are separately reconstructed by legacy resolve_compile_plan after compilation",
+      "status": "Recomputed downstream",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:146-166", "crates/sheet-compiler/src/intermediate_atlas.rs:147-186", "apps/desktop/src-tauri/src/document_commands.rs:1233-1250"]
+    },
+    {
+      "stage": "Stage 10",
+      "intendedOutput": "ResolvedSlotDemandSet with physical footprint, allowed sampling modes, profile/effect capacity",
+      "actualRuntimeOutput": "ResolvedSlotDemandSet for all Stage 9 allocation rectangles; requested_features is always empty",
+      "runtimeCaller": "compile_persisted",
+      "downstreamConsumer": "Stage 11 and construction of Stage 13 inputs",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Demand identity is not carried as an ID/hash. Profile type and weathering class are recorded but never compile an EffectPlan or render effects",
+      "status": "Partially connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:154-205", "crates/effect-compiler/src/stage10.rs:129-169", "crates/effect-compiler/src/stage10.rs:276-301"]
+    },
+    {
+      "stage": "Stage 11",
+      "intendedOutput": "CropCandidate set for each exact slot demand",
+      "actualRuntimeOutput": "CandidateSet generated inside an authored crop window, then mutated/filtered by apply_authored_mapping",
+      "runtimeCaller": "compile_persisted",
+      "downstreamConsumer": "Stage 12",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "The exact post-filter object reaches Stage 12. However new documents seed template-atlas source crops, and TextureSynthesis candidates bypass crop-window enforcement because crop is None",
+      "status": "Connected but transformed incorrectly",
+      "evidence": ["crates/domain/src/document.rs:927-961", "crates/sheet-compiler/src/persisted_pipeline.rs:169-188", "crates/sheet-compiler/src/persisted_pipeline.rs:356-414", "crates/placement-solver/src/candidates.rs:410-424"]
+    },
+    {
+      "stage": "Stage 12",
+      "intendedOutput": "ScoredCandidateSet / stable top-K",
+      "actualRuntimeOutput": "Top 16 candidates per slot scored from Stage 7 measurements",
+      "runtimeCaller": "compile_persisted",
+      "downstreamConsumer": "Stage 13 PlacementSlotInput.candidates",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact top-K object is passed. Field statistics are recomputed by scanning each candidate crop",
+      "status": "Fully connected",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:182-204", "crates/placement-solver/src/optimizer.rs:33-59"]
+    },
+    {
+      "stage": "Stage 13",
+      "intendedOutput": "PlacementPlan containing one validated SamplingPlan per slot",
+      "actualRuntimeOutput": "Complete PlacementPlan and per-slot SamplingPlans",
+      "runtimeCaller": "compile_persisted",
+      "downstreamConsumer": "Stage 14 and 14P identity validation",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact plan is consumed. Reuse defaults permit stochastic/manufactured reuse; measured first repeated slots selected crop-less TextureSynthesis candidates",
+      "status": "Connected but transformed incorrectly",
+      "evidence": ["crates/sheet-compiler/src/persisted_pipeline.rs:206-228", "crates/placement-solver/src/optimizer.rs:15-31", "crates/placement-solver/src/optimizer.rs:284-350"]
+    },
+    {
+      "stage": "Stage 14",
+      "intendedOutput": "SynthesizedSlotMaterial with shared correspondence, validity and registered channels",
+      "actualRuntimeOutput": "One allocation-sized rendered slot per topology slot, sampled serially",
+      "runtimeCaller": "compile_persisted",
+      "downstreamConsumer": "14P compose_intermediate_atlas",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Exact object is passed. TextureSynthesis has no explicit map_position branch and falls through to generic centered sampling while diagnostics still report TextureSynthesis executed",
+      "status": "Blocked by contract mismatch",
+      "evidence": ["crates/sheet-compiler/src/slot_synthesis.rs:115-167", "crates/sheet-compiler/src/slot_synthesis.rs:296-373", "crates/sheet-compiler/src/persisted_pipeline.rs:212-228"]
+    },
+    {
+      "stage": "Stage 14P atlas",
+      "intendedOutput": "Non-exportable intermediate atlas assembled from Stage 14 slots",
+      "actualRuntimeOutput": "Only channel roles present in every required slot; Base Color is mandatory; correspondence and validity remain native-only",
+      "runtimeCaller": "AlgorithmCompiler::compile_intermediate_atlas",
+      "downstreamConsumer": "Tauri projection/PNG encoder",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Region ID is not generated; correspondence/validity/diagnostics/algorithm versions are discarded at IPC; slot-result identity hashes reread every pixel",
+      "status": "Partially connected",
+      "evidence": ["crates/sheet-compiler/src/intermediate_atlas.rs:119-206", "apps/desktop/src-tauri/src/document_commands.rs:1238-1260"]
+    },
+    {
+      "stage": "Structural profile masks / height / normal",
+      "intendedOutput": "Hotspot-local height_f32 and tangent normal RGBA",
+      "actualRuntimeOutput": "No output on Stage 14P; implementation exists in render-core and is used only by dead/disabled compositors and tests",
+      "runtimeCaller": "None in Stage 14P",
+      "downstreamConsumer": "None in Stage 14P",
+      "usedIn14P": false,
+      "ignoredOrRecomputed": "Bypassed; imported Height/Normal may be sampled, but generated structural maps are not composed",
+      "status": "Connected only in tests",
+      "evidence": ["crates/render-core/src/structural_profile.rs:189-250", "crates/sheet-compiler/src/document_compiler.rs:431-460", "crates/sheet-compiler/src/document_compiler.rs:670-705"]
+    },
+    {
+      "stage": "Effect plan / weathering / chips / wear",
+      "intendedOutput": "EffectPlan and scale-aware channel modifications",
+      "actualRuntimeOutput": "No EffectPlan compiler; only Stage 10 capacity metadata and an EffectPlanHeader type exist",
+      "runtimeCaller": "None",
+      "downstreamConsumer": "None",
+      "usedIn14P": false,
+      "ignoredOrRecomputed": "Stages 15, 16 and 18 return unsupported; effect count in measured run is zero",
+      "status": "Dead/unreferenced",
+      "evidence": ["crates/effect-compiler/src/lib.rs:1-14", "crates/domain/src/algorithm_stack.rs:361-367"]
+    },
+    {
+      "stage": "Final map composition / Region ID",
+      "intendedOutput": "Base Color, Height, Normal, Roughness, Metallic, AO, Region ID and Material ID atlases",
+      "actualRuntimeOutput": "Stage 14P emits imported common material channels only; measured run emitted Base Color only",
+      "runtimeCaller": "compose_intermediate_atlas",
+      "downstreamConsumer": "HTML image preview",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "Generated maps and Region ID are bypassed. Old complete compositor exists but is unused",
+      "status": "Preview-only approximation",
+      "evidence": ["crates/sheet-compiler/src/intermediate_atlas.rs:132-205", "crates/sheet-compiler/src/document_compiler.rs:200-315"]
+    },
+    {
+      "stage": "Preview",
+      "intendedOutput": "PBR preview consuming one compiled artifact and authoritative UV/slot metadata",
+      "actualRuntimeOutput": "A data-URL HTML img plus HTML region overlays",
+      "runtimeCaller": "React SheetWorkbench",
+      "downstreamConsumer": "User",
+      "usedIn14P": true,
+      "ignoredOrRecomputed": "No mesh, UV islands, GPU preview renderer, PBR binding or progressive preview. UI region metadata is separately resolved and zipped by order",
+      "status": "Preview-only approximation",
+      "evidence": ["apps/desktop/src/source-first-app.tsx:1668-1756", "crates/preview/src/lib.rs:1-3", "apps/desktop/src-tauri/src/document_commands.rs:1233-1259"]
+    }
+  ]
+}

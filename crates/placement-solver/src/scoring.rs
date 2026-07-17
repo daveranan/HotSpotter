@@ -241,7 +241,7 @@ pub struct ScoredCandidateSet {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScoringError { InvalidSettings, MalformedInput }
+pub enum ScoringError { InvalidSettings, MalformedInput, Cancelled }
 
 pub fn score_candidate_set<S: SlotDemandView>(
     slot: &S,
@@ -249,7 +249,14 @@ pub fn score_candidate_set<S: SlotDemandView>(
     context: &ScoringContext,
     settings: &ScoringSettings,
 ) -> Result<ScoredCandidateSet, ScoringError> {
-    score_candidates(slot, &candidates.candidates, context, settings)
+    score_candidate_set_with_guard(slot, candidates, context, settings, &|| false)
+}
+
+pub fn score_candidate_set_with_guard<S: SlotDemandView>(
+    slot: &S, candidates: &CandidateSet, context: &ScoringContext, settings: &ScoringSettings,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ScoredCandidateSet, ScoringError> {
+    score_candidates_with_guard(slot, &candidates.candidates, context, settings, cancelled)
 }
 
 pub fn score_candidates<S: SlotDemandView>(
@@ -258,6 +265,14 @@ pub fn score_candidates<S: SlotDemandView>(
     context: &ScoringContext,
     settings: &ScoringSettings,
 ) -> Result<ScoredCandidateSet, ScoringError> {
+    score_candidates_with_guard(slot, candidates, context, settings, &|| false)
+}
+
+fn score_candidates_with_guard<S: SlotDemandView>(
+    slot: &S, candidates: &[CropCandidate], context: &ScoringContext, settings: &ScoringSettings,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ScoredCandidateSet, ScoringError> {
+    if cancelled() { return Err(ScoringError::Cancelled); }
     validate(slot, context, settings)?;
     let mut weights = UnaryWeights::for_behavior_and_role(context.material_behavior, slot.role());
     for (term, value) in &settings.weight_overrides { set_weight(&mut weights, *term, *value); }
@@ -265,6 +280,7 @@ pub fn score_candidates<S: SlotDemandView>(
     let mut scored = Vec::new();
     let mut rejections = Vec::new();
     for candidate in candidates {
+        if cancelled() { return Err(ScoringError::Cancelled); }
         let reasons = legality_rejections(slot, candidate);
         if !reasons.is_empty() {
             rejections.push(ApplicabilityRejection { candidate_id: candidate.candidate_id.clone(), reasons });

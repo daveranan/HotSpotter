@@ -180,7 +180,7 @@ impl Default for CandidateSettings {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CandidateError { InvalidSettings, MalformedInput, ResourceLimitExceeded }
+pub enum CandidateError { InvalidSettings, MalformedInput, ResourceLimitExceeded, Cancelled }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,11 +204,19 @@ struct Position { x: u32, y: u32, strategy: PositionStrategy, descriptors: Candi
 pub fn generate_candidates<D: MaterialDomainView, S: SlotDemandView>(
     domain: &D, slot: &S, evidence: &CandidateEvidence, settings: &CandidateSettings, seed: u64,
 ) -> Result<CandidateSet, CandidateError> {
+    generate_candidates_with_guard(domain, slot, evidence, settings, seed, &|| false)
+}
+
+pub fn generate_candidates_with_guard<D: MaterialDomainView, S: SlotDemandView>(
+    domain: &D, slot: &S, evidence: &CandidateEvidence, settings: &CandidateSettings, seed: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CandidateSet, CandidateError> {
+    if cancelled() { return Err(CandidateError::Cancelled); }
     validate(domain, slot, evidence, settings)?;
     let (domain_w, domain_h) = domain.dimensions();
     let pixels = u64::from(domain_w) * u64::from(domain_h);
     if pixels > settings.max_work { return Err(CandidateError::ResourceLimitExceeded); }
-    let unusable_integral = build_unusable_integral(domain, domain_w, domain_h);
+    let unusable_integral = build_unusable_integral(domain, domain_w, domain_h, cancelled)?;
     let transforms = legal_transforms(slot, evidence);
     let direct_possible = transforms.iter().flat_map(|transform| crop_sizes(slot, settings, transform.rotation))
         .any(|(_, w, h)| w <= domain_w && h <= domain_h
@@ -219,10 +227,12 @@ pub fn generate_candidates<D: MaterialDomainView, S: SlotDemandView>(
     let mut attempted = 0_u32;
     let mut rejected = 0_u32;
     for transform in &transforms {
+        if cancelled() { return Err(CandidateError::Cancelled); }
         for (scale, width, height) in crop_sizes(slot, settings, transform.rotation) {
             if width > domain_w || height > domain_h { continue; }
             let positions = positions(domain_w, domain_h, width, height, evidence, settings);
             for position in positions {
+                if cancelled() { return Err(CandidateError::Cancelled); }
                 attempted = attempted.saturating_add(1);
                 let crop = SourceCrop { x: position.x, y: position.y, width, height };
                 if !rect_usable(&unusable_integral, domain_w, crop) { rejected = rejected.saturating_add(1); continue; }
@@ -240,6 +250,7 @@ pub fn generate_candidates<D: MaterialDomainView, S: SlotDemandView>(
     }
     add_synthesis_candidates(&mut out, domain, slot, evidence, &transforms, direct_possible,
         direct_rejection.clone(), seed);
+    if cancelled() { return Err(CandidateError::Cancelled); }
     out.sort_by(|a, b| candidate_sort_key(a).cmp(&candidate_sort_key(b)));
     out.dedup_by(|a, b| a.candidate_id == b.candidate_id);
     let before = out.len();
@@ -312,11 +323,12 @@ fn legal_transforms<S: SlotDemandView>(slot: &S, e: &CandidateEvidence) -> Vec<C
         rotation, mirror: *mirror })).collect()
 }
 
-fn build_unusable_integral<D: MaterialDomainView>(domain: &D, w: u32, h: u32) -> Vec<u64> {
+fn build_unusable_integral<D: MaterialDomainView>(domain: &D, w: u32, h: u32,
+    cancelled: &dyn Fn() -> bool) -> Result<Vec<u64>, CandidateError> {
     let stride = w as usize + 1; let mut integral = vec![0_u64; stride * (h as usize + 1)];
-    for y in 0..h { let mut row = 0_u64; for x in 0..w { row += u64::from(!domain.valid(x, y));
+    for y in 0..h { if cancelled() { return Err(CandidateError::Cancelled); } let mut row = 0_u64; for x in 0..w { row += u64::from(!domain.valid(x, y));
         integral[(y as usize + 1) * stride + x as usize + 1] = integral[y as usize * stride + x as usize + 1] + row; } }
-    integral
+    Ok(integral)
 }
 
 fn rect_usable(integral: &[u64], domain_w: u32, r: SourceCrop) -> bool {

@@ -245,6 +245,7 @@ Iteration order, tie-breaking, candidate truncation, parallel reductions, and ra
 | 7 | Six feature fields and usability | Phase 2 | material-analysis |
 | 8 | Routed material domains | Phase 3 | material-synthesis |
 | 9 | Exact fixed template topology | Phase 1 | domain |
+| 9V | Grid authoring, deterministic layout variants, and versioned presets | Phase 1.5 | domain/project-store/desktop |
 | 10 | Slot demand and effect capacity | Phase 4 | placement/effect compilers |
 | 11 | Legal direct and synthesis candidates | Phase 4 | placement-solver |
 | 12 | Complete unary candidate costs | Phase 4 | placement-solver |
@@ -317,6 +318,48 @@ Targeted verification:
 
 ```powershell
 cargo test -p hot-trimmer-image-io -p hot-trimmer-render-core -p hot-trimmer-domain registered_preparation
+```
+
+### Phase 1.5 - Grid authoring, layout variants, and template presets (Prompt 09V)
+
+This authoring milestone sits after the immutable Stage 9 compiler and before Stage 10. Drafts and variant previews are
+editable; only an explicit successful freeze creates the versioned Stage 9 topology consumed downstream.
+
+Deliverables:
+
+- Add typed recursive layout drafts over canonical 4096 x 4096 integer units, with a default 64 x 64 logical grid,
+  exact guides/shared boundaries, horizontal/vertical split, shared-boundary resize, subdivide, compatible merge,
+  reserved zones, hotspot inset/padding, locks, semantic metadata, command history, and transactional persistence.
+- Use hybrid free rectangular leaves plus optional hierarchy/split provenance so users can move blocks like an inventory
+  editor without being constrained to guillotine partitions. Validate all committed geometry in canonical units.
+- Add bounded deterministic variant generation for Balanced Architecture, Panel Heavy, Strip Heavy, Dense Modular,
+  Detail Heavy, Mechanical/Radial, and Minimal/Mobile intents. Score topology-only role, aspect, hierarchy, strip-bank,
+  radial/cap, fragmentation, and reserved-area objectives; source/material evidence is forbidden.
+- Add a command-backed Tetris/inventory-style Grid/Layout workspace: draw in empty space, carve/split, select/multi-select,
+  snapped ghost drag/drop, resize, nudge, rotate where legal, duplicate, delete, copy/paste, align/distribute/equalize,
+  strip/array creation, merge, locks, hierarchy/outliner, semantic palette/inspector, guides, validation, minimap,
+  undo/redo, variant gallery, resolution preview, draft/preset controls, and explicit freeze/version switching.
+- Make collision behavior explicit: Block by default, compatible equal-footprint Swap, or previewed bounded group Repack.
+  Invalid/red drops and cancelled gestures are no-ops; valid/green commits are one typed atomic command and undo step.
+- Persist project-local and user-global immutable layout presets through the template registry/project store so Prompt
+  LIB can later index the same identities. Freeze produces the existing TemplateDefinition/snapshot/hash and a
+  compatibility diff; it does not introduce another topology compiler.
+- Bound layout depth/leaves/guides, variant count/work/memory/serialization, and cancellation/stale-revision latency.
+
+Acceptance gate:
+
+- The worked progressive 64 x 64 layout round-trips through draft, preset, reopen, freeze, and exact 1K/2K/4K/8K
+  compilation with stable rectangles and hash.
+- Property fixtures prove split/resize/merge preserve exact topology and semantic metadata or fail atomically.
+- Interaction fixtures prove draw/carve/move/resize/delete/multi-select/swap/repack/snapping/rotation/cancellation are
+  deterministic, atomic, and never cause hidden destructive reflow.
+- Variant results are valid, meaningfully distinct, inspectably scored, and byte-identical for the same intent/seed.
+- Draft/preset/material changes cannot mutate released standards, pinned snapshots, or downstream topology implicitly.
+
+Targeted verification:
+
+```powershell
+cargo test -p hot-trimmer-desktop algorithm_stage_09_layout_authoring
 ```
 
 ### Phase 2 - Source intelligence (Stages 4-7)
@@ -530,9 +573,10 @@ filesystem paths or pasted pixels.
 
 Deliverables:
 
-- Add versioned content-addressed assets for registered material source sets, authored source-patch presets, stamp
-  masks, registered stamp channel sets, stamp sheets, profile presets, and effect recipes, with immutable IDs/versions,
-  provenance/license, tags, pivot, physical/calibration defaults, channel semantics, and global/project-local ownership.
+- Add versioned content-addressed assets for registered material source sets, authored source-patch presets, Prompt
+  09V layout presets, stamp masks, registered stamp channel sets, stamp sheets, profile presets, and effect recipes,
+  with immutable IDs/versions, provenance/license, tags, pivot, physical/calibration defaults, channel semantics, and
+  global/project-local ownership. Layout entries index the existing immutable template-preset identity/tree.
 - Add bounded registered-set, single-file, folder, and atlas-sheet import; channel association and shared registered-
   channel slicing; content deduplication; mask polarity and normal-convention authoring; transactional metadata/version
   updates; portable embedded snapshots; and dependency-safe replace/delete behavior.

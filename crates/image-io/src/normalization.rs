@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{CancellationToken, ImageIoError, apply_orientation, extract_icc_profile, read_orientation};
 
 pub const STAGE_02_ALGORITHM_ID: &str = "hot_trimmer.channel_normalization";
-pub const STAGE_02_ALGORITHM_VERSION: &str = "2.0.0";
+pub const STAGE_02_ALGORITHM_VERSION: &str = "2.1.0";
 pub const DEFAULT_TILE_EDGE: u32 = 128;
 pub const DEFAULT_MAX_PYRAMID_BYTES: u64 = 1_073_741_824;
 /// An 8-bit neutral normal encodes as 127 or 128 in each component. Its decoded
@@ -250,6 +250,9 @@ pub struct NormalizationSettings {
     /// Includes level zero. Zero means continue to 1x1.
     pub max_levels: u8,
     pub max_memory_bytes: u64,
+    /// Optional authoritative level-zero bound for intermediate products. Source registration and immutable
+    /// digest verification still occur at original resolution before this typed Stage 2 reduction.
+    pub max_level_zero_edge: Option<u32>,
     pub decode_policy: DecodePolicy,
     pub working_space: WorkingColorSpace,
     pub working_space_version: String,
@@ -262,6 +265,7 @@ impl Default for NormalizationSettings {
             tile_edge: DEFAULT_TILE_EDGE,
             max_levels: 0,
             max_memory_bytes: DEFAULT_MAX_PYRAMID_BYTES,
+            max_level_zero_edge: None,
             decode_policy: DecodePolicy::default(),
             working_space: WorkingColorSpace::LinearSrgb,
             working_space_version: "linear-srgb-v1".into(),
@@ -277,6 +281,7 @@ pub enum NormalizationDiagnostic {
     AlphaModeResolved(ResolvedAlphaMode),
     ClippedHighlights { samples: u64 },
     CrushedShadows { samples: u64 },
+    LevelZeroReduced { source: (u32, u32), prepared: (u32, u32) },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -411,7 +416,10 @@ pub fn prepare_registered_channel_set(
     validate_registration(registered)?;
     if settings.tile_edge == 0 { return Err(NormalizationError::InvalidTileEdge); }
     check_cancel(cancellation)?;
-    let dimensions = level_dimensions(registered.oriented_size.width, registered.oriented_size.height, settings.max_levels);
+    if settings.max_level_zero_edge == Some(0) { return Err(NormalizationError::InvalidPlaneDimensions); }
+    let level_zero = bounded_dimensions(registered.oriented_size.width, registered.oriented_size.height,
+        settings.max_level_zero_edge);
+    let dimensions = level_dimensions(level_zero.0, level_zero.1, settings.max_levels);
     let required = estimate_peak_bytes(&registered.channels, &dimensions, settings.tile_edge);
     if required > settings.max_memory_bytes {
         return Err(NormalizationError::MemoryLimit { required, limit: settings.max_memory_bytes });
@@ -466,6 +474,7 @@ pub fn prepared_cache_key(
     hash.update(settings.pyramid_version.as_bytes());
     hash.update(settings.tile_edge.to_le_bytes());
     hash.update([settings.max_levels]);
+    hash.update(settings.max_level_zero_edge.unwrap_or(0).to_le_bytes());
     PreparedChannelCacheKey(ContentDigest(format!("{:x}", hash.finalize())))
 }
 
@@ -520,6 +529,18 @@ fn decode_channel(
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<NormalizationDiagnostic>,
 ) -> Result<PreparedChannel, NormalizationError> {
+    let source_dimensions = (decoded.image.width(), decoded.image.height());
+    let prepared_dimensions = bounded_dimensions(source_dimensions.0, source_dimensions.1, settings.max_level_zero_edge);
+    let decoded = if prepared_dimensions == source_dimensions { decoded } else {
+        diagnostics.push(NormalizationDiagnostic::LevelZeroReduced {
+            source: source_dimensions, prepared: prepared_dimensions,
+        });
+        let filter = if channel.registration.role == MaterialChannelRole::MaterialId {
+            image::imageops::FilterType::Nearest
+        } else { image::imageops::FilterType::Lanczos3 };
+        DecodedSource { image: decoded.image.resize_exact(prepared_dimensions.0, prepared_dimensions.1, filter),
+            icc: decoded.icc }
+    };
     match channel.registration.role {
         MaterialChannelRole::BaseColor => decode_base_color(decoded, settings, cancellation, diagnostics),
         MaterialChannelRole::Normal => decode_normal(channel, decoded.image, settings, cancellation),
@@ -529,6 +550,15 @@ fn decode_channel(
         }
         role => decode_scalar(role, decoded.image, settings, cancellation),
     }
+}
+
+fn bounded_dimensions(width: u32, height: u32, max_edge: Option<u32>) -> (u32, u32) {
+    let Some(max_edge) = max_edge else { return (width, height) };
+    let largest = width.max(height);
+    if largest <= max_edge { return (width, height); }
+    let scale = f64::from(max_edge) / f64::from(largest);
+    (((f64::from(width) * scale).round() as u32).max(1),
+        ((f64::from(height) * scale).round() as u32).max(1))
 }
 
 fn decode_base_color(
@@ -860,6 +890,12 @@ mod tests {
             ..NormalizationSettings::default()
         };
         assert!(matches!(prepare_registered_channel_set(&set, &bytes, &too_small, &CancellationToken::new()), Err(NormalizationError::MemoryLimit { .. })));
+        let bounded = prepare_registered_channel_set(&set, &bytes, &NormalizationSettings {
+            tile_edge: 1, max_level_zero_edge: Some(1), ..NormalizationSettings::default()
+        }, &CancellationToken::new()).unwrap();
+        assert!(bounded.channels.iter().all(|channel| channel.dimensions() == vec![(1, 1)]));
+        assert!(bounded.report.diagnostics.iter().any(|diagnostic| matches!(diagnostic,
+            NormalizationDiagnostic::LevelZeroReduced { source: (2, 2), prepared: (1, 1) })));
         let cancelled = CancellationToken::new(); cancelled.cancel();
         assert!(matches!(prepare_registered_channel_set(&set, &bytes, &NormalizationSettings::default(), &cancelled), Err(NormalizationError::Cancelled)));
 

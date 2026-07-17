@@ -192,13 +192,22 @@ impl SlotDemandView for ResolvedSlotDemand {
 pub struct ResolvedSlotDemandSet { pub stage_result: StageResult, pub slots: Vec<ResolvedSlotDemand> }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SlotDemandError { EmptyDestination, InvalidWorldDimensions, InvalidIntent, InvalidSourceScale }
+pub enum SlotDemandError { EmptyDestination, InvalidWorldDimensions, InvalidIntent, InvalidSourceScale, Cancelled }
 
 pub fn resolve_slot_demands(
     inputs: &[(&RegionDefinition, SlotDemandIntent)],
 ) -> Result<ResolvedSlotDemandSet, SlotDemandError> {
-    let slots = inputs.iter().map(|(region, intent)| resolve_slot_demand(region, intent))
+    resolve_slot_demands_with_guard(inputs, &|| false)
+}
+
+pub fn resolve_slot_demands_with_guard(
+    inputs: &[(&RegionDefinition, SlotDemandIntent)], cancelled: &dyn Fn() -> bool,
+) -> Result<ResolvedSlotDemandSet, SlotDemandError> {
+    let slots = inputs.iter().map(|(region, intent)| {
+        if cancelled() { Err(SlotDemandError::Cancelled) } else { resolve_slot_demand(region, intent) }
+    })
         .collect::<Result<Vec<_>, _>>()?;
+    if cancelled() { return Err(SlotDemandError::Cancelled); }
     let diagnostics = slots.iter().flat_map(|slot| &slot.diagnostics)
         .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Insufficient)
         .map(compilation_diagnostic).collect();

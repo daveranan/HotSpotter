@@ -589,6 +589,102 @@ Root
 
 Released template versions pin the final integer rectangles.
 
+## 13.1 Grid authoring and draft authority
+
+Stage 9 topology may be created through an editable recursive draft, but downstream stages consume only a frozen
+`TemplateDefinition` snapshot. The canonical authority remains 4096 x 4096 integer units. The default authoring view
+uses a 64 x 64 logical grid whose boundaries map exactly into canonical units; bounded 8/16/32/64/128 densities and
+integer authored guides are also legal.
+
+A draft supports:
+
+```text
+recursive horizontal and vertical split
+equal, weighted, count, and guide-aligned children
+shared-boundary resize
+subdivide and edge-adjacent compatible merge
+reserved or intentionally unused zones
+allocation padding and hotspot inset
+locked nodes, guides, and semantic groups
+command-backed undo and redo
+```
+
+The draft is a hybrid rectangular-region model. Recursive split trees and groups preserve generation/history semantics,
+but valid leaf rectangles may be moved freely; the editor is not limited to guillotine partitions.
+
+Every leaf retains stable key/order plus role, fit semantics, orientation, structural profile intent, material and
+variation group, world-size intent, importance, legal transforms, ID color, mapping default, and radial parameters.
+Split or merge must preserve that metadata or request an explicit resolution; it cannot discard incompatible semantics.
+
+Draft revisions, screen coordinates, zoom, and preview pixels are never topology authority. Freeze validates the draft,
+assigns stable identities, serializes canonical JSON/hash, and publishes a new immutable template version. Existing
+project snapshots and released templates never change in place.
+
+### 13.1.1 Inventory-style direct manipulation
+
+The primary interaction feels like editing a grid inventory:
+
+```text
+Draw Region by dragging across empty cells
+Carve/Split by dragging inside one selected region
+Pick up and move one or many selected regions
+Resize from snapped edges or corners
+Nudge with the keyboard
+Duplicate, copy/paste, delete, and legal quarter-turn rotate
+Align, distribute, equalize, create arrays/strip banks, and merge
+```
+
+Dragging shows a snapped ghost footprint. Green means the entire atomic command is valid; red identifies exact
+collisions, locked regions, bounds, minimum sizes, or semantic incompatibility. Escape cancels. Pointer positions are
+converted through the current view into logical/canonical intent, but only validated canonical integer coordinates are
+committed.
+
+Collision behavior is never implicit. `Block` is the default. `Swap` is legal only for compatible equal footprints.
+`Push/Repack` is an explicit bounded preview affecting a declared group. Drawing over existing content does not erase
+it; the user must choose Carve/Split or an explicit replacement command. Deleting creates intentional unallocated
+space, and Fill/Pack/Compact operations require preview and confirmation rather than running after ordinary edits.
+
+The workspace includes grid, authored-guide, and neighboring-edge snapping; modifier override; numeric logical and
+canonical geometry; selection/multi-selection; role colors/icons/labels; semantic palette and inspector; locks;
+hierarchy/outliner and breadcrumbs; allocation/hotspot/bleed overlays; validation list; minimap; filters; and resolution
+boundary previews. An optional material image is reference-only and never participates in topology or snapping.
+
+Each successful draw/drop/resize is one typed transaction and one undo entry. Failed, cancelled, or stale gestures are
+no-ops and cannot partially mutate the draft.
+
+## 13.2 Deterministic layout variants
+
+The author may request a bounded variant family using:
+
+```text
+logical grid and authored guides
+deterministic seed
+locked nodes and reserved zones
+hierarchy-depth and leaf-count limits
+panel, strip, detail, cap, and radial proportions
+minimum and maximum logical spans
+preferred aspect families
+symmetry and repetition preferences
+```
+
+Initial general intents are Balanced Architecture, Panel Heavy, Strip Heavy, Dense Modular, Detail Heavy,
+Mechanical/Radial, and Minimal/Mobile. Variants are ranked through inspectable topology-only objectives: semantic-role
+coverage, aspect and size hierarchy, useful strip banks, cap/radial availability, reserved/wasted area, fragmentation,
+and violations. Source pixels, material classification, crop quality, effects, and output appearance cannot participate.
+
+Generated variants are previews. Accepting one creates an editable draft; it does not mutate the current frozen
+template. Identical complete intent and seed produce byte-identical variants, ordering, and scores.
+
+## 13.3 Layout presets and compatibility
+
+A layout preset stores immutable draft tree/intent, semantic metadata, version, and content identity in project-local
+or user-global template storage. Prompt LIB later indexes these same identities rather than copying them into another
+asset model.
+
+Freezing or switching to a different preset/version is an explicit topology change. Hot Trimmer shows a compatibility
+diff and requires keep/remap/clear decisions for authored pins, region mappings, and Blender assignments. A mutable
+filepath, current editor canvas, or `latest` pointer can never substitute for the pinned snapshot.
+
 ---
 
 # 14. Stage 10: slot demand and effect-capacity construction
@@ -1403,12 +1499,16 @@ Every project reference resolves through an immutable asset ID, version, and con
 ```text
 MaterialSourceSet
 SourcePatchPreset
+LayoutPreset
 StampMask
 RegisteredStampChannels
 StampSheet
 ProfilePreset
 EffectRecipe
 ```
+
+`LayoutPreset` indexes the immutable Prompt 09V preset identity and authored tree. The library does not copy,
+reinterpret, or compile a second topology representation.
 
 Material sources retain registered PBR channel identities and import settings. Patch presets retain authored crop,
 rectification, registration, and calibration lineage. All assets retain provenance/license, tags/category/author,

@@ -118,7 +118,9 @@ renderer, or an unrelated synthesis engine.
 | 00 | Corpus, harness, and engine cutover contracts | Cross-cutting setup |
 | 01-07 | One prompt per source-preparation/analysis stage | 1-7 |
 | 08A-08F | Domain engines and router | 8 |
-| 09-14 | One prompt per topology, placement, and synthesis stage | 9-14 |
+| 09 | Fixed semantic template topology | 9 |
+| 09V | Grid authoring, deterministic layout variants, and template presets | Stage 9 authoring integration |
+| 10-14 | One prompt per demand, placement, and synthesis stage | 10-14 |
 | 14P-A | First visible authoritative atlas integration | Through Stage 14 |
 | 14P-B | Intermediate-preview QA and cache hardening | Through Stage 14 |
 | 15 | Structural profiles and semantic occupancy | 15 |
@@ -765,6 +767,112 @@ Stop conditions:
 
 ---
 
+## Prompt 09V — grid authoring, layout variants, and template presets
+
+```text
+Implement Prompt 09V after Prompt 09 and before Prompt 10.
+
+Read the common rules and revised Stage 9 plus the Stage 09 report. This is an authoring integration milestone for
+Stage 9, not material-dependent runtime packing. Consume the existing TemplateDefinition/registry/snapshot contracts.
+No subagents.
+
+Objective:
+Let users author trim-sheet topology on a logical grid, generate useful deterministic subdivision variants, save and
+reuse layouts as presets, and explicitly freeze one draft as immutable Stage 9 topology before material placement.
+
+Scope — typed layout authoring:
+- Define TemplateDraft, LayoutTree, LayoutNode, GridGuide, LayoutEditCommand, LayoutVariantIntent, LayoutVariant,
+  LayoutPreset, validation diagnostics, and an explicit FreezeTemplate result producing a versioned
+  TemplateDefinition/TemplateSnapshot.
+- Use the Stage 9 canonical 4096 x 4096 integer space as authority. Offer a 64 x 64 logical authoring grid by default,
+  with bounded 8/16/32/64/128 grid densities and authored guides that map exactly to canonical integer boundaries.
+  Display pixels and zoom coordinates never become topology authority.
+- Implement recursive horizontal/vertical split with equal, weighted, count, or guide-aligned children; resize shared
+  boundaries; subdivide; merge edge-adjacent compatible cells; duplicate patterns; reorder stable semantic groups;
+  reserve/unused zones; and explicit allocation padding/hotspot inset. Preserve exact shared boundaries throughout.
+- Use a hybrid rectangular-region draft as authoring authority: recursive split trees/groups retain useful generation
+  and hierarchy provenance, but users may freely move valid leaf rectangles on the grid. Direct manipulation must not
+  be artificially restricted to guillotine partitions or require editing the hierarchy tree.
+- Let each leaf author stable key/name/order, Planar/RepeatingStrip/UniqueDetail/TrimCap/Radial role, fit semantics,
+  orientation, structural profile intent, material/variation group, world-size intent, importance, legal transforms,
+  ID color, source-mapping default, radial parameters, and lock state. Merge/split must require an explicit policy for
+  incompatible semantic metadata; it must not guess or discard it.
+- Maintain command-backed undo/redo and transactional persistence. Draft edits create draft revisions only. They do
+  not mutate released standard templates, project-pinned snapshots, compiled topology, placement, or Blender UVs.
+
+Scope — layout variant generation:
+- Generate a bounded deterministic family from author intent: logical grid, seed, hierarchy-depth/count limits,
+  desired panel/strip/detail/cap/radial proportions, minimum/maximum cell spans, preferred aspect families, reserved
+  zones, symmetry/repetition preferences, and locked nodes/guides.
+- Include useful initial intents: Balanced Architecture, Panel Heavy, Strip Heavy, Dense Modular, Detail Heavy,
+  Mechanical/Radial, and Minimal/Mobile. Treat them as general layout constraints, never named-material workflows.
+- Rank variants by inspectable topology-only terms: requested-role coverage, aspect-family coverage, size hierarchy,
+  reuse-friendly strip banks, radial/cap availability, wasted/reserved area, fragmentation, and constraint violations.
+  Material pixels, source classification, crop quality, output seed, and effect appearance cannot influence topology.
+- Preview several candidate trees/rectangles without making any one authoritative. Regeneration with the same complete
+  intent and seed is byte-identical; accepting a variant copies it into an editable draft rather than silently
+  replacing the current template.
+
+Scope — authoring UI and presets:
+- Make the Grid/Layout workspace feel like a robust Tetris/inventory editor. The primary canvas supports click-select,
+  box/multi-select, click-drag Draw Region, pick-up/drag/drop with a snapped ghost footprint, edge/corner resize handles,
+  keyboard nudge, duplicate, delete, copy/paste, 90-degree rotate where semantically legal, and pan/zoom. Green ghost
+  means a valid atomic drop; red ghost explains collision, bounds, minimum-size, lock, or semantic failure.
+- Support two explicit creation modes: Draw in Empty Space and Carve/Split Selected Region. Drawing never silently
+  destroys overlapped regions. Delete leaves intentional unallocated space; Fill Empty, Pack Selection, and compact/
+  distribute commands are explicit operations with preview, not automatic reflow after every edit.
+- Add grid/guide/neighbor-edge snapping with temporary modifier override, numeric canonical/logical position and size,
+  align/distribute, equalize width/height, array/strip creation, repeat subdivision, merge, semantic-role palette,
+  region colors/icons/labels, locks, hierarchy/outliner, breadcrumbs, validation list, and right-click command menu.
+- Collision policy is visible and selected before the gesture: Block by default, Swap only for compatible equal
+  footprints, and explicit Push/Repack preview for a bounded selected group. No hidden cascade movement is permitted.
+- Keep selection state and preview gestures ephemeral. A drop/draw/resize becomes one typed atomic command and one
+  undo step only after validation. Escape cancels without mutation; stale/cancelled commands restore the prior draft.
+- Provide solo/isolate, hide/show labels, allocation versus hotspot/bleed overlays, logical/canonical coordinates,
+  semantic filters, minimap, and exact 1K/2K/4K/8K boundary preview. A material image may appear as an optional visual
+  reference beneath the grid but cannot affect rectangles, snapping, validation, variant scoring, or frozen topology.
+- Every enabled control invokes a typed native command; UI geometry is projection only.
+- Support New Draft, Duplicate Template, Generate Variants, Accept Variant, Save Draft, Save Preset, Freeze as New
+  Template Version, and Reset Draft. Saving a preset records immutable intent/tree/version identity, not a mutable
+  filepath or pointer to the current canvas.
+- Store project-local and user-global presets through the template registry/project-store contract. Prompt LIB later
+  indexes the same preset identities in its unified browser; do not create a second incompatible library model here.
+- On freeze, validate topology and semantics, assign stable IDs/colors/order, snapshot canonical JSON/hash, and show a
+  compatibility diff. Changing a project from one frozen template/version to another is an explicit topology change
+  with keep/remap/clear decisions for pins, mappings, and later Blender assignments.
+- Bound tree depth, leaf count, guides, variant count, generation work, memory, serialized size, and cancellation
+  latency. A cancelled/stale generation or freeze publishes no draft/template/preset mutation.
+- Add docs/phase-reports/algorithm-stage-09-layout-variants.md.
+
+Acceptance:
+- A user can author the worked 64 x 64 progressively subdivided layout, undo/redo it, save it as a preset, reopen it,
+  freeze it, and obtain byte-identical canonical rectangles/hash at 1K/2K/4K/8K.
+- Direct-manipulation fixtures cover draw, carve, move, resize, duplicate, delete, multi-select, swap, explicit repack,
+  snapping override, keyboard nudge, rotation legality, collision rejection, and gesture cancellation as atomic undoable
+  commands. Invalid drops change nothing and report the exact conflicting cells/regions.
+- Split/resize/merge property fixtures retain in-bounds nonoverlap, exact shared boundaries, stable locked nodes, and
+  complete semantic metadata or return a typed incompatibility without mutation.
+- Every initial variant intent produces multiple deterministic, genuinely different valid layouts satisfying its
+  declared role/aspect/size constraints; the same intent and seed reproduce byte-identical ordering and scores.
+- Standard templates and existing project snapshots never change when drafts, presets, variants, materials,
+  resolutions, or seeds change. Freeze/version switching is explicit and compatibility-diagnosed.
+- The accepted frozen template enters Prompt 10 through the existing Stage 9 topology compiler with no alternate
+  runtime packing or UI-side conversion.
+
+Verification — run exactly:
+cargo test -p hot-trimmer-desktop algorithm_stage_09_layout_authoring
+
+Stop conditions:
+- Stop if material/source analysis influences generated rectangles or topology scores.
+- Stop if a draft or preview variant can reach Stage 10 without explicit successful freeze.
+- Stop if screen-space rectangles, fractional rounding, or per-resolution editing become topology authority.
+- Stop if drawing or moving a region silently deletes, clips, resizes, or cascades other regions.
+- Stop if editing a preset/template silently changes an existing project's pinned topology or Blender assignments.
+- Stop if merge/split drops role, fit, group, world-size, radial, transform, or lock metadata without an explicit choice.
+```
+
+---
+
 ## Prompt 10 — Stage 10: resolved slot demand and effect capacity
 
 ```text
@@ -1150,8 +1258,9 @@ Scope — library contracts and storage:
 - Define versioned LibraryAssetId, LibraryAssetVersion, content digest, LibraryAssetKind, StampAssetRef, provenance,
   license/source metadata, tags, category, author, default physical size/range, aspect policy, pivot, orientation,
   tileability, channel semantics, and preview metadata.
-- Initially support MaterialSourceSet, SourcePatchPreset, StampMask, RegisteredStampChannels, StampSheet,
-  ProfilePreset, and EffectRecipe while keeping the asset-kind enum extensible. Material sources retain registered
+- Initially support MaterialSourceSet, SourcePatchPreset, LayoutPreset, StampMask, RegisteredStampChannels,
+  StampSheet, ProfilePreset, and EffectRecipe while keeping the asset-kind enum extensible. LayoutPreset indexes the
+  immutable Prompt 09V preset identity/tree rather than copying or recompiling topology. Material sources retain registered
   PBR channel identities/import settings; patch presets retain their authored crop/rectification/calibration lineage.
   A library item stores reusable source evidence and defaults, never executable compiler truth, cached analysis as
   primary data, or already-composited atlas pixels.
@@ -1176,8 +1285,8 @@ Scope — Hot Trimmer management window:
 - Provide atlas-sheet slicing with editable rectangles and a preview of each resulting item. All enabled controls
   invoke typed native commands, persist transactionally, observe cancellation/revision guards, and update stable
   references without UI-side compiler logic.
-- Let source selection, Stage 15 profile selection, and Stage 16 detail authoring browse/select items by compatible
-  kind, but do
+- Let layout selection, source selection, Stage 15 profile selection, and Stage 16 detail authoring browse/select
+  items by compatible kind, but do
   not implement brush strokes, scattering, final PBR composition, export packaging, cloud sync, or marketplace work.
 
 Acceptance:

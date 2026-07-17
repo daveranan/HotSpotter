@@ -192,6 +192,7 @@ function App() {
   const previewDraftId = useRef(0);
   const dirtyPreviewRegion = useRef<string | null>(null);
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
+  const lastAutomaticPreviewRevision = useRef<number | null>(null);
   const patchPreviewRequestId = useRef(0);
   const lastTransientPreviewAt = useRef(0);
   const transientPreviewInFlight = useRef(false);
@@ -240,8 +241,11 @@ function App() {
     if (!native || !project?.document) return;
     if (suppressAutomaticPreviewRevision.current === project.document.documentRevision) {
       suppressAutomaticPreviewRevision.current = null;
+      lastAutomaticPreviewRevision.current = project.document.documentRevision;
       return;
     }
+    if (lastAutomaticPreviewRevision.current === project.document.documentRevision) return;
+    lastAutomaticPreviewRevision.current = project.document.documentRevision;
     const dirtyRegion = dirtyPreviewRegion.current;
     dirtyPreviewRegion.current = null;
     void requestPreview(dirtyRegion ?? undefined);
@@ -698,6 +702,7 @@ function App() {
   async function requestPreview(regionId?: string, projection?: CropProjection) {
     if (!native || !project?.document) return;
     const draftId = ++previewDraftId.current;
+    setProblem(null);
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: { ...protocol, revision: project.document.documentRevision },
@@ -705,6 +710,7 @@ function App() {
       if (draftId === previewDraftId.current) {
         setArtifact(next);
         setPreview(null);
+        setProblem(null);
       }
     } catch (reason) {
       if (failure(reason).code !== "operation_cancelled") setProblem(failure(reason));
