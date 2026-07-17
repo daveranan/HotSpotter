@@ -7,8 +7,10 @@ license.workspace = true
 
 [dependencies]
 hot-trimmer-domain.workspace = true
+hot-trimmer-image-io = { path = "../image-io" }
 hot-trimmer-material-analysis.workspace = true
 hot-trimmer-render-core = { path = "../render-core" }
+thiserror.workspace = true
 
 [lints]
 workspace = true

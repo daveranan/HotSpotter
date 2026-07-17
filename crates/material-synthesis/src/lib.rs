@@ -2,6 +2,10 @@
 
 use hot_trimmer_domain::{CompilationDiagnostic, RecoveryChoice, StageResult};
 
+mod material_domain;
+
+pub use material_domain::*;
+
 #[must_use]
 pub fn unsupported(stage: u8) -> StageResult {
     StageResult::FailedWithRecovery {

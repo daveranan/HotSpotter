@@ -526,6 +526,7 @@ mod tests {
         let base = ImagePlane::from_row_major(width, height, 8, &colors).unwrap();
         DelitPreparedExemplar {
             exemplar_id: "stage-06-evidence".into(),
+            prepared_source_digest: ContentDigest::sha256(b"stage-06-fixture"),
             perspective_confidence_milli: 1000,
             original_prepared_base_color: base.clone(),
             channels: vec![PreparedExemplarChannel::BaseColor { plane: base, alpha_mode: ResolvedAlphaMode::Opaque }],

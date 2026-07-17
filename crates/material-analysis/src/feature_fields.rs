@@ -135,6 +135,8 @@ pub struct FeatureFieldQa {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeatureFieldReport {
     pub cache_key: ContentDigest,
+    /// Exact Stage 3 prepared-source lineage; Stage 8 must require an exact match.
+    pub prepared_source_digest: ContentDigest,
     /// All field planes and source channels are registered to this immutable digest.
     pub registration_digest: ContentDigest,
     pub saliency: ResolutionPyramid<LinearScalar>,
@@ -233,13 +235,14 @@ pub fn extract_feature_fields(
         &usability_confidence])?;
 
     let registration_digest = ContentDigest::sha256(format!(
-        "{}|{}|{}|{}|{}", source.exemplar_id, width, height, stage_six.cache_key.0,
+        "{}|{}|{}|{}|{}|{}", source.prepared_source_digest.0, source.exemplar_id, width, height, stage_six.cache_key.0,
         source.channels.iter().map(|c| format!("{:?}", c.role())).collect::<Vec<_>>().join(",")
     ).as_bytes());
     let cache_key = feature_field_cache_key(&registration_digest, settings);
     let diagnostics = insufficiency_diagnostics(&candidates, &usability_confidence, &seam.available_terms);
     Ok(FeatureFieldReport {
         cache_key,
+        prepared_source_digest: source.prepared_source_digest.clone(),
         registration_digest,
         saliency,
         structure: StructureFields { edge, line, boundary, grid, fiber, intersection },
@@ -805,7 +808,8 @@ mod tests {
             let normals = vec![TangentNormal { xyz: [0.0, 0.0, 1.0], alpha: 1.0 }; values.len()];
             channels.push(PreparedExemplarChannel::Normal { plane: ImagePlane::from_row_major(width, height, 16, &normals).unwrap(), source_convention: NormalConvention::OpenGl, canonical_convention: NormalConvention::OpenGl, alpha_policy: NormalAlphaPolicy::Preserve });
         }
-        DelitPreparedExemplar { exemplar_id: "content-only-id".into(), perspective_confidence_milli: 1000,
+        DelitPreparedExemplar { exemplar_id: "content-only-id".into(),
+            prepared_source_digest: ContentDigest::sha256(b"stage-7-fixture"), perspective_confidence_milli: 1000,
             original_prepared_base_color: base, channels, coverage: None, masks: None,
             reflectance_provenance: ReflectanceProvenance::ImportedPrepared,
             route_execution: RouteExecution::PassThrough(DelightingPassThroughReason::AuthoredTextureOrPbrSet),

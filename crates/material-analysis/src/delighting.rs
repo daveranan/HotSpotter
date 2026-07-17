@@ -61,6 +61,8 @@ pub struct DelightingMasks {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DelitPreparedExemplar {
     pub exemplar_id: String,
+    /// Immutable Stage 3 prepared-source lineage shared by all downstream analysis.
+    pub prepared_source_digest: ContentDigest,
     /// Stage 3 geometric confidence in `[0,1000]`, carried without reinterpretation.
     pub perspective_confidence_milli: u16,
     /// Immutable Stage 3 Base Color retained for exact restoration.
@@ -259,6 +261,7 @@ fn execute_provider(
     let settings_hash = provider_settings_hash(&descriptor, intent);
     Ok(DelitPreparedExemplar {
         exemplar_id: exemplar.exemplar_id.clone(),
+        prepared_source_digest: exemplar.cache_key.0.clone(),
         perspective_confidence_milli: exemplar.perspective_confidence_milli,
         original_prepared_base_color: original,
         channels,
@@ -302,6 +305,7 @@ fn pass_through(
     );
     DelitPreparedExemplar {
         exemplar_id: exemplar.exemplar_id.clone(),
+        prepared_source_digest: exemplar.cache_key.0.clone(),
         perspective_confidence_milli: exemplar.perspective_confidence_milli,
         original_prepared_base_color: original,
         channels: exemplar.channels.clone(),
@@ -378,6 +382,7 @@ fn classical(
     let channels = replace_base_color(&exemplar.channels, plane);
     Ok(DelitPreparedExemplar {
         exemplar_id: exemplar.exemplar_id.clone(),
+        prepared_source_digest: exemplar.cache_key.0.clone(),
         perspective_confidence_milli: exemplar.perspective_confidence_milli,
         original_prepared_base_color: original,
         channels,
@@ -808,6 +813,7 @@ mod tests {
         let (source_scalar, source_ids) = {
             let source = DelitPreparedExemplar {
                 exemplar_id: String::new(), original_prepared_base_color: base_color(&exemplar).unwrap().clone(),
+                prepared_source_digest: exemplar.cache_key.0.clone(),
                 perspective_confidence_milli: exemplar.perspective_confidence_milli,
                 channels: exemplar.channels.clone(), coverage: None, masks: None,
                 reflectance_provenance: ReflectanceProvenance::ImportedPrepared,

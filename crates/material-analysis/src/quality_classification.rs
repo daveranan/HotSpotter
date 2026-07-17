@@ -1009,6 +1009,7 @@ mod tests {
         }
         DelitPreparedExemplar {
             exemplar_id: "evidence-only".into(),
+            prepared_source_digest: ContentDigest::sha256(b"quality-fixture"),
             perspective_confidence_milli: 880,
             original_prepared_base_color: base,
             channels,

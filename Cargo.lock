@@ -1622,8 +1622,10 @@ name = "hot-trimmer-material-synthesis"
 version = "0.1.0"
 dependencies = [
  "hot-trimmer-domain",
+ "hot-trimmer-image-io",
  "hot-trimmer-material-analysis",
  "hot-trimmer-render-core",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
