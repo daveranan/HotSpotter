@@ -3,8 +3,10 @@
 use hot_trimmer_domain::{CompilationDiagnostic, RecoveryChoice, StageResult};
 
 mod candidates;
+mod scoring;
 
 pub use candidates::*;
+pub use scoring::*;
 
 #[must_use]
 pub fn unsupported(stage: u8) -> StageResult {
