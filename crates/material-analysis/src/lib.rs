@@ -3,10 +3,12 @@
 use hot_trimmer_domain::{CompilationDiagnostic, RecoveryChoice, StageResult};
 
 mod delighting;
+mod feature_fields;
 mod quality_classification;
 mod scale_orientation;
 
 pub use delighting::*;
+pub use feature_fields::*;
 pub use quality_classification::*;
 pub use scale_orientation::*;
 
