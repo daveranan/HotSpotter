@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CompiledSheetProjection, TrimSheetDocumentCommand } from "@hot-trimmer/ipc-contracts";
-import { adjustCrop, anchoredZoom, movePatch, normalizePatchToRectangle, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
+import { adjustCrop, anchoredZoom, fitSourceFrame, movePatch, normalizePatchToRectangle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
 
 test("document command wire shapes are typed and carry exact stable IDs", () => {
   const regionId = "764f7fc0-5091-47f8-878f-1e926b0c9f66";
@@ -27,6 +27,24 @@ test("compiled overlay bounds are read from the artifact rather than reconstruct
     [bounds.x / artifact.width, bounds.y / artifact.height, bounds.width / artifact.width, bounds.height / artifact.height],
     [0.25, 0.125, 0.5, 0.25],
   );
+});
+
+test("truthful-base-color preserves stable slot identity and explicit source intent", () => {
+  const region = {
+    regionId: "region-cornice-long",
+    mapping: { sourceCropIntent: "unplaced" as const },
+  };
+  const slot = {
+    regionId: region.regionId,
+    slotKey: "cornice_long",
+    candidateId: "candidate-cornice-long",
+    samplingPlanId: "plan-cornice-long",
+    stage14ResultId: "result-cornice-long",
+  };
+  assert.equal(slot.regionId, region.regionId);
+  assert.equal(region.mapping.sourceCropIntent, "unplaced");
+  assert.notEqual(slot.candidateId, slot.samplingPlanId);
+  assert.notEqual(slot.samplingPlanId, slot.stage14ResultId);
 });
 
 test("source crop geometry moves and resizes inside normalized source space", () => {
@@ -102,4 +120,33 @@ test("patch selection moves, resizes, rotates, and normalizes without leaving so
   const top = { x: normalized[1].x - normalized[0].x, y: normalized[1].y - normalized[0].y };
   const side = { x: normalized[3].x - normalized[0].x, y: normalized[3].y - normalized[0].y };
   assert.ok(Math.abs(top.x * side.x + top.y * side.y) < 0.000001);
+});
+
+test("source-frame authoring keeps square defaults and aspect-locked bounds deterministic", () => {
+  assert.deepEqual(fitSourceFrame({ width: 8000, height: 4000 }, { width: 1, height: 1 }, "largest"), {
+    x: 0.25, y: 0, width: 0.5, height: 1,
+  });
+  assertBoundsClose(fitSourceFrame({ width: 750, height: 3600 }, { width: 1, height: 1 }, "largest"), {
+    x: 0, y: (3600 - 750) / 2 / 3600, width: 1, height: 750 / 3600,
+  });
+  assertBoundsClose(resizeAspectLocked({ x: 0.25, y: 0.25, width: 0.25, height: 0.25 }, "se", 0.1, 0.05, 1), {
+    x: 0.25, y: 0.25, width: 0.35, height: 0.35,
+  });
+  const topEdge = resizeAspectLocked({ x: 0.25, y: 0.25, width: 0.5, height: 0.5 }, "n", 0, -0.1, 1);
+  assertBoundsClose(topEdge, { x: 0.2, y: 0.15, width: 0.6, height: 0.6 });
+  assert.equal(topEdge.width / topEdge.height, 1);
+  const sourceAspect = resizeAspectLocked({ x: 0.2, y: 0.2, width: 0.25, height: 0.5 }, "se", 0.1, 0.05, 0.5);
+  assert.equal(sourceAspect.width / sourceAspect.height, 0.5);
+});
+
+test("boundary-limited rotation holds the last valid transform instead of gesture start", () => {
+  const rectangle = [
+    { x: 0.07, y: 0.25 }, { x: 0.33, y: 0.25 },
+    { x: 0.33, y: 0.75 }, { x: 0.07, y: 0.75 },
+  ] as const;
+  const valid = rotatePatch(rectangle, { x: 0.2, y: 0.5 }, 0.2, { width: 1, height: 1 });
+  const blocked = rotatePatch(valid, { x: 0.2, y: 0.5 }, Math.PI / 2, { width: 1, height: 1 });
+  assert.strictEqual(blocked, valid);
+  const recovered = rotatePatch(valid, { x: 0.2, y: 0.5 }, -0.1, { width: 1, height: 1 });
+  assert.notStrictEqual(recovered, rectangle);
 });

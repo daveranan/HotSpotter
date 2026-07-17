@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, CompiledTemplateTopology, ContentDigest,
-    MaterialChannelRole, SamplingMode,
+    GridRect, MaterialChannelRole, RegionId, SamplingMode,
 };
 use hot_trimmer_material_synthesis::PreparedMaterialDomain;
-use hot_trimmer_placement_solver::{PlacementPlan, SamplingPlan, SourceCrop};
+use hot_trimmer_placement_solver::{CandidateTransform, PlacementPlan, SamplingPlan, SourceCrop};
 use hot_trimmer_render_core::PreparedExemplarChannel;
 
 use crate::SynthesizedSlotMaterial;
@@ -27,6 +27,7 @@ pub struct IntermediateAtlasRequest<'a> {
 
 #[derive(Clone, Debug)]
 pub struct IntermediateSlotInput<'a> {
+    pub region_id: RegionId,
     pub slot_key: &'a str,
     pub display_name: &'a str,
     pub required: bool,
@@ -34,6 +35,7 @@ pub struct IntermediateSlotInput<'a> {
     pub domain: &'a PreparedMaterialDomain,
     pub plan: &'a SamplingPlan,
     pub result: &'a SynthesizedSlotMaterial,
+    pub grid_rect: Option<GridRect>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,11 +47,15 @@ pub struct IntermediateAtlasChannel {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IntermediateSlotInspection {
+    pub region_id: RegionId,
     pub slot_key: String,
     pub display_name: String,
     pub allocation: hot_trimmer_domain::CanonicalRect,
     pub hotspot: hot_trimmer_domain::CanonicalRect,
     pub mapping_mode: SamplingMode,
+    pub source_transform: CandidateTransform,
+    pub isotropic_scale: f64,
+    pub sampling_scale: f64,
     pub valid_pixel_count: u64,
     pub source_id: ContentDigest,
     pub patch_id: Option<String>,
@@ -58,6 +64,7 @@ pub struct IntermediateSlotInspection {
     pub sampling_plan_id: ContentDigest,
     pub stage_14_result_id: ContentDigest,
     pub source_crop: Option<SourceCrop>,
+    pub grid_rect: Option<GridRect>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +155,7 @@ pub(crate) fn compose_intermediate_atlas(
             .ok_or_else(|| IntermediateAtlasError::SlotArtifactMismatch(input.slot_key.into()))?;
         let allocation = topology_slot.allocation;
         if request.placement_plan.placements.iter().find(|plan| plan.slot_id == input.plan.slot_id) != Some(input.plan)
+            || input.plan.slot_id != input.region_id
             || input.result.width != allocation.width || input.result.height != allocation.height
             || allocation.x.checked_add(allocation.width).is_none_or(|end| end > width)
             || allocation.y.checked_add(allocation.height).is_none_or(|end| end > height)
@@ -178,12 +186,14 @@ pub(crate) fn compose_intermediate_atlas(
             }
         }
         inspections.push(IntermediateSlotInspection {
-            slot_key: input.slot_key.into(), display_name: input.display_name.into(), allocation,
+            region_id: input.region_id, slot_key: input.slot_key.into(), display_name: input.display_name.into(), allocation,
             hotspot: topology_slot.hotspot, mapping_mode: input.plan.candidate.mapping_mode,
+            source_transform: input.plan.candidate.transform, isotropic_scale: input.plan.candidate.isotropic_scale,
+            sampling_scale: input.plan.sampling_policy.scale,
             valid_pixel_count: valid_count, source_id: input.plan.candidate.source_id.clone(),
             patch_id: input.patch_id.clone(), domain_id: input.domain.cache_key.clone(),
             candidate_id: input.plan.candidate.candidate_id.clone(), sampling_plan_id: plan_id,
-            stage_14_result_id: result_id, source_crop: input.plan.candidate.crop,
+            stage_14_result_id: result_id, source_crop: input.plan.candidate.crop, grid_rect: input.grid_rect,
         });
     }
     if cancelled() { return Err(IntermediateAtlasError::Cancelled); }

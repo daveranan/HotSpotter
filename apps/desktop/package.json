@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "dev": "vite --host 127.0.0.1 --port 1420",
+    "dev": "vite --configLoader runner --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
-    "test": "node --test src/document-workbench.test.ts",
+    "test": "node --test src/document-workbench.test.ts src/source-frame-partition.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

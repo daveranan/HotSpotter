@@ -1,7 +1,7 @@
 import type { NormalizedBounds, PatchGeometry } from "@hot-trimmer/ipc-contracts";
 
 export type CanvasView = { x: number; y: number; scale: number };
-export type CropDragAction = "move" | "nw" | "ne" | "sw" | "se";
+export type CropDragAction = "move" | "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 export type PaneState = { library: number; source: number; inspector: number };
 export type PaneDragKind = "library-source" | "source-sheet" | "sheet-inspector";
 
@@ -34,25 +34,106 @@ export function adjustCrop(
       y: clamp(bounds.y + dy, 0, 1 - bounds.height),
     };
   }
-  if (action === "nw" || action === "ne" || action === "sw") {
-    const fromLeft = action === "nw" || action === "sw";
-    const fromTop = action === "nw" || action === "ne";
-    const nextX = clamp(bounds.x + dx, 0, bounds.x + bounds.width - minSize);
-    const nextY = clamp(bounds.y + dy, 0, bounds.y + bounds.height - minSize);
-    return {
-      x: fromLeft ? nextX : bounds.x,
-      y: fromTop ? nextY : bounds.y,
-      width: fromLeft ? bounds.width + bounds.x - nextX : clamp(bounds.width + dx, minSize, 1 - bounds.x),
-      height: fromTop ? bounds.height + bounds.y - nextY : clamp(bounds.height + dy, minSize, 1 - bounds.y),
-    };
+  let left = bounds.x;
+  let right = bounds.x + bounds.width;
+  let top = bounds.y;
+  let bottom = bounds.y + bounds.height;
+  if (action.includes("w")) left = clamp(left + dx, 0, right - minSize);
+  if (action.includes("e")) right = clamp(right + dx, left + minSize, 1);
+  if (action.includes("n")) top = clamp(top + dy, 0, bottom - minSize);
+  if (action.includes("s")) bottom = clamp(bottom + dy, top + minSize, 1);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+export type FrameFitMode = "width" | "height" | "largest";
+
+export function fitSourceFrame(
+  source: { width: number; height: number },
+  outputAspect: { width: number; height: number },
+  mode: FrameFitMode,
+): NormalizedBounds {
+  const sourceAspect = source.width / Math.max(1, source.height);
+  const targetAspect = outputAspect.width / Math.max(1, outputAspect.height);
+  let width = 1;
+  let height = 1;
+  if (mode === "largest") {
+    if (sourceAspect >= targetAspect) height = 1, width = Math.min(1, targetAspect / sourceAspect);
+    else width = 1, height = Math.min(1, sourceAspect / targetAspect);
+  } else if (mode === "width") {
+    width = 1;
+    height = Math.min(1, sourceAspect / targetAspect);
+  } else {
+    height = 1;
+    width = Math.min(1, targetAspect / sourceAspect);
   }
-  const right = clamp(bounds.x + bounds.width + dx, bounds.x + minSize, 1);
-  const bottom = clamp(bounds.y + bounds.height + dy, bounds.y + minSize, 1);
-  return {
-    ...bounds,
-    width: right - bounds.x,
-    height: bottom - bounds.y,
-  };
+  return { x: (1 - width) * 0.5, y: (1 - height) * 0.5, width, height };
+}
+
+export function resizeAspectLocked(
+  bounds: NormalizedBounds,
+  action: CropDragAction,
+  dx: number,
+  dy: number,
+  aspect: number,
+): NormalizedBounds {
+  const safeAspect = Math.max(0.000001, aspect);
+  const centerX = bounds.x + bounds.width * 0.5;
+  const centerY = bounds.y + bounds.height * 0.5;
+  const horizontal = action.includes("w") || action.includes("e");
+  const vertical = action.includes("n") || action.includes("s");
+  const primaryFromX = Math.abs(dx) >= Math.abs(dy) * safeAspect;
+  const primary = primaryFromX ? dx : dy * safeAspect;
+  let width = bounds.width;
+  let height = bounds.height;
+  if (horizontal && vertical) {
+    const widthDelta = primaryFromX
+      ? (action.includes("w") ? -primary : primary)
+      : (action.includes("n") ? -primary : primary);
+    width += widthDelta;
+    height = width / safeAspect;
+  } else if (horizontal) {
+    width += action.includes("w") ? -dx : dx;
+    height = width / safeAspect;
+  } else if (vertical) {
+    height += action.includes("n") ? -dy : dy;
+    width = height * safeAspect;
+  }
+  const maxWidth = action.includes("w") ? bounds.x + bounds.width : action.includes("e") ? 1 - bounds.x : Math.min(centerX, 1 - centerX) * 2;
+  const maxHeight = action.includes("n") ? bounds.y + bounds.height : action.includes("s") ? 1 - bounds.y : Math.min(centerY, 1 - centerY) * 2;
+  const scale = Math.min(1, maxWidth / Math.max(width, 0.01), maxHeight / Math.max(height, 0.01));
+  width = Math.max(0.01, width * scale);
+  height = Math.max(0.01, width / safeAspect);
+  if (height > maxHeight) {
+    height = maxHeight;
+    width = height * safeAspect;
+  }
+  let x = action.includes("w") ? bounds.x + bounds.width - width : action.includes("e") ? bounds.x : centerX - width * 0.5;
+  let y = action.includes("n") ? bounds.y + bounds.height - height : action.includes("s") ? bounds.y : centerY - height * 0.5;
+  x = clamp(x, 0, 1 - width);
+  y = clamp(y, 0, 1 - height);
+  return { x, y, width, height };
+}
+
+/** Keeps normalized bounds inside the source while preserving the requested pixel aspect. */
+export function constrainAspectBounds(
+  bounds: NormalizedBounds,
+  aspect: number,
+  primary: "width" | "height" = "width",
+): NormalizedBounds {
+  const safeAspect = Math.max(0.000001, Number.isFinite(aspect) ? aspect : 1);
+  const minimum = 0.001;
+  let width = Math.max(minimum, Number.isFinite(bounds.width) ? bounds.width : minimum);
+  let height = Math.max(minimum, Number.isFinite(bounds.height) ? bounds.height : minimum);
+  if (primary === "height") {
+    height = clamp(height, minimum, Math.min(1, 1 / safeAspect));
+    width = height * safeAspect;
+  } else {
+    width = clamp(width, minimum, Math.min(1, safeAspect));
+    height = width / safeAspect;
+  }
+  const x = clamp(Number.isFinite(bounds.x) ? bounds.x : 0, 0, 1 - width);
+  const y = clamp(Number.isFinite(bounds.y) ? bounds.y : 0, 0, 1 - height);
+  return { x, y, width, height };
 }
 
 export function resizePanes(kind: PaneDragKind, start: PaneState, pointerX: number, left: number, width: number): PaneState {
@@ -87,7 +168,8 @@ export function movePatch(corners: PatchGeometry["corners"], dx: number, dy: num
   const bounds = patchBounds(corners);
   const safeDx = Math.max(-bounds.left, Math.min(1 - bounds.right, dx));
   const safeDy = Math.max(-bounds.top, Math.min(1 - bounds.bottom, dy));
-  return corners.map((corner) => ({ x: corner.x + safeDx, y: corner.y + safeDy })) as unknown as PatchGeometry["corners"];
+  const canonical = (value: number) => Math.round(value * 1_000_000_000) / 1_000_000_000;
+  return corners.map((corner) => ({ x: canonical(corner.x + safeDx), y: canonical(corner.y + safeDy) })) as unknown as PatchGeometry["corners"];
 }
 
 export function normalizePatchToRectangle(

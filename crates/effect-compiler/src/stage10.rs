@@ -569,7 +569,7 @@ mod tests {
             material_group: "material-a".into(), weathering_group: "weather-a".into(),
             radial_parameters: (role == TemplateSlotRole::Radial).then_some(RadialParameters {
                 center_x: 0.5, center_y: 0.5, inner_radius: 0.0, outer_radius: 0.5,
-            }), enabled: true,
+            }), enabled: true, grid_rect: None,
         }
     }
 

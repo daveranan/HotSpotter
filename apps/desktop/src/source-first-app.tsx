@@ -27,10 +27,12 @@ import {
   type ResolvedRegion,
   type SourceChannel,
   type SourceProjection,
+  type SourceFrame,
+  type Stage14SlotProjection,
   type TrimSheetDocumentCommand,
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
-import { adjustCrop, anchoredZoom, clamp01, fitView, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
+import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
@@ -169,6 +171,7 @@ function App() {
   const [artifact, setArtifact] = useState<IntermediateAtlasProjection | null>(null);
   const [preview, setPreview] = useState<PreviewSheetProjection | null>(null);
   const [templateId, setTemplateId] = useState<string>(templates[0][0]);
+  const [targetRegionCount, setTargetRegionCount] = useState(63);
   const [selectedSourceSetId, setSelectedSourceSetId] = useState<string>("");
   const [selectedChannel, setSelectedChannel] = useState<SourceChannel>("base_color");
   const [normalConvention, setNormalConvention] = useState<Extract<NormalConvention, "open_gl" | "direct_x">>("open_gl");
@@ -217,6 +220,7 @@ function App() {
     ?? null;
   const primaryMaterial = project?.document?.primaryMaterial ?? activeSourceSetId;
   const selectedRegion = artifact?.regions.find((region) => region.regionId === selectedRegionId) ?? null;
+  const selectedSlot = artifact?.slots.find((slot) => slot.regionId === selectedRegionId) ?? null;
   const selectedBinding = selectedRegionId ? project?.document?.regionBindings[selectedRegionId] ?? null : null;
   const selectedCrop = selectedBinding?.mapping.projection.type === "crop" ? selectedBinding.mapping.projection : null;
   const currentTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
@@ -651,15 +655,36 @@ function App() {
     }
   }
 
+  async function regenerateSourceFrame(target: number) {
+    if (!native || !project?.document || activity !== "idle") return;
+    const count = Math.max(1, Math.min(256, Math.round(target)));
+    setActivity("compiling");
+    setProblem(null);
+    try {
+      const current = await invoke<ProjectProjection>("regenerate_source_frame_partition", {
+        request: { ...protocol, targetRegionCount: count },
+      });
+      setProject(current);
+      setArtifact(null);
+      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+        request: { ...protocol, revision: current.document!.documentRevision },
+      });
+      setArtifact(compiled);
+      setSelectedRegionId(null);
+    } catch (reason) {
+      setProblem(failure(reason));
+    } finally {
+      setActivity("idle");
+    }
+  }
+
   async function createDocumentAndCompile(seed: ProjectProjection, materialId: string) {
     setActivity("importing");
     setProblem(null);
     try {
       let current = seed;
       if (!current.document) {
-        current = await invoke<ProjectProjection>("create_trim_sheet_document", {
-          request: { ...protocol, templateId, templateVersion: "1.0.0" },
-        });
+        current = await invoke<ProjectProjection>("create_source_frame_document", { request: protocol });
       }
       if (current.document?.primaryMaterial !== materialId) {
         current = await applyCommand({ type: "set_primary_material", materialId });
@@ -705,7 +730,14 @@ function App() {
     setProblem(null);
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
-        request: { ...protocol, revision: project.document.documentRevision },
+        request: {
+          ...protocol,
+          revision: project.document.documentRevision,
+          regionId,
+          transientProjection: projection,
+          draftId,
+          inputHash: JSON.stringify({ revision: project.document.documentRevision, regionId, projection }),
+        },
       });
       if (draftId === previewDraftId.current) {
         setArtifact(next);
@@ -868,6 +900,21 @@ function App() {
     }
   }
 
+  async function setSourceFrame(bounds: NormalizedBounds) {
+    try { await command({ type: "set_source_frame", bounds }); }
+    catch (reason) { setProblem(failure(reason)); }
+  }
+
+  async function detachSourceCell(regionId: string) {
+    try { await command({ type: "detach_source_cell", regionId }); }
+    catch (reason) { setProblem(failure(reason)); }
+  }
+
+  async function resetSourceCell(regionId: string) {
+    try { await command({ type: "reset_source_cell", regionId }); }
+    catch (reason) { setProblem(failure(reason)); }
+  }
+
   async function setRegionRadial(regionId: string, radial: NonNullable<RegionMapping["radial"]>) {
     dirtyPreviewRegion.current = regionId;
     try { await command({ type: "set_region_radial", regionId, radial }); }
@@ -964,12 +1011,18 @@ function App() {
           </div>
           <SourceCanvas
             source={selectedSource}
+            sourceFrame={project?.document?.sourceFrame}
+            logicalGrid={project?.document?.logicalGrid}
+            partitionRegions={artifact?.regions ?? []}
+            selectedSlot={selectedSlot}
             crop={selectedCrop}
             selectedRegion={selectedRegion}
+            onSelectRegion={setSelectedRegionId}
             importing={activity === "importing"}
             onOpenBase={() => void chooseImages("base_color")}
             onCommitCrop={(bounds) => void setSelectedCrop(bounds)}
             onDraftCrop={previewSelectedCrop}
+            onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
             patches={project?.patches.filter((patch) => patch.sourceId === selectedSource?.id) ?? []}
             activePatchId={activePatchId}
             onEditPatch={setActivePatchId}
@@ -999,6 +1052,9 @@ function App() {
           build={build}
           activity={activity}
           setResolution={setResolution}
+          targetRegionCount={targetRegionCount}
+          setTargetRegionCount={setTargetRegionCount}
+          regenerateSourceFrame={regenerateSourceFrame}
         />
         {paneMode === "full" ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         {paneMode === "full" ? <Inspector
@@ -1014,6 +1070,9 @@ function App() {
           onCalibrate={(materialSourceId, calibrationCommand) => void applyMaterialCalibrationCommand(materialSourceId, calibrationCommand)}
           onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
           onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
+          onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
+          onDetachSourceCell={(regionId) => void detachSourceCell(regionId)}
+          onResetSourceCell={(regionId) => void resetSourceCell(regionId)}
         /> : null}
       </section>
       <footer className="statusbar">
@@ -1185,12 +1244,18 @@ function useViewportController(content: { width: number; height: number } | null
 
 function SourceCanvas(props: {
   source: SourceProjection | null;
+  sourceFrame?: SourceFrame;
+  logicalGrid?: { schemaVersion: number; width: number; height: number };
+  partitionRegions: readonly ResolvedRegion[];
+  selectedSlot: Stage14SlotProjection | null;
   crop: CropProjection | null;
   selectedRegion: ResolvedRegion | null;
+  onSelectRegion: (regionId: string | null) => void;
   importing: boolean;
   onOpenBase: () => void;
   onCommitCrop: (bounds: NormalizedBounds) => void;
   onDraftCrop: (bounds: NormalizedBounds) => void;
+  onSetSourceFrame: (bounds: NormalizedBounds) => void;
   patches: readonly Patch[];
   activePatchId: string | null;
   onEditPatch: (patchId: string) => void;
@@ -1205,14 +1270,16 @@ function SourceCanvas(props: {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const viewport = useViewportController(props.source?.orientedSize ?? null);
   const cropDrag = useRef<{ pointerId: number; action: CropDragAction; origin: NormalizedBounds; x: number; y: number } | null>(null);
+  const frameDrag = useRef<{ pointerId: number; action: CropDragAction; origin: NormalizedBounds; x: number; y: number } | null>(null);
   const [draftCrop, setDraftCrop] = useState<NormalizedBounds | null>(null);
+  const [draftFrame, setDraftFrame] = useState<NormalizedBounds | null>(null);
   const draftCropRef = useRef<NormalizedBounds | null>(null);
   const previewFrame = useRef<number | null>(null);
   const patchDrag = useRef<
     | { kind: "corner"; pointerId: number; patchId: string; corner: number; corners: PatchGeometry["corners"] }
     | { kind: "move"; pointerId: number; patchId: string; start: { x: number; y: number }; corners: PatchGeometry["corners"] }
     | { kind: "resize"; pointerId: number; patchId: string; handle: PatchResizeHandle; corners: PatchGeometry["corners"] }
-    | { kind: "rotate"; pointerId: number; patchId: string; center: { x: number; y: number }; startAngle: number; corners: PatchGeometry["corners"] }
+    | { kind: "rotate"; pointerId: number; patchId: string; center: { x: number; y: number }; lastAngle: number; lastValid: PatchGeometry["corners"]; corners: PatchGeometry["corners"] }
     | null
   >(null);
   const patchCreate = useRef<{ pointerId: number; start: { x: number; y: number } } | null>(null);
@@ -1223,12 +1290,17 @@ function SourceCanvas(props: {
   const [pointEditPatchId, setPointEditPatchId] = useState<string | null>(null);
   const [loupePoint, setLoupePoint] = useState<{ x: number; y: number; corner: number; clientX: number; clientY: number } | null>(null);
   const [patchMenu, setPatchMenu] = useState<{ patchId: string; clientX: number; clientY: number } | null>(null);
-  const effectiveCrop = draftCrop ?? props.crop?.bounds ?? null;
+  const committedCrop = props.selectedSlot?.mappingOrigin === "explicit_override"
+    ? props.selectedSlot.sourceBounds ?? props.crop?.bounds ?? null
+    : null;
+  const effectiveCrop = draftCrop ?? committedCrop;
+  const effectiveFrame = draftFrame ?? props.sourceFrame?.bounds ?? null;
 
   useEffect(() => {
     setDraftCrop(null);
     draftCropRef.current = null;
-  }, [props.crop?.bounds.x, props.crop?.bounds.y, props.crop?.bounds.width, props.crop?.bounds.height]);
+    setDraftFrame(null);
+  }, [props.crop?.bounds.x, props.crop?.bounds.y, props.crop?.bounds.width, props.crop?.bounds.height, props.sourceFrame?.identity.join(",")]);
 
   useEffect(() => {
     setDraftRectangle(null);
@@ -1244,7 +1316,14 @@ function SourceCanvas(props: {
       if (event.key !== "Escape") return;
       if (patchMenu) setPatchMenu(null);
       else if (pointEditPatchId) setPointEditPatchId(null);
-      else props.onExitPatch();
+      else {
+        setDraftPatch(null);
+        draftPatchRef.current = null;
+        setDraftCrop(null);
+        draftCropRef.current = null;
+        props.onDraftPatch(null);
+        props.onExitPatch();
+      }
     }
     window.addEventListener("keydown", keyDown);
     return () => window.removeEventListener("keydown", keyDown);
@@ -1280,6 +1359,17 @@ function SourceCanvas(props: {
       setDraftRectangle(rectangleGeometry(creating.start, end));
       return;
     }
+    const activeFrame = frameDrag.current;
+    if (activeFrame?.pointerId === event.pointerId) {
+      const target = point(event);
+      const dx = target.x - activeFrame.x;
+      const dy = target.y - activeFrame.y;
+      const next = activeFrame.action === "move"
+        ? adjustCrop(activeFrame.origin, "move", dx, dy)
+        : resizeAspectLocked(activeFrame.origin, activeFrame.action, dx, dy, frameAspect(props.sourceFrame!, props.source!));
+      setDraftFrame(next);
+      return;
+    }
     const activePoint = patchDrag.current;
     if (activePoint?.pointerId === event.pointerId) {
       const target = point(event);
@@ -1298,7 +1388,12 @@ function SourceCanvas(props: {
         });
       } else {
         const angle = patchPointerAngle(target, activePoint.center, props.source!.orientedSize);
-        corners = rotatePatch(activePoint.corners, activePoint.center, angle - activePoint.startAngle, props.source!.orientedSize);
+        const candidate = rotatePatch(activePoint.lastValid, activePoint.center, angle - activePoint.lastAngle, props.source!.orientedSize);
+        if (candidate !== activePoint.lastValid) {
+          activePoint.lastValid = candidate;
+          activePoint.lastAngle = angle;
+        }
+        corners = activePoint.lastValid;
       }
       const draft = { patchId: activePoint.patchId, geometry: { corners } };
       draftPatchRef.current = draft;
@@ -1311,7 +1406,9 @@ function SourceCanvas(props: {
       const target = point(event);
       const dx = target.x - activeCrop.x;
       const dy = target.y - activeCrop.y;
-      const next = adjustCrop(activeCrop.origin, activeCrop.action, dx, dy);
+      const next = activeCrop.action === "move"
+        ? adjustCrop(activeCrop.origin, "move", dx, dy)
+        : resizeAspectLocked(activeCrop.origin, activeCrop.action, dx, dy, sourceCropAspect(props.selectedSlot, props.source!.orientedSize.width, props.source!.orientedSize.height));
       draftCropRef.current = next;
       setDraftCrop(next);
       if (previewFrame.current === null) {
@@ -1333,6 +1430,11 @@ function SourceCanvas(props: {
       setDraftRectangle(null);
       if (rectangleArea(geometry) > 0.0004) props.onCreatePatch(geometry, false);
     }
+    if (frameDrag.current?.pointerId === event.pointerId) {
+      frameDrag.current = null;
+      if (draftFrame) props.onSetSourceFrame(draftFrame);
+      setDraftFrame(null);
+    }
     if (patchDrag.current?.pointerId === event.pointerId) {
       const patchId = patchDrag.current.patchId;
       patchDrag.current = null;
@@ -1348,12 +1450,20 @@ function SourceCanvas(props: {
     viewport.endPan(event);
   }
 
-  function beginCrop(event: React.PointerEvent<HTMLElement>, action: CropDragAction) {
+  function beginCrop(event: React.PointerEvent<Element>, action: CropDragAction) {
     if (!effectiveCrop || event.button !== 0) return;
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     const start = point(event);
     cropDrag.current = { pointerId: event.pointerId, action, origin: effectiveCrop, x: start.x, y: start.y };
+  }
+
+  function beginFrame(event: React.PointerEvent<SVGElement>, action: CropDragAction) {
+    if (!effectiveFrame || event.button !== 0) return;
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const start = point(event);
+    frameDrag.current = { pointerId: event.pointerId, action, origin: effectiveFrame, x: start.x, y: start.y };
   }
 
   function beginPatchPoint(event: React.PointerEvent<Element>, patch: Patch, corner: number) {
@@ -1389,7 +1499,7 @@ function SourceCanvas(props: {
     const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
     patchDrag.current = {
       kind: "rotate", pointerId: event.pointerId, patchId: patch.id, center,
-      startAngle: patchPointerAngle(point(event), center, props.source!.orientedSize), corners: geometry.corners,
+      lastAngle: patchPointerAngle(point(event), center, props.source!.orientedSize), lastValid: geometry.corners, corners: geometry.corners,
     };
   }
 
@@ -1461,18 +1571,29 @@ function SourceCanvas(props: {
         draggable={false}
         onClick={() => { if (!props.tool) { setPointEditPatchId(null); props.onExitPatch(); } }}
       />
-      {effectiveCrop ? <button
-        className="source-crop"
-        style={cropStyle(effectiveCrop, viewport.view.scale)}
-        onPointerDown={(event) => beginCrop(event, "move")}
-        aria-label={`Move source crop for ${props.selectedRegion?.displayName ?? "selected region"}`}
+      {props.sourceFrame && props.logicalGrid && props.partitionRegions.length > 0 ? <svg
+        className="source-partition-overlay"
+        viewBox={`0 0 ${props.source.orientedSize.width} ${props.source.orientedSize.height}`}
+        aria-label="SourceFrame and accepted logical partition"
       >
-        <span>{props.selectedRegion?.displayName ?? "Region crop"}</span>
-        <b className="handle nw" onPointerDown={(event) => beginCrop(event, "nw")} />
-        <b className="handle ne" onPointerDown={(event) => beginCrop(event, "ne")} />
-        <b className="handle sw" onPointerDown={(event) => beginCrop(event, "sw")} />
-        <b className="handle se" onPointerDown={(event) => beginCrop(event, "se")} />
-      </button> : null}
+        {props.partitionRegions.map((region) => region.sourceBounds ? <rect
+          key={region.regionId}
+          data-region-id={region.regionId}
+          data-selection-surface="source"
+          aria-label={`Select ${region.displayName}`}
+          x={region.sourceBounds.x * props.source!.orientedSize.width}
+          y={region.sourceBounds.y * props.source!.orientedSize.height}
+          width={region.sourceBounds.width * props.source!.orientedSize.width}
+          height={region.sourceBounds.height * props.source!.orientedSize.height}
+          style={{ pointerEvents: "all" }}
+          className={`source-region-boundary ${region.regionId === props.selectedRegion?.regionId ? "selected" : ""}`}
+          onPointerDown={(event) => { event.stopPropagation(); props.onSelectRegion(region.regionId); }}
+          onClick={(event) => { event.stopPropagation(); props.onSelectRegion(region.regionId); }}
+        /> : null)}
+      </svg> : null}
+      {props.selectedRegion && props.selectedSlot?.mappingOrigin === "partition" ? <div className="partition-selection-status" data-selection-status="partition-owned">
+        Partition-owned — Detach to adjust
+      </div> : null}
     </div> : <div className="empty-source-canvas">
       <strong>Open or drop a Base Color</strong>
       <span>The source canvas is ready before the project has a save location.</span>
@@ -1484,6 +1605,70 @@ function SourceCanvas(props: {
       viewBox={`0 0 ${props.source.orientedSize.width} ${props.source.orientedSize.height}`}
       aria-label="Editable patch outlines"
     >
+      {effectiveFrame ? <g className="patch-outline active source-frame-transform">
+        <polygon
+          points={`${effectiveFrame.x * props.source.orientedSize.width},${effectiveFrame.y * props.source.orientedSize.height} ${(effectiveFrame.x + effectiveFrame.width) * props.source.orientedSize.width},${effectiveFrame.y * props.source.orientedSize.height} ${(effectiveFrame.x + effectiveFrame.width) * props.source.orientedSize.width},${(effectiveFrame.y + effectiveFrame.height) * props.source.orientedSize.height} ${effectiveFrame.x * props.source.orientedSize.width},${(effectiveFrame.y + effectiveFrame.height) * props.source.orientedSize.height}`}
+          aria-label="Move SourceFrame"
+          onPointerDown={(event) => {
+            const target = point(event);
+            const selectedCell = props.partitionRegions.find((region) => {
+              const bounds = region.sourceBounds;
+              return bounds
+                && target.x >= bounds.x && target.x <= bounds.x + bounds.width
+                && target.y >= bounds.y && target.y <= bounds.y + bounds.height;
+            });
+            if (selectedCell) {
+              event.stopPropagation();
+              props.onSelectRegion(selectedCell.regionId);
+            } else {
+              beginFrame(event, "move");
+            }
+          }}
+        />
+        <g className="patch-transform">
+          <rect
+            className="rotation-guide"
+            x={effectiveFrame.x * props.source.orientedSize.width - 15 / viewport.view.scale}
+            y={effectiveFrame.y * props.source.orientedSize.height - 15 / viewport.view.scale}
+            width={effectiveFrame.width * props.source.orientedSize.width + 30 / viewport.view.scale}
+            height={effectiveFrame.height * props.source.orientedSize.height + 30 / viewport.view.scale}
+          />
+          {(["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const).map((action) => <rect
+            key={action}
+            x={frameHandlePosition(effectiveFrame, action).x * props.source!.orientedSize.width - 5 / viewport.view.scale}
+            y={frameHandlePosition(effectiveFrame, action).y * props.source!.orientedSize.height - 5 / viewport.view.scale}
+            width={10 / viewport.view.scale}
+            height={10 / viewport.view.scale}
+            className={`resize-handle resize-${action}`}
+            onPointerDown={(event) => beginFrame(event, action)}
+          />)}
+        </g>
+      </g> : null}
+      {effectiveCrop ? <g className="patch-outline active source-crop-transform">
+        <polygon
+          points={`${effectiveCrop.x * props.source.orientedSize.width},${effectiveCrop.y * props.source.orientedSize.height} ${(effectiveCrop.x + effectiveCrop.width) * props.source.orientedSize.width},${effectiveCrop.y * props.source.orientedSize.height} ${(effectiveCrop.x + effectiveCrop.width) * props.source.orientedSize.width},${(effectiveCrop.y + effectiveCrop.height) * props.source.orientedSize.height} ${effectiveCrop.x * props.source.orientedSize.width},${(effectiveCrop.y + effectiveCrop.height) * props.source.orientedSize.height}`}
+          aria-label={`Move source crop for ${props.selectedRegion?.displayName ?? "selected region"}`}
+          onPointerDown={(event) => beginCrop(event, "move")}
+        />
+        <g className="patch-transform">
+          <rect
+            className="rotation-guide"
+            x={effectiveCrop.x * props.source.orientedSize.width - 15 / viewport.view.scale}
+            y={effectiveCrop.y * props.source.orientedSize.height - 15 / viewport.view.scale}
+            width={effectiveCrop.width * props.source.orientedSize.width + 30 / viewport.view.scale}
+            height={effectiveCrop.height * props.source.orientedSize.height + 30 / viewport.view.scale}
+          />
+          {(["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const).map((action) => <rect
+            key={action}
+            x={frameHandlePosition(effectiveCrop, action).x * props.source!.orientedSize.width - 5 / viewport.view.scale}
+            y={frameHandlePosition(effectiveCrop, action).y * props.source!.orientedSize.height - 5 / viewport.view.scale}
+            width={10 / viewport.view.scale}
+            height={10 / viewport.view.scale}
+            className={`resize-handle resize-${action}`}
+            onPointerDown={(event) => beginCrop(event, action)}
+          />)}
+        </g>
+      </g> : null}
       {props.patches.map((patch) => {
         const geometry = draftPatch?.patchId === patch.id ? draftPatch.geometry : patch.geometry;
         const active = props.activePatchId === patch.id;
@@ -1600,6 +1785,24 @@ function rectangleArea(geometry: PatchGeometry): number {
   return Math.abs((topRight.x - topLeft.x) * (bottomRight.y - topLeft.y));
 }
 
+function frameHandlePosition(bounds: NormalizedBounds, handle: CropDragAction) {
+  return {
+    x: handle.includes("w") ? bounds.x : handle.includes("e") ? bounds.x + bounds.width : bounds.x + bounds.width * 0.5,
+    y: handle.includes("n") ? bounds.y : handle.includes("s") ? bounds.y + bounds.height : bounds.y + bounds.height * 0.5,
+  };
+}
+
+function frameAspect(frame: SourceFrame, source: SourceProjection): number {
+  return (frame.outputAspect[0] / Math.max(1, frame.outputAspect[1]))
+    * source.orientedSize.height / Math.max(1, source.orientedSize.width);
+}
+
+function sourceCropAspect(slot: Stage14SlotProjection | null, sourceWidth: number, sourceHeight: number): number {
+  const allocation = slot?.allocationBounds;
+  if (!allocation || allocation.width <= 0 || allocation.height <= 0) return 1;
+  return (allocation.width / allocation.height) * sourceHeight / Math.max(1, sourceWidth);
+}
+
 function cornerLoupeStyle(source: SourceProjection, point: { x: number; y: number; clientX: number; clientY: number }, viewportScale: number): React.CSSProperties {
   const magnification = Math.min(6, Math.max(1, viewportScale * 6));
   const width = source.orientedSize.width * magnification;
@@ -1664,6 +1867,9 @@ function SheetWorkbench(props: {
   build: () => void;
   activity: Activity;
   setResolution: (size: number) => void;
+  targetRegionCount: number;
+  setTargetRegionCount: (count: number) => void;
+  regenerateSourceFrame: (count: number) => void;
 }) {
   const artifact = props.artifact;
   const topologyHash = props.project?.document ? hashBytes(props.project.document.topology.topologyHash) : null;
@@ -1689,11 +1895,10 @@ function SheetWorkbench(props: {
       <span className={`build-status ${props.problem ? "error" : props.artifact ? "ready" : ""}`}>{props.buildState}</span>
     </header>
     <section className="template-strip">
-      <span>REFERENCE-MESH HOTSPOT TEMPLATE</span>
-      <strong>Generate the Generic Architecture hotspot sheet</strong>
-      <select value={props.templateId} onChange={(event) => props.setTemplateId(event.target.value)} disabled={!!props.project?.document}>
-        {templates.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-      </select>
+      <span>SOURCE FRAME PARTITION</span>
+      <strong>{props.artifact ? `${props.artifact.regions.length} accepted regions` : "One canonical source frame"}</strong>
+      <label>Target regions<input aria-label="Target regions" type="number" min={1} max={256} value={props.targetRegionCount} onChange={(event) => props.setTargetRegionCount(Number(event.target.value))} disabled={!props.project?.document} /></label>
+      <button onClick={() => props.regenerateSourceFrame(props.targetRegionCount)} disabled={!props.project?.document || props.activity !== "idle"}>Regenerate / Accept</button>
       <select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document}>
         <option value={1024}>1024</option>
         <option value={2048}>2048</option>
@@ -1750,9 +1955,12 @@ function SheetWorkbench(props: {
         /> : null}
         <div className="overlays">{sheet.regions.map((region) => <button
           key={region.regionId}
+          data-region-id={region.regionId}
+          data-selection-surface="atlas"
+          aria-pressed={region.regionId === props.selectedRegionId}
           className={`region ${region.regionId === props.selectedRegionId ? "selected" : ""}`}
           style={overlayStyle(region, sheet, viewport.view.scale)}
-          onClick={(event) => { event.stopPropagation(); props.setSelectedRegionId(region.regionId === props.selectedRegionId ? null : region.regionId); }}
+          onClick={(event) => { event.stopPropagation(); props.setSelectedRegionId(region.regionId); }}
         ><span>{region.displayName}</span></button>)}</div>
       </div>}
       {workpieceSize ? <div className="viewport-tools">
@@ -1785,9 +1993,15 @@ function Inspector(props: {
   onCalibrate: (materialSourceId: string, command: MaterialCalibrationCommand) => void;
   onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
+  onSetSourceFrame: (bounds: NormalizedBounds) => void;
+  onDetachSourceCell: (regionId: string) => void;
+  onResetSourceCell: (regionId: string) => void;
 }) {
   const binding = props.selectedRegion && props.project?.document?.regionBindings[props.selectedRegion.regionId];
   const stage14Slot = props.selectedRegion && props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegion!.regionId);
+  const overlapIds = stage14Slot?.mappingOrigin === "explicit_override" && props.selectedRegion?.sourceBounds
+    ? props.artifact?.regions.filter((region) => region.regionId !== props.selectedRegion!.regionId && region.sourceBounds && normalizedBoundsOverlap(props.selectedRegion!.sourceBounds!, region.sourceBounds)).map((region) => region.regionId) ?? []
+    : [];
   const analyzedSource = props.sourceAnalysis
     ? props.project?.materialSources.find((source) => source.id === props.sourceAnalysis!.materialSourceId)
     : undefined;
@@ -1813,7 +2027,7 @@ function Inspector(props: {
     </section> : null}
     <section className="inspector-section">
       <span>SOURCE QUALITY &amp; BEHAVIOR</span>
-      {props.sourceAnalysis ? <>
+    {props.sourceAnalysis ? <>
         <dl>
           <dt>Analyzed</dt><dd>{materialBehaviorOptions.find(([id]) => id === props.sourceAnalysis!.sourceAnalysis.analyzedClass)?.[1]}</dd>
           <dt>Confidence</dt><dd>{props.sourceAnalysis.sourceAnalysis.confidencePercent}%</dd>
@@ -1849,6 +2063,10 @@ function Inspector(props: {
         </select></label>
       </> : <p>Select a prepared patch to inspect Stage 5 evidence.</p>}
     </section>
+    {props.project?.document?.sourceFrame ? <SourceFrameEditor
+      frame={props.project.document.sourceFrame}
+      onApply={props.onSetSourceFrame}
+    /> : null}
     <section className="inspector-section">
       <span>SELECTED REGION</span>
       {props.selectedRegion ? <>
@@ -1856,15 +2074,28 @@ function Inspector(props: {
         <code>{props.selectedRegion.regionId}</code>
         <dl>
           <dt>Content</dt><dd>{contentLabel(binding?.content.type)}</dd>
-          <dt>Projection</dt><dd>{binding?.mapping.projection.type ?? "-"}</dd>
-          <dt>Source crop</dt><dd>{cropLabel(binding?.mapping.projection)}</dd>
+          <dt>Projection</dt><dd>{stage14Slot?.mappingOrigin === "partition" ? "Partition crop" : binding?.mapping.projection.type ?? "-"}</dd>
+          <dt>Source crop</dt><dd>{stage14Slot?.mappingOrigin === "partition" ? "Inapplicable — partition-owned" : boundsLabel(stage14Slot?.sourceCrop)}</dd>
+          <dt>Mapping origin</dt><dd>{stage14Slot?.mappingOrigin ?? "-"}</dd>
+          <dt>GridRect</dt><dd>{gridRectLabel(stage14Slot?.gridRect)}</dd>
+          <dt>Source pixels</dt><dd>{boundsLabel(stage14Slot?.sourceCrop)}</dd>
+          <dt>Source normalized</dt><dd>{normalizedBoundsLabel(stage14Slot?.sourceBounds)}</dd>
           <dt>Bounds</dt><dd>{boundsLabel(props.selectedRegion.allocationBounds)}</dd>
+          <dt>Artifact revision</dt><dd>{props.artifact?.documentRevision ?? "-"}</dd>
           <dt>Material</dt><dd>{props.selectedRegion.materialId.slice(0, 8)}</dd>
         </dl>
-        {binding?.mapping.projection.type === "crop" ? <CropEditor
+        {stage14Slot?.mappingOrigin === "partition" ? <button onClick={() => props.onDetachSourceCell(props.selectedRegion!.regionId)}>Detach Source Cell</button> : null}
+        {stage14Slot?.mappingOrigin === "explicit_override" ? <button onClick={() => props.onResetSourceCell(props.selectedRegion!.regionId)}>Reset to Partition</button> : null}
+        {overlapIds.length > 0 ? <p className="source-overlap-warning">Explicit override overlaps: {overlapIds.join(", ")}</p> : null}
+        {stage14Slot?.mappingOrigin === "explicit_override" && binding?.mapping.projection.type === "crop" ? <CropEditor
           key={`${props.selectedRegion.regionId}-crop`}
           regionId={props.selectedRegion.regionId}
           bounds={binding.mapping.projection.bounds}
+          aspect={props.project?.document?.sourceFrame ? sourceCropAspect(
+            stage14Slot,
+            props.project.document.sourceFrame.orientedDimensions.width,
+            props.project.document.sourceFrame.orientedDimensions.height,
+          ) : 1}
           onApply={props.onSetCrop}
         /> : null}
         {props.selectedRegion.role === "radial" && binding?.mapping.radial ? <RadialEditor
@@ -1878,6 +2109,50 @@ function Inspector(props: {
     <LockedSection title="Profiles & Weathering" reason="Generated-map recipes are not command-backed in this slice." />
     <LockedSection title="Decorations" reason="Decoration bindings require authored patch commands." />
   </aside>;
+}
+
+function SourceFrameEditor(props: {
+  frame: SourceFrame;
+  onApply: (bounds: NormalizedBounds) => void;
+}) {
+  const [bounds, setBounds] = useState<NormalizedBounds>(props.frame.bounds);
+  useEffect(() => setBounds(props.frame.bounds), [props.frame.identity.join(",")]);
+  const sourceSize = props.frame.orientedDimensions;
+  const aspect = (props.frame.outputAspect[0] / Math.max(1, props.frame.outputAspect[1]))
+    * sourceSize.height / Math.max(1, sourceSize.width);
+  const set = (key: keyof NormalizedBounds, value: number) => setBounds((current) => constrainAspectBounds(
+    { ...current, [key]: value }, aspect, key === "height" ? "height" : "width",
+  ));
+  const pixelValue = (key: keyof NormalizedBounds) => bounds[key] * (key === "x" || key === "width" ? sourceSize.width : sourceSize.height);
+  const setPixels = (key: keyof NormalizedBounds, value: number) => set(key, value / (key === "x" || key === "width" ? sourceSize.width : sourceSize.height));
+  function fit(mode: "center" | "width" | "height" | "largest") {
+    const next = fitSourceFrame(props.frame.orientedDimensions, { width: props.frame.outputAspect[0], height: props.frame.outputAspect[1] }, mode === "center" ? "largest" : mode);
+    setBounds(next);
+    props.onApply(next);
+  }
+  function apply() {
+    const next = constrainAspectBounds(bounds, aspect);
+    setBounds(next);
+    props.onApply(next);
+  }
+  return <section className="inspector-section source-frame-editor">
+    <span>SOURCE FRAME</span>
+    <dl><dt>Oriented source</dt><dd>{props.frame.orientedDimensions.width} × {props.frame.orientedDimensions.height}</dd><dt>Revision</dt><dd>{props.frame.sourceRevision}</dd></dl>
+    <p className="source-frame-aspect-lock">Aspect ratio locked to {props.frame.outputAspect[0]}:{props.frame.outputAspect[1]}</p>
+    <div className="region-bounds-editor">
+      {(["x", "y", "width", "height"] as const).map((key) => <label key={key}>{key}<input type="number" min={0} max={1} step={0.0001} value={bounds[key]} onChange={(event) => set(key, Number(event.currentTarget.value))} /></label>)}
+    </div>
+    <div className="region-bounds-editor source-frame-pixels">
+      {(["x", "y", "width", "height"] as const).map((key) => <label key={key}>{key} px<input type="number" min={0} step={1} value={Math.round(pixelValue(key))} onChange={(event) => setPixels(key, Number(event.currentTarget.value))} /></label>)}
+    </div>
+    <div className="button-row">
+      <button onClick={apply}>Apply</button>
+      <button onClick={() => fit("center")}>Center</button>
+      <button onClick={() => fit("width")}>Fit Width</button>
+      <button onClick={() => fit("height")}>Fit Height</button>
+      <button onClick={() => fit("largest")}>Largest Fit</button>
+    </div>
+  </section>;
 }
 
 function CalibrationEditor(props: {
@@ -1969,12 +2244,17 @@ function CalibrationEditor(props: {
   </div>;
 }
 
-function CropEditor(props: { regionId: string; bounds: NormalizedBounds; onApply: (regionId: string, bounds: NormalizedBounds) => void }) {
+function CropEditor(props: { regionId: string; bounds: NormalizedBounds; aspect: number; onApply: (regionId: string, bounds: NormalizedBounds) => void }) {
   const [bounds, setBounds] = useState(props.bounds);
+  useEffect(() => setBounds(props.bounds), [props.bounds.x, props.bounds.y, props.bounds.width, props.bounds.height]);
+  const set = (field: keyof NormalizedBounds, value: number) => setBounds((current) => constrainAspectBounds(
+    { ...current, [field]: value }, props.aspect, field === "height" ? "height" : "width",
+  ));
   return <div className="mapping-editor">
     <strong>SOURCE CROP</strong>
-    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={1} step={0.01} value={Number(bounds[field].toFixed(4))} onChange={(event) => setBounds((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}
-    <button onClick={() => props.onApply(props.regionId, bounds)}>Apply crop</button>
+    <small>Aspect locked to the destination region.</small>
+    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={1} step={0.01} value={Number(bounds[field].toFixed(4))} onChange={(event) => set(field, Number(event.target.value))} /></label>)}
+    <button onClick={() => props.onApply(props.regionId, constrainAspectBounds(bounds, props.aspect))}>Apply crop</button>
   </div>;
 }
 
@@ -2018,14 +2298,20 @@ function contentLabel(type?: string) {
   return type === "inherit_primary_material" ? "Primary material" : type?.replaceAll("_", " ") ?? "-";
 }
 
-function boundsLabel(bounds: { x: number; y: number; width: number; height: number }) {
-  return `${bounds.x}, ${bounds.y} / ${bounds.width} x ${bounds.height}`;
+function boundsLabel(bounds?: { x: number; y: number; width: number; height: number }) {
+  return bounds ? `${bounds.x}, ${bounds.y} / ${bounds.width} x ${bounds.height}` : "-";
 }
 
-function cropLabel(projection?: { type: string; bounds?: { x: number; y: number; width: number; height: number } }) {
-  if (!projection || projection.type !== "crop" || !projection.bounds) return "-";
-  const b = projection.bounds;
-  return `${b.x.toFixed(2)}, ${b.y.toFixed(2)} / ${b.width.toFixed(2)} x ${b.height.toFixed(2)}`;
+function normalizedBoundsLabel(bounds?: { x: number; y: number; width: number; height: number }) {
+  return bounds ? `${bounds.x.toFixed(5)}, ${bounds.y.toFixed(5)} / ${bounds.width.toFixed(5)} x ${bounds.height.toFixed(5)}` : "-";
+}
+
+function gridRectLabel(rect?: { x: number; y: number; width: number; height: number }) {
+  return rect ? `${rect.x}, ${rect.y} / ${rect.width} x ${rect.height}` : "-";
+}
+
+function normalizedBoundsOverlap(a: NormalizedBounds, b: NormalizedBounds) {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 
 function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasProjection, "width" | "height">, scale = 1): React.CSSProperties {
@@ -2038,19 +2324,6 @@ function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasPr
     borderColor: `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]})`,
     "--region-stroke": `${Math.min(3, Math.max(0.75, 1 / scale))}px`,
     "--region-label-size": `${Math.min(16, Math.max(7, 10 / scale))}px`,
-  } as React.CSSProperties;
-}
-
-function cropStyle(bounds: NormalizedBounds, scale = 1): React.CSSProperties {
-  return {
-    left: `${bounds.x * 100}%`,
-    top: `${bounds.y * 100}%`,
-    width: `${bounds.width * 100}%`,
-    height: `${bounds.height * 100}%`,
-    borderWidth: `${Math.min(4, Math.max(0.75, 2 / scale))}px`,
-    "--source-handle-size": `${Math.min(20, Math.max(6, 10 / scale))}px`,
-    "--source-handle-offset": `${Math.min(12, Math.max(3, 6 / scale))}px`,
-    "--source-label-size": `${Math.min(16, Math.max(7, 10 / scale))}px`,
   } as React.CSSProperties;
 }
 

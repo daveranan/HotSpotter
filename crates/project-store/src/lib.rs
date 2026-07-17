@@ -17,6 +17,8 @@ use hot_trimmer_domain::{
     RegistrationRecoveryChoice,
     PatchCommandError, PatchEditOutcome, PatchSet, ProjectId, SourceId, SourceSetId,
     TemplateRegistry, TrimSheetDocument, TrimSheetDocumentCommand,
+    LogicalGridSpec, NormalizedBounds, NormalizedPoint, NormalizedScalar, OrientedPixelSize,
+    PartitionRecipe, Projection, RegionSourceOverride, SourceFrame,
 };
 use hot_trimmer_geometry::Quadrilateral;
 use hot_trimmer_image_io::{ColorPolicy, DecodeLimits, inspect_path_with_policy};
@@ -522,6 +524,39 @@ impl ProjectStore {
                 None,
             )?;
         }
+        let source_set_revision = self
+            .connection
+            .query_row(
+                "SELECT source_revision FROM source_sets WHERE id = ?1",
+                [source_set_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .saturating_add(1);
+        let (next_document, rebind_diagnostic) = if channel == SourceChannel::BaseColor {
+            self.document
+                .as_ref()
+                .filter(|document| {
+                    document
+                        .source_frame
+                        .as_ref()
+                        .is_some_and(|frame| frame.source_set_id == SourceSetId::from_bytes(*source_set_id.as_bytes()))
+                })
+                .map(|document| {
+                    rebind_source_frame(
+                        document,
+                        OrientedPixelSize { width: source.width, height: source.height },
+                        source_set_revision,
+                    )
+                })
+                .transpose()?
+                .map_or((None, None), |(document, diagnostic)| {
+                    (Some(document), Some(diagnostic))
+                })
+        } else {
+            (None, None)
+        };
         let now = unix_timestamp()?;
         let default_delighting = serde_json::to_string(&DelightingIntent::default())?;
         let default_classification =
@@ -598,11 +633,12 @@ impl ProjectStore {
         )?;
         advance_source_authority(&transaction, source_set_id)?;
         let payload = format!(
-            "{{\"sourceSetId\":\"{}\",\"channel\":\"{}\",\"sourceId\":\"{}\",\"sha256\":\"{}\"}}",
+            "{{\"sourceSetId\":\"{}\",\"channel\":\"{}\",\"sourceId\":\"{}\",\"sha256\":\"{}\"{} }}",
             source_set_id,
             channel.as_db_value(),
             source.id,
-            source.sha256
+            source.sha256,
+            rebind_diagnostic.as_ref().map_or_else(String::new, |diagnostic| format!(",\"sourceFrameRebind\":\"{}\"", diagnostic.replace('"', "\\\"")))
         );
         transaction.execute(
             "INSERT INTO autosave_journal (occurred_unix, operation, payload_json)
@@ -610,8 +646,16 @@ impl ProjectStore {
             params![now, payload],
         )?;
         transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+        if let Some(document) = next_document.as_ref() {
+            persist_document_state_in_transaction(&transaction, Some(document), "replace_source_rebind", now)?;
+        }
         transaction.commit()?;
         self.patch_set = next_patch_set;
+        if let Some(document) = next_document {
+            self.document_history.clear();
+            self.document_history_cursor = 0;
+            self.document = Some(document);
+        }
         self.clear_history();
         checkpoint(&self.connection)
     }
@@ -878,6 +922,50 @@ impl ProjectStore {
             "create_trim_sheet_document",
         )?;
         self.document = Some(document);
+        self.document_history.clear();
+        self.document_history_cursor = 0;
+        Ok(self.document.as_ref().expect("document just assigned"))
+    }
+
+    /// Creates the primary source-frame workflow. The template argument remains available to
+    /// the compatibility command above, but new source-first documents never select a fixed
+    /// template or infer source crops from destination rectangles.
+    pub fn create_source_frame_document(&mut self) -> Result<&TrimSheetDocument, StoreError> {
+        let materials = load_material_catalog(&self.connection)?;
+        let primary = materials.iter().find(|material| material.maps.iter().any(|map| map.kind == MaterialMapKind::BaseColor))
+            .ok_or(StoreError::BaseColorRequired)?.id;
+        let source = load_sources(&self.connection)?.into_iter()
+            .find(|source| source.source_set_id == Uuid::from_bytes(primary.to_bytes()) && source.channel == SourceChannel::BaseColor)
+            .ok_or(StoreError::BaseColorRequired)?;
+        let source_set = load_source_sets(&self.connection)?.into_iter()
+            .find(|source_set| source_set.id == primary)
+            .ok_or(StoreError::BaseColorRequired)?;
+        let frame = SourceFrame::centered_largest(primary,
+            OrientedPixelSize { width: source.input.width, height: source.input.height }, [1, 1], source_set.source_revision);
+        let recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 63, 0);
+        let document = TrimSheetDocument::from_source_frame(LayoutId::new(), frame, recipe,
+            hot_trimmer_domain::PixelSize { width: 2_048, height: 2_048 }, materials,
+            self.patch_set.patches().to_vec()).map_err(|error| StoreError::Document(error.to_string()))?;
+        persist_document_state(&mut self.connection, Some(&document), "create_source_frame_document")?;
+        self.document = Some(document);
+        self.document_history.clear();
+        self.document_history_cursor = 0;
+        Ok(self.document.as_ref().expect("document just assigned"))
+    }
+
+    pub fn regenerate_source_frame_partition(&mut self, target_region_count: u32) -> Result<&TrimSheetDocument, StoreError> {
+        let current = self.document.as_ref().ok_or_else(|| StoreError::Document("create a source-frame document first".into()))?.clone();
+        let frame = current.source_frame.clone().ok_or_else(|| StoreError::Document("the current document is not source-frame authored".into()))?;
+        let previous = current.partition_provenance.as_ref().ok_or_else(|| StoreError::Document("source-frame provenance is missing".into()))?;
+        let mut recipe = previous.recipe.clone();
+        recipe.target_region_count = target_region_count;
+        let mut next = TrimSheetDocument::from_source_frame(current.id, frame, recipe, current.render_settings.output_size,
+            current.materials.clone(), current.patches.clone()).map_err(|error| StoreError::Document(error.to_string()))?;
+        next.document_revision = current.document_revision.saturating_add(1);
+        next.topology_revision = current.topology_revision.saturating_add(1);
+        next.appearance_revision = next.document_revision;
+        persist_document_state(&mut self.connection, Some(&next), "regenerate_source_frame_partition")?;
+        self.document = Some(next);
         self.document_history.clear();
         self.document_history_cursor = 0;
         Ok(self.document.as_ref().expect("document just assigned"))
@@ -1683,6 +1771,17 @@ fn persist_document_state(
 ) -> Result<(), StoreError> {
     let now = unix_timestamp()?;
     let transaction = connection.transaction()?;
+    persist_document_state_in_transaction(&transaction, document, operation, now)?;
+    transaction.commit()?;
+    checkpoint(connection)
+}
+
+fn persist_document_state_in_transaction(
+    transaction: &Transaction<'_>,
+    document: Option<&TrimSheetDocument>,
+    operation: &str,
+    now: i64,
+) -> Result<(), StoreError> {
     transaction.execute("DELETE FROM region_mapping_recipes", [])?;
     transaction.execute("DELETE FROM region_bindings", [])?;
     transaction.execute("DELETE FROM topology_regions", [])?;
@@ -1746,8 +1845,7 @@ fn persist_document_state(
         ],
     )?;
     transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
-    transaction.commit()?;
-    checkpoint(connection)
+    Ok(())
 }
 
 fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
@@ -1758,11 +1856,129 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::SetRegionProjection { .. } => "set_region_projection",
         TrimSheetDocumentCommand::SetRegionRadial { .. } => "set_region_radial",
         TrimSheetDocumentCommand::SetOutputResolution { .. } => "set_output_resolution",
+        TrimSheetDocumentCommand::SetSourceFrame { .. } => "set_source_frame",
+        TrimSheetDocumentCommand::DetachSourceCell { .. } => "detach_source_cell",
+        TrimSheetDocumentCommand::ResetSourceCell { .. } => "reset_source_cell",
     }
 }
 
 fn hash_hex(hash: hot_trimmer_domain::DocumentHash) -> String {
     hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn rebind_source_frame(
+    document: &TrimSheetDocument,
+    oriented_dimensions: OrientedPixelSize,
+    source_revision: u64,
+) -> Result<(TrimSheetDocument, String), StoreError> {
+    let frame = document
+        .source_frame
+        .as_ref()
+        .ok_or_else(|| StoreError::Document("the current document has no SourceFrame".into()))?;
+    let aspect_changed = u64::from(frame.oriented_dimensions.width)
+        .saturating_mul(u64::from(oriented_dimensions.height))
+        != u64::from(oriented_dimensions.width)
+            .saturating_mul(u64::from(frame.oriented_dimensions.height));
+    let mut next_frame = if aspect_changed {
+        SourceFrame::centered_largest(
+            frame.source_set_id,
+            oriented_dimensions,
+            frame.output_aspect,
+            source_revision,
+        )
+    } else {
+        let mut preserved = frame.clone();
+        preserved.oriented_dimensions = oriented_dimensions;
+        preserved.source_revision = source_revision;
+        preserved.identity = preserved.compute_identity();
+        preserved
+    };
+    next_frame.identity = next_frame.compute_identity();
+    let mut next = document.clone();
+    next.source_frame = Some(next_frame);
+    let mut transformed_overrides = 0usize;
+    if aspect_changed {
+        let override_ids = next.source_overrides.keys().copied().collect::<Vec<_>>();
+        for region_id in override_ids {
+            let Some(region) = next.topology.regions.iter().find(|region| region.id == region_id) else {
+                return Err(StoreError::Document(format!("detached SourceFrame region {region_id} no longer exists")));
+            };
+            let Some(override_value) = next.source_overrides.get(&region_id).copied() else { continue; };
+            let bounds = rebind_override_bounds(
+                override_value.source_bounds,
+                region.allocation_rect.width,
+                region.allocation_rect.height,
+                oriented_dimensions,
+            )?;
+            next.source_overrides.insert(region_id, RegionSourceOverride::new(bounds));
+            let binding = next.region_bindings.get_mut(&region_id)
+                .ok_or_else(|| StoreError::Document(format!("detached SourceFrame region {region_id} has no binding")))?;
+            let Projection::Crop { bounds: binding_bounds, focus } = &mut binding.mapping.projection else {
+                return Err(StoreError::Document(format!("detached SourceFrame region {region_id} has no crop projection")));
+            };
+            *binding_bounds = bounds;
+            *focus = NormalizedPoint::new(bounds.x.get() + bounds.width.get() * 0.5, bounds.y.get() + bounds.height.get() * 0.5)
+                .map_err(|_| StoreError::Document(format!("detached SourceFrame region {region_id} produced invalid focus")))?;
+            transformed_overrides += 1;
+        }
+    }
+    next.document_revision = document.document_revision.saturating_add(1);
+    next.appearance_revision = next.document_revision;
+    next.validate()
+        .map_err(|error| StoreError::Document(format!("SourceFrame rebind is invalid: {error}")))?;
+    let diagnostic = if document.source_overrides.is_empty() {
+        format!(
+            "rebound SourceFrame to {}x{} at source revision {}{}",
+            oriented_dimensions.width,
+            oriented_dimensions.height,
+            source_revision,
+            if aspect_changed { " and refit Largest Fit" } else { "" }
+        )
+    } else if transformed_overrides > 0 {
+        format!(
+            "rebound SourceFrame to {}x{} at source revision {}; transformed {} detached override(s) to preserve destination aspect{}",
+            oriented_dimensions.width,
+            oriented_dimensions.height,
+            source_revision,
+            transformed_overrides,
+            if aspect_changed { " and refit Largest Fit" } else { "" }
+        )
+    } else {
+        format!(
+            "rebound SourceFrame to {}x{} at source revision {}; preserved {} detached override(s) in normalized source space{}",
+            oriented_dimensions.width,
+            oriented_dimensions.height,
+            source_revision,
+            document.source_overrides.len(),
+            if aspect_changed { " and refit Largest Fit" } else { "" }
+        )
+    };
+    Ok((next, diagnostic))
+}
+
+fn rebind_override_bounds(
+    bounds: NormalizedBounds,
+    destination_width: u32,
+    destination_height: u32,
+    source_dimensions: OrientedPixelSize,
+) -> Result<NormalizedBounds, StoreError> {
+    if destination_width == 0 || destination_height == 0 || source_dimensions.width == 0 || source_dimensions.height == 0 {
+        return Err(StoreError::Document("detached SourceFrame region has invalid dimensions".into()));
+    }
+    let target_aspect = (f64::from(destination_width) / f64::from(destination_height))
+        * f64::from(source_dimensions.height) / f64::from(source_dimensions.width);
+    let width = bounds.width.get().min(bounds.height.get() * target_aspect).max(0.001).min(1.0);
+    let height = (width / target_aspect).min(1.0);
+    let center_x = bounds.x.get() + bounds.width.get() * 0.5;
+    let center_y = bounds.y.get() + bounds.height.get() * 0.5;
+    let x = (center_x - width * 0.5).clamp(0.0, 1.0 - width);
+    let y = (center_y - height * 0.5).clamp(0.0, 1.0 - height);
+    Ok(NormalizedBounds {
+        x: NormalizedScalar::new(x).map_err(|_| StoreError::Document("detached override x is invalid".into()))?,
+        y: NormalizedScalar::new(y).map_err(|_| StoreError::Document("detached override y is invalid".into()))?,
+        width: NormalizedScalar::new(width).map_err(|_| StoreError::Document("detached override width is invalid".into()))?,
+        height: NormalizedScalar::new(height).map_err(|_| StoreError::Document("detached override height is invalid".into()))?,
+    })
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
@@ -3809,6 +4025,7 @@ mod algorithm_stage_01_tests {
     use uuid::Uuid;
 
     use super::{ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError};
+    use hot_trimmer_domain::TrimSheetDocumentCommand;
 
     fn input(label: u8, width: u32, height: u32, orientation: u16) -> SourceInput {
         let owned_bytes = vec![label, width as u8, height as u8, orientation as u8];
@@ -3990,6 +4207,60 @@ mod algorithm_stage_01_tests {
             Err(StoreError::ExternalSourceChanged { .. })
         ));
 
+        drop(store);
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn replacing_base_color_rebinds_existing_source_frame_without_changing_grid_rects() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-rebind-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("rebind.hottrimmer");
+        let mut store = ProjectStore::create(&path, "SourceFrame rebind").expect("create project");
+        let primary = Uuid::from_bytes(store.summary().expect("empty summary").source_sets[0].id.to_bytes());
+        store
+            .replace_source_in_set(primary, SourceChannel::BaseColor, &input(70, 8000, 4000, 1))
+            .expect("initial base color");
+        store.create_source_frame_document().expect("create source frame");
+        let before = store.summary().expect("before summary").document.expect("document");
+        let detached_region = before.topology.regions[0].id;
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::DetachSourceCell { region_id: detached_region })
+            .expect("detach one region before replacement");
+        let before = store.summary().expect("before summary after detach").document.expect("document");
+        assert!(before.source_overrides.contains_key(&detached_region));
+        let before_grid = before
+            .topology
+            .regions
+            .iter()
+            .map(|region| (region.id, region.grid_rect))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let before_revision = before.document_revision;
+
+        store
+            .replace_source_in_set(primary, SourceChannel::BaseColor, &input(71, 7952, 4016, 1))
+            .expect("replacement rebinds source frame");
+        let after = store.summary().expect("after summary").document.expect("document");
+        let frame = after.source_frame.expect("rebound source frame");
+        assert_eq!((frame.oriented_dimensions.width, frame.oriented_dimensions.height), (7952, 4016));
+        assert_eq!(frame.source_revision, 2);
+        assert_eq!(frame.identity, frame.compute_identity());
+        assert!(after.source_overrides.contains_key(&detached_region));
+        assert!(after.document_revision > before_revision);
+        assert_eq!(
+            after
+                .topology
+                .regions
+                .iter()
+                .map(|region| (region.id, region.grid_rect))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            before_grid,
+        );
+        let frame_width_px = frame.bounds.width.get() * 7952.0;
+        let frame_height_px = frame.bounds.height.get() * 4016.0;
+        assert!((frame_width_px - frame_height_px).abs() < 0.001);
+        assert!(frame.bounds.x.get() > 0.0);
+        assert_eq!(frame.bounds.y.get(), 0.0);
         drop(store);
         fs::remove_dir_all(root).expect("remove fixture directory");
     }

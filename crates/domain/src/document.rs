@@ -6,14 +6,14 @@ use thiserror::Error;
 
 use crate::{
     Channel, DecorationBinding, IdColor, LayerId, LayoutId, NormalizedBounds, NormalizedPoint,
-    NormalizedScalar, Patch, PatchId, PixelSize, RegionId, SourceBlend, SourceSamplingMode,
+    Patch, PatchId, PixelSize, RegionId, SourceBlend, SourceSamplingMode,
     SourceSetId, SourceWarp, StructuralProfile, TemplateDefinition, TemplateFitSemantics, TemplateRegistry,
     TemplateSlotRole,
     TemplateSnapshot,
+    GridRect, LogicalGridSpec, PartitionProvenance, PartitionRecipe, RegionSourceOverride, SourceFrame,
     layout::source_warp_is_valid,
     templates::{
-        CanonicalRect, RadialParameters, TemplateSourceAddressMode, TemplateSourceMapping,
-        TemplateSourceRect,
+        CanonicalRect, RadialParameters, TemplateSourceMapping,
     },
 };
 
@@ -97,6 +97,16 @@ pub enum Projection {
     Perspective {
         quad: [NormalizedPoint; 4],
     },
+}
+
+/// Whether a region's source crop was authored by the user or is still waiting
+/// for source placement. This is deliberately separate from template allocation
+/// coordinates; an unplaced region samples the complete prepared source domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCropIntent {
+    Unplaced,
+    Authored,
 }
 
 impl Default for Projection {
@@ -199,6 +209,11 @@ impl From<RadialParameters> for RadialMappingSettings {
 #[serde(rename_all = "camelCase")]
 pub struct RegionMapping {
     pub projection: Projection,
+    /// `None` is the legacy meaning: preserve the persisted projection as authored.
+    /// New fixed-template regions use `Some(Unplaced)` so template atlas rectangles
+    /// can never be interpreted as raw source-image crops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_crop_intent: Option<SourceCropIntent>,
     pub warps: Vec<WarpOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radial: Option<RadialMappingSettings>,
@@ -228,6 +243,7 @@ impl Default for RegionMapping {
     fn default() -> Self {
         Self {
             projection: Projection::default(),
+            source_crop_intent: None,
             warps: Vec::new(),
             radial: None,
             transform: MappingTransform::default(),
@@ -347,6 +363,8 @@ pub struct RegionDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radial_parameters: Option<RadialParameters>,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_rect: Option<GridRect>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -375,6 +393,7 @@ pub struct DocumentHash(pub [u8; 32]);
 #[serde(rename_all = "camelCase")]
 pub struct RegionTopologyHashInput {
     pub id: RegionId,
+    pub grid_rect: Option<GridRect>,
     pub id_color: IdColor,
     pub allocation_rect: CanonicalRect,
     pub hotspot_rect: CanonicalRect,
@@ -439,6 +458,7 @@ impl AcceptedTopology {
                 .iter()
                 .map(|region| RegionTopologyHashInput {
                     id: region.id,
+                    grid_rect: region.grid_rect,
                     id_color: region.id_color,
                     allocation_rect: region.allocation_rect,
                     hotspot_rect: region.hotspot_rect,
@@ -565,6 +585,8 @@ pub struct RegionAppearanceHashInput {
 #[serde(rename_all = "camelCase")]
 pub struct AppearanceHashInputs {
     pub topology_hash: DocumentHash,
+    pub source_frame: Option<SourceFrame>,
+    pub source_overrides: BTreeMap<RegionId, RegionSourceOverride>,
     pub materials: Vec<MaterialSourceSet>,
     pub patches: Vec<Patch>,
     pub procedural_materials: Vec<ProceduralMaterial>,
@@ -637,6 +659,14 @@ pub struct TrimSheetDocument {
     pub sheet_framing: SheetFraming,
     pub render_settings: RenderSettings,
     pub generator_provenance: Option<GeneratorProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame: Option<SourceFrame>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_overrides: BTreeMap<RegionId, RegionSourceOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_grid: Option<LogicalGridSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_provenance: Option<PartitionProvenance>,
 }
 
 impl TrimSheetDocument {
@@ -658,6 +688,8 @@ impl TrimSheetDocument {
         procedural_materials.sort_by_key(|material| material.id);
         AppearanceHashInputs {
             topology_hash: self.topology.topology_hash,
+            source_frame: self.source_frame.clone(),
+            source_overrides: self.source_overrides.clone(),
             materials,
             patches,
             procedural_materials,
@@ -700,6 +732,46 @@ impl TrimSheetDocument {
             || self.appearance_revision > self.document_revision
         {
             return Err(TrimSheetDocumentError::InvalidRevisions);
+        }
+        if let Some(frame) = &self.source_frame {
+            if frame.schema_version == 0
+                || frame.oriented_dimensions.width == 0
+                || frame.oriented_dimensions.height == 0
+                || frame.output_aspect.contains(&0)
+                || !valid_normalized_rect(frame.bounds)
+                || frame.identity != frame.compute_identity()
+            {
+                return Err(TrimSheetDocumentError::InvalidSourceFrame);
+            }
+            if !aspect_matches(
+                frame.bounds.width.get() * f64::from(frame.oriented_dimensions.width),
+                frame.bounds.height.get() * f64::from(frame.oriented_dimensions.height),
+                f64::from(frame.output_aspect[0]),
+                f64::from(frame.output_aspect[1]),
+            ) {
+                return Err(TrimSheetDocumentError::InvalidSourceFrameAspect);
+            }
+            for (region_id, value) in &self.source_overrides {
+                let Some(region) = self.topology.regions.iter().find(|region| region.id == *region_id) else {
+                    return Err(TrimSheetDocumentError::InvalidSourceOverride(*region_id));
+                };
+                if value.schema_version == 0
+                    || !valid_normalized_rect(value.source_bounds)
+                    || value.identity != value.compute_identity()
+                {
+                    return Err(TrimSheetDocumentError::InvalidSourceOverride(*region_id));
+                }
+                if !aspect_matches(
+                    value.source_bounds.width.get() * f64::from(frame.oriented_dimensions.width),
+                    value.source_bounds.height.get() * f64::from(frame.oriented_dimensions.height),
+                    f64::from(region.allocation_rect.width),
+                    f64::from(region.allocation_rect.height),
+                ) {
+                    return Err(TrimSheetDocumentError::InvalidSourceOverrideAspect(*region_id));
+                }
+            }
+        } else if let Some(region_id) = self.source_overrides.keys().next() {
+            return Err(TrimSheetDocumentError::InvalidSourceOverride(*region_id));
         }
         let canonical_size = self.topology.snapshot.canonical_size;
         let mut region_ids = BTreeSet::new();
@@ -924,6 +996,54 @@ impl TrimSheetDocument {
         Self::from_pinned_template(id, template, materials, patches, TopologyKind::StandardTemplate)
     }
 
+    /// Creates the primary source-frame document. The accepted partition is persisted up front;
+    /// compilation consumes it and never regenerates topology implicitly.
+    pub fn from_source_frame(
+        id: TrimSheetId,
+        source_frame: SourceFrame,
+        recipe: PartitionRecipe,
+        output_size: PixelSize,
+        materials: Vec<MaterialSourceSet>,
+        patches: Vec<Patch>,
+    ) -> Result<Self, TrimSheetDocumentError> {
+        let partitions = crate::generate_partition(&recipe)
+            .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+        let output_x = crate::resolve_boundaries(0, output_size.width, recipe.grid.width);
+        let output_y = crate::resolve_boundaries(0, output_size.height, recipe.grid.height);
+        let regions = partitions.iter().map(|partition| {
+            let rect = CanonicalRect {
+                x: output_x[partition.grid_rect.x as usize], y: output_y[partition.grid_rect.y as usize],
+                width: output_x[(partition.grid_rect.x + partition.grid_rect.width) as usize] - output_x[partition.grid_rect.x as usize],
+                height: output_y[(partition.grid_rect.y + partition.grid_rect.height) as usize] - output_y[partition.grid_rect.y as usize],
+            };
+            let orientation = if rect.width > rect.height { RegionOrientation::Horizontal }
+                else if rect.height > rect.width { RegionOrientation::Vertical } else { RegionOrientation::Unspecified };
+            RegionDefinition { id: partition.id, display_name: format!("Region {:03}", partition.grid_rect.y * recipe.grid.width + partition.grid_rect.x),
+                id_color: IdColor::for_region(partition.id), allocation_rect: rect, hotspot_rect: rect,
+                role: TemplateSlotRole::Planar, orientation,
+                uv_fit: UvFitPolicy { kind: UvFitKind::Rectangular, fit_axis: FitAxis::Automatic,
+                    keep_proportion: true, allowed_rotations: vec![QuarterTurn::Zero], mirror_allowed: false,
+                    world_size_meters: [f64::from(rect.width.max(1)), f64::from(rect.height.max(1))], classification_tags: vec!["SOURCE_FRAME".into()] },
+                structural_profile: StructuralProfile::Flat, material_group: "primary".into(),
+                weathering_group: "neutral".into(), radial_parameters: None, enabled: true,
+                grid_rect: Some(partition.grid_rect) }
+        }).collect::<Vec<_>>();
+        let topology = AcceptedTopology::new(TopologyKind::CustomAtlas,
+            TopologySnapshot { schema_version: TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, canonical_size: output_size, template: None },
+            format!("source-frame:{}", source_frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>()), regions)?;
+        let provenance = PartitionProvenance { schema_version: crate::PARTITION_RECIPE_SCHEMA_VERSION,
+            recipe: recipe.clone(), recipe_hash: recipe.hash(), accepted_region_ids: topology.regions.iter().map(|region| region.id).collect() };
+        let document = Self { id, document_revision: 1, topology_revision: 1, appearance_revision: 1, topology,
+            primary_material: materials.first().map(|material| material.id), materials, patches,
+            procedural_materials: Vec::new(), region_bindings: partitions.iter().map(|partition| (partition.id, RegionBinding {
+                region_id: partition.id, content: ContentReference::InheritPrimaryMaterial, mapping: RegionMapping::default(),
+                variation: VariationSettings::default(), blend: BlendPolicy::default() })).collect(), decorations: Vec::new(), treatments: Vec::new(),
+            sheet_framing: SheetFraming::default(), render_settings: RenderSettings { output_size, ..RenderSettings::default() },
+            generator_provenance: None, source_frame: Some(source_frame), source_overrides: BTreeMap::new(), logical_grid: Some(recipe.grid), partition_provenance: Some(provenance) };
+        document.validate()?;
+        Ok(document)
+    }
+
     fn from_pinned_template(
         id: TrimSheetId,
         template: &TemplateDefinition,
@@ -990,6 +1110,10 @@ impl TrimSheetDocument {
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
+            source_overrides: BTreeMap::new(),
+            source_frame: None,
+            logical_grid: None,
+            partition_provenance: None,
         };
         document.validate()?;
         Ok(document)
@@ -1028,11 +1152,46 @@ impl TrimSheetDocument {
                 region_id,
                 projection,
             } => {
+                if next.source_frame.is_some() {
+                    if !next.source_overrides.contains_key(region_id) {
+                        return Err(TrimSheetDocumentError::SourceCellMustBeDetached(*region_id));
+                    }
+                    let Projection::Crop { bounds, .. } = projection else {
+                        return Err(TrimSheetDocumentError::InvalidSourceGeometry(*region_id));
+                    };
+                    next.source_overrides.insert(*region_id, RegionSourceOverride::new(*bounds));
+                }
                 next.region_bindings
                     .get_mut(region_id)
                     .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
                     .mapping
                     .projection = projection.clone();
+                next.region_bindings
+                    .get_mut(region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
+                    .mapping
+                    .source_crop_intent = Some(SourceCropIntent::Authored);
+            }
+            TrimSheetDocumentCommand::SetSourceFrame { bounds } => {
+                let frame = next.source_frame.as_ref().ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+                next.source_frame = Some(frame.with_bounds(*bounds));
+            }
+            TrimSheetDocumentCommand::DetachSourceCell { region_id } => {
+                let frame = next.source_frame.as_ref().ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+                let grid = next.logical_grid.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+                let region = next.topology.regions.iter().find(|region| region.id == *region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
+                let rect = region.grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+                let bounds = source_frame_region_bounds(frame, grid, rect);
+                next.source_overrides.insert(*region_id, RegionSourceOverride::new(bounds));
+                let binding = next.region_bindings.get_mut(region_id).ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
+                binding.mapping.projection = Projection::Crop { bounds, focus: NormalizedPoint::new(bounds.x.get() + bounds.width.get() * 0.5, bounds.y.get() + bounds.height.get() * 0.5).expect("override focus") };
+                binding.mapping.source_crop_intent = Some(SourceCropIntent::Authored);
+            }
+            TrimSheetDocumentCommand::ResetSourceCell { region_id } => {
+                next.source_overrides.remove(region_id);
+                let binding = next.region_bindings.get_mut(region_id).ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
+                binding.mapping = RegionMapping::default();
             }
             TrimSheetDocumentCommand::SetRegionRadial { region_id, radial } => {
                 let region = next.topology.regions.iter().find(|region| region.id == *region_id)
@@ -1122,47 +1281,24 @@ fn regions_from_template(
                 weathering_group: slot.variation_group.clone(),
                 radial_parameters: slot.radial_parameters,
                 enabled: true,
+                grid_rect: None,
             })
         })
         .collect()
 }
 
-fn template_region_mapping(mapping: TemplateSourceMapping) -> RegionMapping {
+fn template_region_mapping(_mapping: TemplateSourceMapping) -> RegionMapping {
     RegionMapping {
-        projection: Projection::Crop {
-            bounds: normalized_bounds(mapping.crop),
-            focus: NormalizedPoint::new(
-                canonical_decimal(mapping.crop.x + mapping.crop.width * 0.5),
-                canonical_decimal(mapping.crop.y + mapping.crop.height * 0.5),
-            )
-            .expect("template crop focus is normalized"),
-        },
+        // The manifest's sourceMapping was authored for the fixed atlas layout,
+        // not for an arbitrary imported photograph. Start from the complete
+        // source and retain the explicit unplaced state until the user crops it.
+        projection: Projection::default(),
+        source_crop_intent: Some(SourceCropIntent::Unplaced),
         warps: Vec::new(),
         radial: None,
         transform: MappingTransform::default(),
-        address_mode: template_address_mode(mapping.address_mode),
+        address_mode: AddressMode::Clamp,
         sampling: SamplingPolicy::default(),
-    }
-}
-
-fn canonical_decimal(value: f64) -> f64 {
-    (value * 1_000_000_000.0).round() / 1_000_000_000.0
-}
-
-fn template_address_mode(mode: TemplateSourceAddressMode) -> AddressMode {
-    match mode {
-        TemplateSourceAddressMode::Clamp => AddressMode::Clamp,
-        TemplateSourceAddressMode::Repeat => AddressMode::Repeat,
-        TemplateSourceAddressMode::MirroredRepeat => AddressMode::MirroredRepeat,
-    }
-}
-
-fn normalized_bounds(rect: TemplateSourceRect) -> NormalizedBounds {
-    NormalizedBounds {
-        x: NormalizedScalar::new(rect.x).expect("template crop x is normalized"),
-        y: NormalizedScalar::new(rect.y).expect("template crop y is normalized"),
-        width: NormalizedScalar::new(rect.width).expect("template crop width is normalized"),
-        height: NormalizedScalar::new(rect.height).expect("template crop height is normalized"),
     }
 }
 
@@ -1193,6 +1329,15 @@ pub enum TrimSheetDocumentCommand {
     },
     SetOutputResolution {
         output_size: PixelSize,
+    },
+    SetSourceFrame {
+        bounds: NormalizedBounds,
+    },
+    DetachSourceCell {
+        region_id: RegionId,
+    },
+    ResetSourceCell {
+        region_id: RegionId,
     },
 }
 
@@ -1381,6 +1526,52 @@ fn validate_mapping(
     Ok(())
 }
 
+fn valid_normalized_rect(bounds: NormalizedBounds) -> bool {
+    bounds.x.get().is_finite()
+        && bounds.y.get().is_finite()
+        && bounds.width.get().is_finite()
+        && bounds.height.get().is_finite()
+        && bounds.width.get() > 0.0
+        && bounds.height.get() > 0.0
+        && bounds.x.get() >= 0.0
+        && bounds.y.get() >= 0.0
+        && bounds.x.get() + bounds.width.get() <= 1.0 + f64::EPSILON
+        && bounds.y.get() + bounds.height.get() <= 1.0 + f64::EPSILON
+}
+
+fn aspect_matches(width: f64, height: f64, expected_width: f64, expected_height: f64) -> bool {
+    if !width.is_finite() || !height.is_finite() || !expected_width.is_finite() || !expected_height.is_finite()
+        || width <= 0.0 || height <= 0.0 || expected_width <= 0.0 || expected_height <= 0.0 {
+        return false;
+    }
+    let left = width * expected_height;
+    let right = height * expected_width;
+    (left - right).abs() <= 1e-9 * left.abs().max(right.abs()).max(1.0)
+}
+
+fn source_frame_region_bounds(frame: &SourceFrame, grid: LogicalGridSpec, rect: GridRect) -> NormalizedBounds {
+    let source_x = crate::resolve_boundaries(
+        (frame.bounds.x.get() * f64::from(frame.oriented_dimensions.width)).round() as u32,
+        (frame.bounds.width.get() * f64::from(frame.oriented_dimensions.width)).round() as u32,
+        grid.width,
+    );
+    let source_y = crate::resolve_boundaries(
+        (frame.bounds.y.get() * f64::from(frame.oriented_dimensions.height)).round() as u32,
+        (frame.bounds.height.get() * f64::from(frame.oriented_dimensions.height)).round() as u32,
+        grid.height,
+    );
+    let x = f64::from(source_x[rect.x as usize]) / f64::from(frame.oriented_dimensions.width);
+    let y = f64::from(source_y[rect.y as usize]) / f64::from(frame.oriented_dimensions.height);
+    let right = f64::from(source_x[(rect.x + rect.width) as usize]) / f64::from(frame.oriented_dimensions.width);
+    let bottom = f64::from(source_y[(rect.y + rect.height) as usize]) / f64::from(frame.oriented_dimensions.height);
+    NormalizedBounds {
+        x: crate::NormalizedScalar::new(x).expect("resolved source x"),
+        y: crate::NormalizedScalar::new(y).expect("resolved source y"),
+        width: crate::NormalizedScalar::new(right - x).expect("resolved source width"),
+        height: crate::NormalizedScalar::new(bottom - y).expect("resolved source height"),
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TrimSheetDocumentError {
     #[error("canonical topology size or schema version is invalid")]
@@ -1446,6 +1637,8 @@ pub enum TrimSheetDocumentError {
     MissingSolidContent(RegionId),
     #[error("region source geometry is empty, out of bounds, or singular: {0}")]
     InvalidSourceGeometry(RegionId),
+    #[error("source-frame region must be detached before editing: {0}")]
+    SourceCellMustBeDetached(RegionId),
     #[error("region radial mapping is invalid or unsupported for this region: {0}")]
     InvalidRadialMapping(RegionId),
     #[error("region mapping contains a non-finite or out-of-range numeric value: {0}")]
@@ -1471,6 +1664,14 @@ pub enum TrimSheetDocumentError {
     InvalidRenderSettings,
     #[error("generator provenance is invalid")]
     InvalidGeneratorProvenance,
+    #[error("source frame is invalid")]
+    InvalidSourceFrame,
+    #[error("source frame bounds do not preserve its output aspect")]
+    InvalidSourceFrameAspect,
+    #[error("region source override is invalid: {0}")]
+    InvalidSourceOverride(RegionId),
+    #[error("region source override does not preserve its destination aspect: {0}")]
+    InvalidSourceOverrideAspect(RegionId),
     #[error("deterministic hash serialization failed")]
     HashSerialization,
     #[error("the accepted template snapshot is invalid")]
@@ -1485,7 +1686,7 @@ pub enum TrimSheetDocumentError {
 mod tests {
     use super::*;
     use crate::{
-        PatchGeometry, PatchProperties, RectificationSettings, SourceId, TemplateRegistry,
+        NormalizedScalar, PatchGeometry, PatchProperties, RectificationSettings, SourceId, TemplateRegistry,
         WeightedTemplateGrammar, compile_weighted_grammar,
     };
 
@@ -1549,6 +1750,7 @@ mod tests {
             weathering_group: "neutral".into(),
             radial_parameters: None,
             enabled: true,
+            grid_rect: None,
         }
     }
 
@@ -1594,6 +1796,10 @@ mod tests {
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
+            source_frame: None,
+            source_overrides: BTreeMap::new(),
+            logical_grid: None,
+            partition_provenance: None,
         }
     }
 
@@ -1796,6 +2002,58 @@ mod tests {
                 index: 0
             })
         );
+    }
+
+    #[test]
+    fn source_frame_validation_rejects_stretching_for_frame_and_detached_crop() {
+        let source_set_id = SourceSetId::from_bytes([7; 16]);
+        let frame = SourceFrame::centered_largest(
+            source_set_id,
+            crate::OrientedPixelSize { width: 8_000, height: 4_000 },
+            [1, 1],
+            1,
+        );
+        let recipe = PartitionRecipe::default_for(
+            LogicalGridSpec { schema_version: 1, width: 1, height: 1 },
+            1,
+            5,
+        );
+        let output_size = PixelSize { width: 100, height: 100 };
+        let invalid_frame = frame.with_bounds(NormalizedBounds {
+            x: NormalizedScalar::new(0.1).expect("x"),
+            y: NormalizedScalar::new(0.1).expect("y"),
+            width: NormalizedScalar::new(0.4).expect("width"),
+            height: NormalizedScalar::new(0.4).expect("height"),
+        });
+        assert!(matches!(
+            TrimSheetDocument::from_source_frame(
+                LayoutId::from_bytes([8; 16]), invalid_frame, recipe.clone(), output_size,
+                vec![material(source_set_id)], vec![],
+            ),
+            Err(TrimSheetDocumentError::InvalidSourceFrameAspect)
+        ));
+
+        let document = TrimSheetDocument::from_source_frame(
+            LayoutId::from_bytes([8; 16]), frame, recipe, output_size,
+            vec![material(source_set_id)], vec![],
+        ).expect("valid source-frame document");
+        let region_id = document.topology.regions[0].id;
+        let detached = document.apply_command(&TrimSheetDocumentCommand::DetachSourceCell { region_id })
+            .expect("valid square detached crop");
+        let invalid_crop = NormalizedBounds {
+            x: NormalizedScalar::new(0.1).expect("x"),
+            y: NormalizedScalar::new(0.1).expect("y"),
+            width: NormalizedScalar::new(0.2).expect("width"),
+            height: NormalizedScalar::new(0.1).expect("height"),
+        };
+        let projection = Projection::Crop {
+            bounds: invalid_crop,
+            focus: NormalizedPoint::new(0.2, 0.15).expect("focus"),
+        };
+        assert!(matches!(
+            detached.apply_command(&TrimSheetDocumentCommand::SetRegionProjection { region_id, projection }),
+            Err(TrimSheetDocumentError::InvalidSourceOverrideAspect(id)) if id == region_id
+        ));
     }
 
     #[test]

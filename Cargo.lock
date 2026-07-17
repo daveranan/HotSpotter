@@ -1692,9 +1692,11 @@ dependencies = [
  "hot-trimmer-placement-solver",
  "hot-trimmer-project-store",
  "hot-trimmer-render-core",
+ "image",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]

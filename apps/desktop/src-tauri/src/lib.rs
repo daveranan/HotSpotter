@@ -85,6 +85,8 @@ pub fn run() {
             commands::apply_material_calibration_command,
             commands::rename_project,
             commands::create_trim_sheet_document,
+            commands::create_source_frame_document,
+            commands::regenerate_source_frame_partition,
             commands::apply_document_command,
             commands::apply_patch_command,
             commands::prepare_patch_preview,

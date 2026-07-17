@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+  <title>Source-frame partition golden: 63 regions</title>
+  <desc>Numbered source frame and reconstructed atlas share the same deterministic partition boundaries.</desc>
+  <rect width="1200" height="620" fill="#10151b"/>
+  <g font-family="system-ui, sans-serif" fill="#e9f0f7">
+    <text x="40" y="42" font-size="24" font-weight="700">SOURCE FRAME / 63-REGION DIRECT PARTITION</text>
+    <text x="40" y="70" font-size="14" fill="#9fb3c8">64 × 64 logical grid · centered square frame · shared boundary tables · zero padding</text>
+    <text x="40" y="105" font-size="16">8000 × 4000 numbered source</text>
+    <text x="650" y="105" font-size="16">Reconstructed Base Color atlas</text>
+  </g>
+  <g transform="translate(40 125)">
+    <rect width="520" height="420" fill="#1d6f8f" stroke="#f6c453" stroke-width="4"/>
+    <rect x="130" width="260" height="420" fill="#b85c38" opacity=".92"/>
+    <path d="M0 70h520M0 140h520M0 210h520M0 280h520M0 350h520M65 0v420M195 0v420M325 0v420M455 0v420" stroke="#8ee3ef" stroke-opacity=".34"/>
+    <g fill="none" stroke="#fff3c4" stroke-width="2"><path d="M0 210h520M130 0v210M260 210v210M390 0v210M455 210v210"/><path d="M65 70h130M325 70h130M0 350h130M390 350h130"/></g>
+    <g fill="#fff3c4" font-size="12" font-family="monospace"><text x="8" y="18">R00</text><text x="138" y="18">R01</text><text x="268" y="18">R02</text><text x="398" y="18">R03</text><text x="8" y="88">R16</text><text x="138" y="88">R17</text><text x="268" y="88">R18</text><text x="398" y="88">R19</text><text x="8" y="228">R32</text><text x="268" y="228">R33</text><text x="398" y="228">R34</text><text x="8" y="368">R48</text><text x="138" y="368">R49</text><text x="268" y="368">R50</text><text x="398" y="368">R51</text></g>
+  </g>
+  <g transform="translate(650 125)">
+    <rect width="420" height="420" fill="#1d6f8f" stroke="#f6c453" stroke-width="4"/>
+    <rect x="105" width="210" height="420" fill="#b85c38" opacity=".92"/>
+    <path d="M0 70h420M0 140h420M0 210h420M0 280h420M0 350h420M52.5 0v420M157.5 0v420M262.5 0v420M367.5 0v420" stroke="#8ee3ef" stroke-opacity=".34"/>
+    <g fill="none" stroke="#fff3c4" stroke-width="2"><path d="M0 210h420M105 0v210M210 210v210M315 0v210M367.5 210v210"/><path d="M52.5 70h105M262.5 70h105M0 350h105M315 350h105"/></g>
+    <g fill="#fff3c4" font-size="12" font-family="monospace"><text x="8" y="18">R00</text><text x="113" y="18">R01</text><text x="218" y="18">R02</text><text x="323" y="18">R03</text><text x="8" y="228">R32</text><text x="218" y="228">R33</text><text x="323" y="228">R34</text><text x="8" y="368">R48</text><text x="113" y="368">R49</text><text x="218" y="368">R50</text><text x="323" y="368">R51</text></g>
+  </g>
+</svg>

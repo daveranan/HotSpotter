@@ -376,6 +376,11 @@ fn positions(dw:u32, dh:u32, w:u32, h:u32, e:&CandidateEvidence, s:&CandidateSet
 
 fn direct_families<S: SlotDemandView>(slot:&S, mode:SamplingMode)->Vec<CandidateFamily>{match mode{
     SamplingMode::DirectCrop if slot.role()==TemplateSlotRole::Planar=>vec![CandidateFamily::PanelDirect],
+    SamplingMode::DirectCrop if slot.role()==TemplateSlotRole::RepeatingStrip && slot.orientation()==RegionOrientation::Vertical
+        =>vec![CandidateFamily::RepeatYSegment],
+    SamplingMode::DirectCrop if slot.role()==TemplateSlotRole::RepeatingStrip
+        =>vec![CandidateFamily::RepeatXSegment],
+    SamplingMode::DirectCrop if slot.role()==TemplateSlotRole::TrimCap=>vec![CandidateFamily::ThreeSliceCap],
     SamplingMode::PeriodicTile if slot.role()==TemplateSlotRole::Planar=>vec![CandidateFamily::PanelSeamlessTile],
     SamplingMode::RepeatX=>vec![CandidateFamily::RepeatXSegment,CandidateFamily::RepeatXContiguous,CandidateFamily::RepeatXGraphCut],
     SamplingMode::RepeatY=>vec![CandidateFamily::RepeatYSegment,CandidateFamily::RepeatYContiguous,CandidateFamily::RepeatYGraphCut],
@@ -391,6 +396,7 @@ fn aligned_period(c:SourceCrop,e:&CandidateEvidence,mode:SamplingMode)->Option<[
 fn route_and_cross_axis<S:SlotDemandView>(mode:SamplingMode,o:RegionOrientation,_c:SourceCrop,_slot:&S)->(CandidateRoute,Option<bool>){match mode{
     SamplingMode::RepeatX=>(CandidateRoute::Repeat,Some(o!=RegionOrientation::Vertical)),
     SamplingMode::RepeatY=>(CandidateRoute::Repeat,Some(o==RegionOrientation::Vertical)),
+    SamplingMode::DirectCrop if _slot.role()==TemplateSlotRole::RepeatingStrip => (CandidateRoute::Direct, Some(true)),
     SamplingMode::UniqueContain|SamplingMode::UniqueCover=>(CandidateRoute::Unique,None),SamplingMode::ThreeSliceCap|SamplingMode::NineSlicePanel=>(CandidateRoute::Cap,None),
     SamplingMode::PlanarRadial=>(CandidateRoute::PlanarRadial,None),_=>(CandidateRoute::Direct,None)}}
 

@@ -18,6 +18,11 @@ pub struct ReusePermissions {
     pub stochastic_overlap: bool,
     pub manufactured_periodic_reuse: bool,
     pub repeated_salient_feature: bool,
+    /// Fixed-template unplaced slots must not silently select the same source
+    /// rectangle. Periodic strip reuse remains legal when explicitly identified
+    /// by the candidate's period metadata.
+    #[serde(default)]
+    pub require_spatially_distinct_crops: bool,
 }
 
 impl Default for ReusePermissions {
@@ -26,6 +31,7 @@ impl Default for ReusePermissions {
             stochastic_overlap: true,
             manufactured_periodic_reuse: true,
             repeated_salient_feature: false,
+            require_spatially_distinct_crops: false,
         }
     }
 }
@@ -558,10 +564,18 @@ fn evaluate_pair(
     let periodic_permitted = periodic
         && first_slot.reuse_permissions.manufactured_periodic_reuse
         && second_slot.reuse_permissions.manufactured_periodic_reuse;
+    let identical_crop_reuse_penalized = same_coordinate_domain
+        && !periodic_permitted
+        && (first_slot.reuse_permissions.require_spatially_distinct_crops
+            || second_slot.reuse_permissions.require_spatially_distinct_crops)
+        && first.crop.is_some()
+        && first.crop == second.crop;
     let accepted = !salient_duplicate || salient_reuse_permitted || periodic_permitted;
 
     let overlap_multiplier = if periodic_permitted {
         0.0
+    } else if identical_crop_reuse_penalized {
+        6.0
     } else if stochastic {
         0.18
     } else if unique_behavior {

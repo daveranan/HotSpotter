@@ -6,7 +6,7 @@ use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, ContentDigest, DiagnosticCode, QuarterTurn,
     RecoveryChoice, SamplingMode, SourceSamplingMode, StageResult,
 };
-use hot_trimmer_image_io::{CategoryId, ImagePlane, LinearColor, LinearScalar, MaskValue, TangentNormal};
+use hot_trimmer_image_io::{ImagePlane, LinearColor, LinearScalar, MaskValue, TangentNormal};
 use hot_trimmer_material_synthesis::{DomainRoute, PreparedMaterialDomain, SeamAxis};
 use hot_trimmer_placement_solver::{
     MirrorTransform, SamplingPlan, SliceCenterPolicy, SliceGeometry, SourceCrop,
@@ -177,6 +177,12 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
         || (p.candidate.mapping_mode != SamplingMode::ExplicitStretch && !p.candidate.eligibility.isotropic_scale) {
         return Err(SlotSynthesisError::InvalidPlan);
     }
+    // Stage 14 has no registered TextureSynthesis executor. Reject it instead
+    // of allowing the generic physical branch to become centered full-source
+    // sampling, and require every executable plan to carry its selected crop.
+    if p.candidate.mapping_mode == SamplingMode::TextureSynthesis || p.candidate.crop.is_none() {
+        return Err(SlotSynthesisError::InvalidPlan);
+    }
     if p.candidate.mapping_mode == SamplingMode::ExplicitStretch
         && !matches!(p.stretch_override, StretchOverrideProvenance::UserOverride { .. }) {
         return Err(SlotSynthesisError::MissingExplicitStretchOverride);
@@ -290,7 +296,7 @@ fn validate_synthesized_center(r: &SlotSynthesisRequest<'_>, c: SourceCrop) -> R
 }
 
 fn crop(r: &SlotSynthesisRequest<'_>) -> SourceCrop {
-    r.plan.candidate.crop.unwrap_or(SourceCrop { x: 0, y: 0, width: r.domain.width, height: r.domain.height })
+    r.plan.candidate.crop.expect("validated Stage 14 plan must carry a source crop")
 }
 
 fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
@@ -495,7 +501,7 @@ mod tests {
     use hot_trimmer_domain::{
         MaterialChannelRole, NormalConvention, RegionId, SamplingPolicy, TemplateSlotRole,
     };
-    use hot_trimmer_image_io::{NormalAlphaPolicy, ResolvedAlphaMode};
+    use hot_trimmer_image_io::{CategoryId, NormalAlphaPolicy, ResolvedAlphaMode};
     use hot_trimmer_material_synthesis::{PreparedMaterialDomain, SelectedSeam};
     use hot_trimmer_placement_solver::{
         CandidateDescriptors, CandidateFamily, CandidateRoute, CandidateTransform, CropCandidate,
@@ -565,9 +571,28 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_stage_14_slot_synthesis_acceptance() {
+    fn numbered_grid_crop_coordinates_are_preserved_through_stage_14() {
+        let (domain, domain_id, source_id) = fixture();
+        let mut selected = plan(SamplingMode::DirectCrop, domain_id, source_id);
+        selected.candidate.crop = Some(SourceCrop { x: 2, y: 1, width: 4, height: 4 });
+        selected.slot_physical_size = [1.0, 1.0];
+        selected.source_pixels_per_physical_unit = 4.0;
+        let output = synthesize_slot_material(SlotSynthesisRequest {
+            plan: &selected, domain: &domain, output_dimensions: [4, 4], limits: SlotSynthesisLimits::default(),
+        }, &RenderCancellationToken::new()).unwrap();
+        assert_eq!(*output.correspondence.pixel(0, 0), [2.5, 1.5]);
+        assert_eq!(*output.correspondence.pixel(3, 3), [5.5, 4.5]);
+        let PreparedExemplarChannel::MaterialId { plane } = &output.channels[3] else { panic!() };
+        assert_eq!(plane.pixel(0, 0).0, 10);
+        assert_eq!(plane.pixel(3, 3).0, 37);
+        assert!(output.correspondence.to_row_major().iter().all(|point|
+            point[0] >= 2.5 && point[0] <= 5.5 && point[1] >= 1.5 && point[1] <= 4.5));
+    }
+
+    #[test]
+    fn truthful_base_color_stage_14_registered_channels() {
         let modes=[SamplingMode::DirectCrop,SamplingMode::PeriodicTile,SamplingMode::RepeatX,SamplingMode::RepeatY,
-            SamplingMode::TextureSynthesis,SamplingMode::UniqueContain,SamplingMode::UniqueCover,SamplingMode::ThreeSliceCap,
+            SamplingMode::UniqueContain,SamplingMode::UniqueCover,SamplingMode::ThreeSliceCap,
             SamplingMode::NineSlicePanel,SamplingMode::PlanarRadial,SamplingMode::PolarRadial,SamplingMode::ExplicitStretch];
         for mode in modes { let output=execute(mode); let (color,scalar,id)=channels(&output);
             for y in 0..output.height { for x in 0..output.width { if output.validity.pixel(x,y).0>=0.5 {
@@ -652,6 +677,11 @@ mod tests {
         assert_eq!(error,SlotSynthesisError::MissingExplicitStretchOverride);
         let StageResult::FailedWithRecovery{recovery_choices,..}=error.stage_result() else {panic!()};
         assert!(!recovery_choices.contains(&RecoveryChoice::ExplicitStretch));
+
+        // Unsupported synthesis cannot silently use the generic centered branch.
+        let (domain,d,s)=fixture(); let texture=plan(SamplingMode::TextureSynthesis,d,s);
+        assert_eq!(synthesize_slot_material(SlotSynthesisRequest{plan:&texture,domain:&domain,output_dimensions:[8,8],
+            limits:SlotSynthesisLimits::default()},&RenderCancellationToken::new()).unwrap_err(),SlotSynthesisError::InvalidPlan);
 
         // SamplingPolicy changes the raster correspondence and filter, proving it is authoritative.
         let (domain,d,s)=fixture(); let mut scaled=plan(SamplingMode::DirectCrop,d,s); scaled.sampling_policy.scale=0.5;

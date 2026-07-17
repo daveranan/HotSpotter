@@ -11,4 +11,5 @@ Thumbs.db
 
 /apps/desktop/dist/
 /apps/desktop/src-tauri/gen/
+/.vite-cache/
 /graphify-out/

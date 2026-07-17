@@ -7,6 +7,7 @@ mod layout;
 mod material_source;
 mod patch;
 mod protocol;
+mod source_frame;
 mod templates;
 mod units;
 
@@ -17,6 +18,7 @@ pub use document::{
     GeneratorProvenance, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, ProceduralMaterial, Projection, QuarterTurn,
     RadialMappingSettings, RegionAppearanceHashInput, RegionBinding, RegionDefinition, RegionMapping, RegionOrientation,
+    SourceCropIntent,
     RegionTopologyHashInput, RenderSettings, SamplingPolicy, SheetFraming, SolidChannelValues,
     TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, TopologyHashInputs, TopologyKind, TopologySnapshot,
     TreatmentLayer, TreatmentParameter, TrimSheetChange, TrimSheetDocument,
@@ -53,6 +55,12 @@ pub use patch::{
     PatchProperties, PatchSet, RectificationSettings, RepeatMode,
 };
 pub use protocol::{FoundationStatusRequest, IPC_PROTOCOL_VERSION};
+pub use source_frame::{
+    generate_partition, region_id as source_frame_region_id, resolve_boundaries, GridRect,
+    LogicalGridSpec, PartitionError, PartitionProvenance, PartitionRecipe, PartitionRegion,
+    MappingOrigin, RegionSourceOverride, SourceFrame, LOGICAL_GRID_SCHEMA_VERSION, MAX_LOGICAL_GRID_EDGE,
+    MAX_PARTITION_REGIONS, PARTITION_RECIPE_SCHEMA_VERSION, SOURCE_FRAME_SCHEMA_VERSION,
+};
 pub use templates::{
     CANONICAL_TEMPLATE_EDGE, CanonicalRect, CompiledTemplateSlot, CompiledTemplateTopology,
     RadialParameters, StructuralProfile, TemplateCompatibilityDiagnostic, TemplateDefinition,

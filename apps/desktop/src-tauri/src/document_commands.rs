@@ -328,6 +328,13 @@ pub struct CreateDocumentRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SourceFramePartitionRequest {
+    protocol_version: u16,
+    target_region_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DocumentCommandRequest {
     protocol_version: u16,
     command: TrimSheetDocumentCommand,
@@ -458,6 +465,14 @@ pub struct PreviewSheetProjection {
 pub struct Stage14PreviewRequest {
     protocol_version: u16,
     revision: u64,
+    #[serde(default)]
+    region_id: Option<RegionId>,
+    #[serde(default)]
+    transient_projection: Option<Projection>,
+    #[serde(default)]
+    draft_id: Option<u64>,
+    #[serde(default)]
+    input_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -469,6 +484,9 @@ pub struct Stage14SlotProjection {
     allocation_bounds: hot_trimmer_domain::CanonicalRect,
     hotspot_bounds: hot_trimmer_domain::CanonicalRect,
     mapping_mode: String,
+    source_transform: hot_trimmer_placement_solver::CandidateTransform,
+    isotropic_scale: f64,
+    sampling_scale: f64,
     validity: String,
     correspondence: String,
     source_id: String,
@@ -478,6 +496,9 @@ pub struct Stage14SlotProjection {
     sampling_plan_id: String,
     stage_14_result_id: String,
     source_crop: Option<hot_trimmer_placement_solver::SourceCrop>,
+    source_bounds: Option<hot_trimmer_domain::NormalizedBounds>,
+    mapping_origin: Option<hot_trimmer_domain::MappingOrigin>,
+    grid_rect: Option<hot_trimmer_domain::GridRect>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -503,6 +524,7 @@ pub struct IntermediateAtlasProjection {
     final_compile_available: bool,
     export_available: bool,
     blender_available: bool,
+    source_frame: Option<hot_trimmer_domain::SourceFrame>,
 }
 
 #[tauri::command]
@@ -724,6 +746,32 @@ pub fn create_trim_sheet_document(
         .ok_or_else(no_project)?
         .create_trim_sheet_document(&request.template_id, &request.template_version)
         .map_err(store_error)?;
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn create_source_frame_document(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session.store.as_mut().ok_or_else(no_project)?
+        .create_source_frame_document().map_err(store_error)?;
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn regenerate_source_frame_partition(
+    request: SourceFramePartitionRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session.store.as_mut().ok_or_else(no_project)?
+        .regenerate_source_frame_partition(request.target_region_count).map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
 }
@@ -1008,7 +1056,7 @@ pub async fn preview_through_stage_14(
     let session = Arc::clone(session.inner());
     let preview_service = Arc::clone(preview_service.inner());
     let job = preview_service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-    tauri::async_runtime::spawn_blocking(move || build_stage_14_preview(&session, &preview_service, request.revision, job))
+    tauri::async_runtime::spawn_blocking(move || build_stage_14_preview(&session, &preview_service, request, job))
         .await.map_err(|join| error(ErrorCode::Internal, &format!("Stage 14 preview worker failed: {join}")))?
 }
 
@@ -1152,8 +1200,8 @@ fn removed_preview_specific_fabrication(
     let patch_id = summary.patches.iter().find(|patch| summary.sources.iter().any(|source| source.input.id == patch.source_id
         && source.source_set_id.to_string() == primary.to_string())).map(|patch| patch.id.to_string());
     let slot_inputs = topology.slots.iter().zip(document.topology.regions.iter()).zip(plans.iter().zip(results.iter()))
-        .map(|((slot, region), (plan, result))| IntermediateSlotInput { slot_key: slot.slot_key.as_str(),
-            display_name: region.display_name.as_str(), required: true, patch_id: patch_id.as_deref(), domain: &domain, plan, result }).collect();
+        .map(|((slot, region), (plan, result))| IntermediateSlotInput { region_id: region.id, slot_key: slot.slot_key.as_str(),
+            display_name: region.display_name.as_str(), required: true, patch_id: patch_id.as_deref(), domain: &domain, plan, result, grid_rect: region.grid_rect }).collect();
     let algorithms = (1..=14).map(|stage| (stage, AlgorithmProvenance { algorithm_id: format!("installed-stage-{stage:02}"),
         version: if stage == 14 { hot_trimmer_sheet_compiler::STAGE_14_ALGORITHM_VERSION.into() } else { "installed".into() } })).collect();
     let atlas_request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement, slots: slot_inputs,
@@ -1167,13 +1215,15 @@ fn removed_preview_specific_fabrication(
         maps.insert(channel_key(channel.role).into(), png_data_url(topology.output_size.width,
             topology.output_size.height, channel.rgba8.clone())?);
     }
-    let slots = artifact.slots.iter().zip(&resolved.regions).map(|(slot, region)| Stage14SlotProjection { region_id: region.region_id,
+    let slots = artifact.slots.iter().filter_map(|slot| resolved.regions.iter().find(|region| region.region_id == slot.region_id).map(|region| Stage14SlotProjection { region_id: region.region_id,
         slot_key: slot.slot_key.clone(),
         display_name: slot.display_name.clone(), allocation_bounds: slot.allocation, hotspot_bounds: slot.hotspot,
-        mapping_mode: format!("{:?}", slot.mapping_mode), validity: format!("{} valid pixels", slot.valid_pixel_count),
+        mapping_mode: format!("{:?}", slot.mapping_mode), source_transform: slot.source_transform,
+        isotropic_scale: slot.isotropic_scale, sampling_scale: slot.sampling_scale,
+        validity: format!("{} valid pixels", slot.valid_pixel_count),
         correspondence: "authoritative Stage 14 correspondence".into(), source_id: slot.source_id.0.clone(), patch_id: slot.patch_id.clone(),
         domain_id: slot.domain_id.0.clone(), candidate_id: slot.candidate_id.0.clone(), sampling_plan_id: slot.sampling_plan_id.0.clone(),
-        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop }).collect();
+        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.source_bounds, mapping_origin: region.mapping_origin, grid_rect: slot.grid_rect })).collect();
     Ok(IntermediateAtlasProjection { label: artifact.label, non_exportable: true, incomplete_after_stage: 14,
         revision: artifact.revision, document_revision: artifact.revision,
         topology_hash: hash_hex(document.topology.topology_hash),
@@ -1182,7 +1232,8 @@ fn removed_preview_specific_fabrication(
         topology: artifact.topology, placement_plan_id: artifact.placement_plan_id.0, maps,
         regions: resolved.regions,
         unavailable_channels: artifact.unavailable_channels.iter().map(|role| format!("{role:?}")).collect(),
-        slots, pending: artifact.pending, final_compile_available: false, export_available: false, blender_available: false })
+        slots, pending: artifact.pending, final_compile_available: false, export_available: false, blender_available: false,
+        source_frame: document.source_frame.clone() })
 }
 
 fn srgb_to_linear(value: u8) -> f32 {
@@ -1193,31 +1244,43 @@ fn srgb_to_linear(value: u8) -> f32 {
 fn build_stage_14_preview(
     session: &SharedProjectSession,
     preview_service: &PreviewService,
-    requested_revision: u64,
+    request: Stage14PreviewRequest,
     job: u64,
 ) -> Result<IntermediateAtlasProjection, UserFacingError> {
-    let summary = {
+    let mut summary = {
         let guard = session.lock().map_err(|_| poisoned())?;
         guard.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
     };
     let document = summary.document.as_ref()
         .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
-    if document.document_revision != requested_revision {
+    if document.document_revision != request.revision {
         return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
     }
+    if request.region_id.is_some() != request.transient_projection.is_some() {
+        return Err(error(ErrorCode::InvalidInput, "Transient crop requests require both regionId and transientProjection."));
+    }
+    if let (Some(region_id), Some(projection)) = (request.region_id, request.transient_projection.clone()) {
+        let mut transient_document = document.clone();
+        let binding = transient_document.region_bindings.get_mut(&region_id)
+            .ok_or_else(|| error(ErrorCode::InvalidInput, "Transient crop region is not in the persisted topology."))?;
+        binding.mapping.projection = projection;
+        binding.mapping.source_crop_intent = Some(hot_trimmer_domain::SourceCropIntent::Authored);
+        summary.document = Some(transient_document);
+    }
+    let document = summary.document.as_ref().expect("summary document was present");
     let revision_current = AtomicBool::new(true);
     let monitoring_complete = AtomicBool::new(false);
     let artifact = std::thread::scope(|scope| {
         scope.spawn(|| {
             while !monitoring_complete.load(Ordering::Acquire) {
                 let live = session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
-                    .map(|document| document.document_revision == requested_revision)).unwrap_or(false);
+                    .map(|document| document.document_revision == request.revision)).unwrap_or(false);
                 if !live { revision_current.store(false, Ordering::Release); return; }
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
         let result = AlgorithmCompiler::new().compile_persisted_stage_14_preview(
-            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: requested_revision },
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: request.revision, draft_id: request.draft_id, input_hash: request.input_hash.clone() },
             &EngineCancellationToken::new(),
             || preview_service.latest_draft_id.load(Ordering::Acquire) == job
                 && revision_current.load(Ordering::Acquire),
@@ -1227,7 +1290,7 @@ fn build_stage_14_preview(
     }).map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
     let live_revision = session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
         .map(|document| document.document_revision)).unwrap_or(0);
-    if live_revision != requested_revision || preview_service.latest_draft_id.load(Ordering::Acquire) != job {
+    if live_revision != request.revision || preview_service.latest_draft_id.load(Ordering::Acquire) != job {
         return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
     }
     let primary = document.primary_material.ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
@@ -1240,14 +1303,19 @@ fn build_stage_14_preview(
         maps.insert(channel_key(channel.role).into(), png_data_url(artifact.topology.output_size.width,
             artifact.topology.output_size.height, channel.rgba8.clone())?);
     }
-    let slots = artifact.slots.iter().zip(&resolved.regions).map(|(slot, region)| Stage14SlotProjection {
+    let slots = artifact.slots.iter().map(|slot| {
+        let region = resolved.regions.iter().find(|region| region.region_id == slot.region_id)
+            .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Stage 14 artifact refers to an unknown region identity."))?;
+        Ok(Stage14SlotProjection {
         region_id: region.region_id, slot_key: slot.slot_key.clone(), display_name: slot.display_name.clone(),
         allocation_bounds: slot.allocation, hotspot_bounds: slot.hotspot, mapping_mode: format!("{:?}", slot.mapping_mode),
+        source_transform: slot.source_transform, isotropic_scale: slot.isotropic_scale, sampling_scale: slot.sampling_scale,
         validity: format!("{} valid pixels", slot.valid_pixel_count), correspondence: "authoritative Stage 14 correspondence".into(),
         source_id: slot.source_id.0.clone(), patch_id: slot.patch_id.clone(), domain_id: slot.domain_id.0.clone(),
         candidate_id: slot.candidate_id.0.clone(), sampling_plan_id: slot.sampling_plan_id.0.clone(),
-        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop,
-    }).collect();
+        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.source_bounds, mapping_origin: region.mapping_origin, grid_rect: slot.grid_rect,
+    })
+    }).collect::<Result<Vec<_>, UserFacingError>>()?;
     Ok(IntermediateAtlasProjection {
         label: artifact.label, non_exportable: true, incomplete_after_stage: 14, revision: artifact.revision,
         document_revision: artifact.revision, topology_hash: hash_hex(document.topology.topology_hash),
@@ -1257,6 +1325,7 @@ fn build_stage_14_preview(
         placement_plan_id: artifact.placement_plan_id.0, maps, regions: resolved.regions,
         unavailable_channels: artifact.unavailable_channels.iter().map(|role| format!("{role:?}")).collect(),
         slots, pending: artifact.pending, final_compile_available: false, export_available: false, blender_available: false,
+        source_frame: document.source_frame.clone(),
     })
 }
 
@@ -1919,10 +1988,10 @@ mod algorithm_stage_14_preview_a_tests {
         })).collect::<BTreeMap<_, _>>();
         let request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement,
             slots: vec![
-                IntermediateSlotInput { slot_key: "authored-patch-a", display_name: "Authored Patch A",
-                    required: true, patch_id: Some("patch-a".into()), domain: &first_domain, plan: &first_plan, result: &first },
-                IntermediateSlotInput { slot_key: "authored-patch-b", display_name: "Authored Patch B",
-                    required: true, patch_id: Some("patch-b".into()), domain: &second_domain, plan: &second_plan, result: &second },
+                IntermediateSlotInput { region_id: first_plan.slot_id, slot_key: "authored-patch-a", display_name: "Authored Patch A",
+                    required: true, patch_id: Some("patch-a".into()), domain: &first_domain, plan: &first_plan, result: &first, grid_rect: None },
+                IntermediateSlotInput { region_id: second_plan.slot_id, slot_key: "authored-patch-b", display_name: "Authored Patch B",
+                    required: true, patch_id: Some("patch-b".into()), domain: &second_domain, plan: &second_plan, result: &second, grid_rect: None },
             ], revision: 7, algorithm_versions: algorithms, diagnostics: Vec::new() };
         let compiler = AlgorithmCompiler::new();
         let artifact = compiler.compile_intermediate_atlas(&request, &CancellationToken::new(), || 7).unwrap();
@@ -2036,7 +2105,27 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         }));
         let service = PreviewService::default();
         let job = service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-        let artifact = build_stage_14_preview(&session, &service, revision, job).expect("persisted Stage 1-14 preview");
+        let artifact = build_stage_14_preview(&session, &service, Stage14PreviewRequest {
+            protocol_version: IPC_PROTOCOL_VERSION, revision, region_id: None,
+            transient_projection: None, draft_id: Some(job), input_hash: None,
+        }, job).expect("persisted Stage 1-14 preview");
+        assert_eq!(artifact.slots.len(), 53, "Generic Architecture must publish every fixed-template slot");
+        assert_eq!(artifact.slots.iter().map(|slot| slot.region_id).collect::<HashSet<_>>().len(), 53,
+            "fixed-template region identities must be stable and unique");
+        assert!(artifact.slots.iter().all(|slot| slot.mapping_mode != "TextureSynthesis" && !slot.candidate_id.is_empty()
+            && !slot.sampling_plan_id.is_empty() && !slot.stage_14_result_id.is_empty()
+            && slot.isotropic_scale.is_finite() && slot.isotropic_scale > 0.0
+            && slot.sampling_scale.is_finite() && slot.sampling_scale > 0.0),
+            "unsupported synthesis candidates must not reach the published artifact");
+        for (index, left) in artifact.slots.iter().enumerate() {
+            for right in &artifact.slots[index + 1..] {
+                let separated = left.allocation_bounds.x + left.allocation_bounds.width <= right.allocation_bounds.x
+                    || right.allocation_bounds.x + right.allocation_bounds.width <= left.allocation_bounds.x
+                    || left.allocation_bounds.y + left.allocation_bounds.height <= right.allocation_bounds.y
+                    || right.allocation_bounds.y + right.allocation_bounds.height <= left.allocation_bounds.y;
+                assert!(separated, "fixed-template atlas allocations overlap");
+            }
+        }
         assert_eq!(artifact.incomplete_after_stage, 14);
         assert!(artifact.non_exportable && !artifact.final_compile_available && !artifact.export_available && !artifact.blender_available);
         let expected_patch_id = patch.id.to_string();
@@ -2047,7 +2136,28 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         assert!(artifact.maps.contains_key("baseColor"));
         let crops = artifact.slots.iter().filter_map(|slot| slot.source_crop)
             .map(|crop| (crop.x, crop.y, crop.width, crop.height)).collect::<HashSet<_>>();
-        assert!(crops.len() > 1, "Stage 11-13 must select more than one crop across the persisted topology");
+        assert!(crops.len() > 8, "Stage 11-13 must select purposeful spatially distinct crops across the persisted topology");
+        let unplaced_crops = artifact.slots.iter().filter(|slot| slot.region_id != patch_region_id)
+            .filter_map(|slot| slot.source_crop).collect::<Vec<_>>();
+        assert!(unplaced_crops.iter().all(|crop| crop.width < source_width || crop.height < source_height),
+            "unplaced Gate 1 slots must not consume the complete prepared source domain");
+        let cornice = artifact.slots.iter().find(|slot| slot.slot_key == "cornice_long")
+            .expect("Generic Architecture cornice slot");
+        let cornice_crop = cornice.source_crop.expect("cornice must carry a selected crop");
+        assert!(cornice_crop.width > cornice_crop.height.saturating_mul(4)
+            && (cornice.mapping_mode == "RepeatX" || cornice.mapping_mode == "DirectCrop"),
+            "long strips must carry a horizontal source cut or repeat route");
+        let detail = artifact.slots.iter().find(|slot| slot.slot_key == "detail_cell_a")
+            .expect("Generic Architecture detail slot");
+        let detail_crop = detail.source_crop.expect("detail must carry a selected crop");
+        assert!(detail_crop.width < source_width && detail_crop.height < source_height,
+            "detail slots must carry a selected source detail, not the full source sheet");
+        let radial = artifact.slots.iter().find(|slot| slot.slot_key == "radial_fixture_a")
+            .expect("Generic Architecture radial slot");
+        let radial_crop = radial.source_crop.expect("radial must carry a selected crop");
+        assert!(radial_crop.width < source_width && radial_crop.height < source_height
+            && radial_crop.width.abs_diff(radial_crop.height) <= source_width.max(source_height) / 2,
+            "radial slots must carry a bounded radial/detail source area");
         assert!(artifact.slots.iter().all(|slot| !slot.candidate_id.is_empty()
             && !slot.sampling_plan_id.is_empty() && !slot.stage_14_result_id.is_empty()));
         drop(session);

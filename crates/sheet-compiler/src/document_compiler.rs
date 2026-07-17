@@ -4,6 +4,7 @@ use hot_trimmer_domain::{
     AddressMode, CanonicalRect, ContentReference, DocumentHash, IdColor, MaterialMapKind,
     PatchId, PixelBounds, PixelSize, Projection, RadialMappingSettings, RegionDefinition, RegionId, RegionMapping,
     SourceId, SourceSetId,
+    GridRect, MappingOrigin, NormalizedBounds,
     StructuralProfile, TemplateSlotRole, TrimSheetDocument, TrimSheetDocumentError,
 };
 use hot_trimmer_render_core::{
@@ -41,6 +42,10 @@ pub struct ResolvedRegion {
     pub source_id: Option<SourceId>,
     pub mapping: RegionMapping,
     pub role: TemplateSlotRole,
+    pub grid_rect: Option<GridRect>,
+    pub source_crop: Option<PixelBounds>,
+    pub source_bounds: Option<NormalizedBounds>,
+    pub mapping_origin: Option<MappingOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -186,6 +191,12 @@ pub fn resolve_compile_plan(
             source_id,
             mapping,
             role: region.role,
+            grid_rect: region.grid_rect,
+            source_crop: resolved_source_crop(document, region),
+            source_bounds: resolved_source_bounds(document, region),
+            mapping_origin: resolved_source_bounds(document, region).map(|_| {
+                if document.source_overrides.contains_key(&region.id) { MappingOrigin::ExplicitOverride } else { MappingOrigin::Partition }
+            }),
         });
     }
     Ok(ResolvedCompilePlan {
@@ -194,6 +205,26 @@ pub fn resolve_compile_plan(
         appearance_hash: document.appearance_hash()?,
         dimensions,
         regions,
+    })
+}
+
+fn resolved_source_bounds(document: &TrimSheetDocument, region: &RegionDefinition) -> Option<NormalizedBounds> {
+    if let Some(override_value) = document.source_overrides.get(&region.id) {
+        return Some(override_value.source_bounds);
+    }
+    let frame = document.source_frame.as_ref()?;
+    let grid = document.logical_grid?;
+    Some(frame.region_bounds(grid, region.grid_rect?))
+}
+
+fn resolved_source_crop(document: &TrimSheetDocument, region: &RegionDefinition) -> Option<PixelBounds> {
+    let bounds = resolved_source_bounds(document, region)?;
+    let dimensions = document.source_frame.as_ref()?.oriented_dimensions;
+    Some(PixelBounds {
+        x: (bounds.x.get() * f64::from(dimensions.width)).round() as u32,
+        y: (bounds.y.get() * f64::from(dimensions.height)).round() as u32,
+        width: (bounds.width.get() * f64::from(dimensions.width)).round() as u32,
+        height: (bounds.height.get() * f64::from(dimensions.height)).round() as u32,
     })
 }
 
@@ -814,11 +845,9 @@ fn pixel_bytes(size: PixelSize) -> Result<usize, SheetCompileError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use hot_trimmer_domain::{
         LayoutId, MaterialMapContent, MaterialSourceSet, SourceSetId, TemplateRegistry,
-        TemplateSourceRect, TrimSheetDocumentCommand,
+        SourceCropIntent, TrimSheetDocumentCommand,
     };
 
     use super::*;
@@ -978,25 +1007,14 @@ mod tests {
             template.stable_order[21].as_str(),
         ];
         let sample_points = [(0.25, 0.25), (0.5, 0.5), (0.75, 0.75)];
-        let mut authored_crops = BTreeSet::new();
         for slot_key in sampled_slots {
-            let slot = template
-                .slots
-                .iter()
-                .find(|candidate| candidate.slot_key == slot_key)
-                .expect("sampled slot exists");
             let region = compiled
                 .regions
                 .iter()
                 .find(|candidate| candidate.display_name == title_from_slot_key(slot_key))
                 .expect("compiled region exists for sampled template slot");
-            assert_declared_crop(region, slot.source_mapping.crop);
-            authored_crops.insert((
-                slot.source_mapping.crop.x.to_bits(),
-                slot.source_mapping.crop.y.to_bits(),
-                slot.source_mapping.crop.width.to_bits(),
-                slot.source_mapping.crop.height.to_bits(),
-            ));
+            assert_eq!(region.mapping.source_crop_intent, Some(SourceCropIntent::Unplaced));
+            assert_eq!(region.mapping.projection, Projection::default());
             for local in sample_points {
                 let sheet_point = point_in_region(region.allocation_bounds, local);
                 assert_eq!(
@@ -1009,12 +1027,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            authored_crops.len(),
-            sampled_slots.len(),
-            "sampled template regions must declare distinct source-space crops"
-        );
-
         let full_preview = compile_preview_map(
             &document,
             &registered_maps,
@@ -1051,16 +1063,6 @@ mod tests {
             }
         }
         pixels
-    }
-
-    fn assert_declared_crop(region: &ResolvedRegion, crop: TemplateSourceRect) {
-        let Projection::Crop { bounds, .. } = region.mapping.projection else {
-            panic!("test expects template crop mappings");
-        };
-        assert_close(bounds.x.get(), crop.x);
-        assert_close(bounds.y.get(), crop.y);
-        assert_close(bounds.width.get(), crop.width);
-        assert_close(bounds.height.get(), crop.height);
     }
 
     fn expected_sample_at_point(
@@ -1120,13 +1122,6 @@ mod tests {
             }
         }
         title
-    }
-
-    fn assert_close(actual: f64, expected: f64) {
-        assert!(
-            (actual - expected).abs() < 0.000001,
-            "expected {expected}, got {actual}"
-        );
     }
 
     fn pixel_at(pixels: &[u8], width: u32, point: (u32, u32)) -> [u8; 4] {

@@ -42,6 +42,7 @@ export type ContentReference =
 export interface RegionMapping {
   projection: { type: "crop"; bounds: NormalizedBounds; focus: NormalizedPoint }
     | { type: "perspective"; quad: readonly NormalizedPoint[] };
+  sourceCropIntent?: "unplaced" | "authored";
   warps: readonly unknown[];
   radial?: { centerX: number; centerY: number; innerRadius: number; outerRadius: number; falloff: number };
   transform: {
@@ -68,6 +69,24 @@ export interface RegionDefinition {
   materialGroup: string;
   weatheringGroup: string;
   enabled: boolean;
+  gridRect?: { x: number; y: number; width: number; height: number };
+}
+
+export interface SourceFrame {
+  schemaVersion: number;
+  sourceSetId: string;
+  bounds: NormalizedBounds;
+  orientedDimensions: PixelSize;
+  sourceRevision: number;
+  outputAspect: readonly [number, number];
+  identity: readonly number[];
+}
+
+export type MappingOrigin = "partition" | "explicit_override";
+export interface RegionSourceOverride {
+  schemaVersion: number;
+  sourceBounds: NormalizedBounds;
+  identity: readonly number[];
 }
 
 export interface TrimSheetDocument {
@@ -85,6 +104,10 @@ export interface TrimSheetDocument {
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
   regionBindings: Record<string, RegionBinding>;
   renderSettings: { outputSize: PixelSize; rendererVersion: string };
+  sourceFrame?: SourceFrame;
+  logicalGrid?: { schemaVersion: number; width: number; height: number };
+  partitionProvenance?: unknown;
+  sourceOverrides?: Record<string, RegionSourceOverride>;
 }
 
 export interface SourceProjection {
@@ -259,6 +282,10 @@ export interface ResolvedRegion {
   materialIdColor: readonly [number, number, number];
   mapping: RegionMapping;
   role: string;
+  gridRect?: { x: number; y: number; width: number; height: number };
+  sourceCrop?: PixelBounds;
+  sourceBounds?: NormalizedBounds;
+  mappingOrigin?: MappingOrigin;
 }
 
 export type CompiledMapView =
@@ -283,6 +310,9 @@ export interface Stage14SlotProjection {
   allocationBounds: PixelBounds;
   hotspotBounds: PixelBounds;
   mappingMode: string;
+  sourceTransform: { rotation: string; mirror: string };
+  isotropicScale: number;
+  samplingScale: number;
   validity: string;
   correspondence: string;
   sourceId: string;
@@ -292,6 +322,9 @@ export interface Stage14SlotProjection {
   samplingPlanId: string;
   stage14ResultId: string;
   sourceCrop?: PixelBounds;
+  sourceBounds?: NormalizedBounds;
+  mappingOrigin?: MappingOrigin;
+  gridRect?: { x: number; y: number; width: number; height: number };
 }
 
 export interface IntermediateAtlasProjection {
@@ -315,6 +348,7 @@ export interface IntermediateAtlasProjection {
   finalCompileAvailable: false;
   exportAvailable: false;
   blenderAvailable: false;
+  sourceFrame?: SourceFrame;
 }
 
 export interface PreviewSheetProjection {
@@ -335,7 +369,10 @@ export type TrimSheetDocumentCommand =
   | { type: "set_sheet_framing"; framing: unknown }
   | { type: "set_region_projection"; regionId: string; projection: RegionMapping["projection"] }
   | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }
-  | { type: "set_output_resolution"; outputSize: PixelSize };
+  | { type: "set_output_resolution"; outputSize: PixelSize }
+  | { type: "set_source_frame"; bounds: NormalizedBounds }
+  | { type: "detach_source_cell"; regionId: string }
+  | { type: "reset_source_cell"; regionId: string };
 
 export interface CommandFailure {
   code: string;

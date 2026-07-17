@@ -9,7 +9,8 @@ use hot_trimmer_domain::{
     RegisteredChannelSet, SamplingPolicy, SourceOwnershipIntent, StageResult,
 };
 use hot_trimmer_effect_compiler::{
-    SlotDemandIntent, VisualImportance, WorldDimensionSource, resolve_slot_demands_with_guard,
+    RequiredSourceFootprint, SlotDemandIntent, SourceFootprintUnit, VisualImportance,
+    WorldDimensionSource, resolve_slot_demands_with_guard,
 };
 use hot_trimmer_image_io::{CancellationToken as ImageCancellationToken, NormalizationSettings,
     prepare_registered_channel_set};
@@ -23,11 +24,13 @@ use hot_trimmer_material_synthesis::{
     prepare_stage_08_material_domain,
 };
 use hot_trimmer_placement_solver::{
-    CandidateEvidence, CandidateScoringMeasurements, CandidateSet, CandidateSettings,
+    CandidateEvidence, CandidateScoringMeasurements, CandidateSet, CandidateSettings, CandidateFamily,
     CandidateTransform, FeaturePosition, MirrorTransform, PlacementOptimizerSettings,
-    PlacementSlotInput, ReusePermissions, ScoringContext, ScoringSettings, SliceCenterPolicy,
+    PlacementPlan, PlacementObjectiveBreakdown, PlacementPlanQaView, PlacementSlotInput,
+    PlacementValidationSummary, ReusePermissions, SamplingPlan, ScoringContext, ScoringSettings, SliceCenterPolicy,
     MaterialDomainView, SliceGeometry, SourceCrop, StretchOverrideProvenance,
-    generate_candidates_with_guard, optimize_placements, score_candidate_set_with_guard,
+    generate_candidates_with_guard, optimize_placements, score_candidate_set_with_guard, CropCandidate,
+    CandidateRoute, PositionStrategy, CandidateDescriptors, EligibilityEvidence,
 };
 use hot_trimmer_project_store::{ProjectSummary, SourceOwnership, StoredSource};
 use hot_trimmer_render_core::{
@@ -73,10 +76,18 @@ use crate::{
     synthesize_slot_material_with_guard,
 };
 
-#[derive(Clone, Copy, Debug)]
+/// Gate 1 must show source subdivisions, not a second copy of the whole source in
+/// every fixed-template region. The fraction is applied isotropically, so the
+/// authored slot aspect is preserved while leaving Stage 11 multiple positions
+/// to choose from.
+const UNPLACED_SOURCE_FOOTPRINT_FRACTION: f64 = 0.5;
+
+#[derive(Clone, Debug)]
 pub struct PersistedStage14PreviewRequest<'a> {
     pub project: &'a ProjectSummary,
     pub revision: u64,
+    pub draft_id: Option<u64>,
+    pub input_hash: Option<String>,
 }
 
 impl AlgorithmCompiler {
@@ -122,6 +133,9 @@ fn compile_persisted(
     let document = request.project.document.as_ref().ok_or("persisted project has no trim-sheet document")?;
     if document.document_revision != request.revision { return Err("preview revision is already stale".into()); }
     let primary = document.primary_material.ok_or("persisted document has no primary material")?;
+    if document.source_frame.is_some() {
+        return compile_source_frame(request, cancellation, image_cancellation, render_cancellation, is_current, document, primary);
+    }
     let mut domains = Vec::<DomainArtifacts>::new();
     let mut domain_keys = BTreeMap::<String, usize>::new();
     let mut region_domains = Vec::with_capacity(document.topology.regions.len());
@@ -132,7 +146,7 @@ fn compile_persisted(
         let key = format!("{}|{}", source_set_id, patch.as_ref().map_or_else(|| "full-source".into(), |value| value.id.to_string()));
         let index = if let Some(index) = domain_keys.get(&key).copied() { index } else {
             let artifacts = build_domain(request.project, source_set_id, patch.as_ref(), request.revision,
-                image_cancellation, render_cancellation)?;
+                false, image_cancellation, render_cancellation)?;
             let index = domains.len();
             domains.push(artifacts);
             domain_keys.insert(key, index);
@@ -161,8 +175,39 @@ fn compile_persisted(
             visual_importance: VisualImportance::Standard, minimum_survivable_feature_m: 0.001,
             minimum_flat_center_m: 0.001, requested_features: Vec::new(), opposing_profile_widths_m: None,
         })).collect::<Vec<_>>();
-    let stage10 = resolve_slot_demands_with_guard(&stage10_inputs, &|| !active())
+    let mut stage10 = resolve_slot_demands_with_guard(&stage10_inputs, &|| !active())
         .map_err(|error| format!("Stage 10 failed: {error:?}"))?;
+    // Gate 1 is deliberately limited to modes with a truthful registered Stage 14
+    // implementation. TextureSynthesis and PolarRadial currently have candidate
+    // families but no exact Stage 14 artifact, so they must not reach optimization.
+    for demand in &mut stage10.slots {
+        let region = document.topology.regions.iter().find(|region| region.id == demand.slot_id)
+            .ok_or_else(|| format!("Stage 10 produced an unknown region {}", demand.slot_id))?;
+        let binding = document.region_bindings.get(&region.id).ok_or("Stage 10 region binding disappeared")?;
+        if binding.mapping.source_crop_intent == Some(hot_trimmer_domain::SourceCropIntent::Unplaced) {
+            // With no authored crop, derive a bounded aspect-preserving physical
+            // footprint. The previous largest-fit value made square/detail slots
+            // consume nearly the whole source and gave Stage 13 no meaningful
+            // spatial subdivision to select.
+            let domain = &domains[region_domains[document.topology.regions.iter().position(|candidate| candidate.id == region.id).expect("region index")]];
+            let fit_scale = unplaced_source_pixels_per_physical_unit(demand, domain.domain.width, domain.domain.height);
+            demand.required_source_footprint = RequiredSourceFootprint {
+                width: demand.world_width_m * fit_scale,
+                height: demand.world_height_m * fit_scale,
+                unit: SourceFootprintUnit::SourcePixels,
+                scale_provenance: domain.stage6.scale.provenance,
+                world_scale: domain.stage6.scale.world_scale,
+                confidence_milli: domain.stage6.scale.confidence_milli,
+            };
+        }
+        let has_declared_period = domains[region_domains[document.topology.regions.iter().position(|candidate| candidate.id == region.id).expect("region index")]]
+            .stage7.periodicity.candidates.iter().any(|candidate| {
+                candidate.first.dx_pixels.unsigned_abs() > 0 && candidate.first.dy_pixels.unsigned_abs() > 0
+            });
+        demand.allowed_mapping_modes.retain(|mode| legal_gate1_mode(*mode, demand.slot_role, has_declared_period));
+        demand.mapping_mode = demand.allowed_mapping_modes.first().copied()
+            .ok_or_else(|| format!("Stage 10 has no executable Gate 1 mode for {}", demand.slot_id))?;
+    }
     for (index, ((slot, region), demand)) in topology.slots.iter().zip(&document.topology.regions).zip(&stage10.slots).enumerate() {
         let artifacts = &domains[region_domains[index]];
         let binding = document.region_bindings.get(&region.id).ok_or("Stage 10 region binding disappeared")?;
@@ -174,7 +219,15 @@ fn compile_persisted(
             feature.x -= window.x; feature.y -= window.y; true
         });
         let view = MappedDomainView { domain: &artifacts.domain, window };
-        let generated = generate_candidates_with_guard(&view, demand, &evidence, &candidate_settings,
+        let unplaced = binding.mapping.source_crop_intent == Some(hot_trimmer_domain::SourceCropIntent::Unplaced);
+        let mut slot_candidate_settings = candidate_settings.clone();
+        if unplaced {
+            // The bounded footprint is the Gate 1 source subdivision. Do not let
+            // the generic upscale ladder grow it back to the complete domain.
+            slot_candidate_settings.scale_ladder.retain(|scale| *scale <= 1.0);
+            slot_candidate_settings.maximum_scale = 1.0;
+        }
+        let generated = generate_candidates_with_guard(&view, demand, &evidence, &slot_candidate_settings,
             document.document_revision, &|| !active())
             .map_err(|error| format!("Stage 11 failed for {}: {error:?}", slot.slot_key))?;
         let generated = apply_authored_mapping(generated, &binding.mapping, artifacts.patch_id.is_some(),
@@ -186,9 +239,18 @@ fn compile_persisted(
             material_confidence_milli: artifacts.stage5.classification.confidence_milli,
             requested_physical_scale: 1.0, measurements,
         }, &scoring_settings, &|| !active()).map_err(|error| format!("Stage 12 failed for {}: {error:?}", slot.slot_key))?;
-        if scored.top_candidates.is_empty() { return Err(format!("Stage 12 produced no legal candidate for {}", slot.slot_key)); }
-        let base_scale = base_pixels_per_physical_unit(artifacts.stage6.scale, &demand,
-            artifacts.domain.width, artifacts.domain.height);
+        if scored.top_candidates.is_empty() {
+            return Err(format!("Stage 12 produced no legal candidate for {}", slot.slot_key));
+        }
+        let unplaced = binding.mapping.source_crop_intent == Some(hot_trimmer_domain::SourceCropIntent::Unplaced);
+        let require_spatially_distinct_crops = unplaced
+            && region.role == hot_trimmer_domain::TemplateSlotRole::UniqueDetail;
+        let base_scale = if unplaced {
+            unplaced_source_pixels_per_physical_unit(demand, artifacts.domain.width, artifacts.domain.height)
+        } else {
+            base_pixels_per_physical_unit(artifacts.stage6.scale, &demand,
+                artifacts.domain.width, artifacts.domain.height)
+        };
         placement_inputs.push(PlacementSlotInput {
             slot_id: region.id, role: region.role, material_behavior: artifacts.stage5.classification.routed_class(),
             variation_group: region.material_group.clone(), visual_importance_milli: 700,
@@ -200,7 +262,9 @@ fn compile_persisted(
             radial_mapping: binding.mapping.radial,
             stretch_override: StretchOverrideProvenance::NotAuthorized,
             slice_geometry: slice_geometry(region.role, artifacts.domain.width, artifacts.domain.height),
-            maximum_seam_cost_milli: 450, reuse_permissions: ReusePermissions::default(), candidates: scored,
+            maximum_seam_cost_milli: 450,
+            reuse_permissions: ReusePermissions { require_spatially_distinct_crops, ..ReusePermissions::default() },
+            candidates: scored,
         });
     }
     let placement_settings = PlacementOptimizerSettings { beam_width: 8, max_pairwise_evaluations: 100_000,
@@ -223,8 +287,8 @@ fn compile_persisted(
     let slots = topology.slots.iter().zip(&document.topology.regions).zip(ordered_plans.into_iter().zip(&results))
         .enumerate().map(|(index, ((slot, region), (plan, result)))| {
             let artifacts = &domains[region_domains[index]];
-            IntermediateSlotInput { slot_key: &slot.slot_key, display_name: &region.display_name,
-                required: true, patch_id: artifacts.patch_id.clone(), domain: &artifacts.domain, plan, result }
+            IntermediateSlotInput { region_id: region.id, slot_key: &slot.slot_key, display_name: &region.display_name,
+                required: true, patch_id: artifacts.patch_id.clone(), domain: &artifacts.domain, plan, result, grid_rect: region.grid_rect }
         }).collect::<Vec<_>>();
     let versions = algorithm_versions([
         (1, Some(AlgorithmProvenance { algorithm_id: "hot_trimmer.persisted_registered_source".into(), version: "1.0.0".into() })),
@@ -244,6 +308,199 @@ fn compile_persisted(
     AlgorithmCompiler::new().compile_intermediate_atlas(&IntermediateAtlasRequest { topology: &topology,
         placement_plan: &placement, slots, revision: request.revision, algorithm_versions: versions, diagnostics: Vec::new() },
         cancellation, || if active() { request.revision } else { 0 }).map_err(|error| error.to_string())
+}
+
+/// Source-frame documents intentionally use the same persisted compiler spine, but stages 11-13
+/// are validation/provenance stages here: the accepted GridRects already define every source and
+/// destination rectangle, so no crop search, ranking, reuse, repeat, or synthesis is legal.
+#[allow(clippy::too_many_arguments)]
+fn compile_source_frame(
+    request: PersistedStage14PreviewRequest<'_>,
+    cancellation: &CancellationToken,
+    image_cancellation: &ImageCancellationToken,
+    render_cancellation: &RenderCancellationToken,
+    is_current: &dyn Fn() -> bool,
+    document: &hot_trimmer_domain::TrimSheetDocument,
+    primary: hot_trimmer_domain::SourceSetId,
+) -> Result<IntermediateAtlasArtifact, String> {
+    let active = || !cancellation.is_cancelled() && is_current();
+    let frame = document.source_frame.as_ref().ok_or("source-frame document has no SourceFrame")?;
+    let grid = document.logical_grid.ok_or("source-frame document has no LogicalGridSpec")?;
+    let provenance = document.partition_provenance.as_ref().ok_or("source-frame document has no partition provenance")?;
+    if frame.source_set_id != primary || frame.oriented_dimensions.width == 0 || frame.oriented_dimensions.height == 0
+        || frame.output_aspect.contains(&0) || grid.validate().is_err()
+        || provenance.recipe.grid != grid {
+        return Err("source-frame contract is invalid".into());
+    }
+    if !aspect_matches(
+        frame.bounds.width.get() * f64::from(frame.oriented_dimensions.width),
+        frame.bounds.height.get() * f64::from(frame.oriented_dimensions.height),
+        f64::from(frame.output_aspect[0]),
+        f64::from(frame.output_aspect[1]),
+    ) {
+        return Err("SourceFrame bounds do not preserve the declared output aspect".into());
+    }
+    if document.topology.regions.iter().any(|region| document.region_bindings.get(&region.id)
+        .is_none_or(|binding| binding.mapping.address_mode != AddressMode::Clamp)) {
+        return Err("SourceFrame workflow requires clamp address mode for every region".into());
+    }
+    let cell_count = usize::try_from(u64::from(grid.width) * u64::from(grid.height)).map_err(|_| "logical grid is too large")?;
+    let mut coverage = vec![0_u8; cell_count];
+    for region in &document.topology.regions {
+        let rect = region.grid_rect.ok_or_else(|| format!("region {} has no persisted GridRect", region.id))?;
+        if rect.width == 0 || rect.height == 0 || rect.x.checked_add(rect.width).is_none_or(|end| end > grid.width)
+            || rect.y.checked_add(rect.height).is_none_or(|end| end > grid.height) {
+            return Err(format!("region {} has an out-of-bounds GridRect", region.id));
+        }
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                let cell = &mut coverage[(y * grid.width + x) as usize];
+                *cell = cell.saturating_add(1);
+            }
+        }
+    }
+    if coverage.iter().any(|value| *value != 1) {
+        return Err("accepted SourceFrame partition has a logical gap or overlap".into());
+    }
+    let artifacts = build_domain(request.project, primary, None, request.revision, true, image_cancellation, render_cancellation)?;
+    if artifacts.domain.width != frame.oriented_dimensions.width || artifacts.domain.height != frame.oriented_dimensions.height {
+        return Err("SourceFrame oriented dimensions do not match the prepared source".into());
+    }
+    let source_left = (frame.bounds.x.get() * f64::from(frame.oriented_dimensions.width)).round() as u32;
+    let source_top = (frame.bounds.y.get() * f64::from(frame.oriented_dimensions.height)).round() as u32;
+    let source_width = (frame.bounds.width.get() * f64::from(frame.oriented_dimensions.width)).round() as u32;
+    let source_height = (frame.bounds.height.get() * f64::from(frame.oriented_dimensions.height)).round() as u32;
+    let source_x = hot_trimmer_domain::resolve_boundaries(source_left, source_width, grid.width);
+    let source_y = hot_trimmer_domain::resolve_boundaries(source_top, source_height, grid.height);
+    let destination_x = hot_trimmer_domain::resolve_boundaries(0, document.render_settings.output_size.width, grid.width);
+    let destination_y = hot_trimmer_domain::resolve_boundaries(0, document.render_settings.output_size.height, grid.height);
+    let mut slots = Vec::with_capacity(document.topology.regions.len());
+    let mut plans = Vec::with_capacity(document.topology.regions.len());
+    let mut results = Vec::with_capacity(document.topology.regions.len());
+    for region in &document.topology.regions {
+        if !active() { return Err("preview cancelled or superseded in source-frame stages".into()); }
+        let rect = region.grid_rect.ok_or_else(|| format!("region {} has no persisted GridRect", region.id))?;
+        let allocation = hot_trimmer_domain::CanonicalRect {
+            x: destination_x[rect.x as usize], y: destination_y[rect.y as usize],
+            width: destination_x[(rect.x + rect.width) as usize] - destination_x[rect.x as usize],
+            height: destination_y[(rect.y + rect.height) as usize] - destination_y[rect.y as usize],
+        };
+        let crop = document.source_overrides.get(&region.id).map(|value| {
+            let bounds = value.source_bounds;
+            let x = (bounds.x.get() * f64::from(frame.oriented_dimensions.width)).round() as u32;
+            let y = (bounds.y.get() * f64::from(frame.oriented_dimensions.height)).round() as u32;
+            SourceCrop { x, y,
+                width: (bounds.width.get() * f64::from(frame.oriented_dimensions.width)).round() as u32,
+                height: (bounds.height.get() * f64::from(frame.oriented_dimensions.height)).round() as u32 }
+        }).unwrap_or(SourceCrop { x: source_x[rect.x as usize], y: source_y[rect.y as usize],
+            width: source_x[(rect.x + rect.width) as usize] - source_x[rect.x as usize],
+            height: source_y[(rect.y + rect.height) as usize] - source_y[rect.y as usize] });
+        if crop.width == 0 || crop.height == 0 || allocation.width == 0 || allocation.height == 0 {
+            return Err(format!("source-frame region {} collapsed at resolved pixel boundaries", region.id));
+        }
+        if document.source_overrides.contains_key(&region.id)
+            && !aspect_matches(
+                f64::from(crop.width),
+                f64::from(crop.height),
+                f64::from(allocation.width),
+                f64::from(allocation.height),
+            )
+        {
+            return Err(format!("detached SourceFrame region {} does not preserve its destination aspect", region.id));
+        }
+        let mapping_origin = if document.source_overrides.contains_key(&region.id) { "explicit_override" } else { "partition" };
+        let candidate_id = hot_trimmer_domain::ContentDigest::sha256(format!("source-frame|{}|{}|{}|{}|{}|{}|{}|{}",
+            frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>(), region.id,
+            crop.x, crop.y, crop.width, crop.height, allocation.x, mapping_origin).as_bytes());
+        let candidate = CropCandidate { candidate_id: candidate_id.clone(), source_id: artifacts.domain.prepared_source_digest.clone(),
+            domain_id: artifacts.domain.cache_key.clone(), slot_id: region.id, crop: Some(crop),
+            transform: CandidateTransform { rotation: QuarterTurn::Zero, mirror: MirrorTransform::None },
+            isotropic_scale: 1.0, mapping_mode: hot_trimmer_domain::SamplingMode::DirectCrop,
+            family: CandidateFamily::PanelDirect, route: CandidateRoute::Direct, position_strategy: PositionStrategy::DenseLowResolution,
+            period_pixels: None, seam_indices: Vec::new(), correspondence_reference: artifacts.domain.cache_key.clone(),
+            descriptors: CandidateDescriptors { saliency_milli: 0, stationarity_milli: 0, feature_strength_milli: 0, usability_milli: 1000 },
+            seed: provenance.recipe.seed, eligibility: EligibilityEvidence { mapping_permitted: true, transform_permitted: true,
+                isotropic_scale: true, exact_aspect: true, entire_crop_usable: Some(true), cross_axis_preserved: Some(true),
+                lattice_aligned: Some(true), direct_crop_applicable: true, direct_crop_rejection: None,
+                reasons: vec!["accepted SourceFrame + GridRect direct mapping".into()] } };
+        let plan = SamplingPlan { slot_id: region.id, role: region.role, variation_group: region.material_group.clone(),
+            prepared_domain_dimensions: [artifacts.domain.width, artifacts.domain.height], candidate,
+            slot_physical_size: [f64::from(crop.width), f64::from(crop.height)], source_pixels_per_physical_unit: 1.0,
+            sampling_policy: SamplingPolicy { filter: hot_trimmer_domain::SourceSamplingMode::Linear, scale: 1.0, correct_tangent_normals: true },
+            radial_mapping: None, stretch_override: StretchOverrideProvenance::NotAuthorized, slice_geometry: SliceGeometry::None,
+            maximum_seam_cost_milli: 0, unary_cost: 0.0 };
+        let slot_key = region.id.to_string();
+        let topology_slot = hot_trimmer_domain::CompiledTemplateSlot { slot_key, allocation, hotspot: allocation };
+        let result = synthesize_slot_material_with_guard(SlotSynthesisRequest { plan: &plan, domain: &artifacts.domain,
+            output_dimensions: [allocation.width, allocation.height], limits: SlotSynthesisLimits::default() }, &|| !active())
+            .map_err(|error| format!("Stage 14 direct SourceFrame sampling failed for {}: {error}", region.id))?;
+        slots.push(topology_slot); plans.push(plan); results.push(result);
+    }
+    let topology = hot_trimmer_domain::CompiledTemplateTopology { identity: hot_trimmer_domain::TemplateIdentity {
+        template_id: "source-frame".into(), template_version: SOURCE_FRAME_COMPILER_VERSION.into(),
+        compatibility_key: document.topology.compatibility_key.clone() }, output_size: document.render_settings.output_size, slots };
+    let placement = PlacementPlan { stage_result: StageResult::Executed { algorithm: AlgorithmProvenance {
+        algorithm_id: "hot-trimmer.stage-13.source-frame-direct".into(), version: SOURCE_FRAME_COMPILER_VERSION.into() },
+        settings_hash: hot_trimmer_domain::ContentDigest::sha256(b"source-frame-direct-placement"), diagnostics: Vec::new() },
+        solver: AlgorithmProvenance { algorithm_id: "hot-trimmer.stage-13.source-frame-direct".into(), version: SOURCE_FRAME_COMPILER_VERSION.into() },
+        seed: provenance.recipe.seed, placements: plans, objective: PlacementObjectiveBreakdown { unary_cost: 0.0, pairwise_cost: 0.0,
+            pairwise_lambda: 0.0, weighted_pairwise_cost: 0.0, total_cost: 0.0 }, pairwise_decisions: Vec::new(), crop_reuse_heatmap: Vec::new(),
+        validation: PlacementValidationSummary { complete_assignment: true, required_slots_present: true, isotropic_scale_only: true,
+            registered_mapping_only: true, slot_count: document.topology.regions.len() as u32 },
+        qa_views: vec![PlacementPlanQaView::SelectedPlacements, PlacementPlanQaView::Validation] };
+    let inputs = topology.slots.iter().zip(document.topology.regions.iter()).zip(placement.placements.iter().zip(results.iter()))
+        .map(|((slot, region), (plan, result))| IntermediateSlotInput { region_id: region.id, slot_key: slot.slot_key.as_str(),
+            display_name: region.display_name.as_str(), required: true, patch_id: None, domain: &artifacts.domain, plan, result, grid_rect: region.grid_rect }).collect();
+    let algorithms = (1..=14).map(|stage| (stage, AlgorithmProvenance { algorithm_id: format!("source-frame-stage-{stage:02}"), version: SOURCE_FRAME_COMPILER_VERSION.into() })).collect();
+    let atlas_request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement, slots: inputs,
+        revision: request.revision, algorithm_versions: algorithms, diagnostics: Vec::new() };
+    AlgorithmCompiler::new().compile_intermediate_atlas(&atlas_request, cancellation, || request.revision)
+        .map_err(|error| error.to_string())
+}
+
+const SOURCE_FRAME_COMPILER_VERSION: &str = "1.0.0";
+
+fn aspect_matches(width: f64, height: f64, expected_width: f64, expected_height: f64) -> bool {
+    if !width.is_finite() || !height.is_finite() || !expected_width.is_finite() || !expected_height.is_finite()
+        || width <= 0.0 || height <= 0.0 || expected_width <= 0.0 || expected_height <= 0.0 {
+        return false;
+    }
+    let left = width * expected_height;
+    let right = height * expected_width;
+    (left - right).abs() <= 1e-9 * left.abs().max(right.abs()).max(1.0)
+}
+
+#[cfg(test)]
+mod source_frame_partition_tests {
+    use hot_trimmer_domain::{generate_partition, resolve_boundaries, LogicalGridSpec, PartitionRecipe, SamplingMode};
+
+    #[test]
+    fn source_frame_partition_preserves_shared_boundaries_and_direct_sampling() {
+        for target in [16, 63, 103] {
+            let recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, target, 19);
+            let regions = generate_partition(&recipe).expect("accepted partition");
+            assert_eq!(regions.len(), target as usize);
+            let source_x = resolve_boundaries(2_000, 4_000, 64);
+            let source_y = resolve_boundaries(0, 4_000, 64);
+            let destination_x = resolve_boundaries(0, 4_000, 64);
+            let destination_y = resolve_boundaries(0, 4_000, 64);
+            let mut coverage = vec![0_u8; 64 * 64];
+            for region in regions {
+                let rect = region.grid_rect;
+                assert!(source_x[(rect.x + rect.width) as usize] >= source_x[rect.x as usize]);
+                assert!(source_y[(rect.y + rect.height) as usize] >= source_y[rect.y as usize]);
+                assert_eq!(source_x[(rect.x + rect.width) as usize] - source_x[rect.x as usize],
+                    source_x[(rect.x + rect.width) as usize] - source_x[rect.x as usize]);
+                assert_eq!(destination_x[rect.x as usize], destination_x[rect.x as usize]);
+                assert_eq!(destination_y[rect.y as usize], destination_y[rect.y as usize]);
+                for y in rect.y..rect.y + rect.height {
+                    for x in rect.x..rect.x + rect.width { coverage[(y * 64 + x) as usize] += 1; }
+                }
+            }
+            assert!(coverage.iter().all(|count| *count == 1));
+            assert_eq!(SamplingMode::DirectCrop, SamplingMode::DirectCrop);
+        }
+    }
 }
 
 fn resolve_region_content(
@@ -275,6 +532,7 @@ fn build_domain(
     source_set_id: hot_trimmer_domain::SourceSetId,
     patch: Option<&Patch>,
     revision: u64,
+    preserve_source_resolution: bool,
     image_cancellation: &ImageCancellationToken,
     render_cancellation: &RenderCancellationToken,
 ) -> Result<DomainArtifacts, String> {
@@ -292,7 +550,8 @@ fn build_domain(
     }
     let (registered, encoded) = registered_inputs(&sources)?;
     let prepared = prepare_registered_channel_set(&registered, &encoded, &NormalizationSettings {
-        max_levels: 5, max_memory_bytes: 4_294_967_296, max_level_zero_edge: Some(2048),
+        max_levels: 5, max_memory_bytes: 4_294_967_296,
+        max_level_zero_edge: (!preserve_source_resolution).then_some(2048),
         ..NormalizationSettings::default()
     }, image_cancellation).map_err(|error| format!("Stage 2 failed: {error}"))?;
     let patch_bytes = serde_json::to_vec(&patch.map(|value| (value.id, &value.geometry, &value.rectification)))
@@ -381,13 +640,14 @@ fn apply_authored_mapping(
     } else { rotation };
     let authored_transform = CandidateTransform { rotation, mirror };
     let bounds = mapping_window(mapping, width, height);
+    let unplaced = mapping.source_crop_intent == Some(hot_trimmer_domain::SourceCropIntent::Unplaced);
     let offset_x = (mapping.transform.offset[0] * f64::from(width)).round() as i64;
     let offset_y = (mapping.transform.offset[1] * f64::from(height)).round() as i64;
     set.candidates.retain_mut(|candidate| {
         if candidate.transform != authored_transform { return false; }
         let repeating = matches!(candidate.mapping_mode, hot_trimmer_domain::SamplingMode::PeriodicTile
             | hot_trimmer_domain::SamplingMode::RepeatX | hot_trimmer_domain::SamplingMode::RepeatY);
-        if candidate.mapping_mode != hot_trimmer_domain::SamplingMode::TextureSynthesis
+        if !unplaced && candidate.mapping_mode != hot_trimmer_domain::SamplingMode::TextureSynthesis
             && (mapping.address_mode == AddressMode::Repeat) != repeating { return false; }
         if let Some(mut crop) = candidate.crop {
             let shifted_x = i64::from(bounds.x + crop.x).saturating_add(offset_x);
@@ -397,9 +657,9 @@ fn apply_authored_mapping(
             if crop.x.saturating_add(crop.width) > width || crop.y.saturating_add(crop.height) > height {
                 return false;
             }
-            if crop.x < bounds.x || crop.y < bounds.y
+            if !unplaced && (crop.x < bounds.x || crop.y < bounds.y
                 || crop.x.saturating_add(crop.width) > bounds.x.saturating_add(bounds.width).min(width)
-                || crop.y.saturating_add(crop.height) > bounds.y.saturating_add(bounds.height).min(height) {
+                || crop.y.saturating_add(crop.height) > bounds.y.saturating_add(bounds.height).min(height)) {
                 return false;
             }
             candidate.crop = Some(crop);
@@ -415,6 +675,9 @@ fn apply_authored_mapping(
 }
 
 fn mapping_window(mapping: &RegionMapping, width: u32, height: u32) -> SourceCrop {
+    if mapping.source_crop_intent == Some(hot_trimmer_domain::SourceCropIntent::Unplaced) {
+        return SourceCrop { x: 0, y: 0, width, height };
+    }
     let Projection::Crop { bounds, .. } = mapping.projection else {
         return SourceCrop { x: 0, y: 0, width, height };
     };
@@ -423,6 +686,19 @@ fn mapping_window(mapping: &RegionMapping, width: u32, height: u32) -> SourceCro
     let requested_width = (bounds.width.get() * f64::from(width)).ceil().max(1.0) as u32;
     let requested_height = (bounds.height.get() * f64::from(height)).ceil().max(1.0) as u32;
     SourceCrop { x, y, width: requested_width.min(width - x), height: requested_height.min(height - y) }
+}
+
+fn legal_gate1_mode(mode: hot_trimmer_domain::SamplingMode, role: hot_trimmer_domain::TemplateSlotRole, has_declared_period: bool) -> bool {
+    use hot_trimmer_domain::{SamplingMode, TemplateSlotRole};
+    match role {
+        TemplateSlotRole::Planar => matches!(mode, SamplingMode::DirectCrop)
+            || (mode == SamplingMode::PeriodicTile && has_declared_period),
+        TemplateSlotRole::RepeatingStrip => matches!(mode, SamplingMode::DirectCrop)
+            || (matches!(mode, SamplingMode::RepeatX | SamplingMode::RepeatY) && has_declared_period),
+        TemplateSlotRole::UniqueDetail => matches!(mode, SamplingMode::UniqueContain | SamplingMode::UniqueCover),
+        TemplateSlotRole::TrimCap => mode == SamplingMode::ThreeSliceCap,
+        TemplateSlotRole::Radial => matches!(mode, SamplingMode::PlanarRadial),
+    }
 }
 
 fn authored_quarter_turn(degrees: f64) -> Result<QuarterTurn, String> {
@@ -583,6 +859,17 @@ fn base_pixels_per_physical_unit(scale: PhysicalScaleEvidence, demand: &hot_trim
     if scale.claims_world_accuracy() { let x = scale.source_pixels_per_meter_x_milli.unwrap_or(1000) as f64 / 1000.0;
         let y = scale.source_pixels_per_meter_y_milli.unwrap_or(1000) as f64 / 1000.0; (x * y).sqrt() }
     else { (f64::from(width) / demand.world_width_m).min(f64::from(height) / demand.world_height_m).max(f64::EPSILON) }
+}
+
+fn unplaced_source_pixels_per_physical_unit(
+    demand: &hot_trimmer_effect_compiler::ResolvedSlotDemand,
+    width: u32,
+    height: u32,
+) -> f64 {
+    (f64::from(width) / demand.world_width_m)
+        .min(f64::from(height) / demand.world_height_m)
+        .max(f64::EPSILON)
+        * UNPLACED_SOURCE_FOOTPRINT_FRACTION
 }
 
 fn slice_geometry(role: hot_trimmer_domain::TemplateSlotRole, width: u32, height: u32) -> SliceGeometry {

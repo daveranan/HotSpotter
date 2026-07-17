@@ -512,52 +512,61 @@ button:disabled {
   height: 100%;
   display: block;
   object-fit: contain;
+  background: transparent;
   user-select: none;
   -webkit-user-drag: none;
 }
 
-.source-crop {
+.source-partition-overlay {
   position: absolute;
-  padding: 0;
-  border: 2px solid #d7ff79;
-  background: #d7ff791a;
-  color: #111;
-  cursor: move;
+  inset: 0;
+  z-index: 4;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
 }
 
-.source-crop span {
+.source-frame-aspect-lock {
+  display: flex !important;
+  grid-template-columns: auto 1fr !important;
+  align-items: center;
+  gap: 7px !important;
+  margin: 8px 0 12px !important;
+  color: #d7ff79 !important;
+  text-transform: none !important;
+  letter-spacing: normal !important;
+}
+.source-frame-aspect-lock input { width: auto; margin: 0; }
+
+.source-region-boundary {
+  fill: #d7ff7908;
+  stroke: #dca9ffb8;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+  paint-order: stroke;
+  pointer-events: all;
+}
+
+.source-region-boundary:hover,
+.source-region-boundary.selected {
+  fill: #d7ff7914;
+  stroke: #d7ff79;
+  stroke-width: 4;
+}
+
+.partition-selection-status {
   position: absolute;
-  left: -2px;
-  top: -20px;
-  padding: 2px 5px;
-  background: #d7ff79;
-  font: var(--source-label-size, 10px) ui-monospace, Consolas, monospace;
-  white-space: nowrap;
-}
-
-.source-crop:hover, .source-crop:hover span { color: #111; }
-
-.source-crop .handle {
-  position: absolute;
-  width: var(--source-handle-size, 10px);
-  height: var(--source-handle-size, 10px);
-  background: #d7ff79;
-  border: 1px solid #111;
-}
-
-.source-crop .handle.nw {
-  left: calc(-1 * var(--source-handle-offset, 6px));
-  top: calc(-1 * var(--source-handle-offset, 6px));
-  cursor: nwse-resize;
-}
-
-.source-crop .handle.ne { right: calc(-1 * var(--source-handle-offset, 6px)); top: calc(-1 * var(--source-handle-offset, 6px)); cursor: nesw-resize; }
-.source-crop .handle.sw { left: calc(-1 * var(--source-handle-offset, 6px)); bottom: calc(-1 * var(--source-handle-offset, 6px)); cursor: nesw-resize; }
-
-.source-crop .handle.se {
-  right: calc(-1 * var(--source-handle-offset, 6px));
-  bottom: calc(-1 * var(--source-handle-offset, 6px));
-  cursor: nwse-resize;
+  z-index: 6;
+  left: 10px;
+  top: 10px;
+  padding: 5px 8px;
+  border: 1px solid #d7ff79;
+  border-radius: 4px;
+  background: #111d;
+  color: #d7ff79;
+  font: 11px ui-monospace, Consolas, monospace;
+  pointer-events: none;
 }
 
 .patch-overlay {
