@@ -9,6 +9,7 @@ license.workspace = true
 hot-trimmer-domain.workspace = true
 hot-trimmer-placement-solver.workspace = true
 hot-trimmer-render-core = { path = "../render-core" }
+serde.workspace = true
 
 [lints]
 workspace = true

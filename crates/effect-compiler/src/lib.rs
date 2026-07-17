@@ -1,6 +1,10 @@
-#![doc = "Stages 15, 16, and 18 effect compilation boundary."]
+#![doc = "Stages 10, 15, 16, and 18 effect compilation boundary."]
 
 use hot_trimmer_domain::{CompilationDiagnostic, RecoveryChoice, StageResult};
+
+mod stage10;
+
+pub use stage10::*;
 
 #[must_use]
 pub fn unsupported(stage: u8) -> StageResult {

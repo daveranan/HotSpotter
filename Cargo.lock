@@ -1570,6 +1570,7 @@ dependencies = [
  "hot-trimmer-domain",
  "hot-trimmer-placement-solver",
  "hot-trimmer-render-core",
+ "serde",
 ]
 
 [[package]]
