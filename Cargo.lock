@@ -1613,6 +1613,7 @@ dependencies = [
  "hot-trimmer-geometry",
  "hot-trimmer-image-io",
  "hot-trimmer-render-core",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

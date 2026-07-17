@@ -41,6 +41,7 @@ pub use material_source::{
     AssignmentProvenance, ChannelInterpretation, ChannelRegistration, MaterialChannelRole,
     ClassicalDelightingSettings, DelightingIntent, DelightingPassThroughReason,
     DelightingRadius, DelightingRouteIntent, IntrinsicProviderFallback, MaterialSource,
+    MaterialBehaviorClass, MaterialClassificationCommand, MaterialClassificationIntent,
     NormalConvention, OrientedPixelSize, OriginalAssetProvenance,
     RegisteredChannel, RegisteredChannelSet, RegistrationDiagnostic, RegistrationDiagnosticCode,
     RegistrationRecoveryChoice, SourceOwnershipIntent,

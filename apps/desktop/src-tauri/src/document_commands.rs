@@ -12,7 +12,8 @@ use hot_trimmer_domain::{
     ALGORITHM_STACK_CONTRACT_VERSION, AlgorithmProvenance, AssignmentProvenance,
     CancellationToken as EngineCancellationToken, ChannelRegistration,
     CompilerRequestHeader, ContentDigest, ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION,
-    DelightingIntent,
+    DelightingIntent, MaterialBehaviorClass, MaterialClassificationCommand,
+    MaterialClassificationIntent,
     MaterialMapKind, MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
     NormalConvention, OriginalAssetProvenance, OrientedPixelSize, Projection, RegisteredChannel,
     RegisteredChannelSet, RegionId, SourceId, SourceOwnershipIntent, SourceSetId,
@@ -23,7 +24,10 @@ use hot_trimmer_image_io::{
     inspect_bytes_with_policy, inspect_path_with_policy, prepare_registered_channel_set,
     NormalizationSettings, PreparedChannelSet,
 };
-use hot_trimmer_material_analysis::prepare_delit_exemplar;
+use hot_trimmer_material_analysis::{
+    AnalysisSettings, SourceAnalysisCache, analyze_source, prepare_delit_exemplar,
+    source_analysis_cache_key,
+};
 use hot_trimmer_project_store::{
     ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
 };
@@ -62,6 +66,7 @@ pub struct ProjectSession {
     source_projection_cache: Mutex<HashMap<(String, String, String), SourceProjection>>,
     preview_prepared_sources: HashMap<(String, u64), Arc<PreparedChannelSet>>,
     prepared_exemplars: PreparedExemplarCache,
+    source_analysis_cache: SourceAnalysisCache,
 }
 
 impl ProjectSession {
@@ -77,6 +82,7 @@ impl ProjectSession {
             source_projection_cache: Mutex::new(HashMap::new()),
             preview_prepared_sources: HashMap::new(),
             prepared_exemplars: PreparedExemplarCache::default(),
+            source_analysis_cache: SourceAnalysisCache::default(),
         }
     }
 
@@ -94,6 +100,7 @@ impl ProjectSession {
         self.store = Some(store);
         self.preview_prepared_sources.clear();
         self.prepared_exemplars = PreparedExemplarCache::default();
+        self.source_analysis_cache = SourceAnalysisCache::default();
         self.baseline = Some(baseline);
         self.dirty = false;
         self.is_draft = is_draft;
@@ -209,6 +216,7 @@ struct MaterialSourceProjection {
     source_revision: u64,
     registration_digest: String,
     delighting: DelightingIntent,
+    classification: MaterialClassificationIntent,
     registered_channels: Option<RegisteredChannelSetProjection>,
 }
 
@@ -285,6 +293,14 @@ pub struct SetDelightingIntentRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MaterialClassificationCommandRequest {
+    protocol_version: u16,
+    material_source_id: Uuid,
+    classification_command: MaterialClassificationCommand,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectNameRequest {
     protocol_version: u16,
     name: String,
@@ -327,12 +343,25 @@ pub struct PreparedPatchPreviewRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PreparedPatchPreviewProjection {
     patch_id: PatchId,
+    material_source_id: String,
     width: u32,
     height: u32,
     data_url: String,
     perspective_confidence_milli: u16,
     delighting_route: String,
     delighting_strength_milli: u16,
+    source_analysis: SourceInspectorProjection,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceInspectorProjection {
+    quality_summary: String,
+    analyzed_class: MaterialBehaviorClass,
+    routed_class: MaterialBehaviorClass,
+    confidence_percent: u8,
+    evidence_summary: String,
+    warning_count: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,6 +520,7 @@ pub fn import_source(
         .map_err(|failure| source_registration_error(failure, request.channel))?;
     store.refresh_document_assets().map_err(store_error)?;
     session.prepared_exemplars.invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
+    session.source_analysis_cache = SourceAnalysisCache::default();
     session.mark_mutated();
     *import_job.lock().map_err(|_| poisoned())? = None;
     project_projection(&session)
@@ -522,6 +552,7 @@ pub fn remove_source(
         .remove_source_in_set(request.source_set_id, request.channel)
         .map_err(store_error)?;
     session.prepared_exemplars.invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
+    session.source_analysis_cache = SourceAnalysisCache::default();
     session.mark_mutated();
     project_projection(&session)
 }
@@ -549,6 +580,24 @@ pub fn set_delighting_intent(
     let mut session = session.lock().map_err(|_| poisoned())?;
     session.store.as_mut().ok_or_else(no_project)?
         .set_delighting_intent(request.material_source_id, &request.delighting)
+        .map_err(store_error)?;
+    session.source_analysis_cache = SourceAnalysisCache::default();
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn apply_material_classification_command(
+    request: MaterialClassificationCommandRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session.store.as_mut().ok_or_else(no_project)?
+        .apply_material_classification_command(
+            request.material_source_id,
+            request.classification_command,
+        )
         .map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
@@ -748,11 +797,36 @@ pub fn prepare_patch_preview(
         None,
         &RenderCancellationToken::new(),
     ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 4 source preparation failed: {failure}")))?;
+    let analysis_settings = AnalysisSettings::default();
+    let analysis_key = source_analysis_cache_key(&stage_four, &analysis_settings, None);
+    let mut stage_five = if let Some(cached) = session.source_analysis_cache.get(&analysis_key) {
+        cached.clone()
+    } else {
+        let report = analyze_source(
+            &stage_four,
+            &analysis_settings,
+            None,
+            &RenderCancellationToken::new(),
+        ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 5 source analysis failed: {failure}")))?;
+        session.source_analysis_cache.insert_complete(report.clone());
+        report
+    };
+    stage_five.classification.routing_intent = source_set.classification;
+    let inspector = stage_five.inspector_evidence();
     prepared_preview_projection(
         &exemplar,
         stage_four.base_color(),
         &format!("{:?}", stage_four.route_execution),
         source_set.delighting.classical.strength_milli,
+        source_set_id.to_string(),
+        SourceInspectorProjection {
+            quality_summary: inspector.quality_summary,
+            analyzed_class: stage_five.classification.analyzed_class,
+            routed_class: stage_five.classification.routed_class(),
+            confidence_percent: inspector.confidence_percent,
+            evidence_summary: inspector.evidence_summary,
+            warning_count: inspector.warning_count,
+        },
     )
 }
 
@@ -1041,6 +1115,7 @@ fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, Use
             source_revision: material.source_revision,
             registration_digest: material.registration_digest.0.clone(),
             delighting: material.delighting.clone(),
+            classification: material.classification,
             registered_channels,
         })
     }).collect::<Result<Vec<_>, UserFacingError>>()?;
@@ -1226,6 +1301,8 @@ fn prepared_preview_projection(
     base: &hot_trimmer_image_io::ImagePlane<hot_trimmer_image_io::LinearColor>,
     delighting_route: &str,
     delighting_strength_milli: u16,
+    material_source_id: String,
+    source_analysis: SourceInspectorProjection,
 ) -> Result<PreparedPatchPreviewProjection, UserFacingError> {
     let mask = exemplar.usable_mask.as_ref();
     let mut rgba = Vec::with_capacity(
@@ -1249,12 +1326,14 @@ fn prepared_preview_projection(
     }
     Ok(PreparedPatchPreviewProjection {
         patch_id: exemplar.scope.patch_id.ok_or_else(|| error(ErrorCode::Internal, "Prepared patch scope is missing."))?,
+        material_source_id,
         width: exemplar.width,
         height: exemplar.height,
         data_url: png_data_url(exemplar.width, exemplar.height, rgba)?,
         perspective_confidence_milli: exemplar.perspective_confidence_milli,
         delighting_route: delighting_route.to_owned(),
         delighting_strength_milli,
+        source_analysis,
     })
 }
 

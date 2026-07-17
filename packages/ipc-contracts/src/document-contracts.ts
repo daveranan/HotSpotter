@@ -137,6 +137,26 @@ export interface DelightingIntent {
   };
 }
 
+export type MaterialBehaviorClass =
+  | "already_tileable"
+  | "stochastic_isotropic"
+  | "stochastic_directional"
+  | "periodic_lattice_structured"
+  | "layered_banded"
+  | "organic_directional"
+  | "manufactured_pattern"
+  | "unique_detail"
+  | "radial_detail"
+  | "mixed_unknown";
+
+export interface MaterialClassificationIntent {
+  overrideClass: MaterialBehaviorClass | null;
+}
+
+export type MaterialClassificationCommand =
+  | { command: "override"; class: MaterialBehaviorClass }
+  | { command: "reset_to_analysis" };
+
 export interface MaterialSourceProjection {
   id: string;
   name: string;
@@ -144,6 +164,7 @@ export interface MaterialSourceProjection {
   sourceRevision: number;
   registrationDigest: string;
   delighting: DelightingIntent;
+  classification: MaterialClassificationIntent;
   registeredChannels: RegisteredChannelSetProjection | null;
 }
 
@@ -151,6 +172,12 @@ export interface SetExemplarGroupRequest {
   protocolVersion: typeof IPC_PROTOCOL_VERSION;
   materialSourceId: string;
   exemplarGroup: string | null;
+}
+
+export interface MaterialClassificationCommandRequest {
+  protocolVersion: typeof IPC_PROTOCOL_VERSION;
+  materialSourceId: string;
+  classificationCommand: MaterialClassificationCommand;
 }
 
 export interface ProjectProjection {

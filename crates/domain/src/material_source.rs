@@ -146,7 +146,78 @@ pub struct MaterialSource {
     /// Persisted Stage 4 intent. De-lighting is never inferred from source metadata.
     #[serde(default)]
     pub delighting: DelightingIntent,
+    /// Persisted Stage 5 routing intent. `None` means route from measured analysis.
+    #[serde(default)]
+    pub classification: MaterialClassificationIntent,
     pub registered_channels: Option<RegisteredChannelSet>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialBehaviorClass {
+    AlreadyTileable,
+    StochasticIsotropic,
+    StochasticDirectional,
+    PeriodicLatticeStructured,
+    LayeredBanded,
+    OrganicDirectional,
+    ManufacturedPattern,
+    UniqueDetail,
+    RadialDetail,
+    MixedUnknown,
+}
+
+impl MaterialBehaviorClass {
+    pub const ALL: [Self; 10] = [
+        Self::AlreadyTileable,
+        Self::StochasticIsotropic,
+        Self::StochasticDirectional,
+        Self::PeriodicLatticeStructured,
+        Self::LayeredBanded,
+        Self::OrganicDirectional,
+        Self::ManufacturedPattern,
+        Self::UniqueDetail,
+        Self::RadialDetail,
+        Self::MixedUnknown,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AlreadyTileable => "Already tileable",
+            Self::StochasticIsotropic => "Stochastic isotropic",
+            Self::StochasticDirectional => "Stochastic directional",
+            Self::PeriodicLatticeStructured => "Periodic/lattice structured",
+            Self::LayeredBanded => "Layered/banded",
+            Self::OrganicDirectional => "Organic directional",
+            Self::ManufacturedPattern => "Manufactured pattern",
+            Self::UniqueDetail => "Unique detail",
+            Self::RadialDetail => "Radial detail",
+            Self::MixedUnknown => "Mixed/Unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialClassificationIntent {
+    pub override_class: Option<MaterialBehaviorClass>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum MaterialClassificationCommand {
+    Override { class: MaterialBehaviorClass },
+    ResetToAnalysis,
+}
+
+impl MaterialClassificationIntent {
+    pub fn apply(&mut self, command: MaterialClassificationCommand) {
+        self.override_class = match command {
+            MaterialClassificationCommand::Override { class } => Some(class),
+            MaterialClassificationCommand::ResetToAnalysis => None,
+        };
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,7 +285,7 @@ pub enum DelightingRouteIntent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct DelightingIntent {
     pub route: DelightingRouteIntent,
     pub classical: ClassicalDelightingSettings,
@@ -259,4 +330,16 @@ pub struct RegistrationDiagnostic {
     pub channel: MaterialChannelRole,
     pub message: String,
     pub recovery_choices: Vec<RegistrationRecoveryChoice>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DelightingIntent;
+
+    #[test]
+    fn empty_legacy_delighting_payload_uses_the_default_route() {
+        let intent: DelightingIntent = serde_json::from_str("{}").expect("default intent");
+
+        assert_eq!(intent, DelightingIntent::default());
+    }
 }

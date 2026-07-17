@@ -10,6 +10,8 @@ import {
   IPC_PROTOCOL_VERSION,
   type CommandFailure,
   type DelightingIntent,
+  type MaterialBehaviorClass,
+  type MaterialClassificationCommand,
   type CompiledMapView,
   type CompiledSheetProjection,
   type NormalizedBounds,
@@ -65,18 +67,40 @@ const mapViews: readonly [CompiledMapView, string][] = [
   ["materialId", "Material ID"],
 ];
 
+const materialBehaviorOptions: readonly [MaterialBehaviorClass, string][] = [
+  ["already_tileable", "Already tileable"],
+  ["stochastic_isotropic", "Stochastic isotropic"],
+  ["stochastic_directional", "Stochastic directional"],
+  ["periodic_lattice_structured", "Periodic/lattice structured"],
+  ["layered_banded", "Layered/banded"],
+  ["organic_directional", "Organic directional"],
+  ["manufactured_pattern", "Manufactured pattern"],
+  ["unique_detail", "Unique detail"],
+  ["radial_detail", "Radial detail"],
+  ["mixed_unknown", "Mixed/Unknown"],
+];
+
 type Activity = "starting" | "idle" | "importing" | "compiling" | "saving" | "opening";
 type CropProjection = Extract<RegionMapping["projection"], { type: "crop" }>;
 type PaneLayoutMode = "full" | "without-inspector" | "without-library" | "sheet-only";
 
 interface PreparedPatchPreviewProjection {
   patchId: string;
+  materialSourceId: string;
   width: number;
   height: number;
   dataUrl: string;
   perspectiveConfidenceMilli: number;
   delightingRoute: string;
   delightingStrengthMilli: number;
+  sourceAnalysis: {
+    qualitySummary: string;
+    analyzedClass: MaterialBehaviorClass;
+    routedClass: MaterialBehaviorClass;
+    confidencePercent: number;
+    evidenceSummary: string;
+    warningCount: number;
+  };
 }
 
 function paneLayoutMode(width: number): PaneLayoutMode {
@@ -530,6 +554,23 @@ function App() {
     }
   }
 
+  async function applyMaterialClassificationCommand(
+    materialSourceId: string,
+    classificationCommand: MaterialClassificationCommand,
+  ) {
+    if (!project) return;
+    try {
+      const next = await invoke<ProjectProjection>("apply_material_classification_command", {
+        request: { ...protocol, materialSourceId, classificationCommand },
+      });
+      setProject(next);
+      setArtifact(null);
+      setProblem(null);
+    } catch (reason) {
+      setProblem(failure(reason));
+    }
+  }
+
   async function command(commandValue: TrimSheetDocumentCommand): Promise<ProjectProjection> {
     const next = await applyCommand(commandValue);
     setProject(next);
@@ -943,11 +984,13 @@ function App() {
         {paneMode === "full" ? <Inspector
           project={project}
           artifact={artifact}
+          sourceAnalysis={activePatchId ? preparedPatchPreview : null}
           selectedRegion={selectedRegion}
           mapView={mapView}
           setMapView={setMapView}
           onUndo={() => void history(false)}
           onRedo={() => void history(true)}
+          onClassify={(materialSourceId, classificationCommand) => void applyMaterialClassificationCommand(materialSourceId, classificationCommand)}
           onSetDestination={(regionId, rect, padding) => void setRegionDestination(regionId, rect, padding)}
           onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
           onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
@@ -1710,21 +1753,54 @@ function SheetWorkbench(props: {
 function Inspector(props: {
   project: ProjectProjection | null;
   artifact: CompiledSheetProjection | null;
+  sourceAnalysis: PreparedPatchPreviewProjection | null;
   selectedRegion: ResolvedRegion | null;
   mapView: CompiledMapView;
   setMapView: (view: CompiledMapView) => void;
   onUndo: () => void;
   onRedo: () => void;
+  onClassify: (materialSourceId: string, command: MaterialClassificationCommand) => void;
   onSetDestination: (regionId: string, rect: { x: number; y: number; width: number; height: number }, padding: number) => void;
   onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
 }) {
   const binding = props.selectedRegion && props.project?.document?.regionBindings[props.selectedRegion.regionId];
+  const analyzedSource = props.sourceAnalysis
+    ? props.project?.materialSources.find((source) => source.id === props.sourceAnalysis!.materialSourceId)
+    : undefined;
   return <aside className="context-inspector">
     <header className="inspector-actions"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument}>Redo</button></header>
     <section className="inspector-section">
       <span>MAP VIEW</span>
       <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact}>{label}</button>)}</div>
+    </section>
+    <section className="inspector-section">
+      <span>SOURCE QUALITY &amp; BEHAVIOR</span>
+      {props.sourceAnalysis ? <>
+        <dl>
+          <dt>Analyzed</dt><dd>{materialBehaviorOptions.find(([id]) => id === props.sourceAnalysis!.sourceAnalysis.analyzedClass)?.[1]}</dd>
+          <dt>Confidence</dt><dd>{props.sourceAnalysis.sourceAnalysis.confidencePercent}%</dd>
+          <dt>Routed</dt><dd>{materialBehaviorOptions.find(([id]) => id === props.sourceAnalysis!.sourceAnalysis.routedClass)?.[1]}</dd>
+          <dt>Warnings</dt><dd>{props.sourceAnalysis.sourceAnalysis.warningCount}</dd>
+        </dl>
+        <p>{props.sourceAnalysis.sourceAnalysis.qualitySummary}</p>
+        <p>{props.sourceAnalysis.sourceAnalysis.evidenceSummary}</p>
+        <label>Routing intent<select
+          value={analyzedSource?.classification.overrideClass ?? "analysis"}
+          onChange={(event) => {
+            const value = event.currentTarget.value;
+            props.onClassify(
+              props.sourceAnalysis!.materialSourceId,
+              value === "analysis"
+                ? { command: "reset_to_analysis" }
+                : { command: "override", class: value as MaterialBehaviorClass },
+            );
+          }}
+        >
+          <option value="analysis">Use measured analysis</option>
+          {materialBehaviorOptions.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+        </select></label>
+      </> : <p>Select a prepared patch to inspect Stage 5 evidence.</p>}
     </section>
     <section className="inspector-section">
       <span>SELECTED REGION</span>

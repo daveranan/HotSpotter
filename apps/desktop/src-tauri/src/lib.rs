@@ -81,6 +81,7 @@ pub fn run() {
             commands::remove_source,
             commands::set_exemplar_group,
             commands::set_delighting_intent,
+            commands::apply_material_classification_command,
             commands::rename_project,
             commands::create_trim_sheet_document,
             commands::apply_document_command,

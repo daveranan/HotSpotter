@@ -2773,6 +2773,11 @@ mod removed_legacy {
                         .parse::<SourceSetId>()
                         .expect("source-set id"),
                     name: "Material 1".into(),
+                    exemplar_group: None,
+                    source_revision: 0,
+                    registration_digest: hot_trimmer_domain::ContentDigest::sha256(b"fixture"),
+                    delighting: hot_trimmer_domain::DelightingIntent::default(),
+                    classification: hot_trimmer_domain::MaterialClassificationIntent::default(),
                 }],
                 patches: Vec::new(),
                 layout: None,

@@ -12,5 +12,8 @@ hot-trimmer-image-io = { path = "../image-io" }
 hot-trimmer-render-core = { path = "../render-core" }
 thiserror.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

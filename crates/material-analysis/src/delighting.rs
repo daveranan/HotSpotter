@@ -61,6 +61,8 @@ pub struct DelightingMasks {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DelitPreparedExemplar {
     pub exemplar_id: String,
+    /// Stage 3 geometric confidence in `[0,1000]`, carried without reinterpretation.
+    pub perspective_confidence_milli: u16,
     /// Immutable Stage 3 Base Color retained for exact restoration.
     pub original_prepared_base_color: ImagePlane<LinearColor>,
     pub channels: Vec<PreparedExemplarChannel>,
@@ -257,6 +259,7 @@ fn execute_provider(
     let settings_hash = provider_settings_hash(&descriptor, intent);
     Ok(DelitPreparedExemplar {
         exemplar_id: exemplar.exemplar_id.clone(),
+        perspective_confidence_milli: exemplar.perspective_confidence_milli,
         original_prepared_base_color: original,
         channels,
         coverage: exemplar.usable_mask.clone(),
@@ -299,6 +302,7 @@ fn pass_through(
     );
     DelitPreparedExemplar {
         exemplar_id: exemplar.exemplar_id.clone(),
+        perspective_confidence_milli: exemplar.perspective_confidence_milli,
         original_prepared_base_color: original,
         channels: exemplar.channels.clone(),
         coverage: exemplar.usable_mask.clone(),
@@ -374,6 +378,7 @@ fn classical(
     let channels = replace_base_color(&exemplar.channels, plane);
     Ok(DelitPreparedExemplar {
         exemplar_id: exemplar.exemplar_id.clone(),
+        perspective_confidence_milli: exemplar.perspective_confidence_milli,
         original_prepared_base_color: original,
         channels,
         coverage: exemplar.usable_mask.clone(),
@@ -803,6 +808,7 @@ mod tests {
         let (source_scalar, source_ids) = {
             let source = DelitPreparedExemplar {
                 exemplar_id: String::new(), original_prepared_base_color: base_color(&exemplar).unwrap().clone(),
+                perspective_confidence_milli: exemplar.perspective_confidence_milli,
                 channels: exemplar.channels.clone(), coverage: None, masks: None,
                 reflectance_provenance: ReflectanceProvenance::ImportedPrepared,
                 route_execution: RouteExecution::PassThrough(DelightingPassThroughReason::DefaultNewOrUnclassified),
