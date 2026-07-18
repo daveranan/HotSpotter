@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CompiledSheetProjection, TrimSheetDocumentCommand } from "@hot-trimmer/ipc-contracts";
-import { adjustCrop, anchoredZoom, fitSourceFrame, movePatch, normalizePatchToRectangle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
+import { adjustCrop, anchoredZoom, fitSourceFrame, gridRectToPreviewBounds, movePatch, normalizePatchToRectangle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
 
 test("document command wire shapes are typed and carry exact stable IDs", () => {
   const regionId = "764f7fc0-5091-47f8-878f-1e926b0c9f66";
@@ -26,6 +26,17 @@ test("compiled overlay bounds are read from the artifact rather than reconstruct
   assert.deepEqual(
     [bounds.x / artifact.width, bounds.y / artifact.height, bounds.width / artifact.width, bounds.height / artifact.height],
     [0.25, 0.125, 0.5, 0.25],
+  );
+});
+
+test("committed topology is projected into the retained preview pixel space", () => {
+  assert.deepEqual(
+    gridRectToPreviewBounds(
+      { x: 16, y: 8, width: 32, height: 24 },
+      { width: 64, height: 64 },
+      { width: 512, height: 512 },
+    ),
+    { x: 128, y: 64, width: 256, height: 192 },
   );
 });
 

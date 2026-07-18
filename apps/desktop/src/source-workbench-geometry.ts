@@ -287,3 +287,20 @@ export function rotatePatch(
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
+
+/**
+ * Projects authoritative logical-grid ownership into the pixel space of the
+ * retained editor preview. Document allocation rectangles use the accepted
+ * output resolution, which may be different from the lightweight preview.
+ */
+export function gridRectToPreviewBounds(
+  rect: { x: number; y: number; width: number; height: number },
+  grid: { width: number; height: number },
+  preview: { width: number; height: number },
+) {
+  const left = Math.round(rect.x / grid.width * preview.width);
+  const top = Math.round(rect.y / grid.height * preview.height);
+  const right = Math.round((rect.x + rect.width) / grid.width * preview.width);
+  const bottom = Math.round((rect.y + rect.height) / grid.height * preview.height);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}

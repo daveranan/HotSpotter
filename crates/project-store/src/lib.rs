@@ -1850,6 +1850,12 @@ fn persist_document_state_in_transaction(
 
 fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
     match command {
+        TrimSheetDocumentCommand::AcceptSourceFramePartition { .. } => "accept_source_frame_partition",
+        TrimSheetDocumentCommand::SplitSourceFrameRegion { .. } => "split_source_frame_region",
+        TrimSheetDocumentCommand::MergeSourceFrameRegions { .. } => "merge_source_frame_regions",
+        TrimSheetDocumentCommand::MoveSourceFrameBoundary { .. } => "move_source_frame_boundary",
+        TrimSheetDocumentCommand::DrawSourceFrameRegion { .. } => "draw_source_frame_region",
+        TrimSheetDocumentCommand::ResizeSourceFrameRegion { .. } => "resize_source_frame_region",
         TrimSheetDocumentCommand::SetPrimaryMaterial { .. } => "set_primary_material",
         TrimSheetDocumentCommand::SetRegionContent { .. } => "set_region_content",
         TrimSheetDocumentCommand::SetSheetFraming { .. } => "set_sheet_framing",
@@ -4018,7 +4024,7 @@ mod algorithm_stage_01_tests {
     use std::{fs, path::PathBuf};
 
     use hot_trimmer_domain::{
-        AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ContentDigest,
+        AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ContentDigest, GridRect,
         MaterialChannelRole, NormalConvention, RegistrationDiagnosticCode,
         RegistrationRecoveryChoice, SourceId,
     };
@@ -4267,6 +4273,42 @@ mod algorithm_stage_01_tests {
         assert!((frame_width_px - frame_height_px).abs() < 0.001);
         assert!(frame.bounds.x.get() > 0.0);
         assert_eq!(frame.bounds.y.get(), 0.0);
+        drop(store);
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn direct_source_frame_rectangle_is_one_undoable_persisted_command() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-draw-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("draw.hottrimmer");
+        let mut store = ProjectStore::create(&path, "SourceFrame draw").expect("create project");
+        let primary = Uuid::from_bytes(store.summary().expect("empty summary").source_sets[0].id.to_bytes());
+        store.replace_source_in_set(primary, SourceChannel::BaseColor, &input(72, 4096, 4096, 1)).expect("base color");
+        store.create_source_frame_document().expect("create source frame");
+        let before = store.document().expect("document").topology.topology_hash;
+        let drawn_rect = GridRect { x: 8, y: 8, width: 24, height: 16 };
+        store.execute_document_command(&TrimSheetDocumentCommand::DrawSourceFrameRegion { grid_rect: drawn_rect }).expect("draw rectangle");
+        let drawn_hash = store.document().expect("drawn document").topology.topology_hash;
+        assert_ne!(drawn_hash, before);
+        assert!(store.document().unwrap().topology.regions.iter().any(|region| region.grid_rect == Some(drawn_rect)));
+        store.undo_document_command().expect("undo direct draw");
+        assert_eq!(store.document().unwrap().topology.topology_hash, before);
+        store.redo_document_command().expect("redo direct draw");
+        assert_eq!(store.document().unwrap().topology.topology_hash, drawn_hash);
+        assert!(store.document().unwrap().topology.regions.iter().any(|region| region.grid_rect == Some(drawn_rect)));
+        let drawn_id = store.document().unwrap().topology.regions.iter().find(|region| region.grid_rect == Some(drawn_rect)).expect("drawn region").id;
+        let resized_rect = GridRect { x: 10, y: 8, width: 26, height: 18 };
+        store.execute_document_command(&TrimSheetDocumentCommand::ResizeSourceFrameRegion { region_id: drawn_id, grid_rect: resized_rect }).expect("resize selected rectangle");
+        let resized_hash = store.document().expect("resized document").topology.topology_hash;
+        assert_ne!(resized_hash, drawn_hash);
+        assert_eq!(store.document().unwrap().topology.regions.iter().find(|region| region.id == drawn_id).expect("stable resized region").grid_rect, Some(resized_rect));
+        store.undo_document_command().expect("undo direct resize");
+        assert_eq!(store.document().unwrap().topology.topology_hash, drawn_hash);
+        assert_eq!(store.document().unwrap().topology.regions.iter().find(|region| region.id == drawn_id).expect("restored region").grid_rect, Some(drawn_rect));
+        store.redo_document_command().expect("redo direct resize");
+        assert_eq!(store.document().unwrap().topology.topology_hash, resized_hash);
+        assert_eq!(store.document().unwrap().topology.regions.iter().find(|region| region.id == drawn_id).expect("redone region").grid_rect, Some(resized_rect));
         drop(store);
         fs::remove_dir_all(root).expect("remove fixture directory");
     }

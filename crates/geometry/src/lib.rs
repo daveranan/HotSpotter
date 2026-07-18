@@ -678,7 +678,50 @@ mod tests {
         GeometryError, Point, Quadrilateral, RectificationLimits, assist_polygon, order_corners,
         rectified_dimensions,
     };
-    use hot_trimmer_domain::{NormalizedPoint, RectificationSettings};
+    use hot_trimmer_domain::{LogicalGridSpec, NormalizedPoint, PartitionFamily, PartitionRecipe, RectificationSettings, generate_partition};
+
+    #[test]
+    fn intentional_source_partition() {
+        for (grid, target) in [
+            (LogicalGridSpec { schema_version: 1, width: 32, height: 32 }, 16),
+            (LogicalGridSpec { schema_version: 1, width: 64, height: 64 }, 63),
+            (LogicalGridSpec { schema_version: 1, width: 128, height: 64 }, 64),
+            (LogicalGridSpec { schema_version: 1, width: 128, height: 64 }, 100),
+            (LogicalGridSpec { schema_version: 1, width: 128, height: 64 }, 103),
+        ] {
+            let mut recipe = PartitionRecipe::default_for(grid, target, 42);
+            recipe.composition.broad_panels.count = 2;
+            recipe.composition.horizontal_strips.count = 2;
+            recipe.composition.vertical_strips.count = 1;
+            recipe.composition.small_details.count = 2;
+            recipe.composition.radial_reservations.count = 1;
+            let first = generate_partition(&recipe).expect("feasible partition");
+            assert_eq!(first, generate_partition(&recipe).expect("deterministic partition"));
+            assert_eq!(first.len(), target as usize);
+            let mut cells = vec![0_u8; (grid.width * grid.height) as usize];
+            for region in &first {
+                for y in region.grid_rect.y..region.grid_rect.y + region.grid_rect.height {
+                    for x in region.grid_rect.x..region.grid_rect.x + region.grid_rect.width { cells[(y * grid.width + x) as usize] += 1; }
+                }
+            }
+            assert!(cells.iter().all(|coverage| *coverage == 1));
+            assert_eq!(first.iter().filter(|region| region.family == PartitionFamily::BroadPanel).count(), 2);
+            assert_eq!(first.iter().filter(|region| region.family == PartitionFamily::HorizontalStrip).count(), 2);
+            assert_eq!(first.iter().filter(|region| region.family == PartitionFamily::VerticalStrip).count(), 1);
+            assert_eq!(first.iter().filter(|region| region.family == PartitionFamily::SmallDetail).count(), 2);
+            assert_eq!(first.iter().filter(|region| region.family == PartitionFamily::RadialReservation).count(), 1);
+            assert!(first.iter().filter(|region| region.family == PartitionFamily::HorizontalStrip)
+                .all(|region| region.grid_rect.height <= recipe.composition.horizontal_strips.maximum_thickness));
+        }
+
+        let grid = LogicalGridSpec { schema_version: 1, width: 64, height: 64 };
+        let mut panel_heavy = PartitionRecipe::default_for(grid, 64, 42);
+        panel_heavy.composition.broad_panels.count = 4;
+        let mut strip_heavy = PartitionRecipe::default_for(grid, 64, 42);
+        strip_heavy.composition.horizontal_strips.count = 4;
+        assert_ne!(generate_partition(&panel_heavy).unwrap(), generate_partition(&strip_heavy).unwrap(),
+            "family controls must direct geometry, not just labels");
+    }
 
     fn normalized(x: f64, y: f64) -> NormalizedPoint {
         NormalizedPoint::new(x, y).expect("normalized test point")

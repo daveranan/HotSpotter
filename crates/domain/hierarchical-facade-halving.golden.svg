@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="768" height="768" viewBox="0 0 64 64" aria-label="facade-halving hierarchical layout">
+<rect width="64" height="64" fill="#10141b"/>
+<g><rect x="0" y="0" width="32" height="15" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M00 7df16eab-4124-8bcd-be1e-2d2adfd89a9c parent=Some(3) depth=1</title>
+<text x="1" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">M00</text>
+</g>
+<g><rect x="32" y="0" width="16" height="30" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M01 6356a5f1-9926-0054-b132-4eddbf66dca0 parent=Some(2) depth=1</title>
+<text x="33" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">M01</text>
+</g>
+<g><rect x="48" y="0" width="8" height="30" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M02 c0aebab3-d781-85b6-6a3d-d07105538755 parent=Some(2) depth=1</title>
+<text x="49" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">M02</text>
+</g>
+<g><rect x="56" y="0" width="8" height="15" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D03 7fd18cd5-57c0-19ba-ba60-2c2bf6e614ca parent=Some(2) depth=2</title>
+<text x="57" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">D03</text>
+</g>
+<g><rect x="0" y="15" width="16" height="15" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M04 bdd92246-df94-be72-bb62-bad64bc82652 parent=Some(3) depth=1</title>
+<text x="1" y="16.7" font-size="1.15" fill="#ffffff" font-family="monospace">M04</text>
+</g>
+<g><rect x="16" y="15" width="8" height="15" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D05 d9e38173-5554-c05a-645e-14569595def0 parent=Some(3) depth=2</title>
+<text x="17" y="16.7" font-size="1.15" fill="#ffffff" font-family="monospace">D05</text>
+</g>
+<g><rect x="24" y="15" width="8" height="15" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D06 0d4c714b-68c5-ab97-8f9e-3cc7774faf6d parent=Some(3) depth=2</title>
+<text x="25" y="16.7" font-size="1.15" fill="#ffffff" font-family="monospace">D06</text>
+</g>
+<g><rect x="56" y="15" width="8" height="15" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D07 b0b31052-4d67-02df-2ba0-755721998a94 parent=Some(2) depth=2</title>
+<text x="57" y="16.7" font-size="1.15" fill="#ffffff" font-family="monospace">D07</text>
+</g>
+<g><rect x="0" y="30" width="32" height="31" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L08 3db1df61-c816-04ea-8ab0-dc4c0ad74cb5 parent=Some(1) depth=0</title>
+<text x="1" y="31.7" font-size="1.15" fill="#ffffff" font-family="monospace">L08</text>
+</g>
+<g><rect x="32" y="30" width="32" height="31" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L09 729df8a1-1166-13d1-fd1f-1c7249a9fc5d parent=Some(0) depth=0</title>
+<text x="33" y="31.7" font-size="1.15" fill="#ffffff" font-family="monospace">L09</text>
+</g>
+<g><rect x="0" y="61" width="64" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H10 012eeb1b-b772-30a3-3714-8b0f56390be5 parent=None depth=1</title>
+</g>
+<g><rect x="0" y="62" width="64" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H11 78ac21d8-c410-26fe-36bf-38a4a939d3a9 parent=None depth=1</title>
+</g>
+<g><rect x="0" y="63" width="64" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H12 a3b8d6df-04e0-1f00-860a-aa148caae9fa parent=None depth=1</title>
+</g>
+</svg>
+

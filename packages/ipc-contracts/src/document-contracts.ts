@@ -82,6 +82,84 @@ export interface SourceFrame {
   identity: readonly number[];
 }
 
+export interface FamilyQuota {
+  count: number;
+  areaShareMilli: number;
+  minimumWidth: number;
+  minimumHeight: number;
+  maximumWidth: number;
+  maximumHeight: number;
+  minimumAspectMilli: number;
+  maximumAspectMilli: number;
+  subdivisionBudget: number;
+}
+export interface StripQuota { count: number; minimumThickness: number; maximumThickness: number; }
+export interface RadialQuota { count: number; allocationMinDiameter: number; allocationMaxDiameter: number; }
+export interface CompositionProfile {
+  profileId: string;
+  version: number;
+  broadPanels: FamilyQuota;
+  mediumBlocks: FamilyQuota;
+  horizontalStrips: StripQuota;
+  verticalStrips: StripQuota;
+  smallDetails: FamilyQuota;
+  microStrips: StripQuota;
+  radialReservations: RadialQuota;
+}
+export type MacroStyle = "mixed_hierarchy" | "panel_cascade" | "horizontal_trims" | "vertical_trims" | "facade_halving" | "classic_source_hotspot" | "mechanical_radial";
+export type RecursivePolicy = "cascade" | "balanced";
+export type SplitRatio = "half" | "one_third" | "two_third";
+export type AspectClass = "square" | "wide2" | "tall2" | "wide4" | "tall4" | "wide8" | "tall8" | "wide16" | "tall16";
+export interface HierarchicalLayoutRecipe {
+  schemaVersion: number;
+  macroStyle: MacroStyle;
+  recursivePolicy: RecursivePolicy;
+  targetRegionMin: number;
+  targetRegionMax: number;
+  largeShareMilli: number;
+  mediumShareMilli: number;
+  smallShareMilli: number;
+  stripShareMilli: number;
+  radialShareMilli: number;
+  macroParentCount: number;
+  protectedParentCount: number;
+  subdividableParentCount: number;
+  hierarchyDepth: number;
+  scaleFalloffMilli: number;
+  allowedSplitRatios: SplitRatio[];
+  alignmentStrengthMilli: number;
+  variationMilli: number;
+  horizontalStripWeightMilli: number;
+  verticalStripWeightMilli: number;
+  stripThicknessLadder: number[];
+  radialCount: number;
+  radialMinDiameter: number;
+  radialMaxDiameter: number;
+  majorAspects: AspectClass[];
+  mediumAspects: AspectClass[];
+  detailAspects: AspectClass[];
+}
+export interface PartitionRecipe {
+  schemaVersion: number;
+  recipeId: string;
+  recipeVersion: number;
+  grid: { schemaVersion: number; width: number; height: number };
+  targetRegionCount: number;
+  seed: number;
+  horizontalSplitBiasMilli: number;
+  verticalSplitBiasMilli: number;
+  varianceMilli: number;
+  minimumLogicalWidth: number;
+  minimumLogicalHeight: number;
+  minimumAspectMilli: number;
+  maximumAspectMilli: number;
+  workLimit: number;
+  depthLimit: number;
+  composition: CompositionProfile;
+  /** Missing means the version-2 Legacy Reserve + Remainder generator. */
+  hierarchical?: HierarchicalLayoutRecipe;
+}
+
 export type MappingOrigin = "partition" | "explicit_override";
 export interface RegionSourceOverride {
   schemaVersion: number;
@@ -378,6 +456,12 @@ export interface PreviewSheetProjection {
 }
 
 export type TrimSheetDocumentCommand =
+  | { type: "accept_source_frame_partition"; recipe: PartitionRecipe }
+  | { type: "split_source_frame_region"; regionId: string; axis: "horizontal" | "vertical" }
+  | { type: "merge_source_frame_regions"; regionId: string; siblingId: string }
+  | { type: "move_source_frame_boundary"; regionId: string; axis: "horizontal" | "vertical"; coordinate: number }
+  | { type: "draw_source_frame_region"; gridRect: { x: number; y: number; width: number; height: number } }
+  | { type: "resize_source_frame_region"; regionId: string; gridRect: { x: number; y: number; width: number; height: number } }
   | { type: "set_primary_material"; materialId: string }
   | { type: "set_region_content"; regionId: string; content: ContentReference }
   | { type: "set_sheet_framing"; framing: unknown }

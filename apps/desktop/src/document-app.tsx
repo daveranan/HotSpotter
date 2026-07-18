@@ -9,6 +9,7 @@ import {
   type CompiledSheetProjection,
   type ProjectProjection,
   type ResolvedRegion,
+  type SourceProjection,
   type TrimSheetDocumentCommand,
 } from "@hot-trimmer/ipc-contracts";
 import "./document-app.css";
@@ -193,7 +194,7 @@ function Landing({ onNew, onOpen, problem }: { onNew: () => void; onOpen: () => 
   </div></main>;
 }
 
-function SourceWorkspace({ sources, importing, onImport }: { sources: ProjectProjection["sources"]; importing: boolean; onImport: () => void }) {
+function SourceWorkspace({ sources, importing, onImport }: { sources: readonly SourceProjection[]; importing: boolean; onImport: () => void }) {
   return <aside className="source-pane"><PaneHeading index="01" title="Source Workspace" />
     <div className="source-body">
       <span className="eyebrow">PRIMARY INPUT</span>

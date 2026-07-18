@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="768" height="768" viewBox="0 0 64 64" aria-label="horizontal-trim-sheet hierarchical layout">
+<rect width="64" height="64" fill="#10141b"/>
+<g><rect x="0" y="0" width="20" height="44" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L00 068a3e89-74c5-dbfd-866b-2bf0bdeeb4d1 parent=Some(1) depth=0</title>
+<text x="1" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">L00</text>
+</g>
+<g><rect x="20" y="0" width="20" height="44" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L01 a4125a15-9cac-d66a-82ae-92d0fbf1df4f parent=Some(0) depth=0</title>
+<text x="21" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">L01</text>
+</g>
+<g><rect x="40" y="0" width="6" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D02 d8bcf125-f561-fb2c-fd81-d4fbb5af951b parent=Some(2) depth=3</title>
+<text x="41" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">D02</text>
+</g>
+<g><rect x="46" y="0" width="6" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D03 9c99a753-a136-38de-552c-970f0c464a8a parent=Some(2) depth=3</title>
+<text x="47" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">D03</text>
+</g>
+<g><rect x="52" y="0" width="6" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D04 d5c1df9d-11fa-50ac-992f-64728b601a1f parent=Some(2) depth=2</title>
+<text x="53" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">D04</text>
+</g>
+<g><rect x="58" y="0" width="6" height="11" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M05 855b6ad0-717e-1176-7b45-8cc6be61f7da parent=Some(2) depth=2</title>
+<text x="59" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">M05</text>
+</g>
+<g><rect x="40" y="11" width="6" height="12" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D06 b95ceb36-73d6-c7c2-447a-9246124ec442 parent=Some(2) depth=3</title>
+<text x="41" y="12.7" font-size="1.15" fill="#ffffff" font-family="monospace">D06</text>
+</g>
+<g><rect x="46" y="11" width="6" height="12" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D07 1569fa79-ac93-3b8b-d5af-e039369af3fe parent=Some(2) depth=3</title>
+<text x="47" y="12.7" font-size="1.15" fill="#ffffff" font-family="monospace">D07</text>
+</g>
+<g><rect x="52" y="11" width="6" height="12" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D08 3cd56c4e-ffcb-4d69-0e44-99c770cdbc88 parent=Some(2) depth=2</title>
+<text x="53" y="12.7" font-size="1.15" fill="#ffffff" font-family="monospace">D08</text>
+</g>
+<g><rect x="58" y="11" width="3" height="12" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D09 a8ff810a-7eb1-90cf-e62e-332ac7bcbd2a parent=Some(2) depth=3</title>
+</g>
+<g><rect x="61" y="11" width="3" height="12" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D10 f4fad015-3f71-b4f8-43a9-df716721f6dd parent=Some(2) depth=3</title>
+</g>
+<g><rect x="40" y="23" width="12" height="10" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D11 2731787b-0893-d45b-b578-36f80cac32ba parent=Some(3) depth=2</title>
+<text x="41" y="24.7" font-size="1.15" fill="#ffffff" font-family="monospace">D11</text>
+</g>
+<g><rect x="52" y="23" width="6" height="10" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D12 5de653d1-9a53-09d1-7f4e-e1a15db68d90 parent=Some(3) depth=2</title>
+<text x="53" y="24.7" font-size="1.15" fill="#ffffff" font-family="monospace">D12</text>
+</g>
+<g><rect x="58" y="23" width="3" height="21" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M13 0cad4915-1ab3-f5d7-76a8-b0819be5d2d8 parent=Some(3) depth=2</title>
+</g>
+<g><rect x="61" y="23" width="3" height="10" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D14 d9a432da-f3f0-5031-7445-25538e12780d parent=Some(3) depth=3</title>
+</g>
+<g><rect x="40" y="33" width="6" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D15 418bd1b5-53d4-f0ff-c6f8-5f4fdbd449dd parent=Some(3) depth=3</title>
+<text x="41" y="34.7" font-size="1.15" fill="#ffffff" font-family="monospace">D15</text>
+</g>
+<g><rect x="46" y="33" width="6" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D16 331dbd2c-9ef6-44cd-55b7-0e329ee4bd21 parent=Some(3) depth=3</title>
+<text x="47" y="34.7" font-size="1.15" fill="#ffffff" font-family="monospace">D16</text>
+</g>
+<g><rect x="52" y="33" width="6" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D17 a7a98d6d-4e12-43b0-07cc-2226ddb70a2c parent=Some(3) depth=2</title>
+<text x="53" y="34.7" font-size="1.15" fill="#ffffff" font-family="monospace">D17</text>
+</g>
+<g><rect x="61" y="33" width="3" height="11" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D18 aeaef3b7-0ac6-99d1-f028-541da04cf49c parent=Some(3) depth=3</title>
+</g>
+<g><rect x="0" y="44" width="51" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H19 cce3e5dc-1ddd-6efd-0a4d-3597053dbd4d parent=None depth=1</title>
+</g>
+<g><rect x="51" y="44" width="1" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V20 8265cbb5-0f12-f8c5-efd4-0b902c92d542 parent=None depth=1</title>
+</g>
+<g><rect x="52" y="44" width="1" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V21 8df10d7c-0856-5251-c2c3-aaca315f6fdb parent=None depth=1</title>
+</g>
+<g><rect x="53" y="44" width="1" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V22 529b318a-1f54-0b4b-b9b3-646e07848c4a parent=None depth=1</title>
+</g>
+<g><rect x="54" y="44" width="2" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V23 a796f228-a81d-e800-1f36-ff039df091e6 parent=None depth=1</title>
+</g>
+<g><rect x="56" y="44" width="2" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V24 82d5bbaa-8dbf-7dae-4dbb-910e0a5c57fa parent=None depth=1</title>
+</g>
+<g><rect x="58" y="44" width="3" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V25 6e7b5268-10ef-cafd-6235-1034333365b5 parent=None depth=1</title>
+</g>
+<g><rect x="61" y="44" width="3" height="20" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V26 361f3df0-27a2-ce47-8bc0-f7bb2e5ae347 parent=None depth=1</title>
+</g>
+<g><rect x="0" y="45" width="51" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H27 cbd0c250-ad4c-1796-904d-03af699ec08c parent=None depth=1</title>
+</g>
+<g><rect x="0" y="46" width="51" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H28 6767c86a-784b-0ff7-0e5c-56e9539f0ef0 parent=None depth=1</title>
+</g>
+<g><rect x="0" y="47" width="51" height="2" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H29 2fab90e6-3a97-c598-0b5b-a4502a137568 parent=None depth=1</title>
+</g>
+<g><rect x="0" y="49" width="51" height="2" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H30 73e6dac0-b2c0-a539-3ef4-e30f07c6421b parent=None depth=1</title>
+</g>
+<g><rect x="0" y="51" width="51" height="3" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H31 5ded5754-078d-be97-5f94-1934e06044e1 parent=None depth=1</title>
+<text x="1" y="52.7" font-size="1.15" fill="#ffffff" font-family="monospace">H31</text>
+</g>
+<g><rect x="0" y="54" width="51" height="4" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H32 252aca02-cde7-ebcb-a82c-12670af97e5b parent=None depth=1</title>
+<text x="1" y="55.7" font-size="1.15" fill="#ffffff" font-family="monospace">H32</text>
+</g>
+<g><rect x="0" y="58" width="51" height="6" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H33 80991654-295d-de5d-39d2-b211c3291666 parent=None depth=1</title>
+<text x="1" y="59.7" font-size="1.15" fill="#ffffff" font-family="monospace">H33</text>
+</g>
+</svg>
+

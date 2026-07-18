@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::Cursor,
     path::{Path, PathBuf},
@@ -18,7 +18,7 @@ use hot_trimmer_domain::{
     MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
     NormalConvention, OriginalAssetProvenance, OrientedPixelSize, Projection, RegisteredChannel,
     RegisteredChannelSet, RegionId, SourceId, SourceOwnershipIntent, SourceSetId,
-    TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
+    PartitionRecipe, TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, InspectedImage,
@@ -149,6 +149,7 @@ pub struct PreviewService {
     latest_draft_id: AtomicU64,
     cancellation_count: AtomicU64,
     source_frame_cache: Mutex<hot_trimmer_sheet_compiler::SourceFramePreviewCache>,
+    previewed_candidate_recipes: Mutex<BTreeSet<(u64, hot_trimmer_domain::DocumentHash)>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -476,6 +477,10 @@ pub struct Stage14PreviewRequest {
     input_hash: Option<String>,
     #[serde(default)]
     profile: PreviewProfile,
+    /// A transient candidate is compiled by the same persisted spine against a cloned summary.
+    /// It is never stored until the matching AcceptSourceFramePartition command is issued.
+    #[serde(default)]
+    candidate_recipe: Option<PartitionRecipe>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -795,9 +800,20 @@ pub fn regenerate_source_frame_partition(
 pub fn apply_document_command(
     request: DocumentCommandRequest,
     session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
+    if let TrimSheetDocumentCommand::AcceptSourceFramePartition { recipe } = &request.command {
+        let revision = session.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
+            .document.ok_or_else(no_project)?.document_revision;
+        let previewed = preview_service.previewed_candidate_recipes.lock().map_err(|_| poisoned())?
+            .contains(&(revision, recipe.hash()));
+        if !previewed {
+            return Err(error(ErrorCode::LayoutInvalid,
+                "Preview this exact layout candidate before accepting it."));
+        }
+    }
     session
         .store
         .as_mut()
@@ -1159,11 +1175,28 @@ fn removed_preview_specific_fabrication(
     let source_id = ContentDigest::sha256(selected.iter().flat_map(|map| map.sha256.as_bytes()).copied().collect::<Vec<_>>().as_slice());
     let domain = PreparedMaterialDomain::from_registered_channels(domain_id.clone(), source_id, channels)
         .map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 8 registered domain failed: {failure}")))?;
-    let snapshot = document.topology.snapshot.template.as_ref().ok_or_else(|| error(ErrorCode::LayoutInvalid, "Stage 14 preview currently requires a persisted template."))?;
-    let definition: hot_trimmer_domain::TemplateDefinition = serde_json::from_str(&snapshot.snapshot_json)
-        .map_err(|failure| error(ErrorCode::LayoutInvalid, &format!("Persisted template is invalid: {failure}")))?;
-    let topology = definition.compile_for_output(PixelSize { width: document.render_settings.output_size.width,
-        height: document.render_settings.output_size.height }).map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
+    // Source-frame layouts are already an accepted, integer rectangle topology.  Do not force
+    // them through a template snapshot: that made every candidate look like a usable control
+    // while Stage 14 could only compile old template state.
+    let topology = if let Some(snapshot) = document.topology.snapshot.template.as_ref() {
+        let definition: hot_trimmer_domain::TemplateDefinition = serde_json::from_str(&snapshot.snapshot_json)
+            .map_err(|failure| error(ErrorCode::LayoutInvalid, &format!("Persisted template is invalid: {failure}")))?;
+        definition.compile_for_output(PixelSize { width: document.render_settings.output_size.width,
+            height: document.render_settings.output_size.height }).map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?
+    } else {
+        CompiledTemplateTopology {
+            identity: TemplateIdentity {
+                template_id: "source-frame-partition".into(),
+                template_version: document.partition_provenance.as_ref()
+                    .map_or_else(|| "authored".into(), |value| value.recipe.recipe_version.to_string()),
+                compatibility_key: document.topology.compatibility_key.clone(),
+            },
+            output_size: document.render_settings.output_size,
+            slots: document.topology.regions.iter().map(|region| CompiledTemplateSlot {
+                slot_key: region.id.to_string(), allocation: region.allocation_rect, hotspot: region.hotspot_rect,
+            }).collect(),
+        }
+    };
     let resolved = hot_trimmer_sheet_compiler::resolve_compile_plan(document, &selected)
         .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
 
@@ -1269,16 +1302,30 @@ fn build_stage_14_preview(
         let guard = session.lock().map_err(|_| poisoned())?;
         guard.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
     };
-    let document = summary.document.as_ref()
-        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
-    if document.document_revision != request.revision {
+    let accepted_document = summary.document.as_ref()
+        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?.clone();
+    if accepted_document.document_revision != request.revision {
         return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
     }
     if request.region_id.is_some() != request.transient_projection.is_some() {
         return Err(error(ErrorCode::InvalidInput, "Transient crop requests require both regionId and transientProjection."));
     }
+    if let Some(recipe) = request.candidate_recipe.clone() {
+        if request.region_id.is_some() {
+            return Err(error(ErrorCode::InvalidInput, "Candidate topology previews cannot be combined with a transient crop."));
+        }
+        let candidate = accepted_document.accept_source_frame_partition(recipe)
+            .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
+        // This is an in-memory candidate snapshot.  Match the accepted revision only so the
+        // compiler's persisted-revision guard continues to protect cancellation/publication.
+        let mut candidate = candidate;
+        candidate.document_revision = request.revision;
+        candidate.appearance_revision = request.revision;
+        candidate.topology_revision = accepted_document.topology_revision;
+        summary.document = Some(candidate);
+    }
     if let (Some(region_id), Some(projection)) = (request.region_id, request.transient_projection.clone()) {
-        let mut transient_document = document.clone();
+        let mut transient_document = summary.document.as_ref().expect("summary document was present").clone();
         let binding = transient_document.region_bindings.get_mut(&region_id)
             .ok_or_else(|| error(ErrorCode::InvalidInput, "Transient crop region is not in the persisted topology."))?;
         binding.mapping.projection = projection;
@@ -1363,6 +1410,10 @@ fn build_stage_14_preview(
         stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.and_then(|region| region.source_bounds), mapping_origin: region.and_then(|region| region.mapping_origin), grid_rect: slot.grid_rect,
     })
     }).collect::<Result<Vec<_>, UserFacingError>>()?;
+    if let Some(recipe) = request.candidate_recipe.as_ref() {
+        preview_service.previewed_candidate_recipes.lock().map_err(|_| poisoned())?
+            .insert((request.revision, recipe.hash()));
+    }
     Ok(IntermediateAtlasProjection {
         label: artifact.label, non_exportable: true, incomplete_after_stage: 14, revision: artifact.revision,
         document_revision: artifact.revision, topology_hash: hash_hex(document.topology.topology_hash),
@@ -2131,7 +2182,7 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         let job = service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
         let artifact = build_stage_14_preview(&session, &service, Stage14PreviewRequest {
             protocol_version: IPC_PROTOCOL_VERSION, revision, region_id: None,
-            transient_projection: None, draft_id: Some(job), input_hash: None, profile: PreviewProfile::Authoritative,
+            transient_projection: None, draft_id: Some(job), input_hash: None, profile: PreviewProfile::Authoritative, candidate_recipe: None,
         }, job).expect("persisted Stage 1-14 preview");
         assert_eq!(artifact.slots.len(), 53, "Generic Architecture must publish every fixed-template slot");
         assert_eq!(artifact.slots.iter().map(|slot| slot.region_id).collect::<HashSet<_>>().len(), 53,

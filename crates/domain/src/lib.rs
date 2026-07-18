@@ -22,7 +22,7 @@ pub use document::{
     RegionTopologyHashInput, RenderSettings, SamplingPolicy, SheetFraming, SolidChannelValues,
     TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, TopologyHashInputs, TopologyKind, TopologySnapshot,
     TreatmentLayer, TreatmentParameter, TrimSheetChange, TrimSheetDocument,
-    TrimSheetDocumentCommand, TrimSheetDocumentError, TrimSheetId, UvFitKind, UvFitPolicy,
+    PartitionAxis, TrimSheetDocumentCommand, TrimSheetDocumentError, TrimSheetId, UvFitKind, UvFitPolicy,
     WARP_OPERATION_VERSION, WarpOperation,
 };
 pub use error::{DomainError, ErrorCode, UserFacingError};
@@ -57,7 +57,9 @@ pub use patch::{
 pub use protocol::{FoundationStatusRequest, IPC_PROTOCOL_VERSION};
 pub use source_frame::{
     generate_partition, region_id as source_frame_region_id, resolve_boundaries, GridRect,
-    LogicalGridSpec, PartitionError, PartitionProvenance, PartitionRecipe, PartitionRegion,
+    AspectClass, CompositionProfile, FamilyQuota, HierarchicalLayoutRecipe, HierarchyZone, LogicalGridSpec, MacroStyle,
+    PartitionError, PartitionFamily, PartitionLineage, PartitionProvenance, PartitionRecipe, PartitionRegion, PartitionTreeNode,
+    RadialQuota, RecursivePolicy, SplitRatio, StripQuota,
     MappingOrigin, RegionSourceOverride, SourceFrame, LOGICAL_GRID_SCHEMA_VERSION, MAX_LOGICAL_GRID_EDGE,
     MAX_PARTITION_REGIONS, PARTITION_RECIPE_SCHEMA_VERSION, SOURCE_FRAME_SCHEMA_VERSION,
 };

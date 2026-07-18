@@ -28,15 +28,22 @@ import {
   type SourceChannel,
   type SourceProjection,
   type SourceFrame,
+  type PartitionRecipe,
   type Stage14SlotProjection,
   type TrimSheetDocumentCommand,
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
-import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
+import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, gridRectToPreviewBounds, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
 import { SourceFramePreviewController } from "./source-frame-preview-controller";
+import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
+const gridResolutionOptions = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256] as const;
+
+// Recipe fields are all primitive or fixed-order records; this canonical fingerprint is the
+// exact candidate identity accepted by the preview/accept gate.
+function partitionRecipeFingerprint(recipe: PartitionRecipe) { return JSON.stringify(recipe); }
 
 const templates = [
   ["ht.generic_architecture", "Generic Architecture"],
@@ -86,7 +93,7 @@ const materialBehaviorOptions: readonly [MaterialBehaviorClass, string][] = [
   ["mixed_unknown", "Mixed/Unknown"],
 ];
 
-type Activity = "starting" | "idle" | "importing" | "compiling" | "saving" | "opening";
+type Activity = "starting" | "idle" | "importing" | "compiling" | "editing" | "saving" | "opening";
 type CropProjection = Extract<RegionMapping["projection"], { type: "crop" }>;
 type PaneLayoutMode = "full" | "without-inspector" | "without-library" | "sheet-only";
 
@@ -174,6 +181,10 @@ function App() {
   const [previewClientTelemetry, setPreviewClientTelemetry] = useState<string[]>([]);
   const [templateId, setTemplateId] = useState<string>(templates[0][0]);
   const [targetRegionCount, setTargetRegionCount] = useState(63);
+  const [candidateRecipe, setCandidateRecipe] = useState<PartitionRecipe>(defaultPartitionRecipe);
+  const [candidatePreviewing, setCandidatePreviewing] = useState(false);
+  const [candidatePreviewHash, setCandidatePreviewHash] = useState<string | null>(null);
+  const [candidatePreviewRecipe, setCandidatePreviewRecipe] = useState<PartitionRecipe | null>(null);
   const [selectedSourceSetId, setSelectedSourceSetId] = useState<string>("");
   const [selectedChannel, setSelectedChannel] = useState<SourceChannel>("base_color");
   const [normalConvention, setNormalConvention] = useState<Extract<NormalConvention, "open_gl" | "direct_x">>("open_gl");
@@ -194,6 +205,7 @@ function App() {
   const [preparedPatchPreview, setPreparedPatchPreview] = useState<PreparedPatchPreviewProjection | null>(null);
   const [draftPatchPreview, setDraftPatchPreview] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
   const [patchTool, setPatchTool] = useState<"rectangle" | "four-point" | null>(null);
+  const [sourceWorkbenchOpen, setSourceWorkbenchOpen] = useState(true);
   const started = useRef(false);
   const previewDraftId = useRef(0);
   const dirtyPreviewRegion = useRef<string | null>(null);
@@ -208,6 +220,11 @@ function App() {
     geometry?: PatchGeometry;
     maxEdge: number;
     requestId: number;
+  }>());
+  const sourceFramePreviewController = useRef(new SourceFramePreviewController<{
+    regionId: string;
+    projection: CropProjection;
+    revision: number;
   }>());
   const paneDrag = useRef<{ kind: PaneDragKind; start: PaneState } | null>(null);
   const workbenchRef = useRef<HTMLElement | null>(null);
@@ -233,7 +250,13 @@ function App() {
   const stale = !!project?.document && !!artifact && artifact.documentRevision !== project.document.documentRevision;
   const buildState = buildStatus(project, artifact, activity, problem, stale);
   const paneMode = paneLayoutMode(workbenchWidth);
-  const workbenchColumns = paneMode === "full"
+  const sourceFrameLayout = !!project?.document?.sourceFrame;
+  const showSourceWorkspace = paneMode !== "sheet-only" && (!sourceFrameLayout || sourceWorkbenchOpen);
+  const workbenchColumns = sourceFrameLayout
+    ? paneMode === "full" || paneMode === "without-inspector"
+      ? sourceWorkbenchOpen ? `${Math.min(240, panes.library)}px 6px ${Math.min(430, panes.source)}px 6px minmax(0, 1fr)` : `${Math.min(260, panes.library)}px 6px minmax(0, 1fr)`
+      : paneMode === "without-library" && sourceWorkbenchOpen ? `${Math.min(430, panes.source)}px 6px minmax(0, 1fr)` : "minmax(0, 1fr)"
+    : paneMode === "full"
     ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr) 6px ${panes.inspector}px`
     : paneMode === "without-inspector"
       ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr)`
@@ -302,6 +325,19 @@ function App() {
     });
     controller.enqueue({ patchId: activePatchId, maxEdge: transient ? 256 : 512, geometry: transient?.geometry, requestId });
   }, [native, activePatchId, project?.patches, draftPatchPreview, draftPreviewFps]);
+
+  useEffect(() => {
+    const controller = sourceFramePreviewController.current;
+    controller.setMaxFps(draftPreviewFps);
+    if (!native || project?.document?.documentRevision === undefined) {
+      controller.cancel();
+      return;
+    }
+    controller.setExecutor(async (request) => {
+      await requestPreview(request.regionId, request.projection, "draft512", request.revision, false);
+    });
+    return () => controller.cancel();
+  }, [native, project?.document?.documentRevision, draftPreviewFps]);
 
   useEffect(() => {
     const element = workbenchRef.current;
@@ -668,6 +704,55 @@ function App() {
     }
   }
 
+  async function previewPartitionCandidate(recipe: PartitionRecipe) {
+    if (!native || !project?.document || activity !== "idle") return;
+    setActivity("compiling"); setProblem(null);
+    try {
+      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+        request: { ...protocol, revision: project.document.documentRevision, profile: "draft512", candidateRecipe: recipe },
+      });
+      setArtifact(compiled); setCandidatePreviewing(true); setCandidatePreviewHash(partitionRecipeFingerprint(recipe)); setCandidatePreviewRecipe(recipe); setSelectedRegionId(null);
+    } catch (reason) { setProblem(failure(reason)); }
+    finally { setActivity("idle"); }
+  }
+
+  async function acceptPartitionCandidate(recipe: PartitionRecipe) {
+    if (!project?.document || activity !== "idle" || candidatePreviewHash !== partitionRecipeFingerprint(recipe)) return;
+    const acceptedFingerprint = partitionRecipeFingerprint(recipe);
+    setActivity("compiling"); setProblem(null);
+    try {
+      const current = await applyCommand({ type: "accept_source_frame_partition", recipe });
+      // Keep the settled fingerprint after acceptance. Clearing it caused the auto-preview
+      // effect to immediately recreate the same read-only candidate and lock direct editing.
+      setProject(current); setCandidatePreviewing(false); setCandidatePreviewHash(acceptedFingerprint); setCandidatePreviewRecipe(null); setArtifact(null);
+      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+        request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
+      });
+      setArtifact(compiled); setSelectedRegionId(null);
+    } catch (reason) { setProblem(failure(reason)); }
+    finally { setActivity("idle"); }
+  }
+
+  async function editSourceFrameLayout(commandValue: TrimSheetDocumentCommand): Promise<ProjectProjection | null> {
+    if (!project?.document || activity !== "idle" || candidatePreviewing) return null;
+    setActivity("editing"); setProblem(null);
+    try {
+      const current = await applyCommand(commandValue);
+      suppressAutomaticPreviewRevision.current = current.document!.documentRevision;
+      setProject(current);
+      setArtifact((prior) => retopologizeArtifact(prior, current));
+      setSelectedRegionId((selected) => current.document!.topology.regions.some((region) => region.id === selected) ? selected : null);
+      return current;
+    } catch (reason) { setProblem(failure(reason)); return null; }
+    finally { setActivity("idle"); }
+  }
+
+  function discardPartitionCandidate() {
+    if (!candidatePreviewing) return;
+    // Discard settles the current recipe too; it should not regenerate until a control changes.
+    setCandidatePreviewing(false); setCandidatePreviewHash(partitionRecipeFingerprint(candidateRecipe)); setCandidatePreviewRecipe(null); setArtifact(null); void build();
+  }
+
   async function createDocumentAndCompile(seed: ProjectProjection, materialId: string) {
     setActivity("importing");
     setProblem(null);
@@ -715,7 +800,7 @@ function App() {
     }
   }
 
-  async function requestPreview(regionId?: string, projection?: CropProjection, profile: "draft512" | "refinement1024" = "draft512", revision?: number) {
+  async function requestPreview(regionId?: string, projection?: CropProjection, profile: "draft512" | "refinement1024" = "draft512", revision?: number, scheduleRefinement = true) {
     const requestedRevision = revision ?? project?.document?.documentRevision;
     if (!native || requestedRevision === undefined) return;
     const draftId = ++previewDraftId.current;
@@ -738,7 +823,7 @@ function App() {
         setArtifact(next);
         setPreview(null);
         setProblem(null);
-        if (profile === "draft512") {
+        if (profile === "draft512" && scheduleRefinement) {
           window.setTimeout(() => {
             if (draftId === previewDraftId.current && requestedRevision === next.documentRevision) {
               void requestPreview(regionId, projection, "refinement1024", requestedRevision);
@@ -752,20 +837,26 @@ function App() {
   }
 
   function previewSelectedCrop(bounds: NormalizedBounds) {
-    if (!selectedRegionId || !selectedCrop) return;
+    const revision = project?.document?.documentRevision;
+    if (!selectedRegionId || !selectedCrop || revision === undefined) return;
     const projection: CropProjection = {
       ...selectedCrop,
       bounds,
       focus: { x: bounds.x + bounds.width * 0.5, y: bounds.y + bounds.height * 0.5 },
     };
-    void requestPreview(selectedRegionId, projection);
+    sourceFramePreviewController.current.enqueue({ regionId: selectedRegionId, projection, revision });
   }
 
   async function history(redo: boolean) {
     try {
+      const priorTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
       const next = await invoke<ProjectProjection>(redo ? "redo_document_command" : "undo_document_command", { request: protocol });
+      const nextTopologyHash = next.document ? hashBytes(next.document.topology.topologyHash) : null;
+      if (next.document && priorTopologyHash !== nextTopologyHash) suppressAutomaticPreviewRevision.current = next.document.documentRevision;
       setProject(next);
-      setArtifact(null);
+      setPreview(null);
+      setArtifact((prior) => priorTopologyHash !== nextTopologyHash ? retopologizeArtifact(prior, next) : null);
+      setSelectedRegionId((selected) => next.document?.topology.regions.some((region) => region.id === selected) ? selected : null);
       setProblem(null);
     } catch (reason) {
       setProblem(failure(reason));
@@ -859,6 +950,21 @@ function App() {
         setProject(next);
       }
     } catch (reason) { setProblem(failure(reason)); }
+  }
+
+  async function assignPatchToRegion(patchId: string, regionId: string) {
+    if (!project?.document || activity !== "idle") return;
+    setProblem(null);
+    try {
+      dirtyPreviewRegion.current = regionId;
+      const next = await applyCommand({ type: "set_region_content", regionId, content: { type: "patch", id: patchId } });
+      setProject(next);
+      setArtifact((prior) => retopologizeArtifact(prior, next));
+      setSelectedRegionId(regionId);
+    } catch (reason) {
+      dirtyPreviewRegion.current = null;
+      setProblem(failure(reason));
+    }
   }
 
   async function deletePatch(patchId: string) {
@@ -957,6 +1063,7 @@ function App() {
         </div>
         <nav className="workflow" aria-label="Workbench tabs">
           <button className="mode active">Workbench & Hotspot Sheet</button>
+          {sourceFrameLayout ? <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} onClick={() => setSourceWorkbenchOpen((open) => !open)}>{sourceWorkbenchOpen ? "Hide Source Workbench" : "Show Source Workbench"}</button> : null}
           <button className="mode" disabled title="Layer and map editing has no document command in this slice.">Layers & Maps</button>
         </nav>
         <span className="window-drag-space" data-tauri-drag-region />
@@ -971,7 +1078,7 @@ function App() {
         </div> : null}
       </header>
 
-      <section ref={workbenchRef} className={`workbench pane-layout-${paneMode}`} style={{ gridTemplateColumns: workbenchColumns }}>
+      <section ref={workbenchRef} className={`workbench pane-layout-${paneMode} ${sourceFrameLayout ? "source-frame-layout" : ""}`} style={{ gridTemplateColumns: workbenchColumns }}>
         {paneMode === "full" || paneMode === "without-inspector" ? <SourceLibrary
           project={project}
           activeSourceSetId={activeSourceSetId}
@@ -982,7 +1089,7 @@ function App() {
           onSetDelightingIntent={(id, intent) => void setDelightingIntent(id, intent)}
         /> : null}
         {paneMode === "full" || paneMode === "without-inspector" ? <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
-        {paneMode !== "sheet-only" ? <section className="source-workspace">
+        {showSourceWorkspace ? <section className="source-workspace">
           <MapSlots
             sources={activeSources}
             selectedChannel={selectedChannel}
@@ -994,6 +1101,7 @@ function App() {
             <button className={patchTool === "rectangle" ? "active" : ""} onClick={() => setPatchTool((tool) => tool === "rectangle" ? null : "rectangle")} disabled={!selectedSource}>Rectangle</button>
             <button className={patchTool === "four-point" ? "active" : ""} onClick={() => setPatchTool((tool) => tool === "four-point" ? null : "four-point")} disabled={!selectedSource}>Four Point</button>
             <button onClick={() => activePatchId && void deletePatch(activePatchId)} disabled={!activePatchId}>Delete Patch</button>
+            <button onClick={() => activePatchId && selectedRegionId && void assignPatchToRegion(activePatchId, selectedRegionId)} disabled={!activePatchId || !selectedRegionId || activity !== "idle"}>Assign patch to region</button>
             <label className="normal-setting" title="Applied explicitly when importing or replacing a tangent-space Normal map.">
               Normal convention
               <select value={normalConvention} onChange={(event) => setNormalConvention(event.currentTarget.value as "open_gl" | "direct_x")}>
@@ -1037,12 +1145,13 @@ function App() {
             onCancelTool={() => setPatchTool(null)}
           />
         </section> : null}
-        {paneMode !== "sheet-only" ? <PaneSplitter kind="source-sheet" sourceOnly={paneMode === "without-library"} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {showSourceWorkspace ? <PaneSplitter kind="source-sheet" sourceOnly={paneMode === "without-library"} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         <SheetWorkbench
           project={project}
           artifact={artifact}
           preview={preview}
           preparedPatchPreview={activePatchId ? preparedPatchPreview : null}
+          activePatchId={activePatchId}
           mapView={mapView}
           selectedRegionId={selectedRegionId}
           setSelectedRegionId={setSelectedRegionId}
@@ -1057,6 +1166,17 @@ function App() {
            targetRegionCount={targetRegionCount}
            setTargetRegionCount={setTargetRegionCount}
            regenerateSourceFrame={regenerateSourceFrame}
+           candidateRecipe={candidateRecipe}
+           setCandidateRecipe={setCandidateRecipe}
+           candidatePreviewing={candidatePreviewing}
+           candidateIsCurrent={candidatePreviewHash === partitionRecipeFingerprint(candidateRecipe)}
+           candidatePreviewRecipe={candidatePreviewRecipe}
+           previewCandidate={previewPartitionCandidate}
+           discardCandidate={discardPartitionCandidate}
+           acceptCandidate={acceptPartitionCandidate}
+           onLayoutCommand={editSourceFrameLayout}
+           onUndo={() => void history(false)}
+           onRedo={() => void history(true)}
            previewClientTelemetry={previewClientTelemetry}
            onPreviewPaint={(dimensions) => {
              if (previewPublishStartedAt.current !== null) {
@@ -1068,8 +1188,8 @@ function App() {
              }
            }}
          />
-        {paneMode === "full" ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
-        {paneMode === "full" ? <Inspector
+        {paneMode === "full" && !sourceFrameLayout ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {paneMode === "full" && !sourceFrameLayout ? <Inspector
           project={project}
           artifact={artifact}
           sourceAnalysis={activePatchId ? preparedPatchPreview : null}
@@ -1288,7 +1408,6 @@ function SourceCanvas(props: {
   const [draftCrop, setDraftCrop] = useState<NormalizedBounds | null>(null);
   const [draftFrame, setDraftFrame] = useState<NormalizedBounds | null>(null);
   const draftCropRef = useRef<NormalizedBounds | null>(null);
-  const previewFrame = useRef<number | null>(null);
   const patchDrag = useRef<
     | { kind: "corner"; pointerId: number; patchId: string; corner: number; corners: PatchGeometry["corners"] }
     | { kind: "move"; pointerId: number; patchId: string; start: { x: number; y: number }; corners: PatchGeometry["corners"] }
@@ -1425,12 +1544,7 @@ function SourceCanvas(props: {
         : resizeAspectLocked(activeCrop.origin, activeCrop.action, dx, dy, sourceCropAspect(props.selectedSlot, props.source!.orientedSize.width, props.source!.orientedSize.height));
       draftCropRef.current = next;
       setDraftCrop(next);
-      if (previewFrame.current === null) {
-        previewFrame.current = requestAnimationFrame(() => {
-          previewFrame.current = null;
-          if (draftCropRef.current) props.onDraftCrop(draftCropRef.current);
-        });
-      }
+      props.onDraftCrop(next);
       return;
     }
     viewport.movePan(event);
@@ -1857,6 +1971,7 @@ function SheetWorkbench(props: {
   artifact: IntermediateAtlasProjection | null;
   preview: PreviewSheetProjection | null;
   preparedPatchPreview: PreparedPatchPreviewProjection | null;
+  activePatchId: string | null;
   mapView: CompiledMapView;
   selectedRegionId: string | null;
   setSelectedRegionId: (id: string | null) => void;
@@ -1871,6 +1986,17 @@ function SheetWorkbench(props: {
   targetRegionCount: number;
   setTargetRegionCount: (count: number) => void;
   regenerateSourceFrame: (count: number) => void;
+  candidateRecipe: PartitionRecipe;
+  setCandidateRecipe: React.Dispatch<React.SetStateAction<PartitionRecipe>>;
+  candidatePreviewing: boolean;
+  candidateIsCurrent: boolean;
+  candidatePreviewRecipe: PartitionRecipe | null;
+  previewCandidate: (recipe: PartitionRecipe) => void;
+  discardCandidate: () => void;
+  acceptCandidate: (recipe: PartitionRecipe) => void;
+  onLayoutCommand: (command: TrimSheetDocumentCommand) => Promise<ProjectProjection | null>;
+  onUndo: () => void;
+  onRedo: () => void;
   previewClientTelemetry: readonly string[];
   onPreviewPaint: (dimensions: { width: number; height: number }) => void;
 }) {
@@ -1886,31 +2012,174 @@ function SheetWorkbench(props: {
   const sheet = validPreview ?? artifact;
   const imageUrl = validPreview?.dataUrl ?? artifact?.maps[props.mapView];
   const sheetMatchesDocument = !!sheet && sheet.topologyHash === topologyHash;
+  const requestedFamilies = Object.values(props.candidateRecipe.composition).reduce((total, value) => total + (typeof value === "object" && "count" in value ? value.count : 0), 0);
+  const requestedBudget = props.candidateRecipe.composition.broadPanels.count * props.candidateRecipe.composition.broadPanels.subdivisionBudget
+    + props.candidateRecipe.composition.mediumBlocks.count * props.candidateRecipe.composition.mediumBlocks.subdivisionBudget
+    + props.candidateRecipe.composition.smallDetails.count * props.candidateRecipe.composition.smallDetails.subdivisionBudget;
+  const hierarchical = props.candidateRecipe.hierarchical;
+  const requestedArea = hierarchical
+    ? hierarchical.largeShareMilli + hierarchical.mediumShareMilli + hierarchical.smallShareMilli + hierarchical.stripShareMilli + hierarchical.radialShareMilli
+    : props.candidateRecipe.composition.broadPanels.areaShareMilli + props.candidateRecipe.composition.mediumBlocks.areaShareMilli + props.candidateRecipe.composition.smallDetails.areaShareMilli;
+  const requestedFloor = hierarchical ? hierarchical.targetRegionMin : requestedFamilies + requestedBudget + (requestedFamilies > 0 ? 1 : 0);
+  const requestedMaximum = hierarchical?.targetRegionMax ?? props.candidateRecipe.targetRegionCount;
+  const candidateValid = hierarchical
+    ? requestedArea === 1000 && hierarchical.targetRegionMin > 0 && hierarchical.targetRegionMin <= hierarchical.targetRegionMax
+      && hierarchical.protectedParentCount + hierarchical.subdividableParentCount <= hierarchical.macroParentCount
+      && hierarchical.allowedSplitRatios.length > 0 && hierarchical.stripThicknessLadder.length > 0
+    : requestedFloor <= props.candidateRecipe.targetRegionCount && requestedArea <= 1000;
+  const displayedGrid = props.candidatePreviewing ? props.candidatePreviewRecipe?.grid ?? props.candidateRecipe.grid : props.project?.document?.logicalGrid ?? props.candidateRecipe.grid;
+  const candidateState = props.activity === "compiling" ? "Generating"
+    : !candidateValid ? "Invalid"
+    : props.candidatePreviewing && props.candidateIsCurrent ? "Candidate ready"
+    : props.candidatePreviewing ? "Draft changed"
+    : "Accepted";
+  const [layoutMenu, setLayoutMenu] = useState<{ regionId: string; x: number; y: number } | null>(null);
+  const [layoutTool, setLayoutTool] = useState<"select" | "draw">("select");
+  const [gridVisible, setGridVisible] = useState(true);
+  const [gridOpacity, setGridOpacity] = useState(10);
+  const [textureVisible, setTextureVisible] = useState(true);
+  const [regionFillVisible, setRegionFillVisible] = useState(true);
+  const [resizeDraft, setResizeDraft] = useState<{ pointerId: number; regionId: string; handle: ResizeHandle; origin: LogicalRect; rect: LogicalRect } | null>(null);
+  const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startX: number; startY: number; endX: number; endY: number } | null>(null);
+  const sheetRef = useRef<HTMLDivElement>(null);
+  const displayRegions = sheet?.regions ?? [];
+  const selectedGridRect = resizeDraft?.rect ?? displayRegions.find((region) => region.regionId === props.selectedRegionId)?.gridRect;
+  const selectedContent = props.selectedRegionId ? props.project?.document?.regionBindings[props.selectedRegionId]?.content : null;
+  const selectedPatchAssigned = !!props.activePatchId && selectedContent?.type === "patch" && selectedContent.id === props.activePatchId;
+  const drawRect = drawDraft ? normalizedGridRect(drawDraft) : null;
+  const resizeTransfers = useMemo(() => resizeDraft ? previewResizeOwnershipTransfers(displayRegions, resizeDraft.regionId, resizeDraft.origin, resizeDraft.rect, displayedGrid) : [], [displayRegions, resizeDraft, displayedGrid]);
+  const resizeAffectedIds = useMemo(() => new Set(resizeTransfers.flatMap((transfer) => [transfer.fromId, transfer.toId])), [resizeTransfers]);
+  const sourceFrame = props.project?.document?.sourceFrame;
+  const sourceTexture = sourceFrame
+    ? props.project?.materialSources.find((source) => source.id === sourceFrame.sourceSetId)?.registeredChannels?.channels.find((channel) => channel.channel === "base_color")?.thumbnailDataUrl
+    : null;
+  const continuousTexture = props.mapView === "baseColor" ? sourceTexture : null;
+  const editorHasImage = props.mapView === "baseColor" ? !!continuousTexture : !!imageUrl;
+  const sourceTextureProblem = props.mapView === "baseColor" && sourceFrame && !continuousTexture
+    ? "The complete oriented Source Frame Base Color is unavailable. Layout editing will not display a partial Stage 14 map. Re-register Base Color for this Source Frame."
+    : null;
+  const candidateFingerprint = partitionRecipeFingerprint(props.candidateRecipe);
+  const lastAutoPreviewFingerprint = useRef<string | null>(null);
   const workpieceSize = sheet
     ? { width: sheet.width, height: sheet.height }
     : props.preparedPatchPreview
       ? { width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height }
       : null;
   const viewport = useViewportController(workpieceSize);
+  const gridSteps = adaptiveGridSteps(displayedGrid, sheet?.width ?? 1, sheet?.height ?? 1, viewport.view.scale);
+  useEffect(() => {
+    if (!props.project?.document || !candidateValid || props.activity !== "idle" || props.candidateIsCurrent) return;
+    if (lastAutoPreviewFingerprint.current === candidateFingerprint) return;
+    const timer = window.setTimeout(() => {
+      lastAutoPreviewFingerprint.current = candidateFingerprint;
+      props.previewCandidate(props.candidateRecipe);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [candidateFingerprint, candidateValid, props.activity, props.candidateIsCurrent, props.project?.document]);
+  function pointerGridPoint(clientX: number, clientY: number) {
+    const bounds = sheetRef.current?.getBoundingClientRect();
+    if (!bounds) return null;
+    return {
+      x: Math.max(0, Math.min(displayedGrid.width, Math.round((clientX - bounds.left) / bounds.width * displayedGrid.width))),
+      y: Math.max(0, Math.min(displayedGrid.height, Math.round((clientY - bounds.top) / bounds.height * displayedGrid.height))),
+    };
+  }
+  function moveDirectEdit(event: React.PointerEvent<HTMLElement>) {
+    const point = pointerGridPoint(event.clientX, event.clientY);
+    if (!point) return false;
+    if (resizeDraft?.pointerId === event.pointerId) {
+      setResizeDraft((current) => current ? { ...current, rect: resizeGridRect(current.origin, current.handle, point, displayedGrid) } : null);
+      return true;
+    }
+    if (drawDraft?.pointerId === event.pointerId) {
+      setDrawDraft((current) => current ? { ...current, endX: point.x, endY: point.y } : null);
+      return true;
+    }
+    return false;
+  }
+  function finishDirectEdit(pointerId: number, cancel = false) {
+    if (resizeDraft?.pointerId === pointerId) {
+      const draft = resizeDraft;
+      if (cancel || sameGridRect(draft.origin, draft.rect)) { setResizeDraft(null); return; }
+      void props.onLayoutCommand({ type: "resize_source_frame_region", regionId: draft.regionId, gridRect: draft.rect })
+        .then((next) => { if (next?.document?.topology.regions.some((region) => region.id === draft.regionId)) props.setSelectedRegionId(draft.regionId); })
+        .finally(() => setResizeDraft(null));
+      return;
+    }
+    if (drawDraft?.pointerId === pointerId) {
+      const rect = normalizedGridRect(drawDraft);
+      if (cancel || rect.width === 0 || rect.height === 0) { setDrawDraft(null); return; }
+      void props.onLayoutCommand({ type: "draw_source_frame_region", gridRect: rect }).then((next) => {
+        const drawn = next?.document?.topology.regions.find((region) => region.gridRect && sameGridRect(region.gridRect, rect));
+        if (drawn) props.setSelectedRegionId(drawn.id);
+      }).finally(() => setDrawDraft(null));
+    }
+  }
   return <section className="sheet-workbench">
     <header className="sheet-header">
       <div><strong>HOTSPOT SHEET</strong></div>
       <span className={`build-status ${props.problem ? "error" : props.artifact ? "ready" : ""}`}>{props.buildState}</span>
     </header>
-    <section className="template-strip">
+    <section className="layout-stage">
+    <aside className="layout-sidebar" aria-label="Layout controls">
+      <header><span>LAYOUT</span><strong className={`layout-state ${candidateState.toLowerCase().replaceAll(" ", "-")}`}>{candidateState}</strong></header>
+      <div className="layout-tool-row" role="toolbar" aria-label="Atlas editing tools"><button className={layoutTool === "select" ? "active" : ""} onClick={() => { setLayoutTool("select"); setDrawDraft(null); }}>Select / resize</button><button className={layoutTool === "draw" ? "active" : ""} onClick={() => { setLayoutTool("draw"); setLayoutMenu(null); }}>Draw region</button></div>
+      <p className="layout-help">Draw snapped rectangles or resize the selected box with its handles. Middle-drag pans in either tool; texture pixels never recompile for direct edits.</p>
+      <div className="display-controls"><label><input type="checkbox" checked={textureVisible} onChange={(event) => setTextureVisible(event.target.checked)} /> Texture</label><label><input type="checkbox" checked={regionFillVisible} onChange={(event) => setRegionFillVisible(event.target.checked)} /> Region colors</label></div>
+      <div className="grid-controls"><label><input type="checkbox" checked={gridVisible} onChange={(event) => setGridVisible(event.target.checked)} /> Grid</label><label>Opacity <input aria-label="Grid opacity" type="range" min={0} max={100} value={gridOpacity} onChange={(event) => setGridOpacity(Number(event.target.value))} /></label></div>
+      {selectedGridRect ? <output className="selection-readout">Selected: x {selectedGridRect.x}, y {selectedGridRect.y} · {selectedGridRect.width} × {selectedGridRect.height}</output> : drawRect ? <output className="selection-readout draw">Drawing: x {drawRect.x}, y {drawRect.y} · {drawRect.width} × {drawRect.height}</output> : <output className="selection-readout">No region selected</output>}
+      <p className={`layout-capacity ${candidateValid ? "" : "invalid"}`} aria-live="polite">{hierarchical ? `${requestedFloor}–${requestedMaximum} soft region range` : `${requestedFloor} minimum leaves / ${props.candidateRecipe.targetRegionCount} Count`} · {requestedArea / 10}% unified area</p>
+      {props.problem ? <p className="layout-diagnostic" role="alert">{props.problem.message}<small>{props.problem.recovery}</small></p> : null}
+      {sourceTextureProblem ? <p className="layout-diagnostic" role="alert">{sourceTextureProblem}</p> : null}
       <span>SOURCE FRAME PARTITION</span>
-      <strong>{props.artifact ? `${props.artifact.regions.length} accepted regions` : "One canonical source frame"}</strong>
-      <label>Target regions<input aria-label="Target regions" type="number" min={1} max={256} value={props.targetRegionCount} onChange={(event) => props.setTargetRegionCount(Number(event.target.value))} disabled={!props.project?.document} /></label>
-      <button onClick={() => props.regenerateSourceFrame(props.targetRegionCount)} disabled={!props.project?.document || props.activity !== "idle"}>Regenerate / Accept</button>
-      <select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document}>
-        <option value={1024}>1024</option>
-        <option value={2048}>2048</option>
-        <option value={4096}>4096</option>
-      </select>
-      <button className="primary" onClick={props.build} disabled={!props.project?.document || props.activity !== "idle"}>
-        Preview through Stage 14
-      </button>
-    </section>
+      <strong>{props.candidatePreviewing && props.candidateIsCurrent ? `${props.artifact?.regions.length ?? 0} candidate ready` : props.candidatePreviewing ? "Draft changed — preview again" : props.artifact ? `${props.artifact.regions.length} accepted regions` : "Accepted layout"}</strong>
+      <output aria-live="polite">{hierarchical ? `${hierarchical.protectedParentCount} protected / ${hierarchical.subdividableParentCount} hierarchical parents` : `${requestedFamilies} requested / ${props.candidateRecipe.targetRegionCount} available`}{candidateValid ? "" : " — correct the highlighted recipe constraints"}</output>
+      <label>Grid resolution<select aria-label="Logical grid resolution" value={props.candidateRecipe.grid.width} onChange={(event) => props.setCandidateRecipe((recipe) => recipeWithGridSize(recipe, Number(event.target.value)))} disabled={!props.project?.document}>{gridResolutionOptions.map((size) => <option key={size} value={size}>{size} × {size}</option>)}</select><small>One-cell snapping; visible lines adapt with zoom.</small></label>
+      <label>Composition preset<select aria-label="Composition preset" value={selectedLayoutTemplate(props.candidateRecipe)} onChange={(event) => props.setCandidateRecipe((recipe) => layoutTemplateRecipe(recipe, event.target.value as LayoutTemplateId))}>{layoutTemplateOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select><small>Hierarchical macro-zone recipes; every field below remains editable.</small></label>
+      {hierarchical ? <HierarchicalRecipeControls recipe={props.candidateRecipe} setRecipe={props.setCandidateRecipe} /> : <>
+      <label>Exact region count<input aria-label="Total regions" type="number" min={1} max={256} value={props.candidateRecipe.targetRegionCount} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, targetRegionCount: Number(event.target.value) }))} disabled={!props.project?.document} /></label>
+      <label>Major region count<input aria-label="Major region count" type="number" min={0} max={32} value={props.candidateRecipe.composition.broadPanels.count} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, broadPanels: { ...recipe.composition.broadPanels, count: Number(event.target.value) } } }))} /></label>
+      <label>Major region total area<input aria-label="Major region total area" type="range" min={0} max={90} step={5} value={props.candidateRecipe.composition.broadPanels.areaShareMilli / 10} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, broadPanels: { ...recipe.composition.broadPanels, areaShareMilli: Number(event.target.value) * 10 } } }))} /><output>{props.candidateRecipe.composition.broadPanels.areaShareMilli / 10}% total{props.candidateRecipe.composition.broadPanels.count ? ` · ~${(props.candidateRecipe.composition.broadPanels.areaShareMilli / 10 / props.candidateRecipe.composition.broadPanels.count).toFixed(1)}% each` : ""}</output></label>
+      <label className="inline-check"><input type="checkbox" checked={props.candidateRecipe.composition.broadPanels.subdivisionBudget === 0} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, broadPanels: { ...recipe.composition.broadPanels, subdivisionBudget: event.target.checked ? 0 : Math.max(1, recipe.composition.broadPanels.subdivisionBudget) } } }))} /> Keep major regions whole</label>
+      <div className="layout-pair"><label>Medium blocks<input aria-label="Medium block count" type="number" min={0} max={64} value={props.candidateRecipe.composition.mediumBlocks.count} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, mediumBlocks: { ...recipe.composition.mediumBlocks, count: Number(event.target.value) } } }))} /></label><label>Medium total area %<input aria-label="Medium block total area" type="number" min={0} max={100} value={props.candidateRecipe.composition.mediumBlocks.areaShareMilli / 10} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, mediumBlocks: { ...recipe.composition.mediumBlocks, areaShareMilli: Number(event.target.value) * 10 } } }))} /></label></div>
+      <div className="layout-pair"><label>Horizontal bands<input aria-label="Horizontal band count" type="number" min={0} max={64} value={props.candidateRecipe.composition.horizontalStrips.count} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, horizontalStrips: { ...recipe.composition.horizontalStrips, count: Number(event.target.value) } } }))} /></label><label>Vertical trims<input aria-label="Vertical trim count" type="number" min={0} max={64} value={props.candidateRecipe.composition.verticalStrips.count} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, verticalStrips: { ...recipe.composition.verticalStrips, count: Number(event.target.value) } } }))} /></label></div>
+      <label>Minimum strip thickness<input aria-label="Minimum strip thickness in cells" type="number" min={1} max={props.candidateRecipe.grid.width} value={props.candidateRecipe.composition.horizontalStrips.minimumThickness} onChange={(event) => props.setCandidateRecipe((recipe) => recipeWithStripMinimum(recipe, Number(event.target.value)))} /><small>Grid cells; one cell is legal.</small></label>
+      <label>Detail density<input aria-label="Detail density" type="range" min={0} max={16} value={props.candidateRecipe.composition.smallDetails.count} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, smallDetails: { ...recipe.composition.smallDetails, count: Number(event.target.value) } } }))} /><output>{props.candidateRecipe.composition.smallDetails.count}</output></label>
+      <label>Radial slot reservations<input aria-label="Radial slot reservation count" type="number" min={0} max={16} value={props.candidateRecipe.composition.radialReservations.count} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, composition: { ...recipe.composition, radialReservations: { ...recipe.composition.radialReservations, count: Number(event.target.value) } } }))} /><small>Square allocation slots; circular rendering arrives in Prompt 5.</small></label>
+      <div className="layout-pair"><label>Seed<input aria-label="Layout seed" type="number" min={0} value={props.candidateRecipe.seed} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, seed: Number(event.target.value) }))} /></label><label>Variation %<input aria-label="Layout variation percent" type="number" min={0} max={100} value={props.candidateRecipe.varianceMilli / 10} onChange={(event) => props.setCandidateRecipe((recipe) => ({ ...recipe, varianceMilli: Number(event.target.value) * 10 }))} /></label></div>
+      <details className="layout-advanced"><summary>Advanced geometry</summary>
+        <div className="layout-pair"><label>Major min W<input type="number" min={1} max={props.candidateRecipe.grid.width} value={props.candidateRecipe.composition.broadPanels.minimumWidth} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "broadPanels", { minimumWidth: Number(event.target.value) }))} /><small>{cellPercent(props.candidateRecipe.composition.broadPanels.minimumWidth, props.candidateRecipe.grid.width)}%</small></label><label>Major min H<input type="number" min={1} max={props.candidateRecipe.grid.height} value={props.candidateRecipe.composition.broadPanels.minimumHeight} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "broadPanels", { minimumHeight: Number(event.target.value) }))} /><small>{cellPercent(props.candidateRecipe.composition.broadPanels.minimumHeight, props.candidateRecipe.grid.height)}%</small></label></div>
+        <div className="layout-pair"><label>Major max W<input type="number" min={1} max={props.candidateRecipe.grid.width} value={props.candidateRecipe.composition.broadPanels.maximumWidth} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "broadPanels", { maximumWidth: Number(event.target.value) }))} /><small>{cellPercent(props.candidateRecipe.composition.broadPanels.maximumWidth, props.candidateRecipe.grid.width)}%</small></label><label>Major max H<input type="number" min={1} max={props.candidateRecipe.grid.height} value={props.candidateRecipe.composition.broadPanels.maximumHeight} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "broadPanels", { maximumHeight: Number(event.target.value) }))} /><small>{cellPercent(props.candidateRecipe.composition.broadPanels.maximumHeight, props.candidateRecipe.grid.height)}%</small></label></div>
+        <label>Major subdivision density<input type="number" min={0} max={16} value={props.candidateRecipe.composition.broadPanels.subdivisionBudget} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "broadPanels", { subdivisionBudget: Number(event.target.value) }))} /></label>
+        <label>Maximum strip thickness<input type="number" min={1} max={props.candidateRecipe.grid.width} value={props.candidateRecipe.composition.horizontalStrips.maximumThickness} onChange={(event) => props.setCandidateRecipe((recipe) => recipeWithStripMaximum(recipe, Number(event.target.value)))} /></label>
+        <label>Detail total area %<input type="number" min={0} max={100} value={props.candidateRecipe.composition.smallDetails.areaShareMilli / 10} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "smallDetails", { areaShareMilli: Number(event.target.value) * 10 }))} /></label>
+        <label>Detail subdivision density<input type="number" min={0} max={16} value={props.candidateRecipe.composition.smallDetails.subdivisionBudget} onChange={(event) => props.setCandidateRecipe((recipe) => updateFamilyQuota(recipe, "smallDetails", { subdivisionBudget: Number(event.target.value) }))} /></label>
+        <div className="layout-pair"><label>Radial min diameter<input type="number" min={1} max={props.candidateRecipe.grid.width} value={props.candidateRecipe.composition.radialReservations.allocationMinDiameter} onChange={(event) => props.setCandidateRecipe((recipe) => recipeWithRadialDiameter(recipe, Number(event.target.value), recipe.composition.radialReservations.allocationMaxDiameter))} /></label><label>Radial max diameter<input type="number" min={1} max={props.candidateRecipe.grid.width} value={props.candidateRecipe.composition.radialReservations.allocationMaxDiameter} onChange={(event) => props.setCandidateRecipe((recipe) => recipeWithRadialDiameter(recipe, recipe.composition.radialReservations.allocationMinDiameter, Number(event.target.value)))} /></label></div>
+      </details>
+      </>}
+      <footer className="layout-actions">
+        <button onClick={() => props.previewCandidate(props.candidateRecipe)} disabled={!props.project?.document || props.activity !== "idle" || !candidateValid}>Update now</button>
+        <button onClick={props.discardCandidate} disabled={!props.candidatePreviewing || props.activity !== "idle"}>Discard</button>
+        <button className="primary" onClick={() => props.acceptCandidate(props.candidateRecipe)} disabled={!props.candidatePreviewing || !props.candidateIsCurrent || props.activity !== "idle"}>Accept</button>
+      </footer>
+      <details className="layout-advanced material-preview-settings"><summary>Optional material preview</summary>
+        <label>Output resolution<select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document}>
+          <option value={1024}>1024</option><option value={2048}>2048</option><option value={4096}>4096</option>
+        </select></label>
+        <button onClick={props.build} disabled={!props.project?.document || props.activity !== "idle"}>Rebuild material maps</button>
+        <small>Layout drawing and resizing never require this rebuild.</small>
+      </details>
+      <section className="layout-editing">
+        <strong>Direct atlas editing</strong>
+        <p>{props.candidatePreviewing
+          ? "This generated candidate is read-only. Accept it to resize, draw, split, or merge its regions."
+          : layoutTool === "draw" ? "Drag anywhere on the atlas to place an exact snapped rectangle." : "Select a region, drag an edge handle continuously, or right-click for split/merge."}</p>
+        {props.candidatePreviewing ? <button className="primary" onClick={() => props.acceptCandidate(props.candidateRecipe)} disabled={!props.candidateIsCurrent || props.activity !== "idle"}>Accept candidate and edit</button> : null}
+        <div className="layout-history"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument || props.activity !== "idle"}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument || props.activity !== "idle"}>Redo</button></div>
+        <button onClick={() => props.selectedRegionId && props.onLayoutCommand({ type: "split_source_frame_region", regionId: props.selectedRegionId, axis: "horizontal" })} disabled={!props.selectedRegionId || props.candidatePreviewing || props.activity !== "idle"}>Split horizontally</button>
+        <button onClick={() => props.selectedRegionId && props.onLayoutCommand({ type: "split_source_frame_region", regionId: props.selectedRegionId, axis: "vertical" })} disabled={!props.selectedRegionId || props.candidatePreviewing || props.activity !== "idle"}>Split vertically</button>
+      </section>
+    </aside>
     <section
       ref={viewport.containerRef}
       className="sheet-canvas"
@@ -1919,11 +2188,11 @@ function SheetWorkbench(props: {
         viewport.beginPan(event);
         if (event.button === 0 && event.target === event.currentTarget) props.setSelectedRegionId(null);
       }}
-      onPointerMove={viewport.movePan}
-      onPointerUp={viewport.endPan}
-      onPointerCancel={viewport.endPan}
+      onPointerMove={(event) => { if (!moveDirectEdit(event)) viewport.movePan(event); }}
+      onPointerUp={(event) => { finishDirectEdit(event.pointerId); viewport.endPan(event); }}
+      onPointerCancel={(event) => { finishDirectEdit(event.pointerId, true); viewport.endPan(event); }}
     >
-      {!sheet || !imageUrl ? props.preparedPatchPreview ? <div
+      {!sheet || !editorHasImage ? sourceTextureProblem ? <div className="empty-sheet source-texture-error"><strong>Complete Base Color unavailable</strong><span>{sourceTextureProblem}</span></div> : props.preparedPatchPreview ? <div
         className="rectified-workpiece"
         style={{ width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
       >
@@ -1943,28 +2212,38 @@ function SheetWorkbench(props: {
         <strong>{props.project?.legacyLayoutDiscarded ? "No trim sheet yet" : "No compiled sheet"}</strong>
         <span>{props.project?.legacyLayoutDiscarded ? "Sources, maps, and patches were preserved. Old layout state is not shown or converted." : "Build from the current Base Color when ready."}</span>
       </div> : <div
+        ref={sheetRef}
         className="sheet"
         style={{ width: sheet.width, height: sheet.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
         onPointerDown={(event) => {
-          if (event.button === 0 && !(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
+          if (event.button !== 0) return;
+          if (layoutTool === "draw" && !props.candidatePreviewing && props.activity === "idle") {
+            const point = pointerGridPoint(event.clientX, event.clientY);
+            if (!point) return;
+            event.preventDefault();
+            event.currentTarget.setPointerCapture(event.pointerId);
+            props.setSelectedRegionId(null);
+            setDrawDraft({ pointerId: event.pointerId, startX: point.x, startY: point.y, endX: point.x, endY: point.y });
+          } else if (!(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
         }}
       >
-        <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} />
-        {sheetMatchesDocument ? <div
-          className="sheet-grid"
-          style={{
-            backgroundSize: "6.25% 6.25%",
-          }}
-        /> : null}
-        <div className="overlays">{sheet.regions.map((region) => <button
-          key={region.regionId}
+        {textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
+        {selectedPatchAssigned && props.preparedPatchPreview && selectedGridRect ? <div className="assigned-patch-preview" style={gridRectOverlayStyle(selectedGridRect, displayedGrid)}><img src={props.preparedPatchPreview.dataUrl} alt="Assigned patch preview" /></div> : null}
+        {(sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}
+        <div className={`overlays ${layoutTool === "draw" ? "drawing" : ""}`}>{displayRegions.map((region) => <button key={region.regionId}
           data-region-id={region.regionId}
           data-selection-surface="atlas"
+          aria-label={`${region.displayName}${region.gridRect ? `, x ${region.gridRect.x}, y ${region.gridRect.y}, ${region.gridRect.width} by ${region.gridRect.height}` : ""}`}
           aria-pressed={region.regionId === props.selectedRegionId}
-          className={`region ${region.regionId === props.selectedRegionId ? "selected" : ""}`}
-          style={overlayStyle(region, sheet, viewport.view.scale)}
-          onClick={(event) => { event.stopPropagation(); props.setSelectedRegionId(region.regionId); }}
-        ><span>{region.displayName}</span></button>)}</div>
+          className={`region ${region.regionId === props.selectedRegionId ? "selected" : ""} ${resizeDraft && (region.regionId === resizeDraft.regionId || resizeAffectedIds.has(region.regionId)) ? "affected" : ""}`}
+          style={overlayStyle(region, sheet, viewport.view.scale, regionFillVisible ? 0.2 : 0)}
+          onClick={(event) => { event.stopPropagation(); if (!props.candidatePreviewing && layoutTool !== "draw") props.setSelectedRegionId(region.regionId); }}
+          onContextMenu={(event) => { event.preventDefault(); if (props.candidatePreviewing) return; event.stopPropagation(); props.setSelectedRegionId(region.regionId); setLayoutMenu({ regionId: region.regionId, x: event.clientX, y: event.clientY }); }}
+        ><span className="region-label">{region.displayName}</span>{region.regionId === props.selectedRegionId && region.gridRect && layoutTool === "select" && !props.candidatePreviewing ? resizeHandles.map((handle) => <i key={handle} className={`selection-handle ${handle}`} aria-label={`Resize ${handle}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); setResizeDraft({ pointerId: event.pointerId, regionId: region.regionId, handle, origin: region.gridRect!, rect: region.gridRect! }); }} />) : null}</button>)}</div>
+        {drawRect && drawRect.width > 0 && drawRect.height > 0 ? <div className="draw-region-preview" style={gridRectOverlayStyle(drawRect, displayedGrid)}><span>{drawRect.x}, {drawRect.y} · {drawRect.width} × {drawRect.height}</span></div> : null}
+        {resizeTransfers.map((transfer, index) => { const owner = displayRegions.find((region) => region.regionId === transfer.toId); const from = displayRegions.find((region) => region.regionId === transfer.fromId); return <div key={`${transfer.fromId}-${transfer.toId}-${index}`} className={`ownership-transfer ${transfer.toId === resizeDraft?.regionId ? "gained" : "released"}`} style={{ ...gridRectOverlayStyle(transfer.rect, displayedGrid), borderColor: owner ? `rgb(${owner.idColor.join(" ")})` : undefined, backgroundColor: owner ? `rgb(${owner.idColor.join(" ")} / .38)` : undefined }}><span>{from?.displayName ?? "Region"} → {owner?.displayName ?? "Region"}</span></div>; })}
+        {resizeDraft && !sameGridRect(resizeDraft.origin, resizeDraft.rect) ? <div className="resize-region-preview" style={gridRectOverlayStyle(resizeDraft.rect, displayedGrid)}><span>{resizeDraft.rect.x}, {resizeDraft.rect.y} / {resizeDraft.rect.width} x {resizeDraft.rect.height}</span></div> : null}
+        {!props.candidatePreviewing && layoutMenu ? <div className="layout-menu" style={{ left: layoutMenu.x, top: layoutMenu.y }} role="menu"><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "horizontal" }); setLayoutMenu(null); }}>Split horizontally</button><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "vertical" }); setLayoutMenu(null); }}>Split vertically</button>{mergeCandidate(sheet.regions, layoutMenu.regionId) ? <button onClick={() => { const sibling = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: layoutMenu.regionId, siblingId: sibling.regionId }); setLayoutMenu(null); }}>Merge / Remove Divider</button> : null}</div> : null}
       </div>}
       {workpieceSize ? <div className="viewport-tools">
         <button onClick={() => viewport.zoom(0.8)}>-</button>
@@ -1972,6 +2251,7 @@ function SheetWorkbench(props: {
         <button onClick={() => viewport.zoom(1.25)}>+</button>
         <button onClick={viewport.fit}>Fit</button>
       </div> : null}
+    </section>
     </section>
     {props.artifact ? <footer className="artifact-footer">
       <span>{props.artifact.width} x {props.artifact.height}</span>
@@ -1986,6 +2266,67 @@ function SheetWorkbench(props: {
     </footer> : null}
   </section>;
 }
+
+function HierarchicalRecipeControls(props: { recipe: PartitionRecipe; setRecipe: React.Dispatch<React.SetStateAction<PartitionRecipe>> }) {
+  const hierarchy = props.recipe.hierarchical!;
+  const aspectOptions = ["square", "wide2", "tall2", "wide4", "tall4", "wide8", "tall8"] as const;
+  return <>
+    <label>Complexity<input aria-label="Layout complexity" type="range" min={12} max={80} value={hierarchy.targetRegionMax} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalComplexity(recipe, Number(event.target.value)))} /><output>{hierarchy.targetRegionMin}–{hierarchy.targetRegionMax} regions</output></label>
+    <label>Large panel share<input aria-label="Large panel share" type="range" min={20} max={85} value={hierarchy.largeShareMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalShare(recipe, "largeShareMilli", Number(event.target.value) * 10))} /><output>{hierarchy.largeShareMilli / 10}%</output></label>
+    <label>Strip share<input aria-label="Strip share" type="range" min={0} max={40} value={hierarchy.stripShareMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalShare(recipe, "stripShareMilli", Number(event.target.value) * 10))} /><output>{hierarchy.stripShareMilli / 10}%</output></label>
+    <label>Radial slots<input aria-label="Radial slots" type="number" min={0} max={16} value={hierarchy.radialCount} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRadialSlots(recipe, Number(event.target.value)))} /></label>
+    <label>Variation<input aria-label="Hierarchical variation" type="range" min={0} max={100} value={hierarchy.variationMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { variationMilli: Number(event.target.value) * 10 }, { varianceMilli: Number(event.target.value) * 10 }))} /><output>{hierarchy.variationMilli / 10}%</output></label>
+    <details className="layout-advanced"><summary>Advanced hierarchy</summary>
+      <div className="layout-pair"><label>Hierarchy depth<input aria-label="Hierarchy depth" type="number" min={1} max={8} value={hierarchy.hierarchyDepth} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { hierarchyDepth: Number(event.target.value) }))} /></label><label>Scale falloff %<input aria-label="Scale falloff" type="number" min={10} max={90} value={hierarchy.scaleFalloffMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { scaleFalloffMilli: Number(event.target.value) * 10 }))} /></label></div>
+      <div className="layout-pair"><label>Protected parents<input aria-label="Protected parent count" type="number" min={0} max={hierarchy.macroParentCount} value={hierarchy.protectedParentCount} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { protectedParentCount: Number(event.target.value) }))} /></label><label>Subdividable parents<input aria-label="Subdividable parent count" type="number" min={0} max={hierarchy.macroParentCount} value={hierarchy.subdividableParentCount} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { subdividableParentCount: Number(event.target.value) }))} /></label></div>
+      <label>Alignment strength<input aria-label="Alignment strength" type="range" min={0} max={100} value={hierarchy.alignmentStrengthMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { alignmentStrengthMilli: Number(event.target.value) * 10 }))} /><output>{hierarchy.alignmentStrengthMilli / 10}%</output></label>
+      <fieldset><legend>Split ratio palette</legend>{(["half", "one_third", "two_third"] as const).map((ratio) => <label className="inline-check" key={ratio}><input type="checkbox" checked={hierarchy.allowedSplitRatios.includes(ratio)} onChange={() => props.setRecipe((recipe) => toggleHierarchicalSplitRatio(recipe, ratio))} />{ratio === "half" ? "1/2" : ratio === "one_third" ? "1/3" : "2/3"}</label>)}</fieldset>
+      <label>Strip thickness ladder<input aria-label="Strip thickness ladder" value={hierarchy.stripThicknessLadder.join(",")} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { stripThicknessLadder: parseThicknessLadder(event.target.value) }))} /><small>Comma-separated logical cells.</small></label>
+      <label>Major aspect palette<select multiple aria-label="Major aspect palette" value={hierarchy.majorAspects} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { majorAspects: Array.from(event.target.selectedOptions, (option) => option.value as typeof hierarchy.majorAspects[number]) }))}>{aspectOptions.map((aspect) => <option key={aspect} value={aspect}>{aspect}</option>)}</select></label>
+      <label>Medium aspect palette<select multiple aria-label="Medium aspect palette" value={hierarchy.mediumAspects} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { mediumAspects: Array.from(event.target.selectedOptions, (option) => option.value as typeof hierarchy.mediumAspects[number]) }))}>{aspectOptions.map((aspect) => <option key={aspect} value={aspect}>{aspect}</option>)}</select></label>
+      <label>Detail aspect palette<select multiple aria-label="Detail aspect palette" value={hierarchy.detailAspects} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { detailAspects: Array.from(event.target.selectedOptions, (option) => option.value as typeof hierarchy.detailAspects[number]) }))}>{aspectOptions.map((aspect) => <option key={aspect} value={aspect}>{aspect}</option>)}</select></label>
+      <div className="layout-pair"><label>Soft region minimum<input aria-label="Soft region minimum" type="number" min={1} max={hierarchy.targetRegionMax} value={hierarchy.targetRegionMin} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { targetRegionMin: Number(event.target.value) }))} /></label><label>Soft region maximum<input aria-label="Soft region maximum" type="number" min={hierarchy.targetRegionMin} max={256} value={hierarchy.targetRegionMax} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { targetRegionMax: Number(event.target.value) }, { targetRegionCount: Number(event.target.value) }))} /></label></div>
+    </details>
+  </>;
+}
+
+function updateHierarchicalRecipe(recipe: PartitionRecipe, patch: Partial<NonNullable<PartitionRecipe["hierarchical"]>>, recipePatch: Partial<PartitionRecipe> = {}): PartitionRecipe {
+  if (!recipe.hierarchical) return recipe;
+  return { ...recipe, ...recipePatch, hierarchical: { ...recipe.hierarchical, ...patch } };
+}
+
+function updateHierarchicalComplexity(recipe: PartitionRecipe, maximum: number): PartitionRecipe {
+  const targetRegionMax = Math.max(1, Math.min(256, maximum));
+  const targetRegionMin = Math.max(1, Math.min(targetRegionMax, Math.round(targetRegionMax * 0.75)));
+  return updateHierarchicalRecipe(recipe, { targetRegionMin, targetRegionMax }, { targetRegionCount: targetRegionMax });
+}
+
+function updateHierarchicalShare(recipe: PartitionRecipe, field: "largeShareMilli" | "stripShareMilli", requested: number): PartitionRecipe {
+  const hierarchy = recipe.hierarchical;
+  if (!hierarchy) return recipe;
+  const other = hierarchy.smallShareMilli + hierarchy.radialShareMilli + (field === "largeShareMilli" ? hierarchy.stripShareMilli : hierarchy.largeShareMilli);
+  const value = Math.max(0, Math.min(1_000 - other, requested));
+  return updateHierarchicalRecipe(recipe, { [field]: value, mediumShareMilli: 1_000 - other - value });
+}
+
+function updateHierarchicalRadialSlots(recipe: PartitionRecipe, count: number): PartitionRecipe {
+  const hierarchy = recipe.hierarchical;
+  if (!hierarchy) return recipe;
+  const radialCount = Math.max(0, Math.min(16, count));
+  if (radialCount === 0) return updateHierarchicalRecipe(recipe, { radialCount, radialShareMilli: 0, largeShareMilli: hierarchy.largeShareMilli + hierarchy.radialShareMilli });
+  if (hierarchy.radialShareMilli > 0) return updateHierarchicalRecipe(recipe, { radialCount });
+  const radialShareMilli = Math.min(100, hierarchy.mediumShareMilli);
+  return updateHierarchicalRecipe(recipe, { radialCount, radialShareMilli, mediumShareMilli: hierarchy.mediumShareMilli - radialShareMilli });
+}
+
+function toggleHierarchicalSplitRatio(recipe: PartitionRecipe, ratio: NonNullable<PartitionRecipe["hierarchical"]>["allowedSplitRatios"][number]): PartitionRecipe {
+  const hierarchy = recipe.hierarchical;
+  if (!hierarchy) return recipe;
+  const allowedSplitRatios = hierarchy.allowedSplitRatios.includes(ratio) ? hierarchy.allowedSplitRatios.filter((value) => value !== ratio) : [...hierarchy.allowedSplitRatios, ratio];
+  return updateHierarchicalRecipe(recipe, { allowedSplitRatios });
+}
+
+function parseThicknessLadder(value: string) { return value.split(",").map((part) => Number(part.trim())).filter((part) => Number.isInteger(part) && part > 0); }
 
 function Inspector(props: {
   project: ProjectProjection | null;
@@ -2014,8 +2355,10 @@ function Inspector(props: {
   const analyzedSource = props.sourceAnalysis
     ? props.project?.materialSources.find((source) => source.id === props.sourceAnalysis!.materialSourceId)
     : undefined;
-  return <aside className="context-inspector">
+  const layoutMode = !!props.project?.document?.sourceFrame;
+  return <aside className={`context-inspector ${layoutMode ? "layout-mode" : ""}`}>
     <header className="inspector-actions"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument}>Redo</button></header>
+    {layoutMode ? <section className="inspector-section layout-summary"><span>LAYOUT MODE</span><p>Composition, candidate state, and atlas editing are in the Layout sidebar. Undo and redo remain available here.</p></section> : null}
     <section className="inspector-section">
       <span>MAP VIEW</span>
       <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact?.maps[id]} title={props.artifact && !props.artifact.maps[id] ? "Unavailable through Stage 14" : undefined}>{label}</button>)}</div>
@@ -2177,15 +2520,16 @@ function CalibrationEditor(props: {
   materialSourceId: string;
   onApply: (materialSourceId: string, command: MaterialCalibrationCommand) => void;
 }) {
+  type CalibrationValueKey = "x1" | "y1" | "x2" | "y2" | "distanceMm" | "motifWidthPx" | "motifHeightPx" | "motifWidthMm" | "motifHeightMm" | "ppmX" | "ppmY" | "confidence" | "orientationDegrees";
   const [mode, setMode] = useState<"measure" | "motif" | "imported" | "override" | "orientation">("measure");
-  const [values, setValues] = useState<Record<string, number>>({
+  const [values, setValues] = useState<Record<CalibrationValueKey, number>>({
     x1: 0, y1: 0, x2: 100, y2: 0, distanceMm: 250,
     motifWidthPx: 100, motifHeightPx: 100, motifWidthMm: 250, motifHeightMm: 250,
     ppmX: 400, ppmY: 400, confidence: 100, orientationDegrees: 0,
   });
   const [provenance, setProvenance] = useState<"convention" | "prior_estimated">("convention");
-  const set = (key: string, value: number) => setValues((current) => ({ ...current, [key]: value }));
-  const positive = (...keys: string[]) => keys.every((key) => Number.isFinite(values[key]) && values[key] > 0);
+  const set = (key: CalibrationValueKey, value: number) => setValues((current) => ({ ...current, [key]: value }));
+  const positive = (...keys: CalibrationValueKey[]) => keys.every((key) => Number.isFinite(values[key]) && values[key] > 0);
   const confidenceMilli = Math.round(Math.min(100, Math.max(0, values.confidence)) * 10);
   const apply = () => {
     let command: MaterialCalibrationCommand | null = null;
@@ -2225,7 +2569,7 @@ function CalibrationEditor(props: {
     }
     if (command) props.onApply(props.materialSourceId, command);
   };
-  const numeric = (key: string, label: string, min?: number, max?: number) => <label>{label}<input
+  const numeric = (key: CalibrationValueKey, label: string, min?: number, max?: number) => <label>{label}<input
     type="number" step="any" min={min} max={max} value={values[key]}
     onChange={(event) => set(key, event.currentTarget.valueAsNumber)}
   /></label>;
@@ -2297,6 +2641,7 @@ function LockedSection({ title, reason }: { title: string; reason: string }) {
 function buildStatus(project: ProjectProjection | null, artifact: IntermediateAtlasProjection | null, activity: Activity, problem: CommandFailure | null, stale: boolean) {
   if (activity === "importing") return "Importing";
   if (activity === "compiling") return `Compiling revision ${project?.document?.documentRevision ?? 1}`;
+  if (activity === "editing") return "Committing layout metadata";
   if (problem) return "Region error";
   if (!project?.materialSources.some((source) => source.registeredChannels?.channels.some((channel) => channel.channel === "base_color"))) return "Empty";
   if (!project.document) return "Ready";
@@ -2310,6 +2655,60 @@ function channelLabel(channel: SourceChannel): string {
 
 function hashBytes(bytes: readonly number[]): string {
   return bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function retopologizeArtifact(prior: IntermediateAtlasProjection | null, project: ProjectProjection): IntermediateAtlasProjection | null {
+  const document = project.document;
+  if (!prior || !document?.sourceFrame || !document.logicalGrid) return null;
+  const priorById = new Map(prior.regions.map((region) => [region.regionId, region]));
+  const fallback = prior.regions[0];
+  const regions = document.topology.regions.map((definition): ResolvedRegion => {
+    const existing = priorById.get(definition.id);
+    const binding = document.regionBindings[definition.id];
+    const previewBounds = definition.gridRect
+      ? gridRectToPreviewBounds(definition.gridRect, document.logicalGrid!, prior)
+      : {
+          x: Math.round(definition.allocationRect.x / document.renderSettings.outputSize.width * prior.width),
+          y: Math.round(definition.allocationRect.y / document.renderSettings.outputSize.height * prior.height),
+          width: Math.round(definition.allocationRect.width / document.renderSettings.outputSize.width * prior.width),
+          height: Math.round(definition.allocationRect.height / document.renderSettings.outputSize.height * prior.height),
+        };
+    return {
+      regionId: definition.id,
+      displayName: definition.displayName,
+      allocationBounds: previewBounds,
+      hotspotBounds: previewBounds,
+      idColor: existing?.idColor ?? stableRegionColor(definition.id),
+      materialId: existing?.materialId ?? document.primaryMaterial ?? fallback?.materialId ?? "unassigned",
+      materialIdColor: existing?.materialIdColor ?? fallback?.materialIdColor ?? [128, 128, 128],
+      mapping: binding?.mapping ?? existing?.mapping ?? fallback!.mapping,
+      role: definition.role,
+      gridRect: definition.gridRect,
+      sourceCrop: existing?.sourceCrop,
+      sourceBounds: existing?.sourceBounds,
+      mappingOrigin: existing?.mappingOrigin ?? "partition",
+    };
+  });
+  const regionById = new Map(regions.map((region) => [region.regionId, region]));
+  return {
+    ...prior,
+    revision: document.documentRevision,
+    documentRevision: document.documentRevision,
+    topologyHash: hashBytes(document.topology.topologyHash),
+    topology: document.topology,
+    regions,
+    slots: prior.slots.flatMap((slot) => {
+      const region = regionById.get(slot.regionId);
+      return region ? [{ ...slot, displayName: region.displayName, allocationBounds: region.allocationBounds, hotspotBounds: region.hotspotBounds, gridRect: region.gridRect }] : [];
+    }),
+    telemetry: [...prior.telemetry, "local topology edit: retained compiled map pixels; metadata committed asynchronously"],
+  };
+}
+
+function stableRegionColor(id: string): readonly [number, number, number] {
+  let hash = 2166136261;
+  for (let index = 0; index < id.length; index += 1) hash = Math.imul(hash ^ id.charCodeAt(index), 16777619);
+  return [72 + (hash & 127), 72 + ((hash >>> 8) & 127), 72 + ((hash >>> 16) & 127)];
 }
 
 function contentLabel(type?: string) {
@@ -2332,7 +2731,207 @@ function normalizedBoundsOverlap(a: NormalizedBounds, b: NormalizedBounds) {
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 
-function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasProjection, "width" | "height">, scale = 1): React.CSSProperties {
+type LogicalRect = { x: number; y: number; width: number; height: number };
+type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+const resizeHandles: readonly ResizeHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
+
+function normalizedGridRect(draft: { startX: number; startY: number; endX: number; endY: number }): LogicalRect {
+  return { x: Math.min(draft.startX, draft.endX), y: Math.min(draft.startY, draft.endY), width: Math.abs(draft.endX - draft.startX), height: Math.abs(draft.endY - draft.startY) };
+}
+
+function sameGridRect(first: LogicalRect, second: LogicalRect) {
+  return first.x === second.x && first.y === second.y && first.width === second.width && first.height === second.height;
+}
+
+function resizeGridRect(origin: LogicalRect, handle: ResizeHandle, point: { x: number; y: number }, grid: { width: number; height: number }): LogicalRect {
+  let left = origin.x;
+  let top = origin.y;
+  let right = origin.x + origin.width;
+  let bottom = origin.y + origin.height;
+  if (handle.includes("w")) left = Math.max(0, Math.min(right - 1, point.x));
+  if (handle.includes("e")) right = Math.min(grid.width, Math.max(left + 1, point.x));
+  if (handle.includes("n")) top = Math.max(0, Math.min(bottom - 1, point.y));
+  if (handle.includes("s")) bottom = Math.min(grid.height, Math.max(top + 1, point.y));
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+type ResizeOwnershipTransfer = { rect: LogicalRect; fromId: string; toId: string };
+
+function previewResizeOwnershipTransfers(regions: readonly ResolvedRegion[], selectedId: string, origin: LogicalRect, target: LogicalRect, grid: { width: number; height: number }): ResizeOwnershipTransfer[] {
+  if (sameGridRect(origin, target)) return [];
+  const transfers: ResizeOwnershipTransfer[] = [];
+  for (const region of regions) {
+    if (region.regionId === selectedId || !region.gridRect) continue;
+    const gained = logicalRectIntersection(region.gridRect, target);
+    if (gained) transfers.push({ rect: gained, fromId: region.regionId, toId: selectedId });
+  }
+  const retained = logicalRectIntersection(origin, target);
+  if (!retained) return transfers;
+  const released = subtractLogicalRect(origin, retained);
+  if (released.length === 0) return transfers;
+  const neighbors = regions.flatMap((region, ordinal) => region.regionId !== selectedId && region.gridRect && logicalRectsTouch(origin, region.gridRect)
+    ? [{ ordinal, id: region.regionId, rect: region.gridRect }]
+    : []);
+  if (neighbors.length === 0) return transfers;
+  for (const piece of released) {
+    const neighbor = neighbors.reduce((best, candidate) => {
+      const candidateScore = logicalTransferScore(piece, candidate.rect, candidate.ordinal);
+      const bestScore = logicalTransferScore(piece, best.rect, best.ordinal);
+      return compareNumberTuple(candidateScore, bestScore) < 0 ? candidate : best;
+    });
+    transfers.push({ rect: piece, fromId: selectedId, toId: neighbor.id });
+  }
+  return transfers;
+}
+
+function logicalRectIntersection(first: LogicalRect, second: LogicalRect): LogicalRect | null {
+  const x = Math.max(first.x, second.x);
+  const y = Math.max(first.y, second.y);
+  const right = Math.min(first.x + first.width, second.x + second.width);
+  const bottom = Math.min(first.y + first.height, second.y + second.height);
+  return right > x && bottom > y ? { x, y, width: right - x, height: bottom - y } : null;
+}
+
+function subtractLogicalRect(rect: LogicalRect, cut: LogicalRect): LogicalRect[] {
+  const pieces: LogicalRect[] = [];
+  if (cut.y > rect.y) pieces.push({ x: rect.x, y: rect.y, width: rect.width, height: cut.y - rect.y });
+  if (cut.y + cut.height < rect.y + rect.height) pieces.push({ x: rect.x, y: cut.y + cut.height, width: rect.width, height: rect.y + rect.height - cut.y - cut.height });
+  if (cut.x > rect.x) pieces.push({ x: rect.x, y: cut.y, width: cut.x - rect.x, height: cut.height });
+  if (cut.x + cut.width < rect.x + rect.width) pieces.push({ x: cut.x + cut.width, y: cut.y, width: rect.x + rect.width - cut.x - cut.width, height: cut.height });
+  return pieces;
+}
+
+function logicalRectsTouch(first: LogicalRect, second: LogicalRect) {
+  const vertical = (first.x + first.width === second.x || second.x + second.width === first.x)
+    && first.y < second.y + second.height && first.y + first.height > second.y;
+  const horizontal = (first.y + first.height === second.y || second.y + second.height === first.y)
+    && first.x < second.x + second.width && first.x + first.width > second.x;
+  return vertical || horizontal;
+}
+
+function logicalTransferScore(piece: LogicalRect, neighbor: LogicalRect, ordinal: number): readonly number[] {
+  const mergeable = (piece.y === neighbor.y && piece.height === neighbor.height && (piece.x + piece.width === neighbor.x || neighbor.x + neighbor.width === piece.x))
+    || (piece.x === neighbor.x && piece.width === neighbor.width && (piece.y + piece.height === neighbor.y || neighbor.y + neighbor.height === piece.y));
+  const verticalTouch = piece.x + piece.width === neighbor.x || neighbor.x + neighbor.width === piece.x;
+  const horizontalTouch = piece.y + piece.height === neighbor.y || neighbor.y + neighbor.height === piece.y;
+  const touchSpan = verticalTouch
+    ? Math.max(0, Math.min(piece.y + piece.height, neighbor.y + neighbor.height) - Math.max(piece.y, neighbor.y))
+    : horizontalTouch ? Math.max(0, Math.min(piece.x + piece.width, neighbor.x + neighbor.width) - Math.max(piece.x, neighbor.x)) : 0;
+  const dx = piece.x + piece.width <= neighbor.x ? neighbor.x - piece.x - piece.width
+    : neighbor.x + neighbor.width <= piece.x ? piece.x - neighbor.x - neighbor.width : 0;
+  const dy = piece.y + piece.height <= neighbor.y ? neighbor.y - piece.y - piece.height
+    : neighbor.y + neighbor.height <= piece.y ? piece.y - neighbor.y - neighbor.height : 0;
+  return [mergeable ? 0 : 1, -touchSpan, dx + dy, ordinal];
+}
+
+function compareNumberTuple(first: readonly number[], second: readonly number[]) {
+  for (let index = 0; index < Math.min(first.length, second.length); index += 1) {
+    if (first[index] !== second[index]) return first[index]! - second[index]!;
+  }
+  return first.length - second.length;
+}
+
+function adaptiveGridSteps(grid: { width: number; height: number }, width: number, height: number, scale: number) {
+  const choose = (cells: number, pixels: number) => {
+    const cellPixels = pixels * scale / Math.max(1, cells);
+    return [1, 2, 4, 8, 16, 32, 64, 128, 256].find((step) => cellPixels * step >= 12) ?? 256;
+  };
+  const minorX = choose(grid.width, width);
+  const minorY = choose(grid.height, height);
+  return { minorX, minorY, majorX: Math.min(grid.width, minorX * 4), majorY: Math.min(grid.height, minorY * 4) };
+}
+
+function gridRectOverlayStyle(rect: LogicalRect, grid: { width: number; height: number }): React.CSSProperties {
+  return { left: `${rect.x / grid.width * 100}%`, top: `${rect.y / grid.height * 100}%`, width: `${rect.width / grid.width * 100}%`, height: `${rect.height / grid.height * 100}%` };
+}
+
+function sourceFrameTextureStyle(frame: SourceFrame): React.CSSProperties {
+  return {
+    position: "absolute",
+    left: `${-frame.bounds.x / frame.bounds.width * 100}%`,
+    top: `${-frame.bounds.y / frame.bounds.height * 100}%`,
+    width: `${100 / frame.bounds.width}%`,
+    height: `${100 / frame.bounds.height}%`,
+    maxWidth: "none",
+    maxHeight: "none",
+  };
+}
+
+function recipeWithGridSize(recipe: PartitionRecipe, size: number): PartitionRecipe {
+  const previous = recipe.grid.width;
+  const scale = (value: number, minimum = 1) => Math.max(minimum, Math.min(size, Math.round(value * size / Math.max(1, previous))));
+  const scaleFamily = (family: PartitionRecipe["composition"]["broadPanels"]) => {
+    const minimumWidth = scale(family.minimumWidth);
+    const minimumHeight = scale(family.minimumHeight);
+    return { ...family, minimumWidth, minimumHeight, maximumWidth: Math.max(minimumWidth, scale(family.maximumWidth)), maximumHeight: Math.max(minimumHeight, scale(family.maximumHeight)) };
+  };
+  const horizontalMinimum = scale(recipe.composition.horizontalStrips.minimumThickness);
+  const verticalMinimum = scale(recipe.composition.verticalStrips.minimumThickness);
+  const radialMinimum = scale(recipe.composition.radialReservations.allocationMinDiameter);
+  const radialMaximum = Math.max(radialMinimum, Math.min(Math.max(1, size - 1), scale(recipe.composition.radialReservations.allocationMaxDiameter)));
+  const hierarchical = recipe.hierarchical ? {
+    ...recipe.hierarchical,
+    stripThicknessLadder: recipe.hierarchical.stripThicknessLadder.map((value) => scale(value)),
+    radialMinDiameter: scale(recipe.hierarchical.radialMinDiameter),
+    radialMaxDiameter: Math.max(scale(recipe.hierarchical.radialMinDiameter), Math.min(Math.max(1, size - 1), scale(recipe.hierarchical.radialMaxDiameter))),
+  } : undefined;
+  return {
+    ...recipe,
+    grid: { ...recipe.grid, width: size, height: size },
+    hierarchical,
+    composition: {
+      ...recipe.composition,
+      broadPanels: scaleFamily(recipe.composition.broadPanels),
+      mediumBlocks: scaleFamily(recipe.composition.mediumBlocks),
+      smallDetails: scaleFamily(recipe.composition.smallDetails),
+      horizontalStrips: { ...recipe.composition.horizontalStrips, minimumThickness: horizontalMinimum, maximumThickness: Math.max(horizontalMinimum, scale(recipe.composition.horizontalStrips.maximumThickness)) },
+      verticalStrips: { ...recipe.composition.verticalStrips, minimumThickness: verticalMinimum, maximumThickness: Math.max(verticalMinimum, scale(recipe.composition.verticalStrips.maximumThickness)) },
+      microStrips: { ...recipe.composition.microStrips, minimumThickness: scale(recipe.composition.microStrips.minimumThickness), maximumThickness: scale(recipe.composition.microStrips.maximumThickness) },
+      radialReservations: { ...recipe.composition.radialReservations, allocationMinDiameter: radialMinimum, allocationMaxDiameter: radialMaximum },
+    },
+  };
+}
+
+function updateFamilyQuota<K extends "broadPanels" | "mediumBlocks" | "smallDetails">(recipe: PartitionRecipe, family: K, patch: Partial<PartitionRecipe["composition"][K]>): PartitionRecipe {
+  return { ...recipe, composition: { ...recipe.composition, [family]: { ...recipe.composition[family], ...patch } } };
+}
+
+function recipeWithStripMinimum(recipe: PartitionRecipe, minimumThickness: number): PartitionRecipe {
+  return { ...recipe, composition: { ...recipe.composition,
+    horizontalStrips: { ...recipe.composition.horizontalStrips, minimumThickness, maximumThickness: Math.max(minimumThickness, recipe.composition.horizontalStrips.maximumThickness) },
+    verticalStrips: { ...recipe.composition.verticalStrips, minimumThickness, maximumThickness: Math.max(minimumThickness, recipe.composition.verticalStrips.maximumThickness) },
+  } };
+}
+
+function recipeWithStripMaximum(recipe: PartitionRecipe, maximumThickness: number): PartitionRecipe {
+  return { ...recipe, composition: { ...recipe.composition,
+    horizontalStrips: { ...recipe.composition.horizontalStrips, maximumThickness: Math.max(recipe.composition.horizontalStrips.minimumThickness, maximumThickness) },
+    verticalStrips: { ...recipe.composition.verticalStrips, maximumThickness: Math.max(recipe.composition.verticalStrips.minimumThickness, maximumThickness) },
+  } };
+}
+
+function recipeWithRadialDiameter(recipe: PartitionRecipe, minimum: number, maximum: number): PartitionRecipe {
+  const allocationMinDiameter = Math.max(1, Math.min(recipe.grid.width - 1, minimum));
+  const allocationMaxDiameter = Math.max(allocationMinDiameter, Math.min(recipe.grid.width - 1, maximum));
+  return { ...recipe, composition: { ...recipe.composition, radialReservations: { ...recipe.composition.radialReservations, allocationMinDiameter, allocationMaxDiameter } } };
+}
+
+function cellPercent(cells: number, extent: number) { return (cells / Math.max(1, extent) * 100).toFixed(1); }
+
+function mergeCandidate(regions: readonly ResolvedRegion[], regionId: string) {
+  const region = regions.find((item) => item.regionId === regionId);
+  if (!region?.gridRect) return null;
+  const rect = region.gridRect;
+  return regions.find((candidate) => {
+    const other = candidate.gridRect;
+    if (!other || candidate.regionId === regionId) return false;
+    const vertical = rect.y === other.y && rect.height === other.height && (rect.x + rect.width === other.x || other.x + other.width === rect.x);
+    const horizontal = rect.x === other.x && rect.width === other.width && (rect.y + rect.height === other.y || other.y + other.height === rect.y);
+    return vertical || horizontal;
+  }) ?? null;
+}
+
+function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasProjection, "width" | "height">, scale = 1, fillOpacity = 0): React.CSSProperties {
   const bounds = region.allocationBounds;
   return {
     left: `${bounds.x / artifact.width * 100}%`,
@@ -2340,6 +2939,7 @@ function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasPr
     width: `${bounds.width / artifact.width * 100}%`,
     height: `${bounds.height / artifact.height * 100}%`,
     borderColor: `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]})`,
+    "--region-fill": `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]} / ${fillOpacity})`,
     "--region-stroke": `${Math.min(3, Math.max(0.75, 1 / scale))}px`,
     "--region-label-size": `${Math.min(16, Math.max(7, 10 / scale))}px`,
   } as React.CSSProperties;

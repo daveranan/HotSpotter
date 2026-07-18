@@ -10,7 +10,8 @@ use crate::{
     SourceSetId, SourceWarp, StructuralProfile, TemplateDefinition, TemplateFitSemantics, TemplateRegistry,
     TemplateSlotRole,
     TemplateSnapshot,
-    GridRect, LogicalGridSpec, PartitionProvenance, PartitionRecipe, RegionSourceOverride, SourceFrame,
+    GridRect, LogicalGridSpec, PartitionFamily, PartitionProvenance, PartitionRecipe, PartitionTreeNode, RegionSourceOverride, SourceFrame,
+    source_frame_region_id,
     layout::source_warp_is_valid,
     templates::{
         CanonicalRect, RadialParameters, TemplateSourceMapping,
@@ -22,6 +23,11 @@ pub type TrimSheetId = LayoutId;
 pub const TRIM_SHEET_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 pub const WARP_OPERATION_VERSION: u16 = 1;
 pub const MAX_MAPPING_MAGNITUDE: f64 = 16.0;
+
+/// An authored source-frame divider is always moved as one shared lattice boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionAxis { Horizontal, Vertical }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -385,7 +391,7 @@ pub struct TopologySnapshot {
     pub template: Option<TemplateSnapshot>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DocumentHash(pub [u8; 32]);
 
@@ -1007,7 +1013,7 @@ impl TrimSheetDocument {
         patches: Vec<Patch>,
     ) -> Result<Self, TrimSheetDocumentError> {
         let partitions = crate::generate_partition(&recipe)
-            .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+            .map_err(TrimSheetDocumentError::InvalidSourcePartition)?;
         let output_x = crate::resolve_boundaries(0, output_size.width, recipe.grid.width);
         let output_y = crate::resolve_boundaries(0, output_size.height, recipe.grid.height);
         let regions = partitions.iter().map(|partition| {
@@ -1023,16 +1029,18 @@ impl TrimSheetDocument {
                 role: TemplateSlotRole::Planar, orientation,
                 uv_fit: UvFitPolicy { kind: UvFitKind::Rectangular, fit_axis: FitAxis::Automatic,
                     keep_proportion: true, allowed_rotations: vec![QuarterTurn::Zero], mirror_allowed: false,
-                    world_size_meters: [f64::from(rect.width.max(1)), f64::from(rect.height.max(1))], classification_tags: vec!["SOURCE_FRAME".into()] },
+                    world_size_meters: [f64::from(rect.width.max(1)), f64::from(rect.height.max(1))], classification_tags: vec!["SOURCE_FRAME".into(), format!("SOURCE_FRAME_{:?}", partition.family).to_uppercase()] },
                 structural_profile: StructuralProfile::Flat, material_group: "primary".into(),
                 weathering_group: "neutral".into(), radial_parameters: None, enabled: true,
                 grid_rect: Some(partition.grid_rect) }
         }).collect::<Vec<_>>();
         let topology = AcceptedTopology::new(TopologyKind::CustomAtlas,
             TopologySnapshot { schema_version: TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, canonical_size: output_size, template: None },
-            format!("source-frame:{}", source_frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>()), regions)?;
+            format!("source-frame:{}:{}", source_frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>(), recipe.hash().0.iter().map(|byte| format!("{byte:02x}")).collect::<String>()), regions)?;
         let provenance = PartitionProvenance { schema_version: crate::PARTITION_RECIPE_SCHEMA_VERSION,
-            recipe: recipe.clone(), recipe_hash: recipe.hash(), accepted_region_ids: topology.regions.iter().map(|region| region.id).collect() };
+            recipe: recipe.clone(), recipe_hash: recipe.hash(), accepted_region_ids: topology.regions.iter().map(|region| region.id).collect(),
+            tree: partitions.iter().enumerate().map(|(ordinal, region)| crate::PartitionTreeNode { grid_rect: region.grid_rect, family: region.family, ordinal: ordinal as u32, lineage: region.lineage }).collect(),
+            topology_hash: topology.topology_hash };
         let document = Self { id, document_revision: 1, topology_revision: 1, appearance_revision: 1, topology,
             primary_material: materials.first().map(|material| material.id), materials, patches,
             procedural_materials: Vec::new(), region_bindings: partitions.iter().map(|partition| (partition.id, RegionBinding {
@@ -1136,6 +1144,24 @@ impl TrimSheetDocument {
     ) -> Result<Self, TrimSheetDocumentError> {
         let mut next = self.clone();
         match command {
+            TrimSheetDocumentCommand::AcceptSourceFramePartition { recipe } => {
+                return self.accept_source_frame_partition(recipe.clone());
+            }
+            TrimSheetDocumentCommand::SplitSourceFrameRegion { region_id, axis } => {
+                return self.split_source_frame_region(*region_id, *axis);
+            }
+            TrimSheetDocumentCommand::MergeSourceFrameRegions { region_id, sibling_id } => {
+                return self.merge_source_frame_regions(*region_id, *sibling_id);
+            }
+            TrimSheetDocumentCommand::MoveSourceFrameBoundary { region_id, axis, coordinate } => {
+                return self.move_source_frame_boundary(*region_id, *axis, *coordinate);
+            }
+            TrimSheetDocumentCommand::DrawSourceFrameRegion { grid_rect } => {
+                return self.draw_source_frame_region(*grid_rect);
+            }
+            TrimSheetDocumentCommand::ResizeSourceFrameRegion { region_id, grid_rect } => {
+                return self.resize_source_frame_region(*region_id, *grid_rect);
+            }
             TrimSheetDocumentCommand::SetPrimaryMaterial { material_id } => {
                 next.primary_material = Some(*material_id);
             }
@@ -1213,6 +1239,367 @@ impl TrimSheetDocument {
         next.appearance_revision = next.document_revision;
         next.validate()?;
         Ok(next)
+    }
+
+    /// Pins one already-previewed recipe as a single topology command.  The generator is never
+    /// rerun by loading or compiling: this command stores its complete recipe, leaf tree and IDs.
+    pub fn accept_source_frame_partition(&self, recipe: PartitionRecipe) -> Result<Self, TrimSheetDocumentError> {
+        let frame = self.source_frame.clone().ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        let mut next = Self::from_source_frame(self.id, frame, recipe, self.render_settings.output_size,
+            self.materials.clone(), self.patches.clone())?;
+        next.document_revision = self.document_revision.saturating_add(1);
+        next.topology_revision = self.topology_revision.saturating_add(1);
+        next.appearance_revision = next.document_revision;
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Splits one source-frame leaf on the logical lattice.  The existing region retains its
+    /// identity; the newly created sibling receives a deterministic new identity.  Source crop
+    /// overrides are cleared because partition-owned crops follow the new rectangles.
+    pub fn split_source_frame_region(&self, region_id: RegionId, axis: PartitionAxis) -> Result<Self, TrimSheetDocumentError> {
+        let mut next = self.source_frame_editable_clone()?;
+        let index = next.topology.regions.iter().position(|region| region.id == region_id)
+            .ok_or(TrimSheetDocumentError::MissingRegionBinding(region_id))?;
+        let rect = next.topology.regions[index].grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        let extent = match axis { PartitionAxis::Vertical => rect.width, PartitionAxis::Horizontal => rect.height };
+        if extent < 2 { return Err(TrimSheetDocumentError::InvalidPartitionEdit("region is one lattice cell wide on that axis".into())); }
+        let split = extent / 2;
+        let (first, second) = match axis {
+            PartitionAxis::Vertical => (
+                GridRect { width: split, ..rect },
+                GridRect { x: rect.x + split, width: rect.width - split, ..rect },
+            ),
+            PartitionAxis::Horizontal => (
+                GridRect { height: split, ..rect },
+                GridRect { y: rect.y + split, height: rect.height - split, ..rect },
+            ),
+        };
+        let recipe = next.partition_provenance.as_ref().expect("editable provenance").recipe.clone();
+        let new_id = unique_partition_region_id(&recipe, second, next.topology.regions.iter().map(|region| region.id));
+        let mut sibling = next.topology.regions[index].clone();
+        sibling.id = new_id;
+        sibling.id_color = IdColor::for_region(new_id);
+        sibling.display_name = format!("Region {:03}", next.topology.regions.len());
+        next.topology.regions[index].grid_rect = Some(first);
+        sibling.grid_rect = Some(second);
+        next.topology.regions.push(sibling);
+        let binding = next.region_bindings.get(&region_id).cloned().ok_or(TrimSheetDocumentError::MissingRegionBinding(region_id))?;
+        let mut sibling_binding = binding;
+        sibling_binding.region_id = new_id;
+        sibling_binding.mapping = RegionMapping::default();
+        next.region_bindings.insert(new_id, sibling_binding);
+        next.source_overrides.remove(&region_id);
+        next.region_bindings.get_mut(&region_id).expect("existing binding").mapping = RegionMapping::default();
+        next.repin_source_frame_topology()?;
+        Ok(next)
+    }
+
+    /// Removes a divider only when the two selected leaves share its complete span.  The first
+    /// region keeps its ID; the sibling binding/override is removed.  This makes "delete" a
+    /// safe Merge/Remove Divider operation and never leaves an empty atlas cell.
+    pub fn merge_source_frame_regions(&self, region_id: RegionId, sibling_id: RegionId) -> Result<Self, TrimSheetDocumentError> {
+        if region_id == sibling_id { return Err(TrimSheetDocumentError::InvalidPartitionEdit("choose two adjacent regions".into())); }
+        let mut next = self.source_frame_editable_clone()?;
+        let first_index = next.topology.regions.iter().position(|region| region.id == region_id)
+            .ok_or(TrimSheetDocumentError::MissingRegionBinding(region_id))?;
+        let second_index = next.topology.regions.iter().position(|region| region.id == sibling_id)
+            .ok_or(TrimSheetDocumentError::MissingRegionBinding(sibling_id))?;
+        let first = next.topology.regions[first_index].grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        let second = next.topology.regions[second_index].grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        let merged = mergeable_grid_rect(first, second).ok_or_else(|| TrimSheetDocumentError::InvalidPartitionEdit("regions must share one complete divider".into()))?;
+        next.topology.regions[first_index].grid_rect = Some(merged);
+        next.topology.regions.remove(second_index);
+        next.region_bindings.remove(&sibling_id);
+        next.source_overrides.remove(&region_id);
+        next.source_overrides.remove(&sibling_id);
+        next.region_bindings.get_mut(&region_id).expect("existing binding").mapping = RegionMapping::default();
+        next.repin_source_frame_topology()?;
+        Ok(next)
+    }
+
+    /// Moves only a full shared divider.  Both adjacent rectangles are updated atomically and
+    /// retain their IDs, so undo/redo and mapping ownership remain stable.
+    pub fn move_source_frame_boundary(&self, region_id: RegionId, axis: PartitionAxis, coordinate: u32) -> Result<Self, TrimSheetDocumentError> {
+        let mut next = self.source_frame_editable_clone()?;
+        let index = next.topology.regions.iter().position(|region| region.id == region_id)
+            .ok_or(TrimSheetDocumentError::MissingRegionBinding(region_id))?;
+        let rect = next.topology.regions[index].grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        let sibling_index = next.topology.regions.iter().enumerate().find_map(|(candidate_index, candidate)| {
+            if candidate_index == index { return None; }
+            let other = candidate.grid_rect?;
+            let full_vertical = axis == PartitionAxis::Vertical && rect.y == other.y && rect.height == other.height
+                && (rect.x + rect.width == other.x || other.x + other.width == rect.x);
+            let full_horizontal = axis == PartitionAxis::Horizontal && rect.x == other.x && rect.width == other.width
+                && (rect.y + rect.height == other.y || other.y + other.height == rect.y);
+            (full_vertical || full_horizontal).then_some(candidate_index)
+        }).ok_or_else(|| TrimSheetDocumentError::InvalidPartitionEdit("this edge is not a full shared divider".into()))?;
+        let other = next.topology.regions[sibling_index].grid_rect.expect("source-frame region");
+        let (start, end) = match axis {
+            PartitionAxis::Vertical => (rect.x.min(other.x), (rect.x + rect.width).max(other.x + other.width)),
+            PartitionAxis::Horizontal => (rect.y.min(other.y), (rect.y + rect.height).max(other.y + other.height)),
+        };
+        if coordinate <= start || coordinate >= end { return Err(TrimSheetDocumentError::InvalidPartitionEdit("boundary must remain inside its adjacent regions".into())); }
+        let (left_rect, right_rect) = match axis {
+            PartitionAxis::Vertical if rect.x < other.x => (
+                GridRect { width: coordinate - rect.x, ..rect },
+                GridRect { x: coordinate, width: other.x + other.width - coordinate, ..other },
+            ),
+            PartitionAxis::Vertical => (
+                GridRect { x: coordinate, width: rect.x + rect.width - coordinate, ..rect },
+                GridRect { width: coordinate - other.x, ..other },
+            ),
+            PartitionAxis::Horizontal if rect.y < other.y => (
+                GridRect { height: coordinate - rect.y, ..rect },
+                GridRect { y: coordinate, height: other.y + other.height - coordinate, ..other },
+            ),
+            PartitionAxis::Horizontal => (
+                GridRect { y: coordinate, height: rect.y + rect.height - coordinate, ..rect },
+                GridRect { height: coordinate - other.y, ..other },
+            ),
+        };
+        next.topology.regions[index].grid_rect = Some(left_rect);
+        next.topology.regions[sibling_index].grid_rect = Some(right_rect);
+        for id in [region_id, next.topology.regions[sibling_index].id] {
+            next.source_overrides.remove(&id);
+            next.region_bindings.get_mut(&id).expect("existing binding").mapping = RegionMapping::default();
+        }
+        next.repin_source_frame_topology()?;
+        Ok(next)
+    }
+
+    /// Inserts one directly-authored snapped rectangle as a single atomic partition edit.
+    /// Every intersected leaf is clipped into non-overlapping remainder rectangles, so the
+    /// authored rectangle and remainder still form an exact cover with no texture regeneration.
+    pub fn draw_source_frame_region(&self, grid_rect: GridRect) -> Result<Self, TrimSheetDocumentError> {
+        let mut next = self.source_frame_editable_clone()?;
+        let grid = next.logical_grid.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        if grid_rect.width == 0 || grid_rect.height == 0 || grid_rect.x.saturating_add(grid_rect.width) > grid.width
+            || grid_rect.y.saturating_add(grid_rect.height) > grid.height {
+            return Err(TrimSheetDocumentError::InvalidPartitionEdit("drawn rectangle must be inside the logical grid and at least one cell wide".into()));
+        }
+        let recipe = next.partition_provenance.as_ref().expect("editable provenance").recipe.clone();
+        let original_regions = next.topology.regions.clone();
+        let mut rebuilt = Vec::with_capacity(original_regions.len() + 4);
+        let mut occupied_ids = original_regions.iter().map(|region| region.id).collect::<BTreeSet<_>>();
+        let mut drawn_template = None;
+        let mut drawn_binding = None;
+
+        for region in original_regions {
+            let rect = region.grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+            let Some(intersection) = grid_rect_intersection(rect, grid_rect) else {
+                rebuilt.push(region);
+                continue;
+            };
+            drawn_template.get_or_insert_with(|| region.clone());
+            drawn_binding.get_or_insert(next.region_bindings.get(&region.id).cloned()
+                .ok_or(TrimSheetDocumentError::MissingRegionBinding(region.id))?);
+            next.source_overrides.remove(&region.id);
+            let mut pieces = subtract_grid_rect(rect, intersection);
+            pieces.sort_by_key(|piece| std::cmp::Reverse((u64::from(piece.width) * u64::from(piece.height), piece.y, piece.x)));
+            if let Some(first) = pieces.first().copied() {
+                let mut retained = region.clone();
+                retained.grid_rect = Some(first);
+                rebuilt.push(retained);
+                next.region_bindings.get_mut(&region.id).expect("intersected binding").mapping = RegionMapping::default();
+                for piece in pieces.into_iter().skip(1) {
+                    let new_id = unique_partition_region_id(&recipe, piece, occupied_ids.iter().copied());
+                    occupied_ids.insert(new_id);
+                    let mut sibling = region.clone();
+                    sibling.id = new_id;
+                    sibling.id_color = IdColor::for_region(new_id);
+                    sibling.display_name = format!("Region {:03}", rebuilt.len());
+                    sibling.grid_rect = Some(piece);
+                    rebuilt.push(sibling);
+                    let mut binding = next.region_bindings.get(&region.id).cloned().expect("intersected binding");
+                    binding.region_id = new_id;
+                    binding.mapping = RegionMapping::default();
+                    next.region_bindings.insert(new_id, binding);
+                }
+            } else {
+                next.region_bindings.remove(&region.id);
+                occupied_ids.remove(&region.id);
+            }
+        }
+
+        let mut drawn = drawn_template.ok_or_else(|| TrimSheetDocumentError::InvalidPartitionEdit("drawn rectangle does not intersect the atlas".into()))?;
+        let drawn_id = unique_partition_region_id(&recipe, grid_rect, occupied_ids.iter().copied());
+        drawn.id = drawn_id;
+        drawn.id_color = IdColor::for_region(drawn_id);
+        drawn.display_name = format!("Region {:03}", rebuilt.len());
+        drawn.grid_rect = Some(grid_rect);
+        rebuilt.push(drawn);
+        let mut binding = drawn_binding.expect("drawn intersection binding");
+        binding.region_id = drawn_id;
+        binding.mapping = RegionMapping::default();
+        next.region_bindings.insert(drawn_id, binding);
+        next.topology.regions = rebuilt;
+        next.repin_source_frame_topology()?;
+        Ok(next)
+    }
+
+    /// Resizes one existing source-frame region while preserving its stable identity. Only cells
+    /// inside the union of the old and requested rectangles can change owner. Gained cells move
+    /// from intersected neighbors to the selected region; released cells move to the nearest
+    /// neighbor that touched the old region. The result is rectangularized and validated as one
+    /// atomic exact-cover edit, with any unavoidable neighbor fragments receiving deterministic
+    /// IDs while the selected region keeps `region_id`.
+    pub fn resize_source_frame_region(&self, region_id: RegionId, grid_rect: GridRect) -> Result<Self, TrimSheetDocumentError> {
+        let mut next = self.source_frame_editable_clone()?;
+        let grid = next.logical_grid.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        if grid_rect.width == 0 || grid_rect.height == 0 || grid_rect.x.saturating_add(grid_rect.width) > grid.width
+            || grid_rect.y.saturating_add(grid_rect.height) > grid.height {
+            return Err(TrimSheetDocumentError::InvalidPartitionEdit("resized rectangle must be inside the logical grid and at least one cell wide".into()));
+        }
+        let selected_index = next.topology.regions.iter().position(|region| region.id == region_id)
+            .ok_or(TrimSheetDocumentError::MissingRegionBinding(region_id))?;
+        let original_regions = next.topology.regions.clone();
+        let original_rect = original_regions[selected_index].grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        if original_rect == grid_rect { return Ok(next); }
+
+        let cell_count = usize::try_from(u64::from(grid.width) * u64::from(grid.height))
+            .map_err(|_| TrimSheetDocumentError::InvalidPartitionEdit("logical grid is too large to resize safely".into()))?;
+        let mut owners = vec![region_id; cell_count];
+        for region in &original_regions {
+            let rect = region.grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    owners[grid_cell_index(grid, x, y)] = region.id;
+                }
+            }
+        }
+
+        let touching_neighbors = original_regions.iter().enumerate().filter_map(|(index, region)| {
+            let rect = region.grid_rect?;
+            (region.id != region_id && grid_rects_touch(original_rect, rect)).then_some((index, region.id, rect))
+        }).collect::<Vec<_>>();
+        let retained_overlap = grid_rect_intersection(original_rect, grid_rect)
+            .ok_or_else(|| TrimSheetDocumentError::InvalidPartitionEdit("resize must retain part of the selected region; use Draw Region to place a separate rectangle".into()))?;
+        let released = subtract_grid_rect(original_rect, retained_overlap);
+        if !released.is_empty() && touching_neighbors.is_empty() {
+            return Err(TrimSheetDocumentError::InvalidPartitionEdit("the only atlas region cannot be made smaller because no neighbor can receive the released area".into()));
+        }
+        for piece in released {
+            // A resize releases at most four rectangular strips. Transfer each strip as one
+            // ownership unit; choosing a recipient per cell creates diagonal Voronoi stairs
+            // which then explode into dozens of thin rectangular regions.
+            let (_, owner, _) = touching_neighbors.iter().min_by_key(|(ordinal, _, rect)| {
+                (
+                    mergeable_grid_rect(piece, *rect).is_none(),
+                    std::cmp::Reverse(grid_rect_touch_span(piece, *rect)),
+                    grid_rect_distance(piece, *rect),
+                    *ordinal,
+                )
+            }).expect("released cells require a touching neighbor");
+            for y in piece.y..piece.y + piece.height {
+                for x in piece.x..piece.x + piece.width {
+                    owners[grid_cell_index(grid, x, y)] = *owner;
+                }
+            }
+        }
+        for y in grid_rect.y..grid_rect.y + grid_rect.height {
+            for x in grid_rect.x..grid_rect.x + grid_rect.width {
+                owners[grid_cell_index(grid, x, y)] = region_id;
+            }
+        }
+
+        let pieces_by_owner = rectangularize_grid_owners(grid, &owners);
+        let recipe = next.partition_provenance.as_ref().expect("editable provenance").recipe.clone();
+        let mut occupied_ids = original_regions.iter().map(|region| region.id).collect::<BTreeSet<_>>();
+        let original_bindings = next.region_bindings.clone();
+        let mut rebuilt = Vec::new();
+        next.region_bindings.clear();
+        for region in original_regions {
+            let owner = region.id;
+            let original = region.grid_rect.expect("source-frame region");
+            let Some(mut pieces) = pieces_by_owner.get(&owner).cloned() else {
+                next.source_overrides.remove(&owner);
+                occupied_ids.remove(&owner);
+                continue;
+            };
+            pieces.sort_by_key(|piece| std::cmp::Reverse((u64::from(piece.width) * u64::from(piece.height), piece.y, piece.x)));
+            if owner == region_id {
+                pieces.sort_by_key(|piece| if *piece == grid_rect { 0 } else { 1 });
+            }
+            let changed = pieces.len() != 1 || pieces[0] != original;
+            for (piece_index, piece) in pieces.into_iter().enumerate() {
+                let mut definition = region.clone();
+                let mut binding = original_bindings.get(&owner).cloned()
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(owner))?;
+                if piece_index == 0 {
+                    definition.grid_rect = Some(piece);
+                    if changed {
+                        binding.mapping = RegionMapping::default();
+                        next.source_overrides.remove(&owner);
+                    }
+                    next.region_bindings.insert(owner, binding);
+                } else {
+                    let new_id = unique_partition_region_id(&recipe, piece, occupied_ids.iter().copied());
+                    occupied_ids.insert(new_id);
+                    definition.id = new_id;
+                    definition.id_color = IdColor::for_region(new_id);
+                    definition.display_name = format!("Region {:03}", rebuilt.len());
+                    definition.grid_rect = Some(piece);
+                    binding.region_id = new_id;
+                    binding.mapping = RegionMapping::default();
+                    next.region_bindings.insert(new_id, binding);
+                }
+                rebuilt.push(definition);
+            }
+        }
+        if rebuilt.len() > crate::source_frame::MAX_PARTITION_REGIONS as usize {
+            return Err(TrimSheetDocumentError::InvalidPartitionEdit("resize would fragment neighboring ownership beyond the 256-region safety limit".into()));
+        }
+        next.topology.regions = rebuilt;
+        next.repin_source_frame_topology()?;
+        Ok(next)
+    }
+
+    fn source_frame_editable_clone(&self) -> Result<Self, TrimSheetDocumentError> {
+        if self.source_frame.is_none() || self.logical_grid.is_none() || self.partition_provenance.is_none()
+            || self.topology.kind != TopologyKind::CustomAtlas {
+            return Err(TrimSheetDocumentError::InvalidPartitionEdit("layout editing is available only for an accepted source-frame atlas".into()));
+        }
+        Ok(self.clone())
+    }
+
+    fn repin_source_frame_topology(&mut self) -> Result<(), TrimSheetDocumentError> {
+        let grid = self.logical_grid.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+        let output = self.render_settings.output_size;
+        for region in &mut self.topology.regions {
+            let rect = region.grid_rect.ok_or(TrimSheetDocumentError::InvalidSourceFrame)?;
+            let allocation = grid_rect_to_output(rect, grid, output);
+            region.allocation_rect = allocation;
+            region.hotspot_rect = allocation;
+            region.orientation = if allocation.width > allocation.height { RegionOrientation::Horizontal }
+                else if allocation.height > allocation.width { RegionOrientation::Vertical } else { RegionOrientation::Unspecified };
+        }
+        self.topology.regions.sort_by_key(|region| {
+            let rect = region.grid_rect.expect("source-frame region");
+            (rect.y, rect.x, rect.height, rect.width)
+        });
+        let prior_families = self.partition_provenance.as_ref().expect("editable provenance")
+            .accepted_region_ids.iter().copied()
+            .zip(self.partition_provenance.as_ref().expect("editable provenance").tree.iter().map(|node| (node.family, node.lineage)))
+            .collect::<BTreeMap<_, _>>();
+        let provenance = self.partition_provenance.as_mut().expect("editable provenance");
+        provenance.accepted_region_ids = self.topology.regions.iter().map(|region| region.id).collect();
+        provenance.tree = self.topology.regions.iter().enumerate().map(|(ordinal, region)| PartitionTreeNode {
+            grid_rect: region.grid_rect.expect("source-frame region"),
+            family: prior_families.get(&region.id).map(|value| value.0).unwrap_or(PartitionFamily::Remainder),
+            ordinal: ordinal as u32,
+            lineage: prior_families.get(&region.id).map(|value| value.1).unwrap_or_default(),
+        }).collect();
+        let signature = hash_serializable(&provenance.tree)?;
+        let frame = self.source_frame.as_ref().expect("source frame");
+        self.topology = AcceptedTopology::new(TopologyKind::CustomAtlas, self.topology.snapshot.clone(),
+            format!("source-frame:{}:{}:{}", hex_hash(frame.identity), hex_hash(provenance.recipe_hash), hex_hash(signature)), self.topology.regions.clone())?;
+        provenance.topology_hash = self.topology.topology_hash;
+        self.document_revision = self.document_revision.saturating_add(1);
+        self.topology_revision = self.topology_revision.saturating_add(1);
+        self.appearance_revision = self.document_revision;
+        self.validate()?;
+        Ok(())
     }
 
     /// Reconciles imported material and patch catalogs without consulting any layout state.
@@ -1309,6 +1696,29 @@ fn template_region_mapping(_mapping: TemplateSourceMapping) -> RegionMapping {
     rename_all_fields = "camelCase"
 )]
 pub enum TrimSheetDocumentCommand {
+    AcceptSourceFramePartition {
+        recipe: PartitionRecipe,
+    },
+    SplitSourceFrameRegion {
+        region_id: RegionId,
+        axis: PartitionAxis,
+    },
+    MergeSourceFrameRegions {
+        region_id: RegionId,
+        sibling_id: RegionId,
+    },
+    MoveSourceFrameBoundary {
+        region_id: RegionId,
+        axis: PartitionAxis,
+        coordinate: u32,
+    },
+    DrawSourceFrameRegion {
+        grid_rect: GridRect,
+    },
+    ResizeSourceFrameRegion {
+        region_id: RegionId,
+        grid_rect: GridRect,
+    },
     SetPrimaryMaterial {
         material_id: SourceSetId,
     },
@@ -1572,6 +1982,126 @@ fn source_frame_region_bounds(frame: &SourceFrame, grid: LogicalGridSpec, rect: 
     }
 }
 
+fn grid_rect_to_output(rect: GridRect, grid: LogicalGridSpec, output: PixelSize) -> CanonicalRect {
+    let xs = crate::resolve_boundaries(0, output.width, grid.width);
+    let ys = crate::resolve_boundaries(0, output.height, grid.height);
+    CanonicalRect { x: xs[rect.x as usize], y: ys[rect.y as usize],
+        width: xs[(rect.x + rect.width) as usize] - xs[rect.x as usize],
+        height: ys[(rect.y + rect.height) as usize] - ys[rect.y as usize] }
+}
+
+fn grid_rect_intersection(first: GridRect, second: GridRect) -> Option<GridRect> {
+    let x = first.x.max(second.x);
+    let y = first.y.max(second.y);
+    let right = first.x.saturating_add(first.width).min(second.x.saturating_add(second.width));
+    let bottom = first.y.saturating_add(first.height).min(second.y.saturating_add(second.height));
+    if right > x && bottom > y { Some(GridRect { x, y, width: right - x, height: bottom - y }) } else { None }
+}
+
+fn subtract_grid_rect(rect: GridRect, cut: GridRect) -> Vec<GridRect> {
+    let mut pieces = Vec::with_capacity(4);
+    let rect_right = rect.x + rect.width;
+    let rect_bottom = rect.y + rect.height;
+    let cut_right = cut.x + cut.width;
+    let cut_bottom = cut.y + cut.height;
+    if cut.y > rect.y {
+        pieces.push(GridRect { x: rect.x, y: rect.y, width: rect.width, height: cut.y - rect.y });
+    }
+    if cut_bottom < rect_bottom {
+        pieces.push(GridRect { x: rect.x, y: cut_bottom, width: rect.width, height: rect_bottom - cut_bottom });
+    }
+    if cut.x > rect.x {
+        pieces.push(GridRect { x: rect.x, y: cut.y, width: cut.x - rect.x, height: cut.height });
+    }
+    if cut_right < rect_right {
+        pieces.push(GridRect { x: cut_right, y: cut.y, width: rect_right - cut_right, height: cut.height });
+    }
+    pieces
+}
+
+fn grid_cell_index(grid: LogicalGridSpec, x: u32, y: u32) -> usize {
+    y as usize * grid.width as usize + x as usize
+}
+
+fn grid_rects_touch(first: GridRect, second: GridRect) -> bool {
+    let vertical = (first.x + first.width == second.x || second.x + second.width == first.x)
+        && first.y < second.y + second.height && first.y + first.height > second.y;
+    let horizontal = (first.y + first.height == second.y || second.y + second.height == first.y)
+        && first.x < second.x + second.width && first.x + first.width > second.x;
+    vertical || horizontal
+}
+
+fn grid_rect_distance(first: GridRect, second: GridRect) -> u32 {
+    let dx = if first.x + first.width <= second.x { second.x - (first.x + first.width) }
+        else if second.x + second.width <= first.x { first.x - (second.x + second.width) } else { 0 };
+    let dy = if first.y + first.height <= second.y { second.y - (first.y + first.height) }
+        else if second.y + second.height <= first.y { first.y - (second.y + second.height) } else { 0 };
+    dx.saturating_add(dy)
+}
+
+fn grid_rect_touch_span(first: GridRect, second: GridRect) -> u32 {
+    if first.x + first.width == second.x || second.x + second.width == first.x {
+        return (first.y + first.height).min(second.y + second.height).saturating_sub(first.y.max(second.y));
+    }
+    if first.y + first.height == second.y || second.y + second.height == first.y {
+        return (first.x + first.width).min(second.x + second.width).saturating_sub(first.x.max(second.x));
+    }
+    0
+}
+
+fn rectangularize_grid_owners(grid: LogicalGridSpec, owners: &[RegionId]) -> BTreeMap<RegionId, Vec<GridRect>> {
+    let mut visited = vec![false; owners.len()];
+    let mut rectangles = BTreeMap::<RegionId, Vec<GridRect>>::new();
+    for y in 0..grid.height {
+        for x in 0..grid.width {
+            let start = grid_cell_index(grid, x, y);
+            if visited[start] { continue; }
+            let owner = owners[start];
+            let mut width = 1;
+            while x + width < grid.width {
+                let index = grid_cell_index(grid, x + width, y);
+                if visited[index] || owners[index] != owner { break; }
+                width += 1;
+            }
+            let mut height = 1;
+            'rows: while y + height < grid.height {
+                for offset in 0..width {
+                    let index = grid_cell_index(grid, x + offset, y + height);
+                    if visited[index] || owners[index] != owner { break 'rows; }
+                }
+                height += 1;
+            }
+            for row in y..y + height {
+                for column in x..x + width {
+                    visited[grid_cell_index(grid, column, row)] = true;
+                }
+            }
+            rectangles.entry(owner).or_default().push(GridRect { x, y, width, height });
+        }
+    }
+    rectangles
+}
+
+fn mergeable_grid_rect(first: GridRect, second: GridRect) -> Option<GridRect> {
+    if first.y == second.y && first.height == second.height && (first.x + first.width == second.x || second.x + second.width == first.x) {
+        return Some(GridRect { x: first.x.min(second.x), y: first.y, width: first.width + second.width, height: first.height });
+    }
+    if first.x == second.x && first.width == second.width && (first.y + first.height == second.y || second.y + second.height == first.y) {
+        return Some(GridRect { x: first.x, y: first.y.min(second.y), width: first.width, height: first.height + second.height });
+    }
+    None
+}
+
+fn unique_partition_region_id(recipe: &PartitionRecipe, rect: GridRect, existing: impl Iterator<Item = RegionId>) -> RegionId {
+    let existing = existing.collect::<BTreeSet<_>>();
+    (0..u32::MAX).map(|ordinal| source_frame_region_id(recipe, rect, ordinal))
+        .find(|id| !existing.contains(id)).expect("a SHA-256 region identity is available")
+}
+
+fn hex_hash(value: DocumentHash) -> String {
+    value.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TrimSheetDocumentError {
     #[error("canonical topology size or schema version is invalid")]
@@ -1676,6 +2206,10 @@ pub enum TrimSheetDocumentError {
     HashSerialization,
     #[error("the accepted template snapshot is invalid")]
     InvalidTemplateSnapshot,
+    #[error("source-frame partition recipe is invalid: {0}")]
+    InvalidSourcePartition(crate::PartitionError),
+    #[error("source-frame layout edit is invalid: {0}")]
+    InvalidPartitionEdit(String),
     #[error("a pinned standard or custom template topology was mutated")]
     TemplateTopologyMutation,
     #[error("standard template does not exactly match its shipped registry definition")]
@@ -2054,6 +2588,86 @@ mod tests {
             detached.apply_command(&TrimSheetDocumentCommand::SetRegionProjection { region_id, projection }),
             Err(TrimSheetDocumentError::InvalidSourceOverrideAspect(id)) if id == region_id
         ));
+    }
+
+    #[test]
+    fn source_frame_layout_edits_are_atomic_and_preserve_boundary_ids() {
+        let source_set_id = SourceSetId::from_bytes([9; 16]);
+        let frame = SourceFrame::centered_largest(source_set_id,
+            crate::OrientedPixelSize { width: 8_000, height: 4_000 }, [1, 1], 1);
+        let document = TrimSheetDocument::from_source_frame(
+            LayoutId::from_bytes([10; 16]), frame,
+            PartitionRecipe::default_for(LogicalGridSpec { schema_version: 1, width: 8, height: 8 }, 2, 3),
+            PixelSize { width: 256, height: 256 }, vec![material(source_set_id)], vec![],
+        ).expect("source frame document");
+        let region_id = document.topology.regions[0].id;
+        let rect = document.topology.regions[0].grid_rect.expect("grid rectangle");
+        let axis = if rect.width >= 2 { PartitionAxis::Vertical } else { PartitionAxis::Horizontal };
+        let split = document.apply_command(&TrimSheetDocumentCommand::SplitSourceFrameRegion { region_id, axis })
+            .expect("split shared source-frame leaf");
+        assert_eq!(split.topology.regions.len(), 3);
+        assert!(split.topology.regions.iter().any(|region| region.id == region_id), "the existing leaf keeps its ID");
+        split.validate().expect("split keeps complete coverage");
+        let sibling_id = split.topology.regions.iter().find(|region| region.id != region_id
+            && mergeable_grid_rect(region.grid_rect.expect("grid"), split.topology.regions.iter().find(|candidate| candidate.id == region_id).unwrap().grid_rect.expect("grid")).is_some())
+            .expect("new sibling").id;
+        let first = split.topology.regions.iter().find(|region| region.id == region_id).unwrap().grid_rect.unwrap();
+        let second = split.topology.regions.iter().find(|region| region.id == sibling_id).unwrap().grid_rect.unwrap();
+        let coordinate = match axis {
+            PartitionAxis::Vertical => first.x.min(second.x) + 1,
+            PartitionAxis::Horizontal => first.y.min(second.y) + 1,
+        };
+        let moved = split.apply_command(&TrimSheetDocumentCommand::MoveSourceFrameBoundary { region_id, axis, coordinate })
+            .expect("move shared divider atomically");
+        assert!(moved.topology.regions.iter().any(|region| region.id == region_id));
+        assert!(moved.topology.regions.iter().any(|region| region.id == sibling_id));
+        moved.validate().expect("boundary move keeps coverage and bindings");
+        let merged = moved.apply_command(&TrimSheetDocumentCommand::MergeSourceFrameRegions { region_id, sibling_id })
+            .expect("remove divider without an empty cell");
+        assert_eq!(merged.topology.regions.len(), 2);
+        assert!(merged.topology.regions.iter().any(|region| region.id == region_id));
+        assert!(!merged.region_bindings.contains_key(&sibling_id));
+        merged.validate().expect("merge keeps complete coverage and bindings");
+        let authored_rect = GridRect { x: 1, y: 1, width: 6, height: 3 };
+        let drawn = merged.apply_command(&TrimSheetDocumentCommand::DrawSourceFrameRegion { grid_rect: authored_rect })
+            .expect("directly draw one rectangle across existing leaves");
+        assert_eq!(drawn.document_revision, merged.document_revision + 1, "draw is one atomic command");
+        assert!(drawn.topology.regions.iter().any(|region| region.grid_rect == Some(authored_rect)));
+        drawn.validate().expect("drawn rectangle and clipped remainder remain an exact cover");
+        let drawn_id = drawn.topology.regions.iter().find(|region| region.grid_rect == Some(authored_rect)).expect("drawn region").id;
+        let binding_before_resize = drawn.region_bindings.get(&drawn_id).expect("drawn binding").content.clone();
+        let resized_rect = GridRect { x: 2, y: 1, width: 5, height: 4 };
+        let resized = drawn.apply_command(&TrimSheetDocumentCommand::ResizeSourceFrameRegion { region_id: drawn_id, grid_rect: resized_rect })
+            .expect("resize transfers only gained and released ownership");
+        assert_eq!(resized.document_revision, drawn.document_revision + 1, "resize is one atomic command");
+        assert_eq!(resized.topology.regions.iter().filter(|region| region.id == drawn_id).count(), 1, "selected identity is never replaced or duplicated");
+        assert_eq!(resized.topology.regions.iter().find(|region| region.id == drawn_id).expect("resized region").grid_rect, Some(resized_rect));
+        assert_eq!(resized.region_bindings.get(&drawn_id).expect("resized binding").content, binding_before_resize, "selected content ownership survives resize");
+        resized.validate().expect("resized region and redistributed neighbors remain an exact cover");
+    }
+
+    #[test]
+    fn source_frame_resize_does_not_turn_released_strips_into_cell_staircases() {
+        let source_set_id = SourceSetId::from_bytes([19; 16]);
+        let frame = SourceFrame::centered_largest(source_set_id,
+            crate::OrientedPixelSize { width: 8_000, height: 4_000 }, [1, 1], 1);
+        let document = TrimSheetDocument::from_source_frame(
+            LayoutId::from_bytes([20; 16]), frame,
+            PartitionRecipe::default_for(LogicalGridSpec { schema_version: 1, width: 64, height: 64 }, 63, 7),
+            PixelSize { width: 512, height: 512 }, vec![material(source_set_id)], vec![],
+        ).expect("dense source-frame document");
+        let selected = document.topology.regions.iter()
+            .filter_map(|region| region.grid_rect.map(|rect| (region.id, rect)))
+            .filter(|(_, rect)| rect.width > 2 && rect.height > 2)
+            .max_by_key(|(_, rect)| u64::from(rect.width) * u64::from(rect.height))
+            .expect("a resizable major region");
+        let target = GridRect { x: selected.1.x + 1, y: selected.1.y + 1, width: selected.1.width - 2, height: selected.1.height - 2 };
+        let resized = document.apply_command(&TrimSheetDocumentCommand::ResizeSourceFrameRegion { region_id: selected.0, grid_rect: target })
+            .expect("released strips transfer atomically");
+        assert_eq!(resized.topology.regions.iter().find(|region| region.id == selected.0).and_then(|region| region.grid_rect), Some(target));
+        assert!(resized.topology.regions.len() <= document.topology.regions.len() + 12,
+            "a four-strip contraction must not create a cell-level staircase");
+        resized.validate().expect("compact resize remains an exact cover");
     }
 
     #[test]
