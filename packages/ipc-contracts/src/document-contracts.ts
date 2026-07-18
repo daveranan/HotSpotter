@@ -481,6 +481,7 @@ export interface PreviewSheetProjection {
 
 export type TrimSheetDocumentCommand =
   | { type: "apply_authored_layout_preset"; preset: AuthoredLayoutPreset; instanceId: string }
+  | { type: "set_authored_layout_preset_snapshot"; preset: AuthoredLayoutPreset }
   | { type: "accept_source_frame_partition"; recipe: PartitionRecipe }
   | { type: "split_source_frame_region"; regionId: string; axis: "horizontal" | "vertical" }
   | { type: "merge_source_frame_regions"; regionId: string; siblingId: string }

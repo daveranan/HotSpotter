@@ -1,8 +1,8 @@
+mod algorithm_stack;
 mod channel;
 mod document;
 mod error;
 mod id;
-mod algorithm_stack;
 mod layout;
 mod material_source;
 mod patch;
@@ -11,24 +11,24 @@ mod source_frame;
 mod templates;
 mod units;
 
+pub use algorithm_stack::*;
 pub use channel::{Channel, ChannelDataKind};
 pub use document::{
-    AcceptedTopology, AddressMode, AppearanceHashInputs, AuthoredLayoutPreset, AuthoredLayoutPresetRegion, BlendPolicy, ChangeClassification,
+    AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION, AcceptedTopology, AddressMode, AppearanceHashInputs,
+    AuthoredLayoutPreset, AuthoredLayoutPresetRegion, BlendPolicy, ChangeClassification,
     ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, FitAxis,
     GeneratorProvenance, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
-    MaterialMapKind, MaterialSourceSet, ProceduralMaterial, Projection, QuarterTurn,
-    RadialMappingSettings, RegionAppearanceHashInput, RegionBinding, RegionDefinition, RegionMapping, RegionOrientation,
-    SourceCropIntent,
-    RegionTopologyHashInput, RenderSettings, SamplingPolicy, SheetFraming, SolidChannelValues,
-    TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, TopologyHashInputs, TopologyKind, TopologySnapshot,
-    TreatmentLayer, TreatmentParameter, TrimSheetChange, TrimSheetDocument,
-    PartitionAxis, TrimSheetDocumentCommand, TrimSheetDocumentError, TrimSheetId, UvFitKind, UvFitPolicy,
-    WARP_OPERATION_VERSION, WarpOperation, AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
-    diagonal_cascade_authored_preset, new_blank_authored_preset,
+    MaterialMapKind, MaterialSourceSet, PartitionAxis, ProceduralMaterial, Projection, QuarterTurn,
+    RadialMappingSettings, RegionAppearanceHashInput, RegionBinding, RegionDefinition,
+    RegionMapping, RegionOrientation, RegionTopologyHashInput, RenderSettings, SamplingPolicy,
+    SheetFraming, SolidChannelValues, SourceCropIntent, TRIM_SHEET_DOCUMENT_SCHEMA_VERSION,
+    TopologyHashInputs, TopologyKind, TopologySnapshot, TreatmentLayer, TreatmentParameter,
+    TrimSheetChange, TrimSheetDocument, TrimSheetDocumentCommand, TrimSheetDocumentError,
+    TrimSheetId, UvFitKind, UvFitPolicy, WARP_OPERATION_VERSION, WarpOperation,
+    diagonal_cascade_authored_preset, new_blank_authored_preset, validate_authored_layout_preset,
 };
 pub use error::{DomainError, ErrorCode, UserFacingError};
 pub use id::{LayerId, LayoutId, MapId, PatchId, ProjectId, RegionId, SourceId, SourceSetId};
-pub use algorithm_stack::*;
 pub use layout::{
     AutoPackSettings, DecorationBinding, FillBehavior, FixedRegionSize, IdColor, Layout,
     LayoutContractError, LayoutItem, LayoutKind, LayoutOrder, LayoutPreset, LayoutRegion,
@@ -41,15 +41,15 @@ pub use layout::{
     TemplateSnapshot, TrimAxis, TrimCaps,
 };
 pub use material_source::{
-    AssignmentProvenance, ChannelInterpretation, ChannelRegistration, MaterialChannelRole,
-    ClassicalDelightingSettings, DelightingIntent, DelightingPassThroughReason,
-    DelightingRadius, DelightingRouteIntent, IntrinsicProviderFallback, MaterialSource,
-    MaterialBehaviorClass, MaterialClassificationCommand, MaterialClassificationIntent,
-    MaterialCalibrationCommand, MaterialCalibrationError, MaterialCalibrationIntent,
-    PhysicalScaleEvidence, ScaleProvenance, SourcePixelPointMilli, WorldScaleAvailability,
-    NormalConvention, OrientedPixelSize, OriginalAssetProvenance,
-    RegisteredChannel, RegisteredChannelSet, RegistrationDiagnostic, RegistrationDiagnosticCode,
-    RegistrationRecoveryChoice, SourceOwnershipIntent,
+    AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ClassicalDelightingSettings,
+    DelightingIntent, DelightingPassThroughReason, DelightingRadius, DelightingRouteIntent,
+    IntrinsicProviderFallback, MaterialBehaviorClass, MaterialCalibrationCommand,
+    MaterialCalibrationError, MaterialCalibrationIntent, MaterialChannelRole,
+    MaterialClassificationCommand, MaterialClassificationIntent, MaterialSource, NormalConvention,
+    OrientedPixelSize, OriginalAssetProvenance, PhysicalScaleEvidence, RegisteredChannel,
+    RegisteredChannelSet, RegistrationDiagnostic, RegistrationDiagnosticCode,
+    RegistrationRecoveryChoice, ScaleProvenance, SourceOwnershipIntent, SourcePixelPointMilli,
+    WorldScaleAvailability,
 };
 pub use patch::{
     MapParticipation, Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchGeometry,
@@ -57,12 +57,13 @@ pub use patch::{
 };
 pub use protocol::{FoundationStatusRequest, IPC_PROTOCOL_VERSION};
 pub use source_frame::{
-    generate_partition, region_id as source_frame_region_id, resolve_boundaries, GridRect,
-    AspectClass, CompositionProfile, FamilyQuota, HierarchicalLayoutRecipe, HierarchyZone, LogicalGridSpec, MacroStyle,
-    PartitionError, PartitionFamily, PartitionLineage, PartitionProvenance, PartitionRecipe, PartitionRegion, PartitionTreeNode,
-    RadialQuota, RecursivePolicy, SplitRatio, StripQuota,
-    MappingOrigin, RegionSourceOverride, SourceFrame, LOGICAL_GRID_SCHEMA_VERSION, MAX_LOGICAL_GRID_EDGE,
-    MAX_PARTITION_REGIONS, PARTITION_RECIPE_SCHEMA_VERSION, SOURCE_FRAME_SCHEMA_VERSION,
+    AspectClass, CompositionProfile, FamilyQuota, GridRect, HierarchicalLayoutRecipe,
+    HierarchyZone, LOGICAL_GRID_SCHEMA_VERSION, LogicalGridSpec, MAX_LOGICAL_GRID_EDGE,
+    MAX_PARTITION_REGIONS, MacroStyle, MappingOrigin, PARTITION_RECIPE_SCHEMA_VERSION,
+    PartitionError, PartitionFamily, PartitionLineage, PartitionProvenance, PartitionRecipe,
+    PartitionRegion, PartitionTreeNode, RadialQuota, RecursivePolicy, RegionSourceOverride,
+    SOURCE_FRAME_SCHEMA_VERSION, SourceFrame, SplitRatio, StripQuota, generate_partition,
+    region_id as source_frame_region_id, resolve_boundaries,
 };
 pub use templates::{
     CANONICAL_TEMPLATE_EDGE, CanonicalRect, CompiledTemplateSlot, CompiledTemplateTopology,

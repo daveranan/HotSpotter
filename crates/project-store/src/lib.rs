@@ -8,17 +8,15 @@ use std::{
 };
 
 use hot_trimmer_domain::{
-    AssignmentProvenance, ChannelInterpretation, ChannelRegistration, ContentDigest, LayoutId,
-    DelightingIntent, MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole,
-    MaterialMapContent, MaterialMapKind, MaterialSourceSet,
-    MaterialClassificationCommand, MaterialClassificationIntent,
-    NormalConvention,
-    Patch, PatchCommand, RegistrationDiagnostic, RegistrationDiagnosticCode,
-    RegistrationRecoveryChoice,
-    PatchCommandError, PatchEditOutcome, PatchSet, ProjectId, SourceId, SourceSetId,
-    TemplateRegistry, TrimSheetDocument, TrimSheetDocumentCommand,
-    LogicalGridSpec, NormalizedBounds, NormalizedPoint, NormalizedScalar, OrientedPixelSize,
-    PartitionRecipe, Projection, RegionSourceOverride, SourceFrame,
+    AssignmentProvenance, AuthoredLayoutPreset, AuthoredLayoutPresetRegion, ChannelInterpretation,
+    ChannelRegistration, ContentDigest, DelightingIntent, LayoutId, LogicalGridSpec,
+    MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole,
+    MaterialClassificationCommand, MaterialClassificationIntent, MaterialMapContent,
+    MaterialMapKind, MaterialSourceSet, NormalConvention, NormalizedBounds, NormalizedPoint,
+    NormalizedScalar, OrientedPixelSize, PartitionRecipe, Patch, PatchCommand, PatchCommandError,
+    PatchEditOutcome, PatchSet, ProjectId, Projection, RegionSourceOverride,
+    RegistrationDiagnostic, RegistrationDiagnosticCode, RegistrationRecoveryChoice, SourceFrame,
+    SourceId, SourceSetId, TemplateRegistry, TrimSheetDocument, TrimSheetDocumentCommand,
 };
 use hot_trimmer_geometry::Quadrilateral;
 use hot_trimmer_image_io::{ColorPolicy, DecodeLimits, inspect_path_with_policy};
@@ -256,7 +254,10 @@ pub enum StoreError {
 impl StoreError {
     /// Projects registration failures into the typed Stage 1 diagnostic contract.
     #[must_use]
-    pub fn registration_diagnostic(&self, channel: SourceChannel) -> Option<RegistrationDiagnostic> {
+    pub fn registration_diagnostic(
+        &self,
+        channel: SourceChannel,
+    ) -> Option<RegistrationDiagnostic> {
         let (code, recovery_choices) = match self {
             Self::BaseColorRequired => (
                 RegistrationDiagnosticCode::BaseColorRequired,
@@ -389,7 +390,16 @@ impl ProjectStore {
         verify_integrity(&connection)?;
 
         let patch_set = PatchSet::new(load_patches(&connection)?)?;
-        let document = load_document(&connection)?;
+        let mut document = load_document(&connection)?;
+        if let Some(current) = document.as_mut()
+            && snapshot_legacy_authored_layout(current)?
+        {
+            persist_document_state(
+                &mut connection,
+                Some(current),
+                "migrate_accepted_topology_to_authored_preset",
+            )?;
+        }
         let store = Self {
             connection,
             project_path: path.to_path_buf(),
@@ -538,15 +548,17 @@ impl ProjectStore {
             self.document
                 .as_ref()
                 .filter(|document| {
-                    document
-                        .source_frame
-                        .as_ref()
-                        .is_some_and(|frame| frame.source_set_id == SourceSetId::from_bytes(*source_set_id.as_bytes()))
+                    document.source_frame.as_ref().is_some_and(|frame| {
+                        frame.source_set_id == SourceSetId::from_bytes(*source_set_id.as_bytes())
+                    })
                 })
                 .map(|document| {
                     rebind_source_frame(
                         document,
-                        OrientedPixelSize { width: source.width, height: source.height },
+                        OrientedPixelSize {
+                            width: source.width,
+                            height: source.height,
+                        },
                         source_set_revision,
                     )
                 })
@@ -638,7 +650,12 @@ impl ProjectStore {
             channel.as_db_value(),
             source.id,
             source.sha256,
-            rebind_diagnostic.as_ref().map_or_else(String::new, |diagnostic| format!(",\"sourceFrameRebind\":\"{}\"", diagnostic.replace('"', "\\\"")))
+            rebind_diagnostic
+                .as_ref()
+                .map_or_else(String::new, |diagnostic| format!(
+                    ",\"sourceFrameRebind\":\"{}\"",
+                    diagnostic.replace('"', "\\\"")
+                ))
         );
         transaction.execute(
             "INSERT INTO autosave_journal (occurred_unix, operation, payload_json)
@@ -647,7 +664,12 @@ impl ProjectStore {
         )?;
         transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
         if let Some(document) = next_document.as_ref() {
-            persist_document_state_in_transaction(&transaction, Some(document), "replace_source_rebind", now)?;
+            persist_document_state_in_transaction(
+                &transaction,
+                Some(document),
+                "replace_source_rebind",
+                now,
+            )?;
         }
         transaction.commit()?;
         self.patch_set = next_patch_set;
@@ -741,13 +763,89 @@ impl ProjectStore {
         checkpoint(&self.connection)
     }
 
+    /// Removes one independent, unreferenced material source set atomically.
+    pub fn remove_source_set(&mut self, source_set_id: Uuid) -> Result<(), StoreError> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_sets WHERE id = ?1)",
+            [source_set_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::InvalidData(
+                "material source does not exist".into(),
+            ));
+        }
+        let source_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM sources WHERE source_set_id = ?1")?;
+            let rows =
+                statement.query_map([source_set_id.to_string()], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if self.patch_set.patches().iter().any(|patch| {
+            source_ids
+                .iter()
+                .any(|id| id == &patch.source_id.to_string())
+        }) {
+            return Err(StoreError::SourceInUseByPatches);
+        }
+        let next_document = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document.with_assets(
+                    document
+                        .materials
+                        .iter()
+                        .filter(|material| material.id.to_string() != source_set_id.to_string())
+                        .cloned()
+                        .collect(),
+                    self.patch_set.patches().to_vec(),
+                )
+            })
+            .transpose()
+            .map_err(|error| StoreError::Document(error.to_string()))?;
+        let now = unix_timestamp()?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM source_derived_cache WHERE source_set_id = ?1",
+            [source_set_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM sources WHERE source_set_id = ?1",
+            [source_set_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM source_sets WHERE id = ?1",
+            [source_set_id.to_string()],
+        )?;
+        transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+        transaction.execute("INSERT INTO autosave_journal (occurred_unix, operation, payload_json) VALUES (?1, 'remove_source_set', json_object('sourceSetId', ?2))",
+            params![now, source_set_id.to_string()])?;
+        if let Some(document) = next_document.as_ref() {
+            persist_document_state_in_transaction(
+                &transaction,
+                Some(document),
+                "remove_source_set",
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        self.document = next_document;
+        self.clear_history();
+        checkpoint(&self.connection)
+    }
+
     /// Groups independently registered exemplars without assigning a material behavior class.
     pub fn set_exemplar_group(
         &mut self,
         source_set_id: Uuid,
         exemplar_group: Option<&str>,
     ) -> Result<(), StoreError> {
-        let exemplar_group = exemplar_group.map(str::trim).filter(|value| !value.is_empty());
+        let exemplar_group = exemplar_group
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         if exemplar_group.is_some_and(|value| value.len() > 255) {
             return Err(StoreError::InvalidData(
                 "exemplar group must contain at most 255 bytes".into(),
@@ -759,7 +857,9 @@ impl ProjectStore {
             params![source_set_id.to_string(), exemplar_group],
         )?;
         if updated == 0 {
-            return Err(StoreError::InvalidData("material source does not exist".into()));
+            return Err(StoreError::InvalidData(
+                "material source does not exist".into(),
+            ));
         }
         advance_source_authority(&transaction, source_set_id)?;
         transaction.commit()?;
@@ -780,7 +880,9 @@ impl ProjectStore {
             params![source_set_id.to_string(), encoded],
         )?;
         if updated == 0 {
-            return Err(StoreError::InvalidData("material source does not exist".into()));
+            return Err(StoreError::InvalidData(
+                "material source does not exist".into(),
+            ));
         }
         transaction.execute(
             "DELETE FROM source_derived_cache WHERE source_set_id = ?1",
@@ -797,11 +899,15 @@ impl ProjectStore {
         source_set_id: Uuid,
         command: MaterialClassificationCommand,
     ) -> Result<(), StoreError> {
-        let encoded: String = self.connection.query_row(
-            "SELECT classification_json FROM source_sets WHERE id = ?1",
-            [source_set_id.to_string()],
-            |row| row.get(0),
-        ).optional()?.ok_or_else(|| StoreError::InvalidData("material source does not exist".into()))?;
+        let encoded: String = self
+            .connection
+            .query_row(
+                "SELECT classification_json FROM source_sets WHERE id = ?1",
+                [source_set_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::InvalidData("material source does not exist".into()))?;
         let mut intent: MaterialClassificationIntent = serde_json::from_str(&encoded)?;
         intent.apply(command);
         let transaction = self.connection.transaction()?;
@@ -824,11 +930,15 @@ impl ProjectStore {
         source_set_id: Uuid,
         command: MaterialCalibrationCommand,
     ) -> Result<(), StoreError> {
-        let encoded: String = self.connection.query_row(
-            "SELECT calibration_json FROM source_sets WHERE id = ?1",
-            [source_set_id.to_string()],
-            |row| row.get(0),
-        ).optional()?.ok_or_else(|| StoreError::InvalidData("material source does not exist".into()))?;
+        let encoded: String = self
+            .connection
+            .query_row(
+                "SELECT calibration_json FROM source_sets WHERE id = ?1",
+                [source_set_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::InvalidData("material source does not exist".into()))?;
         let mut intent: MaterialCalibrationIntent = serde_json::from_str(&encoded)?;
         intent.apply(command).map_err(|failure| {
             StoreError::InvalidData(format!("invalid material calibration command: {failure:?}"))
@@ -870,6 +980,32 @@ impl ProjectStore {
              VALUES (?1, 'rename_project', json_object('name', ?2))",
             params![now, name],
         )?;
+        transaction.commit()?;
+        checkpoint(&self.connection)
+    }
+
+    /// Renames one stable material source set without changing its identity or content revision.
+    pub fn rename_source_set(&mut self, source_set_id: Uuid, name: &str) -> Result<(), StoreError> {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 255 {
+            return Err(StoreError::InvalidData(
+                "source name must be 1 to 255 characters".into(),
+            ));
+        }
+        let now = unix_timestamp()?;
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE source_sets SET name = ?2 WHERE id = ?1",
+            params![source_set_id.to_string(), name],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidData(
+                "material source does not exist".into(),
+            ));
+        }
+        transaction.execute("UPDATE project SET modified_unix = ?1", [now])?;
+        transaction.execute("INSERT INTO autosave_journal (occurred_unix, operation, payload_json) VALUES (?1, 'rename_source_set', json_object('sourceSetId', ?2, 'name', ?3))",
+            params![now, source_set_id.to_string(), name])?;
         transaction.commit()?;
         checkpoint(&self.connection)
     }
@@ -932,40 +1068,96 @@ impl ProjectStore {
     /// template or infer source crops from destination rectangles.
     pub fn create_source_frame_document(&mut self) -> Result<&TrimSheetDocument, StoreError> {
         let materials = load_material_catalog(&self.connection)?;
-        let primary = materials.iter().find(|material| material.maps.iter().any(|map| map.kind == MaterialMapKind::BaseColor))
-            .ok_or(StoreError::BaseColorRequired)?.id;
-        let source = load_sources(&self.connection)?.into_iter()
-            .find(|source| source.source_set_id == Uuid::from_bytes(primary.to_bytes()) && source.channel == SourceChannel::BaseColor)
+        let primary = materials
+            .iter()
+            .find(|material| {
+                material
+                    .maps
+                    .iter()
+                    .any(|map| map.kind == MaterialMapKind::BaseColor)
+            })
+            .ok_or(StoreError::BaseColorRequired)?
+            .id;
+        let source = load_sources(&self.connection)?
+            .into_iter()
+            .find(|source| {
+                source.source_set_id == Uuid::from_bytes(primary.to_bytes())
+                    && source.channel == SourceChannel::BaseColor
+            })
             .ok_or(StoreError::BaseColorRequired)?;
-        let source_set = load_source_sets(&self.connection)?.into_iter()
+        let source_set = load_source_sets(&self.connection)?
+            .into_iter()
             .find(|source_set| source_set.id == primary)
             .ok_or(StoreError::BaseColorRequired)?;
-        let frame = SourceFrame::centered_largest(primary,
-            OrientedPixelSize { width: source.input.width, height: source.input.height }, [1, 1], source_set.source_revision);
+        let frame = SourceFrame::centered_largest(
+            primary,
+            OrientedPixelSize {
+                width: source.input.width,
+                height: source.input.height,
+            },
+            [1, 1],
+            source_set.source_revision,
+        );
         let document_id = LayoutId::new();
-        let document = TrimSheetDocument::from_authored_layout_preset(document_id, frame,
-            hot_trimmer_domain::diagonal_cascade_authored_preset(), document_id.to_string(),
-            hot_trimmer_domain::PixelSize { width: 2_048, height: 2_048 }, materials,
-            self.patch_set.patches().to_vec()).map_err(|error| StoreError::Document(error.to_string()))?;
-        persist_document_state(&mut self.connection, Some(&document), "create_source_frame_document")?;
+        let document = TrimSheetDocument::from_authored_layout_preset(
+            document_id,
+            frame,
+            hot_trimmer_domain::diagonal_cascade_authored_preset(),
+            document_id.to_string(),
+            hot_trimmer_domain::PixelSize {
+                width: 2_048,
+                height: 2_048,
+            },
+            materials,
+            self.patch_set.patches().to_vec(),
+        )
+        .map_err(|error| StoreError::Document(error.to_string()))?;
+        persist_document_state(
+            &mut self.connection,
+            Some(&document),
+            "create_source_frame_document",
+        )?;
         self.document = Some(document);
         self.document_history.clear();
         self.document_history_cursor = 0;
         Ok(self.document.as_ref().expect("document just assigned"))
     }
 
-    pub fn regenerate_source_frame_partition(&mut self, target_region_count: u32) -> Result<&TrimSheetDocument, StoreError> {
-        let current = self.document.as_ref().ok_or_else(|| StoreError::Document("create a source-frame document first".into()))?.clone();
-        let frame = current.source_frame.clone().ok_or_else(|| StoreError::Document("the current document is not source-frame authored".into()))?;
-        let previous = current.partition_provenance.as_ref().ok_or_else(|| StoreError::Document("source-frame provenance is missing".into()))?;
+    pub fn regenerate_source_frame_partition(
+        &mut self,
+        target_region_count: u32,
+    ) -> Result<&TrimSheetDocument, StoreError> {
+        let current = self
+            .document
+            .as_ref()
+            .ok_or_else(|| StoreError::Document("create a source-frame document first".into()))?
+            .clone();
+        let frame = current.source_frame.clone().ok_or_else(|| {
+            StoreError::Document("the current document is not source-frame authored".into())
+        })?;
+        let previous = current
+            .partition_provenance
+            .as_ref()
+            .ok_or_else(|| StoreError::Document("source-frame provenance is missing".into()))?;
         let mut recipe = previous.recipe.clone();
         recipe.target_region_count = target_region_count;
-        let mut next = TrimSheetDocument::from_source_frame(current.id, frame, recipe, current.render_settings.output_size,
-            current.materials.clone(), current.patches.clone()).map_err(|error| StoreError::Document(error.to_string()))?;
+        let mut next = TrimSheetDocument::from_source_frame(
+            current.id,
+            frame,
+            recipe,
+            current.render_settings.output_size,
+            current.materials.clone(),
+            current.patches.clone(),
+        )
+        .map_err(|error| StoreError::Document(error.to_string()))?;
         next.document_revision = current.document_revision.saturating_add(1);
         next.topology_revision = current.topology_revision.saturating_add(1);
         next.appearance_revision = next.document_revision;
-        persist_document_state(&mut self.connection, Some(&next), "regenerate_source_frame_partition")?;
+        persist_document_state(
+            &mut self.connection,
+            Some(&next),
+            "regenerate_source_frame_partition",
+        )?;
         self.document = Some(next);
         self.document_history.clear();
         self.document_history_cursor = 0;
@@ -1332,7 +1524,9 @@ impl ProjectStore {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            if let Some((mismatch, companion_width, companion_height, companion_orientation)) = mismatch {
+            if let Some((mismatch, companion_width, companion_height, companion_orientation)) =
+                mismatch
+            {
                 if companion_orientation != orientation {
                     return Err(StoreError::OrientationMismatch {
                         channel: SourceChannel::from_db_value(&mismatch)?.as_db_value(),
@@ -1362,8 +1556,11 @@ impl ProjectStore {
         }
         if (width, height) != (expected_width, expected_height) {
             return Err(StoreError::RegistrationMismatch {
-                channel: channel.as_db_value(), expected_width, expected_height,
-                actual_width: width, actual_height: height,
+                channel: channel.as_db_value(),
+                expected_width,
+                expected_height,
+                actual_width: width,
+                actual_height: height,
             });
         }
         Ok(())
@@ -1537,15 +1734,27 @@ fn load_source_sets(connection: &Connection) -> Result<Vec<SourceSetSnapshot>, S
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?, row.get::<_, u64>(3)?, row.get::<_, String>(4)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, u64>(3)?,
+            row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, name, exemplar_group, source_revision, registration_digest, delighting_json, classification_json, calibration_json) = row?;
+        let (
+            id,
+            name,
+            exemplar_group,
+            source_revision,
+            registration_digest,
+            delighting_json,
+            classification_json,
+            calibration_json,
+        ) = row?;
         Ok(SourceSetSnapshot {
             id: id.parse().map_err(|_| StoreError::InvalidId(id))?,
             name,
@@ -1620,6 +1829,57 @@ fn load_document(connection: &Connection) -> Result<Option<TrimSheetDocument>, S
         Ok(document)
     })
     .transpose()
+}
+
+fn snapshot_legacy_authored_layout(document: &mut TrimSheetDocument) -> Result<bool, StoreError> {
+    if document.authored_layout_preset.is_some()
+        || document.source_frame.is_none()
+        || document.partition_provenance.is_none()
+    {
+        return Ok(false);
+    }
+    let grid = document.logical_grid.ok_or_else(|| {
+        StoreError::Document(
+            "accepted SourceFrame topology cannot migrate because its logical grid is missing"
+                .into(),
+        )
+    })?;
+    let regions = document.topology.regions.iter().map(|region| {
+        Ok(AuthoredLayoutPresetRegion {
+            preset_region_key: format!("migrated-{}", region.id),
+            display_name: region.display_name.clone(),
+            grid_rect: region.grid_rect.ok_or_else(|| StoreError::Document(format!(
+                "accepted SourceFrame region {} cannot migrate because its GridRect is missing", region.id,
+            )))?,
+            role: region.role,
+            orientation: region.orientation,
+            uv_fit: region.uv_fit.clone(),
+            structural_profile: region.structural_profile,
+        })
+    }).collect::<Result<Vec<_>, StoreError>>()?;
+    let preset = AuthoredLayoutPreset {
+        preset_id: format!("embedded.migrated.{}", document.id),
+        schema_version: hot_trimmer_domain::AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
+        name: "Migrated accepted layout".into(),
+        logical_grid: grid,
+        canonical_aspect: [
+            document.render_settings.output_size.width,
+            document.render_settings.output_size.height,
+        ],
+        regions,
+        provenance: "migrated_accepted_topology_without_regeneration".into(),
+    };
+    hot_trimmer_domain::validate_authored_layout_preset(&preset).map_err(|reason| {
+        StoreError::Document(format!("accepted topology cannot migrate: {reason}"))
+    })?;
+    document.authored_layout_preset = Some(preset);
+    document
+        .authored_layout_instance_id
+        .get_or_insert_with(|| document.id.to_string());
+    document
+        .validate()
+        .map_err(|reason| StoreError::Document(reason.to_string()))?;
+    Ok(true)
 }
 
 fn load_sources(connection: &Connection) -> Result<Vec<StoredSource>, StoreError> {
@@ -1851,8 +2111,15 @@ fn persist_document_state_in_transaction(
 
 fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
     match command {
-        TrimSheetDocumentCommand::ApplyAuthoredLayoutPreset { .. } => "apply_authored_layout_preset",
-        TrimSheetDocumentCommand::AcceptSourceFramePartition { .. } => "accept_source_frame_partition",
+        TrimSheetDocumentCommand::ApplyAuthoredLayoutPreset { .. } => {
+            "apply_authored_layout_preset"
+        }
+        TrimSheetDocumentCommand::SetAuthoredLayoutPresetSnapshot { .. } => {
+            "set_authored_layout_preset_snapshot"
+        }
+        TrimSheetDocumentCommand::AcceptSourceFramePartition { .. } => {
+            "accept_source_frame_partition"
+        }
         TrimSheetDocumentCommand::SplitSourceFrameRegion { .. } => "split_source_frame_region",
         TrimSheetDocumentCommand::MergeSourceFrameRegions { .. } => "merge_source_frame_regions",
         TrimSheetDocumentCommand::MoveSourceFrameBoundary { .. } => "move_source_frame_boundary",
@@ -1908,25 +2175,51 @@ fn rebind_source_frame(
     if aspect_changed {
         let override_ids = next.source_overrides.keys().copied().collect::<Vec<_>>();
         for region_id in override_ids {
-            let Some(region) = next.topology.regions.iter().find(|region| region.id == region_id) else {
-                return Err(StoreError::Document(format!("detached SourceFrame region {region_id} no longer exists")));
+            let Some(region) = next
+                .topology
+                .regions
+                .iter()
+                .find(|region| region.id == region_id)
+            else {
+                return Err(StoreError::Document(format!(
+                    "detached SourceFrame region {region_id} no longer exists"
+                )));
             };
-            let Some(override_value) = next.source_overrides.get(&region_id).copied() else { continue; };
+            let Some(override_value) = next.source_overrides.get(&region_id).copied() else {
+                continue;
+            };
             let bounds = rebind_override_bounds(
                 override_value.source_bounds,
                 region.allocation_rect.width,
                 region.allocation_rect.height,
                 oriented_dimensions,
             )?;
-            next.source_overrides.insert(region_id, RegionSourceOverride::new(bounds));
-            let binding = next.region_bindings.get_mut(&region_id)
-                .ok_or_else(|| StoreError::Document(format!("detached SourceFrame region {region_id} has no binding")))?;
-            let Projection::Crop { bounds: binding_bounds, focus } = &mut binding.mapping.projection else {
-                return Err(StoreError::Document(format!("detached SourceFrame region {region_id} has no crop projection")));
+            next.source_overrides
+                .insert(region_id, RegionSourceOverride::new(bounds));
+            let binding = next.region_bindings.get_mut(&region_id).ok_or_else(|| {
+                StoreError::Document(format!(
+                    "detached SourceFrame region {region_id} has no binding"
+                ))
+            })?;
+            let Projection::Crop {
+                bounds: binding_bounds,
+                focus,
+            } = &mut binding.mapping.projection
+            else {
+                return Err(StoreError::Document(format!(
+                    "detached SourceFrame region {region_id} has no crop projection"
+                )));
             };
             *binding_bounds = bounds;
-            *focus = NormalizedPoint::new(bounds.x.get() + bounds.width.get() * 0.5, bounds.y.get() + bounds.height.get() * 0.5)
-                .map_err(|_| StoreError::Document(format!("detached SourceFrame region {region_id} produced invalid focus")))?;
+            *focus = NormalizedPoint::new(
+                bounds.x.get() + bounds.width.get() * 0.5,
+                bounds.y.get() + bounds.height.get() * 0.5,
+            )
+            .map_err(|_| {
+                StoreError::Document(format!(
+                    "detached SourceFrame region {region_id} produced invalid focus"
+                ))
+            })?;
             transformed_overrides += 1;
         }
     }
@@ -1940,7 +2233,11 @@ fn rebind_source_frame(
             oriented_dimensions.width,
             oriented_dimensions.height,
             source_revision,
-            if aspect_changed { " and refit Largest Fit" } else { "" }
+            if aspect_changed {
+                " and refit Largest Fit"
+            } else {
+                ""
+            }
         )
     } else if transformed_overrides > 0 {
         format!(
@@ -1949,7 +2246,11 @@ fn rebind_source_frame(
             oriented_dimensions.height,
             source_revision,
             transformed_overrides,
-            if aspect_changed { " and refit Largest Fit" } else { "" }
+            if aspect_changed {
+                " and refit Largest Fit"
+            } else {
+                ""
+            }
         )
     } else {
         format!(
@@ -1958,7 +2259,11 @@ fn rebind_source_frame(
             oriented_dimensions.height,
             source_revision,
             document.source_overrides.len(),
-            if aspect_changed { " and refit Largest Fit" } else { "" }
+            if aspect_changed {
+                " and refit Largest Fit"
+            } else {
+                ""
+            }
         )
     };
     Ok((next, diagnostic))
@@ -1970,22 +2275,38 @@ fn rebind_override_bounds(
     destination_height: u32,
     source_dimensions: OrientedPixelSize,
 ) -> Result<NormalizedBounds, StoreError> {
-    if destination_width == 0 || destination_height == 0 || source_dimensions.width == 0 || source_dimensions.height == 0 {
-        return Err(StoreError::Document("detached SourceFrame region has invalid dimensions".into()));
+    if destination_width == 0
+        || destination_height == 0
+        || source_dimensions.width == 0
+        || source_dimensions.height == 0
+    {
+        return Err(StoreError::Document(
+            "detached SourceFrame region has invalid dimensions".into(),
+        ));
     }
     let target_aspect = (f64::from(destination_width) / f64::from(destination_height))
-        * f64::from(source_dimensions.height) / f64::from(source_dimensions.width);
-    let width = bounds.width.get().min(bounds.height.get() * target_aspect).max(0.001).min(1.0);
+        * f64::from(source_dimensions.height)
+        / f64::from(source_dimensions.width);
+    let width = bounds
+        .width
+        .get()
+        .min(bounds.height.get() * target_aspect)
+        .max(0.001)
+        .min(1.0);
     let height = (width / target_aspect).min(1.0);
     let center_x = bounds.x.get() + bounds.width.get() * 0.5;
     let center_y = bounds.y.get() + bounds.height.get() * 0.5;
     let x = (center_x - width * 0.5).clamp(0.0, 1.0 - width);
     let y = (center_y - height * 0.5).clamp(0.0, 1.0 - height);
     Ok(NormalizedBounds {
-        x: NormalizedScalar::new(x).map_err(|_| StoreError::Document("detached override x is invalid".into()))?,
-        y: NormalizedScalar::new(y).map_err(|_| StoreError::Document("detached override y is invalid".into()))?,
-        width: NormalizedScalar::new(width).map_err(|_| StoreError::Document("detached override width is invalid".into()))?,
-        height: NormalizedScalar::new(height).map_err(|_| StoreError::Document("detached override height is invalid".into()))?,
+        x: NormalizedScalar::new(x)
+            .map_err(|_| StoreError::Document("detached override x is invalid".into()))?,
+        y: NormalizedScalar::new(y)
+            .map_err(|_| StoreError::Document("detached override y is invalid".into()))?,
+        width: NormalizedScalar::new(width)
+            .map_err(|_| StoreError::Document("detached override width is invalid".into()))?,
+        height: NormalizedScalar::new(height)
+            .map_err(|_| StoreError::Document("detached override height is invalid".into()))?,
     })
 }
 
@@ -2108,7 +2429,10 @@ fn migrate_to_v14(transaction: &Transaction<'_>) -> Result<(), StoreError> {
         "ALTER TABLE source_sets ADD COLUMN calibration_json TEXT NOT NULL DEFAULT '{}'",
         [],
     )?;
-    transaction.execute("UPDATE source_sets SET calibration_json = ?1", [default_intent])?;
+    transaction.execute(
+        "UPDATE source_sets SET calibration_json = ?1",
+        [default_intent],
+    )?;
     Ok(())
 }
 
@@ -2118,7 +2442,10 @@ fn migrate_to_v13(transaction: &Transaction<'_>) -> Result<(), StoreError> {
         "ALTER TABLE source_sets ADD COLUMN classification_json TEXT NOT NULL DEFAULT '{}'",
         [],
     )?;
-    transaction.execute("UPDATE source_sets SET classification_json = ?1", [default_intent])?;
+    transaction.execute(
+        "UPDATE source_sets SET classification_json = ?1",
+        [default_intent],
+    )?;
     Ok(())
 }
 
@@ -2128,7 +2455,10 @@ fn migrate_to_v12(transaction: &Transaction<'_>) -> Result<(), StoreError> {
         "ALTER TABLE source_sets ADD COLUMN delighting_json TEXT NOT NULL DEFAULT '{}'",
         [],
     )?;
-    transaction.execute("UPDATE source_sets SET delighting_json = ?1", [default_intent])?;
+    transaction.execute(
+        "UPDATE source_sets SET delighting_json = ?1",
+        [default_intent],
+    )?;
     Ok(())
 }
 
@@ -2368,7 +2698,9 @@ fn verify_external_source(source: &SourceInput, channel: SourceChannel) -> Resul
     } else {
         None
     };
-    changed.map_or(Ok(()), |field| Err(StoreError::ExternalSourceChanged { field }))
+    changed.map_or(Ok(()), |field| {
+        Err(StoreError::ExternalSourceChanged { field })
+    })
 }
 
 fn validate_channel_registration(
@@ -2416,7 +2748,9 @@ fn interpretation_from_db(value: &str) -> Result<ChannelInterpretation, StoreErr
         "linear_opacity" => Ok(ChannelInterpretation::LinearOpacity),
         "binary_mask" => Ok(ChannelInterpretation::BinaryMask),
         "categorical_id" => Ok(ChannelInterpretation::CategoricalId),
-        _ => Err(StoreError::InvalidData(format!("unknown channel interpretation: {value}"))),
+        _ => Err(StoreError::InvalidData(format!(
+            "unknown channel interpretation: {value}"
+        ))),
     }
 }
 
@@ -2435,7 +2769,9 @@ fn normal_convention_from_db(value: &str) -> Result<NormalConvention, StoreError
         "open_gl" => Ok(NormalConvention::OpenGl),
         "direct_x" => Ok(NormalConvention::DirectX),
         "unspecified" => Ok(NormalConvention::Unspecified),
-        _ => Err(StoreError::InvalidData(format!("unknown normal convention: {value}"))),
+        _ => Err(StoreError::InvalidData(format!(
+            "unknown normal convention: {value}"
+        ))),
     }
 }
 
@@ -2452,7 +2788,9 @@ fn assignment_provenance_from_db(value: &str) -> Result<AssignmentProvenance, St
         "user_assigned" => Ok(AssignmentProvenance::UserAssigned),
         "filename_suggested" => Ok(AssignmentProvenance::FilenameSuggested),
         "embedded_metadata" => Ok(AssignmentProvenance::EmbeddedMetadata),
-        _ => Err(StoreError::InvalidData(format!("unknown assignment provenance: {value}"))),
+        _ => Err(StoreError::InvalidData(format!(
+            "unknown assignment provenance: {value}"
+        ))),
     }
 }
 
@@ -2476,10 +2814,17 @@ fn advance_source_authority(
     let rows = statement.query_map([source_set_id.to_string()], |row| {
         Ok(format!(
             "{}|{}|{}|{}x{}|{}|{}|{}|{}|{}|{}",
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-            row.get::<_, u32>(3)?, row.get::<_, u32>(4)?, row.get::<_, u16>(5)?,
-            row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
-            row.get::<_, u16>(9)?, row.get::<_, String>(10)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, u32>(3)?,
+            row.get::<_, u32>(4)?,
+            row.get::<_, u16>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, u16>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     let canonical = format!(
@@ -2715,7 +3060,10 @@ mod document_tests {
         let expected_inputs = store.document().unwrap().appearance_hash_inputs();
         drop(store);
         let reopened = ProjectStore::open(&path).unwrap();
-        assert_eq!(reopened.document().unwrap().appearance_hash_inputs(), expected_inputs);
+        assert_eq!(
+            reopened.document().unwrap().appearance_hash_inputs(),
+            expected_inputs
+        );
         assert_eq!(
             reopened.document().unwrap().appearance_hash().unwrap(),
             expected_hash
@@ -4061,7 +4409,11 @@ mod algorithm_stage_01_tests {
         fs::create_dir_all(&root).expect("create fixture directory");
         let path = root.join("registration.hottrimmer");
         let mut store = ProjectStore::create(&path, "Stage 1").expect("create current schema");
-        let primary = Uuid::from_bytes(store.summary().expect("empty summary").source_sets[0].id.to_bytes());
+        let primary = Uuid::from_bytes(
+            store.summary().expect("empty summary").source_sets[0]
+                .id
+                .to_bytes(),
+        );
 
         let missing_base = store
             .replace_source_in_set(primary, SourceChannel::Normal, &input(1, 8, 4, 1))
@@ -4069,30 +4421,56 @@ mod algorithm_stage_01_tests {
         let diagnostic = missing_base
             .registration_diagnostic(SourceChannel::Normal)
             .expect("typed registration diagnostic");
-        assert_eq!(diagnostic.code, RegistrationDiagnosticCode::BaseColorRequired);
-        assert_eq!(diagnostic.recovery_choices, vec![RegistrationRecoveryChoice::AssignBaseColor]);
+        assert_eq!(
+            diagnostic.code,
+            RegistrationDiagnosticCode::BaseColorRequired
+        );
+        assert_eq!(
+            diagnostic.recovery_choices,
+            vec![RegistrationRecoveryChoice::AssignBaseColor]
+        );
 
         let base = input(2, 8, 4, 1);
         let original_bytes = base.owned_bytes.clone().expect("owned bytes");
-        store.replace_source_in_set(primary, SourceChannel::BaseColor, &base).expect("Base-Color-only is valid");
+        store
+            .replace_source_in_set(primary, SourceChannel::BaseColor, &base)
+            .expect("Base-Color-only is valid");
         let base_only = store.summary().expect("base-only summary");
         assert_eq!(base_only.source_sets[0].source_revision, 1);
-        assert_eq!(base_only.sources[0].input.owned_bytes.as_deref(), Some(original_bytes.as_slice()));
-        assert_eq!(base_only.sources[0].input.sha256, ContentDigest::sha256(&original_bytes).0);
-        assert_eq!(base_only.sources[0].registration.interpretation, ChannelInterpretation::ColorManagedBaseColor);
+        assert_eq!(
+            base_only.sources[0].input.owned_bytes.as_deref(),
+            Some(original_bytes.as_slice())
+        );
+        assert_eq!(
+            base_only.sources[0].input.sha256,
+            ContentDigest::sha256(&original_bytes).0
+        );
+        assert_eq!(
+            base_only.sources[0].registration.interpretation,
+            ChannelInterpretation::ColorManagedBaseColor
+        );
 
         let dimension_error = store
             .replace_source_in_set(primary, SourceChannel::Roughness, &input(3, 4, 8, 1))
             .expect_err("no implicit resize or rotate");
-        assert!(matches!(dimension_error, StoreError::RegistrationMismatch { .. }));
+        assert!(matches!(
+            dimension_error,
+            StoreError::RegistrationMismatch { .. }
+        ));
         assert_eq!(
-            dimension_error.registration_diagnostic(SourceChannel::Roughness).unwrap().code,
+            dimension_error
+                .registration_diagnostic(SourceChannel::Roughness)
+                .unwrap()
+                .code,
             RegistrationDiagnosticCode::OrientedDimensionMismatch,
         );
         let orientation_error = store
             .replace_source_in_set(primary, SourceChannel::Roughness, &input(4, 8, 4, 6))
             .expect_err("orientation transforms cannot drift");
-        assert!(matches!(orientation_error, StoreError::OrientationMismatch { .. }));
+        assert!(matches!(
+            orientation_error,
+            StoreError::OrientationMismatch { .. }
+        ));
 
         let invalid_normal = ChannelRegistration {
             role: MaterialChannelRole::Normal,
@@ -4113,63 +4491,130 @@ mod algorithm_stage_01_tests {
             } else {
                 AssignmentProvenance::UserAssigned
             };
-            registration.confidence_milli = if registration.assignment_provenance == AssignmentProvenance::FilenameSuggested { 700 } else { 1000 };
+            registration.confidence_milli =
+                if registration.assignment_provenance == AssignmentProvenance::FilenameSuggested {
+                    700
+                } else {
+                    1000
+                };
             if channel == SourceChannel::Normal {
                 registration.normal_convention = NormalConvention::OpenGl;
             }
             store
-                .replace_registered_source_in_set(primary, &input(10 + index as u8, 8, 4, 1), registration)
+                .replace_registered_source_in_set(
+                    primary,
+                    &input(10 + index as u8, 8, 4, 1),
+                    registration,
+                )
                 .expect("full PBR and auxiliary roles register through one path");
         }
         let full = store.summary().expect("full registered source");
-        assert_eq!(full.sources.iter().filter(|source| source.source_set_id == primary).count(), 10);
+        assert_eq!(
+            full.sources
+                .iter()
+                .filter(|source| source.source_set_id == primary)
+                .count(),
+            10
+        );
         assert_eq!(full.source_sets[0].source_revision, 10);
-        assert!(full.sources.iter().filter(|source| source.channel != SourceChannel::BaseColor)
-            .all(|source| source.registration.interpretation != ChannelInterpretation::ColorManagedBaseColor));
+        assert!(
+            full.sources
+                .iter()
+                .filter(|source| source.channel != SourceChannel::BaseColor)
+                .all(|source| source.registration.interpretation
+                    != ChannelInterpretation::ColorManagedBaseColor)
+        );
 
         store.connection.execute(
             "INSERT INTO source_derived_cache (source_set_id, registration_digest, cache_key) VALUES (?1, ?2, 'stale')",
             rusqlite::params![primary.to_string(), full.source_sets[0].registration_digest.0],
         ).expect("seed derived cache");
         let before_replace = full.source_sets[0].clone();
-        store.replace_source_in_set(primary, SourceChannel::Roughness, &input(40, 8, 4, 1)).expect("replace channel");
+        store
+            .replace_source_in_set(primary, SourceChannel::Roughness, &input(40, 8, 4, 1))
+            .expect("replace channel");
         let after_replace = store.summary().expect("replacement summary").source_sets[0].clone();
-        assert_eq!(after_replace.source_revision, before_replace.source_revision + 1);
-        assert_ne!(after_replace.registration_digest, before_replace.registration_digest);
-        let stale_count: u32 = store.connection.query_row(
-            "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
-            [primary.to_string()], |row| row.get(0),
-        ).expect("cache count");
-        assert_eq!(stale_count, 0, "replacement must invalidate all derived entries");
+        assert_eq!(
+            after_replace.source_revision,
+            before_replace.source_revision + 1
+        );
+        assert_ne!(
+            after_replace.registration_digest,
+            before_replace.registration_digest
+        );
+        let stale_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
+                [primary.to_string()],
+                |row| row.get(0),
+            )
+            .expect("cache count");
+        assert_eq!(
+            stale_count, 0,
+            "replacement must invalidate all derived entries"
+        );
 
         store.connection.execute(
             "INSERT INTO source_derived_cache (source_set_id, registration_digest, cache_key) VALUES (?1, ?2, 'stale-remove')",
             rusqlite::params![primary.to_string(), after_replace.registration_digest.0],
         ).expect("seed removal cache");
-        store.remove_source_in_set(primary, SourceChannel::Specular).expect("remove companion");
+        store
+            .remove_source_in_set(primary, SourceChannel::Specular)
+            .expect("remove companion");
         let after_remove = store.summary().unwrap().source_sets[0].clone();
-        assert_eq!(after_remove.source_revision, after_replace.source_revision + 1);
-        let removal_cache_count: u32 = store.connection.query_row(
-            "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
-            [primary.to_string()], |row| row.get(0),
-        ).expect("removal cache count");
-        assert_eq!(removal_cache_count, 0, "removal must invalidate all derived entries");
+        assert_eq!(
+            after_remove.source_revision,
+            after_replace.source_revision + 1
+        );
+        let removal_cache_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
+                [primary.to_string()],
+                |row| row.get(0),
+            )
+            .expect("removal cache count");
+        assert_eq!(
+            removal_cache_count, 0,
+            "removal must invalidate all derived entries"
+        );
 
         let exemplar = Uuid::new_v4();
-        store.replace_source_in_set(exemplar, SourceChannel::BaseColor, &input(50, 16, 16, 1)).expect("independent exemplar");
+        store
+            .replace_source_in_set(exemplar, SourceChannel::BaseColor, &input(50, 16, 16, 1))
+            .expect("independent exemplar");
         store.connection.execute(
             "INSERT INTO source_derived_cache (source_set_id, registration_digest, cache_key) VALUES (?1, ?2, 'stale-group')",
             rusqlite::params![primary.to_string(), after_remove.registration_digest.0],
         ).expect("seed grouping cache");
-        store.set_exemplar_group(primary, Some("related-captures")).expect("group primary exemplar");
-        let grouping_cache_count: u32 = store.connection.query_row(
-            "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
-            [primary.to_string()], |row| row.get(0),
-        ).expect("grouping cache count");
-        assert_eq!(grouping_cache_count, 0, "grouping must invalidate all derived entries");
-        store.set_exemplar_group(exemplar, Some("related-captures")).expect("group second exemplar");
+        store
+            .set_exemplar_group(primary, Some("related-captures"))
+            .expect("group primary exemplar");
+        let grouping_cache_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_derived_cache WHERE source_set_id = ?1",
+                [primary.to_string()],
+                |row| row.get(0),
+            )
+            .expect("grouping cache count");
+        assert_eq!(
+            grouping_cache_count, 0,
+            "grouping must invalidate all derived entries"
+        );
+        store
+            .set_exemplar_group(exemplar, Some("related-captures"))
+            .expect("group second exemplar");
         let grouped = store.summary().expect("grouped exemplars");
-        assert_eq!(grouped.source_sets.iter().filter(|source| source.exemplar_group.as_deref() == Some("related-captures")).count(), 2);
+        assert_eq!(
+            grouped
+                .source_sets
+                .iter()
+                .filter(|source| source.exemplar_group.as_deref() == Some("related-captures"))
+                .count(),
+            2
+        );
 
         let mut tampered = input(60, 8, 4, 1);
         tampered.sha256 = "0".repeat(64);
@@ -4179,37 +4624,64 @@ mod algorithm_stage_01_tests {
         ));
 
         let external_path = root.join("external.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255])).save(&external_path).expect("write external fixture");
-        let inspected = hot_trimmer_image_io::inspect_path(&external_path, hot_trimmer_image_io::DecodeLimits::default())
-            .expect("desktop-style external inspection");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]))
+            .save(&external_path)
+            .expect("write external fixture");
+        let inspected = hot_trimmer_image_io::inspect_path(
+            &external_path,
+            hot_trimmer_image_io::DecodeLimits::default(),
+        )
+        .expect("desktop-style external inspection");
         let info = inspected.info;
         let external = SourceInput {
-            id: SourceId::new(), ownership: SourceOwnership::VerifiedExternalReference,
-            external_path: Some(external_path.clone()), origin_path: external_path.clone(),
-            sha256: info.sha256, width: info.width, height: info.height, format: info.format,
-            color_type: info.color_type, has_alpha: info.has_alpha,
+            id: SourceId::new(),
+            ownership: SourceOwnership::VerifiedExternalReference,
+            external_path: Some(external_path.clone()),
+            origin_path: external_path.clone(),
+            sha256: info.sha256,
+            width: info.width,
+            height: info.height,
+            format: info.format,
+            color_type: info.color_type,
+            has_alpha: info.has_alpha,
             exif_orientation: info.exif_orientation,
             has_embedded_icc_profile: info.has_embedded_icc_profile,
-            encoded_bytes: info.encoded_bytes, owned_bytes: None,
+            encoded_bytes: info.encoded_bytes,
+            owned_bytes: None,
         };
-        store.replace_source_in_set(Uuid::new_v4(), SourceChannel::BaseColor, &external)
+        store
+            .replace_source_in_set(Uuid::new_v4(), SourceChannel::BaseColor, &external)
             .expect("store re-verifies a stable external reference");
 
         let raced_path = root.join("external-race.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])).save(&raced_path).expect("write race fixture");
-        let inspected = hot_trimmer_image_io::inspect_path(&raced_path, hot_trimmer_image_io::DecodeLimits::default())
-            .expect("initial race inspection");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&raced_path)
+            .expect("write race fixture");
+        let inspected = hot_trimmer_image_io::inspect_path(
+            &raced_path,
+            hot_trimmer_image_io::DecodeLimits::default(),
+        )
+        .expect("initial race inspection");
         let info = inspected.info;
         let raced = SourceInput {
-            id: SourceId::new(), ownership: SourceOwnership::VerifiedExternalReference,
-            external_path: Some(raced_path.clone()), origin_path: raced_path.clone(),
-            sha256: info.sha256, width: info.width, height: info.height, format: info.format,
-            color_type: info.color_type, has_alpha: info.has_alpha,
+            id: SourceId::new(),
+            ownership: SourceOwnership::VerifiedExternalReference,
+            external_path: Some(raced_path.clone()),
+            origin_path: raced_path.clone(),
+            sha256: info.sha256,
+            width: info.width,
+            height: info.height,
+            format: info.format,
+            color_type: info.color_type,
+            has_alpha: info.has_alpha,
             exif_orientation: info.exif_orientation,
             has_embedded_icc_profile: info.has_embedded_icc_profile,
-            encoded_bytes: info.encoded_bytes, owned_bytes: None,
+            encoded_bytes: info.encoded_bytes,
+            owned_bytes: None,
         };
-        image::RgbaImage::from_pixel(3, 2, image::Rgba([9, 8, 7, 255])).save(&raced_path).expect("mutate external before persistence");
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([9, 8, 7, 255]))
+            .save(&raced_path)
+            .expect("mutate external before persistence");
         assert!(matches!(
             store.replace_source_in_set(Uuid::new_v4(), SourceChannel::BaseColor, &raced),
             Err(StoreError::ExternalSourceChanged { .. })
@@ -4221,21 +4693,40 @@ mod algorithm_stage_01_tests {
 
     #[test]
     fn replacing_base_color_rebinds_existing_source_frame_without_changing_grid_rects() {
-        let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-rebind-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-source-frame-rebind-{}",
+            Uuid::new_v4()
+        ));
         fs::create_dir_all(&root).expect("create fixture directory");
         let path = root.join("rebind.hottrimmer");
         let mut store = ProjectStore::create(&path, "SourceFrame rebind").expect("create project");
-        let primary = Uuid::from_bytes(store.summary().expect("empty summary").source_sets[0].id.to_bytes());
+        let primary = Uuid::from_bytes(
+            store.summary().expect("empty summary").source_sets[0]
+                .id
+                .to_bytes(),
+        );
         store
             .replace_source_in_set(primary, SourceChannel::BaseColor, &input(70, 8000, 4000, 1))
             .expect("initial base color");
-        store.create_source_frame_document().expect("create source frame");
-        let before = store.summary().expect("before summary").document.expect("document");
+        store
+            .create_source_frame_document()
+            .expect("create source frame");
+        let before = store
+            .summary()
+            .expect("before summary")
+            .document
+            .expect("document");
         let detached_region = before.topology.regions[0].id;
         store
-            .execute_document_command(&TrimSheetDocumentCommand::DetachSourceCell { region_id: detached_region })
+            .execute_document_command(&TrimSheetDocumentCommand::DetachSourceCell {
+                region_id: detached_region,
+            })
             .expect("detach one region before replacement");
-        let before = store.summary().expect("before summary after detach").document.expect("document");
+        let before = store
+            .summary()
+            .expect("before summary after detach")
+            .document
+            .expect("document");
         assert!(before.source_overrides.contains_key(&detached_region));
         let before_grid = before
             .topology
@@ -4248,13 +4739,31 @@ mod algorithm_stage_01_tests {
         store
             .replace_source_in_set(primary, SourceChannel::BaseColor, &input(71, 7952, 4016, 1))
             .expect("replacement rebinds source frame");
-        let after = store.summary().expect("after summary").document.expect("document");
+        let after = store
+            .summary()
+            .expect("after summary")
+            .document
+            .expect("document");
         let frame = after.source_frame.expect("rebound source frame");
-        assert_eq!((frame.oriented_dimensions.width, frame.oriented_dimensions.height), (7952, 4016));
+        assert_eq!(
+            (
+                frame.oriented_dimensions.width,
+                frame.oriented_dimensions.height
+            ),
+            (7952, 4016)
+        );
         assert_eq!(frame.source_revision, 2);
         assert_eq!(frame.identity, frame.compute_identity());
-        let rebound_override = after.source_overrides.get(&detached_region).expect("detached override transformed");
-        let rebound_region = after.topology.regions.iter().find(|region| region.id == detached_region).expect("rebound region");
+        let rebound_override = after
+            .source_overrides
+            .get(&detached_region)
+            .expect("detached override transformed");
+        let rebound_region = after
+            .topology
+            .regions
+            .iter()
+            .find(|region| region.id == detached_region)
+            .expect("rebound region");
         let source_aspect = rebound_override.source_bounds.width.get() * 7952.0
             / (rebound_override.source_bounds.height.get() * 4016.0);
         let destination_aspect = f64::from(rebound_region.allocation_rect.width)
@@ -4281,37 +4790,200 @@ mod algorithm_stage_01_tests {
 
     #[test]
     fn direct_source_frame_rectangle_is_one_undoable_persisted_command() {
-        let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-draw-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("hot-trimmer-source-frame-draw-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create fixture directory");
         let path = root.join("draw.hottrimmer");
         let mut store = ProjectStore::create(&path, "SourceFrame draw").expect("create project");
-        let primary = Uuid::from_bytes(store.summary().expect("empty summary").source_sets[0].id.to_bytes());
-        store.replace_source_in_set(primary, SourceChannel::BaseColor, &input(72, 4096, 4096, 1)).expect("base color");
-        store.create_source_frame_document().expect("create source frame");
+        let primary = Uuid::from_bytes(
+            store.summary().expect("empty summary").source_sets[0]
+                .id
+                .to_bytes(),
+        );
+        store
+            .replace_source_in_set(primary, SourceChannel::BaseColor, &input(72, 4096, 4096, 1))
+            .expect("base color");
+        store
+            .create_source_frame_document()
+            .expect("create source frame");
         let before = store.document().expect("document").topology.topology_hash;
-        let drawn_rect = GridRect { x: 8, y: 8, width: 24, height: 16 };
-        store.execute_document_command(&TrimSheetDocumentCommand::DrawSourceFrameRegion { grid_rect: drawn_rect }).expect("draw rectangle");
-        let drawn_hash = store.document().expect("drawn document").topology.topology_hash;
+        let drawn_rect = GridRect {
+            x: 8,
+            y: 8,
+            width: 24,
+            height: 16,
+        };
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::DrawSourceFrameRegion {
+                grid_rect: drawn_rect,
+            })
+            .expect("draw rectangle");
+        let drawn_hash = store
+            .document()
+            .expect("drawn document")
+            .topology
+            .topology_hash;
         assert_ne!(drawn_hash, before);
-        assert!(store.document().unwrap().topology.regions.iter().any(|region| region.grid_rect == Some(drawn_rect)));
+        assert!(
+            store
+                .document()
+                .unwrap()
+                .topology
+                .regions
+                .iter()
+                .any(|region| region.grid_rect == Some(drawn_rect))
+        );
         store.undo_document_command().expect("undo direct draw");
         assert_eq!(store.document().unwrap().topology.topology_hash, before);
         store.redo_document_command().expect("redo direct draw");
         assert_eq!(store.document().unwrap().topology.topology_hash, drawn_hash);
-        assert!(store.document().unwrap().topology.regions.iter().any(|region| region.grid_rect == Some(drawn_rect)));
-        let drawn_id = store.document().unwrap().topology.regions.iter().find(|region| region.grid_rect == Some(drawn_rect)).expect("drawn region").id;
-        let resized_rect = GridRect { x: 10, y: 8, width: 26, height: 18 };
-        store.execute_document_command(&TrimSheetDocumentCommand::ResizeSourceFrameRegion { region_id: drawn_id, grid_rect: resized_rect }).expect("resize selected rectangle");
-        let resized_hash = store.document().expect("resized document").topology.topology_hash;
+        assert!(
+            store
+                .document()
+                .unwrap()
+                .topology
+                .regions
+                .iter()
+                .any(|region| region.grid_rect == Some(drawn_rect))
+        );
+        let drawn_id = store
+            .document()
+            .unwrap()
+            .topology
+            .regions
+            .iter()
+            .find(|region| region.grid_rect == Some(drawn_rect))
+            .expect("drawn region")
+            .id;
+        let resized_rect = GridRect {
+            x: 10,
+            y: 8,
+            width: 26,
+            height: 18,
+        };
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::ResizeSourceFrameRegion {
+                region_id: drawn_id,
+                grid_rect: resized_rect,
+            })
+            .expect("resize selected rectangle");
+        let resized_hash = store
+            .document()
+            .expect("resized document")
+            .topology
+            .topology_hash;
         assert_ne!(resized_hash, drawn_hash);
-        assert_eq!(store.document().unwrap().topology.regions.iter().find(|region| region.id == drawn_id).expect("stable resized region").grid_rect, Some(resized_rect));
+        assert_eq!(
+            store
+                .document()
+                .unwrap()
+                .topology
+                .regions
+                .iter()
+                .find(|region| region.id == drawn_id)
+                .expect("stable resized region")
+                .grid_rect,
+            Some(resized_rect)
+        );
         store.undo_document_command().expect("undo direct resize");
         assert_eq!(store.document().unwrap().topology.topology_hash, drawn_hash);
-        assert_eq!(store.document().unwrap().topology.regions.iter().find(|region| region.id == drawn_id).expect("restored region").grid_rect, Some(drawn_rect));
+        assert_eq!(
+            store
+                .document()
+                .unwrap()
+                .topology
+                .regions
+                .iter()
+                .find(|region| region.id == drawn_id)
+                .expect("restored region")
+                .grid_rect,
+            Some(drawn_rect)
+        );
         store.redo_document_command().expect("redo direct resize");
-        assert_eq!(store.document().unwrap().topology.topology_hash, resized_hash);
-        assert_eq!(store.document().unwrap().topology.regions.iter().find(|region| region.id == drawn_id).expect("redone region").grid_rect, Some(resized_rect));
+        assert_eq!(
+            store.document().unwrap().topology.topology_hash,
+            resized_hash
+        );
+        assert_eq!(
+            store
+                .document()
+                .unwrap()
+                .topology
+                .regions
+                .iter()
+                .find(|region| region.id == drawn_id)
+                .expect("redone region")
+                .grid_rect,
+            Some(resized_rect)
+        );
         drop(store);
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn opening_generated_source_frame_snapshots_exact_topology_without_regeneration() {
+        let root =
+            std::env::temp_dir().join(format!("hot-trimmer-authored-migration-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("migration.hottrimmer");
+        let mut store = ProjectStore::create(&path, "Authored migration").expect("create project");
+        let primary = Uuid::from_bytes(
+            store.summary().expect("summary").source_sets[0]
+                .id
+                .to_bytes(),
+        );
+        store
+            .replace_source_in_set(primary, SourceChannel::BaseColor, &input(73, 4096, 4096, 1))
+            .expect("base color");
+        store.create_source_frame_document().expect("source frame");
+        let mut legacy = store.document().expect("document").clone();
+        legacy.authored_layout_preset = None;
+        legacy.authored_layout_instance_id = None;
+        let before = legacy
+            .topology
+            .regions
+            .iter()
+            .map(|region| (region.id, region.grid_rect))
+            .collect::<Vec<_>>();
+        persist_document_state(
+            &mut store.connection,
+            Some(&legacy),
+            "legacy_generated_fixture",
+        )
+        .expect("persist fixture");
+        drop(store);
+
+        let reopened = ProjectStore::open(&path).expect("open migrates accepted topology");
+        let migrated = reopened.document().expect("migrated document");
+        assert_eq!(
+            migrated
+                .topology
+                .regions
+                .iter()
+                .map(|region| (region.id, region.grid_rect))
+                .collect::<Vec<_>>(),
+            before
+        );
+        let preset = migrated
+            .authored_layout_preset
+            .as_ref()
+            .expect("embedded authored snapshot");
+        assert_eq!(
+            preset
+                .regions
+                .iter()
+                .map(|region| region.grid_rect)
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|(_, rect)| rect.expect("grid rect"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            preset.provenance,
+            "migrated_accepted_topology_without_regeneration"
+        );
+        drop(reopened);
         fs::remove_dir_all(root).expect("remove fixture directory");
     }
 }

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets.ts";
+import type { TrimSheetDocument } from "@hot-trimmer/ipc-contracts";
+import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, presetExactlyCoversGrid, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets.ts";
 
 test("manual-layout-presets: built-ins are deterministic exact-cover authored snapshots", () => {
-  assert.deepEqual(diagonalCascadePreset.regions.map((region) => [region.presetRegionKey, region.gridRect]), diagonalCascadePreset.regions.map((region) => [region.presetRegionKey, region.gridRect]));
-  assert.deepEqual(newBlankPreset(64).regions[0].gridRect, { x: 0, y: 0, width: 64, height: 64 });
+  assert.equal(new Set(diagonalCascadePreset.regions.map((region) => region.presetRegionKey)).size, diagonalCascadePreset.regions.length);
+  assert.equal(presetExactlyCoversGrid(diagonalCascadePreset), true);
+  assert.equal(presetExactlyCoversGrid(newBlankPreset(64)), true);
   assert.equal(JSON.stringify(diagonalCascadePreset).includes("recipe"), false);
 });
 
@@ -19,13 +21,13 @@ test("manual-layout-presets: Diagonal Cascade exactly matches the classic source
 test("manual-layout-presets: grid changes preserve representable boundaries and flag quantization", () => {
   assert.equal(rescalePreset(diagonalCascadePreset, 128).exact, true);
   assert.equal(rescalePreset(diagonalCascadePreset, 24).exact, false);
+  for (const size of authoredGridResolutions) assert.equal(presetExactlyCoversGrid(rescalePreset(diagonalCascadePreset, size).preset), true, `${size} must remain exact-cover`);
 });
 
 test("manual-layout-presets: displayed hover snap is the committed point at zoomed boundaries", () => {
   const rect = { left: 10.25, top: 20.5, width: 511.5, height: 383.25 };
-  for (const point of [[10.25,20.5],[521.75,403.75],[277.125,219.4]] as const) {
-    assert.deepEqual(snappedGridPoint(...point, rect, 64, 64), snappedGridPoint(...point, rect, 64, 64));
-  }
+  assert.deepEqual(snappedGridPoint(10.25, 20.5, rect, 64, 64), { x: 0, y: 0, cellX: 0, cellY: 0, centerX: .5, centerY: .5 });
+  assert.deepEqual(snappedGridPoint(277.125, 219.4, rect, 64, 64), { x: 33, y: 33, cellX: 33, cellY: 33, centerX: 33.5, centerY: 33.5 });
   assert.deepEqual(snappedGridPoint(521.75, 403.75, rect, 64, 64), { x: 64, y: 64, cellX: 63, cellY: 63, centerX: 63.5, centerY: 63.5 });
   assert.deepEqual(snappedGridPoint(14, 24, rect, 64, 64), { x: 0, y: 1, cellX: 0, cellY: 0, centerX: .5, centerY: .5 });
   assert.deepEqual(cellDragRect(4, 7, 4, 7), { x: 4, y: 7, width: 1, height: 1 });
@@ -57,8 +59,34 @@ test("manual-layout-presets: hotspot history is keyboard-only", () => {
   assert.doesNotMatch(app, /priorTopologyHash !== nextTopologyHash \? retopologizeArtifact\(prior, next\) : null/);
 });
 
-test("manual-layout-presets: grid resolution uses the reduced discrete slider", () => {
-  assert.deepEqual([...authoredGridResolutions], [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 256]);
+test("manual-layout-presets: grid resolution uses every authored product stop", () => {
+  assert.deepEqual([...authoredGridResolutions], [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256]);
   const app = readFileSync("src/source-first-app.tsx", "utf8");
   assert.match(app, /aria-label="Logical grid resolution" type="range"/);
+});
+
+test("manual-layout-presets: Save As preserves keys by authored rectangle after topology reorder", () => {
+  const document = {
+    authoredLayoutPreset: { ...newBlankPreset(8), regions: [
+      { ...newBlankPreset(8).regions[0]!, presetRegionKey: "left", gridRect: { x: 0, y: 0, width: 4, height: 8 } },
+      { ...newBlankPreset(8).regions[0]!, presetRegionKey: "right", gridRect: { x: 4, y: 0, width: 4, height: 8 } },
+    ] },
+    logicalGrid: { schemaVersion: 1, width: 8, height: 8 },
+    renderSettings: { outputSize: { width: 2048, height: 2048 } },
+    topology: { regions: [
+      { id: "region-right", displayName: "Right", gridRect: { x: 4, y: 0, width: 4, height: 8 } },
+      { id: "region-left", displayName: "Left", gridRect: { x: 0, y: 0, width: 4, height: 8 } },
+    ] },
+  } as unknown as TrimSheetDocument;
+  assert.deepEqual(snapshotDocumentPreset(document, "user.saved", "Saved").regions.map((region) => region.presetRegionKey), ["right", "left"]);
+});
+
+test("manual-layout-presets: settled Base Color and user preset storage use authoritative native paths", () => {
+  const app = readFileSync("src/source-first-app.tsx", "utf8");
+  assert.match(app, /localTopologyPending \|\| !imageUrl/);
+  assert.match(app, /textureVisible && imageUrl \? <img src=\{imageUrl\}/);
+  assert.match(app, /invoke<AuthoredLayoutPreset\[]>\("list_authored_layout_presets"/);
+  assert.match(app, /invoke<AuthoredLayoutPreset\[]>\("save_authored_layout_preset"/);
+  assert.match(app, /invoke<AuthoredLayoutPreset\[]>\("delete_authored_layout_preset"/);
+  assert.match(app, /set_authored_layout_preset_snapshot/);
 });

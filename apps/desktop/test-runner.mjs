@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 
 const suites = {
   "manual-layout-presets": "src/manual-layout-presets.test.ts",
+  "multi-source-patch-assignment": "src/multi-source-patch-assignment.test.ts",
 };
 const requested = process.argv.slice(2);
 const files = requested.length

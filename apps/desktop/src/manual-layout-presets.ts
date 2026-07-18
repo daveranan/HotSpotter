@@ -1,6 +1,6 @@
 import type { AuthoredLayoutPreset, AuthoredLayoutPresetRegion, TrimSheetDocument } from "@hot-trimmer/ipc-contracts";
 
-export const authoredGridResolutions = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 256] as const;
+export const authoredGridResolutions = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256] as const;
 export const DIAGONAL_CASCADE_PRESET_ID = "builtin.diagonal-cascade";
 export const NEW_BLANK_PRESET_ID = "builtin.new-blank";
 
@@ -33,25 +33,64 @@ export function newBlankPreset(size = 64): AuthoredLayoutPreset {
 
 export function snapshotDocumentPreset(document: TrimSheetDocument, presetId: string, name: string): AuthoredLayoutPreset {
   const grid = document.logicalGrid ?? { schemaVersion: 1, width: 64, height: 64 };
-  const priorKeys = new Map(document.authoredLayoutPreset?.regions.map((region, index) => [document.topology.regions[index]?.id, region.presetRegionKey]));
+  // Topology commands sort regions spatially, so array position cannot carry a preset-local
+  // identity. Exact unchanged rectangles retain their prior key; edited/new rectangles receive
+  // a project-region-derived key which remains stable across subsequent Save operations.
+  const priorKeys = new Map(document.authoredLayoutPreset?.regions.map((region) => [rectKey(region.gridRect), region.presetRegionKey]));
   return {
     presetId, schemaVersion: 1, name, logicalGrid: grid, canonicalAspect: [document.renderSettings.outputSize.width, document.renderSettings.outputSize.height],
-    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(region.id) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height)] : []),
+    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height)] : []),
     provenance: "user_authored_snapshot",
   };
 }
 
 export function rescalePreset(preset: AuthoredLayoutPreset, size: number): { preset: AuthoredLayoutPreset; exact: boolean } {
-  const old = preset.logicalGrid.width;
-  const scale = size / old;
-  let exact = preset.logicalGrid.width === preset.logicalGrid.height;
+  const oldWidth = preset.logicalGrid.width;
+  const oldHeight = preset.logicalGrid.height;
+  const x = quantizedAxis(preset.regions.flatMap((region) => [region.gridRect.x, region.gridRect.x + region.gridRect.width]), oldWidth, size);
+  const y = quantizedAxis(preset.regions.flatMap((region) => [region.gridRect.y, region.gridRect.y + region.gridRect.height]), oldHeight, size);
   const regions = preset.regions.map((region) => {
-    const values = [region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height].map((value) => value * scale);
-    exact &&= values.every(Number.isInteger);
-    const [x0,y0,x1,y1] = [region.gridRect.x, region.gridRect.y, region.gridRect.x + region.gridRect.width, region.gridRect.y + region.gridRect.height].map((value) => Math.round(value * scale));
-    return { ...region, gridRect: { x: x0, y: y0, width: Math.max(1, x1 - x0), height: Math.max(1, y1 - y0) } };
+    const left = x.positions.get(region.gridRect.x)!;
+    const right = x.positions.get(region.gridRect.x + region.gridRect.width)!;
+    const top = y.positions.get(region.gridRect.y)!;
+    const bottom = y.positions.get(region.gridRect.y + region.gridRect.height)!;
+    return { ...region, gridRect: { x: left, y: top, width: right - left, height: bottom - top } };
   });
-  return { exact, preset: { ...preset, logicalGrid: { schemaVersion: 1, width: size, height: size }, regions } };
+  const result = { ...preset, logicalGrid: { schemaVersion: 1, width: size, height: size }, regions };
+  if (!presetExactlyCoversGrid(result)) throw new Error("Quantized layout does not exactly cover the requested grid.");
+  return { exact: x.exact && y.exact, preset: result };
+}
+
+export function presetExactlyCoversGrid(preset: AuthoredLayoutPreset): boolean {
+  const { width, height } = preset.logicalGrid;
+  if (width <= 0 || height <= 0) return false;
+  const owners = new Uint8Array(width * height);
+  for (const region of preset.regions) {
+    const rect = region.gridRect;
+    if (rect.width <= 0 || rect.height <= 0 || rect.x < 0 || rect.y < 0 || rect.x + rect.width > width || rect.y + rect.height > height) return false;
+    for (let y = rect.y; y < rect.y + rect.height; y += 1) for (let x = rect.x; x < rect.x + rect.width; x += 1) {
+      const index = y * width + x;
+      owners[index] += 1;
+      if (owners[index] !== 1) return false;
+    }
+  }
+  return owners.every((owner) => owner === 1);
+}
+
+function quantizedAxis(boundaries: readonly number[], oldSize: number, newSize: number) {
+  const ordered = [...new Set([0, oldSize, ...boundaries])].sort((left, right) => left - right);
+  if (ordered.length > newSize + 1) throw new Error(`A ${newSize}-cell grid cannot preserve ${ordered.length - 1} authored intervals.`);
+  const mapped = ordered.map((boundary, index) => index === 0 ? 0 : index === ordered.length - 1 ? newSize : Math.round(boundary * newSize / oldSize));
+  // Keep the authored endpoints pinned. Only interior boundaries move while the
+  // two passes guarantee at least one target cell for every authored interval.
+  for (let index = 1; index < mapped.length - 1; index += 1) mapped[index] = Math.max(mapped[index]!, mapped[index - 1]! + 1);
+  for (let index = mapped.length - 2; index > 0; index -= 1) mapped[index] = Math.min(mapped[index]!, mapped[index + 1]! - 1);
+  const positions = new Map(ordered.map((boundary, index) => [boundary, mapped[index]!]));
+  return { positions, exact: ordered.every((boundary) => boundary * newSize % oldSize === 0) };
+}
+
+function rectKey(rect: { x: number; y: number; width: number; height: number }) {
+  return `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
 }
 
 export function snappedGridPoint(clientX: number, clientY: number, rect: Pick<DOMRect, "left"|"top"|"width"|"height">, width: number, height: number) {

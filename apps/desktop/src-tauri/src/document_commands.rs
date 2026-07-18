@@ -1,29 +1,31 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
-    io::Cursor,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hot_trimmer_domain::{
     ALGORITHM_STACK_CONTRACT_VERSION, AlgorithmProvenance, AssignmentProvenance,
-    CancellationToken as EngineCancellationToken, ChannelRegistration,
-    CompilerRequestHeader, ContentDigest, ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION,
-    DelightingIntent, MaterialBehaviorClass, MaterialCalibrationCommand, MaterialCalibrationIntent,
-    MaterialClassificationCommand,
-    MaterialClassificationIntent,
-    MaterialChannelRole, OutputSpecHeader, PatchCommand, PatchGeometry, PatchId,
-    NormalConvention, OriginalAssetProvenance, OrientedPixelSize, Projection, RegisteredChannel,
-    RegisteredChannelSet, RegionId, SourceId, SourceOwnershipIntent, SourceSetId,
-    PartitionRecipe, TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
+    AuthoredLayoutPreset, CancellationToken as EngineCancellationToken, ChannelRegistration,
+    CompilerRequestHeader, ContentDigest, ContentReference, DelightingIntent, ErrorCode, FoundationStatusRequest,
+    IPC_PROTOCOL_VERSION, MaterialBehaviorClass, MaterialCalibrationCommand,
+    MaterialCalibrationIntent, MaterialChannelRole, MaterialClassificationCommand,
+    MaterialClassificationIntent, NormalConvention, OrientedPixelSize, OriginalAssetProvenance,
+    OutputSpecHeader, PartitionRecipe, PatchCommand, PatchGeometry, PatchId, Projection, RegionId,
+    RegisteredChannel, RegisteredChannelSet, SourceId, SourceOwnershipIntent, SourceSetId,
+    TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
 };
 use hot_trimmer_image_io::{
-    CancellationToken, ColorPolicy, DecodeLimits, InspectedImage,
-    inspect_bytes_with_policy, inspect_path_with_policy, prepare_registered_channel_set,
-    NormalizationSettings, PreparedChannelSet,
+    CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, NormalizationSettings,
+    PreparedChannelSet, inspect_bytes_with_policy, inspect_path_with_policy,
+    prepare_registered_channel_set,
 };
 use hot_trimmer_material_analysis::{
     AnalysisSettings, ScaleOrientationCache, ScaleOrientationSettings, SourceAnalysisCache,
@@ -33,16 +35,15 @@ use hot_trimmer_material_analysis::{
 use hot_trimmer_project_store::{
     ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
 };
+use hot_trimmer_render_core::{
+    ExemplarMaskIntent, PlanarArea, PreparedExemplar, PreparedExemplarCache,
+    PreparedExemplarRequest, PreparedExemplarScope, RectificationQuality, RectificationWorkLimits,
+    RenderCancellationToken, prepare_registered_exemplar,
+};
 use hot_trimmer_sheet_compiler::{
     AlgorithmCompiler, CompiledMapSet, PreviewMapKind, ResolvedRegion,
 };
 use image::{DynamicImage, ImageFormat, RgbaImage};
-use hot_trimmer_render_core::{
-    ExemplarMaskIntent, PlanarArea, PreparedExemplar, PreparedExemplarCache,
-    PreparedExemplarRequest, PreparedExemplarScope,
-    RectificationQuality, RectificationWorkLimits, RenderCancellationToken,
-    prepare_registered_exemplar,
-};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
@@ -50,6 +51,7 @@ use uuid::Uuid;
 use crate::paths::AppPaths;
 
 const MAX_RECENT_PROJECTS: usize = 10;
+const USER_LAYOUT_PRESET_LIBRARY_FILE: &str = "authored-layout-presets.v1.json";
 
 #[derive(Clone, Copy, Debug)]
 pub struct StartupState {
@@ -125,15 +127,22 @@ impl ProjectSession {
         let key = (
             source.input.id.to_string(),
             source.input.sha256.clone(),
-            serde_json::to_string(&source.registration).map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?,
+            serde_json::to_string(&source.registration)
+                .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?,
         );
-        if let Some(projection) = self.source_projection_cache.lock().map_err(|_| poisoned())?
-            .get(&key).cloned()
+        if let Some(projection) = self
+            .source_projection_cache
+            .lock()
+            .map_err(|_| poisoned())?
+            .get(&key)
+            .cloned()
         {
             return Ok(projection);
         }
         let projection = source_projection(source)?;
-        self.source_projection_cache.lock().map_err(|_| poisoned())?
+        self.source_projection_cache
+            .lock()
+            .map_err(|_| poisoned())?
             .insert(key, projection.clone());
         Ok(projection)
     }
@@ -194,15 +203,25 @@ pub struct SourceProjection {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OriginalSourceProjection { path: String, immutable_digest: String, encoded_bytes: u64 }
+struct OriginalSourceProjection {
+    path: String,
+    immutable_digest: String,
+    encoded_bytes: u64,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SourceStorageProjection { ownership: SourceOwnership, external_path: Option<String> }
+struct SourceStorageProjection {
+    ownership: SourceOwnership,
+    external_path: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OrientedSizeProjection { width: u32, height: u32 }
+struct OrientedSizeProjection {
+    width: u32,
+    height: u32,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -283,6 +302,13 @@ pub struct SourceSlotRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SourceSetRequest {
+    protocol_version: u16,
+    source_set_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetExemplarGroupRequest {
     protocol_version: u16,
     material_source_id: Uuid,
@@ -318,6 +344,35 @@ pub struct MaterialCalibrationCommandRequest {
 pub struct ProjectNameRequest {
     protocol_version: u16,
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSetNameRequest {
+    protocol_version: u16,
+    source_set_id: Uuid,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAuthoredLayoutPresetRequest {
+    protocol_version: u16,
+    preset: AuthoredLayoutPreset,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAuthoredLayoutPresetRequest {
+    protocol_version: u16,
+    preset_id: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthoredLayoutPresetLibrary {
+    schema_version: u16,
+    presets: Vec<AuthoredLayoutPreset>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -485,13 +540,21 @@ pub struct Stage14PreviewRequest {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PreviewProfile { Draft512, Refinement1024, #[default] Authoritative }
+pub enum PreviewProfile {
+    Draft512,
+    Refinement1024,
+    #[default]
+    Authoritative,
+}
 
 impl From<PreviewProfile> for hot_trimmer_sheet_compiler::SourceFramePreviewProfile {
-    fn from(value: PreviewProfile) -> Self { match value {
-        PreviewProfile::Draft512 => Self::Draft512, PreviewProfile::Refinement1024 => Self::Refinement1024,
-        PreviewProfile::Authoritative => Self::Authoritative,
-    }}
+    fn from(value: PreviewProfile) -> Self {
+        match value {
+            PreviewProfile::Draft512 => Self::Draft512,
+            PreviewProfile::Refinement1024 => Self::Refinement1024,
+            PreviewProfile::Authoritative => Self::Authoritative,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -629,17 +692,22 @@ pub fn import_source(
     let mut session = session.lock().map_err(|_| poisoned())?;
     let store = session.store.as_mut().ok_or_else(no_project)?;
     store
-        .replace_registered_source_in_set(request.source_set_id, &input, ChannelRegistration {
-            role: request.channel.material_role(),
-            interpretation: request.channel.material_role().required_interpretation(),
-            normal_convention: request.normal_convention,
-            assignment_provenance: request.assignment_provenance,
-            confidence_milli: request.confidence_milli,
-        })
+        .replace_registered_source_in_set(
+            request.source_set_id,
+            &input,
+            ChannelRegistration {
+                role: request.channel.material_role(),
+                interpretation: request.channel.material_role().required_interpretation(),
+                normal_convention: request.normal_convention,
+                assignment_provenance: request.assignment_provenance,
+                confidence_milli: request.confidence_milli,
+            },
+        )
         .map_err(|failure| source_registration_error(failure, request.channel))?;
     store.refresh_document_assets().map_err(store_error)?;
-    session.prepared_exemplars.invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
-    session.source_analysis_cache = SourceAnalysisCache::default();
+    session
+        .prepared_exemplars
+        .invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
     session.mark_mutated();
     *import_job.lock().map_err(|_| poisoned())? = None;
     project_projection(&session)
@@ -670,8 +738,47 @@ pub fn remove_source(
         .ok_or_else(no_project)?
         .remove_source_in_set(request.source_set_id, request.channel)
         .map_err(store_error)?;
-    session.prepared_exemplars.invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
-    session.source_analysis_cache = SourceAnalysisCache::default();
+    session
+        .prepared_exemplars
+        .invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn remove_source_set(
+    request: SourceSetRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    let summary = session
+        .store
+        .as_ref()
+        .ok_or_else(no_project)?
+        .summary()
+        .map_err(store_error)?;
+    if let Some(document) = summary.document.as_ref() {
+        let id = SourceSetId::from_bytes(*request.source_set_id.as_bytes());
+        let referenced = document.primary_material == Some(id)
+            || document.source_frame.as_ref().is_some_and(|frame| frame.source_set_id == id)
+            || document.region_bindings.values().any(|binding| matches!(&binding.content, ContentReference::MaterialSource(value) if *value == id));
+        if referenced {
+            return Err(error(
+                ErrorCode::InvalidInput,
+                "The source is referenced by the primary material, SourceFrame, or a region. Assign an explicit fallback first.",
+            ));
+        }
+    }
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
+        .remove_source_set(request.source_set_id)
+        .map_err(store_error)?;
+    session
+        .prepared_exemplars
+        .invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
     session.mark_mutated();
     project_projection(&session)
 }
@@ -683,8 +790,14 @@ pub fn set_exemplar_group(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    session.store.as_mut().ok_or_else(no_project)?
-        .set_exemplar_group(request.material_source_id, request.exemplar_group.as_deref())
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
+        .set_exemplar_group(
+            request.material_source_id,
+            request.exemplar_group.as_deref(),
+        )
         .map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
@@ -697,7 +810,10 @@ pub fn set_delighting_intent(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    session.store.as_mut().ok_or_else(no_project)?
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
         .set_delighting_intent(request.material_source_id, &request.delighting)
         .map_err(store_error)?;
     session.source_analysis_cache = SourceAnalysisCache::default();
@@ -712,7 +828,10 @@ pub fn apply_material_classification_command(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    session.store.as_mut().ok_or_else(no_project)?
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
         .apply_material_classification_command(
             request.material_source_id,
             request.classification_command,
@@ -729,7 +848,10 @@ pub fn apply_material_calibration_command(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    session.store.as_mut().ok_or_else(no_project)?
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
         .apply_material_calibration_command(request.material_source_id, request.calibration_command)
         .map_err(store_error)?;
     session.mark_mutated();
@@ -751,6 +873,95 @@ pub fn rename_project(
         .map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
+}
+
+#[tauri::command]
+pub fn rename_source_set(
+    request: SourceSetNameRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
+        .rename_source_set(request.source_set_id, &request.name)
+        .map_err(store_error)?;
+    session.mark_mutated();
+    project_projection(&session)
+}
+
+#[tauri::command]
+pub fn list_authored_layout_presets(
+    request: FoundationStatusRequest,
+    paths: State<'_, AppPaths>,
+) -> Result<Vec<AuthoredLayoutPreset>, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    Ok(read_authored_layout_preset_library(&paths)?.presets)
+}
+
+#[tauri::command]
+pub fn save_authored_layout_preset(
+    request: SaveAuthoredLayoutPresetRequest,
+    paths: State<'_, AppPaths>,
+) -> Result<Vec<AuthoredLayoutPreset>, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    hot_trimmer_domain::validate_authored_layout_preset(&request.preset)
+        .map_err(|reason| error(ErrorCode::InvalidInput, &reason.to_string()))?;
+    if request.preset.preset_id.starts_with("builtin.")
+        || request.preset.preset_id.trim().is_empty()
+    {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Built-in layout presets are immutable.",
+        ));
+    }
+    let mut library = read_authored_layout_preset_library(&paths)?;
+    if let Some(existing) = library
+        .presets
+        .iter_mut()
+        .find(|preset| preset.preset_id == request.preset.preset_id)
+    {
+        *existing = request.preset;
+    } else {
+        library.presets.push(request.preset);
+    }
+    library.presets.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then(left.preset_id.cmp(&right.preset_id))
+    });
+    write_authored_layout_preset_library(&paths, &library)?;
+    Ok(library.presets)
+}
+
+#[tauri::command]
+pub fn delete_authored_layout_preset(
+    request: DeleteAuthoredLayoutPresetRequest,
+    paths: State<'_, AppPaths>,
+) -> Result<Vec<AuthoredLayoutPreset>, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    if request.preset_id.starts_with("builtin.") {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Built-in layout presets are immutable.",
+        ));
+    }
+    let mut library = read_authored_layout_preset_library(&paths)?;
+    let before = library.presets.len();
+    library
+        .presets
+        .retain(|preset| preset.preset_id != request.preset_id);
+    if library.presets.len() == before {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "The saved layout preset no longer exists.",
+        ));
+    }
+    write_authored_layout_preset_library(&paths, &library)?;
+    Ok(library.presets)
 }
 
 #[tauri::command]
@@ -777,8 +988,12 @@ pub fn create_source_frame_document(
 ) -> Result<ProjectProjection, UserFacingError> {
     request.validate().map_err(UserFacingError::from)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    session.store.as_mut().ok_or_else(no_project)?
-        .create_source_frame_document().map_err(store_error)?;
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
+        .create_source_frame_document()
+        .map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
 }
@@ -790,8 +1005,12 @@ pub fn regenerate_source_frame_partition(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
-    session.store.as_mut().ok_or_else(no_project)?
-        .regenerate_source_frame_partition(request.target_region_count).map_err(store_error)?;
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
+        .regenerate_source_frame_partition(request.target_region_count)
+        .map_err(store_error)?;
     session.mark_mutated();
     project_projection(&session)
 }
@@ -805,13 +1024,25 @@ pub fn apply_document_command(
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
     if let TrimSheetDocumentCommand::AcceptSourceFramePartition { recipe } = &request.command {
-        let revision = session.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
-            .document.ok_or_else(no_project)?.document_revision;
-        let previewed = preview_service.previewed_candidate_recipes.lock().map_err(|_| poisoned())?
+        let revision = session
+            .store
+            .as_ref()
+            .ok_or_else(no_project)?
+            .summary()
+            .map_err(store_error)?
+            .document
+            .ok_or_else(no_project)?
+            .document_revision;
+        let previewed = preview_service
+            .previewed_candidate_recipes
+            .lock()
+            .map_err(|_| poisoned())?
             .contains(&(revision, recipe.hash()));
         if !previewed {
-            return Err(error(ErrorCode::LayoutInvalid,
-                "Preview this exact layout candidate before accepting it."));
+            return Err(error(
+                ErrorCode::LayoutInvalid,
+                "Preview this exact layout candidate before accepting it.",
+            ));
         }
     }
     session
@@ -831,13 +1062,42 @@ pub fn apply_patch_command(
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
+    if let PatchCommand::Delete { patch_id } = &request.command {
+        let referenced_regions = session
+            .store
+            .as_ref()
+            .ok_or_else(no_project)?
+            .summary()
+            .map_err(store_error)?
+            .document
+            .into_iter()
+            .flat_map(|document| document.region_bindings.into_values())
+            .filter(
+                |binding| matches!(binding.content, ContentReference::Patch(id) if id == *patch_id),
+            )
+            .map(|binding| binding.region_id.to_string())
+            .collect::<Vec<_>>();
+        if !referenced_regions.is_empty() {
+            return Err(error(
+                ErrorCode::InvalidInput,
+                &format!(
+                    "Patch {patch_id} is assigned to region(s): {}",
+                    referenced_regions.join(", ")
+                ),
+            ));
+        }
+    }
     let invalidated = {
         let store = session.store.as_mut().ok_or_else(no_project)?;
-        let outcome = store.execute_patch_command(&request.command, request.coalescing_group).map_err(store_error)?;
+        let outcome = store
+            .execute_patch_command(&request.command, request.coalescing_group)
+            .map_err(store_error)?;
         store.refresh_document_assets().map_err(store_error)?;
         outcome.invalidated_patch_ids
     };
-    for patch_id in invalidated { session.prepared_exemplars.invalidate_patch(patch_id); }
+    for patch_id in invalidated {
+        session.prepared_exemplars.invalidate_patch(patch_id);
+    }
     session.mark_mutated();
     project_projection(&session)
 }
@@ -855,7 +1115,9 @@ pub fn undo_patch_command(
         store.refresh_document_assets().map_err(store_error)?;
         outcome.invalidated_patch_ids
     };
-    for patch_id in invalidated { session.prepared_exemplars.invalidate_patch(patch_id); }
+    for patch_id in invalidated {
+        session.prepared_exemplars.invalidate_patch(patch_id);
+    }
     session.mark_mutated();
     project_projection(&session)
 }
@@ -873,7 +1135,9 @@ pub fn redo_patch_command(
         store.refresh_document_assets().map_err(store_error)?;
         outcome.invalidated_patch_ids
     };
-    for patch_id in invalidated { session.prepared_exemplars.invalidate_patch(patch_id); }
+    for patch_id in invalidated {
+        session.prepared_exemplars.invalidate_patch(patch_id);
+    }
     session.mark_mutated();
     project_projection(&session)
 }
@@ -885,43 +1149,85 @@ pub fn prepare_patch_preview(
 ) -> Result<PreparedPatchPreviewProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     if !(64..=2048).contains(&request.max_edge) {
-        return Err(error(ErrorCode::InvalidInput, "Patch preview edge must be between 64 and 2048 pixels."));
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Patch preview edge must be between 64 and 2048 pixels.",
+        ));
     }
     let mut session = session.lock().map_err(|_| poisoned())?;
-    let summary = session.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?;
-    let patch = summary.patches.iter().find(|patch| patch.id == request.patch_id)
-        .ok_or_else(|| error(ErrorCode::InvalidInput, "The selected patch no longer exists."))?;
+    let summary = session
+        .store
+        .as_ref()
+        .ok_or_else(no_project)?
+        .summary()
+        .map_err(store_error)?;
+    let patch = summary
+        .patches
+        .iter()
+        .find(|patch| patch.id == request.patch_id)
+        .ok_or_else(|| {
+            error(
+                ErrorCode::InvalidInput,
+                "The selected patch no longer exists.",
+            )
+        })?;
     let transient = request.geometry.is_some();
     let geometry = request.geometry.as_ref().unwrap_or(&patch.geometry);
-    let anchor = summary.sources.iter().find(|source| source.input.id == patch.source_id)
-        .ok_or_else(|| error(ErrorCode::ProjectInvalid, "The patch source no longer exists."))?;
+    let anchor = summary
+        .sources
+        .iter()
+        .find(|source| source.input.id == patch.source_id)
+        .ok_or_else(|| {
+            error(
+                ErrorCode::ProjectInvalid,
+                "The patch source no longer exists.",
+            )
+        })?;
     let source_set_id = SourceSetId::from_bytes(*anchor.source_set_id.as_bytes());
-    let source_set = summary.source_sets.iter().find(|source_set| source_set.id == source_set_id)
-        .ok_or_else(|| error(ErrorCode::ProjectInvalid, "The patch material source no longer exists."))?;
+    let source_set = summary
+        .source_sets
+        .iter()
+        .find(|source_set| source_set.id == source_set_id)
+        .ok_or_else(|| {
+            error(
+                ErrorCode::ProjectInvalid,
+                "The patch material source no longer exists.",
+            )
+        })?;
     let prepared_source_key = (source_set_id.to_string(), source_set.source_revision);
-    let prepared = if let Some(prepared) = session.preview_prepared_sources.get(&prepared_source_key) {
-        Arc::clone(prepared)
-    } else {
-        let (registered, encoded_sources) = preview_registered_channel_set(
-            &session,
-            &summary.sources,
-            anchor.source_set_id,
-        )?;
-        let normalization_settings = NormalizationSettings {
-            max_levels: 1,
-            max_memory_bytes: 268_435_456,
-            ..NormalizationSettings::default()
+    let prepared =
+        if let Some(prepared) = session.preview_prepared_sources.get(&prepared_source_key) {
+            Arc::clone(prepared)
+        } else {
+            let (registered, encoded_sources) =
+                preview_registered_channel_set(&session, &summary.sources, anchor.source_set_id)?;
+            let normalization_settings = NormalizationSettings {
+                max_levels: 1,
+                max_memory_bytes: 268_435_456,
+                ..NormalizationSettings::default()
+            };
+            let prepared = Arc::new(
+                prepare_registered_channel_set(
+                    &registered,
+                    &encoded_sources,
+                    &normalization_settings,
+                    &CancellationToken::new(),
+                )
+                .map_err(|failure| {
+                    error(
+                        ErrorCode::ImageImportFailed,
+                        &format!("Source preparation failed: {failure}"),
+                    )
+                })?,
+            );
+            if session.preview_prepared_sources.len() >= 8 {
+                session.preview_prepared_sources.clear();
+            }
+            session
+                .preview_prepared_sources
+                .insert(prepared_source_key, Arc::clone(&prepared));
+            prepared
         };
-        let prepared = Arc::new(prepare_registered_channel_set(
-            &registered,
-            &encoded_sources,
-            &normalization_settings,
-            &CancellationToken::new(),
-        ).map_err(|failure| error(ErrorCode::ImageImportFailed, &format!("Source preparation failed: {failure}")))?);
-        if session.preview_prepared_sources.len() >= 8 { session.preview_prepared_sources.clear(); }
-        session.preview_prepared_sources.insert(prepared_source_key, Arc::clone(&prepared));
-        prepared
-    };
     let patch_bytes = serde_json::to_vec(&(patch.id, geometry, patch.rectification))
         .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
     let revision_digest = ContentDigest::sha256(&patch_bytes);
@@ -929,7 +1235,9 @@ pub fn prepare_patch_preview(
         .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
     let exemplar_request = PreparedExemplarRequest {
         exemplar_id: patch.id.to_string(),
-        area: PlanarArea::FourPoint { corners: geometry.corners },
+        area: PlanarArea::FourPoint {
+            corners: geometry.corners,
+        },
         lens_correction: None,
         mask: ExemplarMaskIntent {
             crop_polygon: geometry.assistance_mask.clone(),
@@ -952,13 +1260,22 @@ pub fn prepare_patch_preview(
         },
     };
     let key = hot_trimmer_render_core::exemplar_cache_key(&prepared.cache_key, &exemplar_request);
-    let cached = (!transient).then(|| session.prepared_exemplars.get(&key)).flatten().cloned();
+    let cached = (!transient)
+        .then(|| session.prepared_exemplars.get(&key))
+        .flatten()
+        .cloned();
     let exemplar = if let Some(cached) = cached {
         cached
     } else {
-        let value = prepare_registered_exemplar(&prepared, &exemplar_request, &RenderCancellationToken::new())
-            .map_err(|failure| error(ErrorCode::PatchGeometryInvalid, &failure.to_string()))?;
-        if !transient { session.prepared_exemplars.insert_complete(value.clone()); }
+        let value = prepare_registered_exemplar(
+            &prepared,
+            &exemplar_request,
+            &RenderCancellationToken::new(),
+        )
+        .map_err(|failure| error(ErrorCode::PatchGeometryInvalid, &failure.to_string()))?;
+        if !transient {
+            session.prepared_exemplars.insert_complete(value.clone());
+        }
         value
     };
     let stage_four = prepare_delit_exemplar(
@@ -966,7 +1283,13 @@ pub fn prepare_patch_preview(
         &source_set.delighting,
         None,
         &RenderCancellationToken::new(),
-    ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 4 source preparation failed: {failure}")))?;
+    )
+    .map_err(|failure| {
+        error(
+            ErrorCode::InvalidInput,
+            &format!("Stage 4 source preparation failed: {failure}"),
+        )
+    })?;
     let analysis_settings = AnalysisSettings::default();
     let analysis_key = source_analysis_cache_key(&stage_four, &analysis_settings, None);
     let mut stage_five = if let Some(cached) = session.source_analysis_cache.get(&analysis_key) {
@@ -977,14 +1300,23 @@ pub fn prepare_patch_preview(
             &analysis_settings,
             None,
             &RenderCancellationToken::new(),
-        ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 5 source analysis failed: {failure}")))?;
-        session.source_analysis_cache.insert_complete(report.clone());
+        )
+        .map_err(|failure| {
+            error(
+                ErrorCode::InvalidInput,
+                &format!("Stage 5 source analysis failed: {failure}"),
+            )
+        })?;
+        session
+            .source_analysis_cache
+            .insert_complete(report.clone());
         report
     };
     stage_five.classification.routing_intent = source_set.classification;
     let inspector = stage_five.inspector_evidence();
     let stage_six_settings = ScaleOrientationSettings::default();
-    let stage_six_key = scale_orientation_cache_key(&stage_five, &source_set.calibration, &stage_six_settings);
+    let stage_six_key =
+        scale_orientation_cache_key(&stage_five, &source_set.calibration, &stage_six_settings);
     let stage_six = if let Some(cached) = session.scale_orientation_cache.get(&stage_six_key) {
         cached.clone()
     } else {
@@ -994,8 +1326,16 @@ pub fn prepare_patch_preview(
             &source_set.calibration,
             &stage_six_settings,
             &RenderCancellationToken::new(),
-        ).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 6 calibration failed: {failure}")))?;
-        session.scale_orientation_cache.insert_complete(report.clone());
+        )
+        .map_err(|failure| {
+            error(
+                ErrorCode::InvalidInput,
+                &format!("Stage 6 calibration failed: {failure}"),
+            )
+        })?;
+        session
+            .scale_orientation_cache
+            .insert_complete(report.clone());
         report
     };
     prepared_preview_projection(
@@ -1013,16 +1353,27 @@ pub fn prepare_patch_preview(
             warning_count: inspector.warning_count,
             scale_summary: stage_six.measurement_overlay.label.clone(),
             orientation_summary: match stage_six.global_orientation.axis_millidegrees {
-                Some(axis) => format!("axis {:.1}°, confidence {}%", axis as f64 / 1000.0, stage_six.global_orientation.confidence_milli / 10),
-                None => format!("orientation unavailable, confidence {}%", stage_six.global_orientation.confidence_milli / 10),
+                Some(axis) => format!(
+                    "axis {:.1}°, confidence {}%",
+                    axis as f64 / 1000.0,
+                    stage_six.global_orientation.confidence_milli / 10
+                ),
+                None => format!(
+                    "orientation unavailable, confidence {}%",
+                    stage_six.global_orientation.confidence_milli / 10
+                ),
             },
             world_scale_available: stage_six.measurement_overlay.world_scale_available,
-            orientation_overlay: stage_six.local_orientation.iter().map(|sample| OrientationOverlayProjection {
-                source_x_milli: sample.source_x_milli,
-                source_y_milli: sample.source_y_milli,
-                axis_millidegrees: sample.axis_millidegrees,
-                confidence_milli: sample.confidence_milli,
-            }).collect(),
+            orientation_overlay: stage_six
+                .local_orientation
+                .iter()
+                .map(|sample| OrientationOverlayProjection {
+                    source_x_milli: sample.source_x_milli,
+                    source_y_milli: sample.source_y_milli,
+                    axis_millidegrees: sample.axis_millidegrees,
+                    confidence_milli: sample.confidence_milli,
+                })
+                .collect(),
         },
     )
 }
@@ -1086,9 +1437,20 @@ pub async fn preview_through_stage_14(
     validate_protocol(request.protocol_version)?;
     let session = Arc::clone(session.inner());
     let preview_service = Arc::clone(preview_service.inner());
-    let job = preview_service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-    tauri::async_runtime::spawn_blocking(move || build_stage_14_preview(&session, &preview_service, request, job))
-        .await.map_err(|join| error(ErrorCode::Internal, &format!("Stage 14 preview worker failed: {join}")))?
+    let job = preview_service
+        .latest_draft_id
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    tauri::async_runtime::spawn_blocking(move || {
+        build_stage_14_preview(&session, &preview_service, request, job)
+    })
+    .await
+    .map_err(|join| {
+        error(
+            ErrorCode::Internal,
+            &format!("Stage 14 preview worker failed: {join}"),
+        )
+    })?
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1100,7 +1462,8 @@ fn removed_preview_specific_fabrication(
     job: u64,
 ) -> Result<IntermediateAtlasProjection, UserFacingError> {
     use hot_trimmer_domain::{
-        MaterialChannelRole, PixelSize, SamplingMode, SamplingPolicy, SourceSamplingMode, StageResult,
+        MaterialChannelRole, PixelSize, SamplingMode, SamplingPolicy, SourceSamplingMode,
+        StageResult,
     };
     use hot_trimmer_image_io::{CategoryId, ImagePlane, LinearColor, LinearScalar, TangentNormal};
     use hot_trimmer_material_synthesis::PreparedMaterialDomain;
@@ -1118,21 +1481,52 @@ fn removed_preview_specific_fabrication(
 
     let summary = {
         let guard = session.lock().map_err(|_| poisoned())?;
-        guard.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
+        guard
+            .store
+            .as_ref()
+            .ok_or_else(no_project)?
+            .summary()
+            .map_err(store_error)?
     };
-    let document = summary.document.as_ref().ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
+    let document = summary
+        .document
+        .as_ref()
+        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
     if document.document_revision != requested_revision {
-        return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "A newer document revision superseded this preview.",
+        ));
     }
-    document.primary_material.ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
-    let selected = summary.sources.iter()
-        .map(|source| registered_map_cached(source, preview_service)).collect::<Result<Vec<_>, _>>()?;
-    if !selected.iter().any(|map| map.kind == MaterialMapKind::BaseColor) {
-        return Err(error(ErrorCode::InvalidInput, "Preview through Stage 14 requires imported Base Color."));
+    document
+        .primary_material
+        .ok_or_else(|| error(ErrorCode::InvalidInput, "Choose a primary material first."))?;
+    let selected = summary
+        .sources
+        .iter()
+        .map(|source| registered_map_cached(source, preview_service))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !selected
+        .iter()
+        .any(|map| map.kind == MaterialMapKind::BaseColor)
+    {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Preview through Stage 14 requires imported Base Color.",
+        ));
     }
-    let dimensions = selected.first().map(|map| [map.width, map.height]).unwrap_or([0, 0]);
-    if selected.iter().any(|map| [map.width, map.height] != dimensions) {
-        return Err(error(ErrorCode::SourceRegistrationFailed, "Imported registered channels are not aligned."));
+    let dimensions = selected
+        .first()
+        .map(|map| [map.width, map.height])
+        .unwrap_or([0, 0]);
+    if selected
+        .iter()
+        .any(|map| [map.width, map.height] != dimensions)
+    {
+        return Err(error(
+            ErrorCode::SourceRegistrationFailed,
+            "Imported registered channels are not aligned.",
+        ));
     }
     let mut channels = Vec::new();
     for map in &selected {
@@ -1140,61 +1534,145 @@ fn removed_preview_specific_fabrication(
             .map_err(|_| error(ErrorCode::InvalidInput, "Imported material is too large."))?;
         match map.kind {
             MaterialMapKind::BaseColor => {
-                let values = map.rgba8.chunks_exact(4).map(|pixel| LinearColor {
-                    rgb: [srgb_to_linear(pixel[0]), srgb_to_linear(pixel[1]), srgb_to_linear(pixel[2])],
-                    alpha: f32::from(pixel[3]) / 255.0,
-                }).collect::<Vec<_>>();
-                channels.push(PreparedExemplarChannel::BaseColor { plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
-                    .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))?, alpha_mode: hot_trimmer_image_io::ResolvedAlphaMode::Straight });
+                let values = map
+                    .rgba8
+                    .chunks_exact(4)
+                    .map(|pixel| LinearColor {
+                        rgb: [
+                            srgb_to_linear(pixel[0]),
+                            srgb_to_linear(pixel[1]),
+                            srgb_to_linear(pixel[2]),
+                        ],
+                        alpha: f32::from(pixel[3]) / 255.0,
+                    })
+                    .collect::<Vec<_>>();
+                channels.push(PreparedExemplarChannel::BaseColor {
+                    plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
+                        .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))?,
+                    alpha_mode: hot_trimmer_image_io::ResolvedAlphaMode::Straight,
+                });
             }
             MaterialMapKind::Normal => {
-                let values = map.rgba8.chunks_exact(4).map(|pixel| TangentNormal { xyz: [
-                    f32::from(pixel[0]) / 127.5 - 1.0, f32::from(pixel[1]) / 127.5 - 1.0,
-                    f32::from(pixel[2]) / 127.5 - 1.0], alpha: f32::from(pixel[3]) / 255.0 }).collect::<Vec<_>>();
-                channels.push(PreparedExemplarChannel::Normal { plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
-                    .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))?, source_convention: NormalConvention::OpenGl,
-                    canonical_convention: NormalConvention::OpenGl, alpha_policy: hot_trimmer_image_io::NormalAlphaPolicy::Preserve });
+                let values = map
+                    .rgba8
+                    .chunks_exact(4)
+                    .map(|pixel| TangentNormal {
+                        xyz: [
+                            f32::from(pixel[0]) / 127.5 - 1.0,
+                            f32::from(pixel[1]) / 127.5 - 1.0,
+                            f32::from(pixel[2]) / 127.5 - 1.0,
+                        ],
+                        alpha: f32::from(pixel[3]) / 255.0,
+                    })
+                    .collect::<Vec<_>>();
+                channels.push(PreparedExemplarChannel::Normal {
+                    plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
+                        .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))?,
+                    source_convention: NormalConvention::OpenGl,
+                    canonical_convention: NormalConvention::OpenGl,
+                    alpha_policy: hot_trimmer_image_io::NormalAlphaPolicy::Preserve,
+                });
             }
             MaterialMapKind::MaterialId => {
-                let values = map.rgba8.chunks_exact(4).map(|pixel| CategoryId(u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]))).collect::<Vec<_>>();
-                channels.push(PreparedExemplarChannel::MaterialId { plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
-                    .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))? });
+                let values = map
+                    .rgba8
+                    .chunks_exact(4)
+                    .map(|pixel| CategoryId(u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0])))
+                    .collect::<Vec<_>>();
+                channels.push(PreparedExemplarChannel::MaterialId {
+                    plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
+                        .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))?,
+                });
             }
             kind => {
-                let role = match kind { MaterialMapKind::Height => MaterialChannelRole::Height,
-                    MaterialMapKind::Roughness => MaterialChannelRole::Roughness, MaterialMapKind::Metallic => MaterialChannelRole::Metallic,
-                    MaterialMapKind::AmbientOcclusion => MaterialChannelRole::AmbientOcclusion, MaterialMapKind::Specular => MaterialChannelRole::Specular,
-                    MaterialMapKind::Opacity => MaterialChannelRole::Opacity, MaterialMapKind::EdgeMask => MaterialChannelRole::EdgeMask, _ => continue };
-                let values = map.rgba8.chunks_exact(4).take(pixel_count).map(|pixel| LinearScalar(f32::from(pixel[0]) / 255.0)).collect::<Vec<_>>();
-                channels.push(PreparedExemplarChannel::Scalar { role, plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
-                    .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))? });
+                let role = match kind {
+                    MaterialMapKind::Height => MaterialChannelRole::Height,
+                    MaterialMapKind::Roughness => MaterialChannelRole::Roughness,
+                    MaterialMapKind::Metallic => MaterialChannelRole::Metallic,
+                    MaterialMapKind::AmbientOcclusion => MaterialChannelRole::AmbientOcclusion,
+                    MaterialMapKind::Specular => MaterialChannelRole::Specular,
+                    MaterialMapKind::Opacity => MaterialChannelRole::Opacity,
+                    MaterialMapKind::EdgeMask => MaterialChannelRole::EdgeMask,
+                    _ => continue,
+                };
+                let values = map
+                    .rgba8
+                    .chunks_exact(4)
+                    .take(pixel_count)
+                    .map(|pixel| LinearScalar(f32::from(pixel[0]) / 255.0))
+                    .collect::<Vec<_>>();
+                channels.push(PreparedExemplarChannel::Scalar {
+                    role,
+                    plane: ImagePlane::from_row_major(map.width, map.height, 128, &values)
+                        .map_err(|failure| error(ErrorCode::InvalidInput, &failure.to_string()))?,
+                });
             }
         }
     }
-    let domain_id = ContentDigest::sha256(format!("{}|{:?}", primary, document.appearance_hash().map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?).as_bytes());
-    let source_id = ContentDigest::sha256(selected.iter().flat_map(|map| map.sha256.as_bytes()).copied().collect::<Vec<_>>().as_slice());
-    let domain = PreparedMaterialDomain::from_registered_channels(domain_id.clone(), source_id, channels)
-        .map_err(|failure| error(ErrorCode::InvalidInput, &format!("Stage 8 registered domain failed: {failure}")))?;
+    let domain_id = ContentDigest::sha256(
+        format!(
+            "{}|{:?}",
+            primary,
+            document
+                .appearance_hash()
+                .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?
+        )
+        .as_bytes(),
+    );
+    let source_id = ContentDigest::sha256(
+        selected
+            .iter()
+            .flat_map(|map| map.sha256.as_bytes())
+            .copied()
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let domain =
+        PreparedMaterialDomain::from_registered_channels(domain_id.clone(), source_id, channels)
+            .map_err(|failure| {
+                error(
+                    ErrorCode::InvalidInput,
+                    &format!("Stage 8 registered domain failed: {failure}"),
+                )
+            })?;
     // Source-frame layouts are already an accepted, integer rectangle topology.  Do not force
     // them through a template snapshot: that made every candidate look like a usable control
     // while Stage 14 could only compile old template state.
     let topology = if let Some(snapshot) = document.topology.snapshot.template.as_ref() {
-        let definition: hot_trimmer_domain::TemplateDefinition = serde_json::from_str(&snapshot.snapshot_json)
-            .map_err(|failure| error(ErrorCode::LayoutInvalid, &format!("Persisted template is invalid: {failure}")))?;
-        definition.compile_for_output(PixelSize { width: document.render_settings.output_size.width,
-            height: document.render_settings.output_size.height }).map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?
+        let definition: hot_trimmer_domain::TemplateDefinition =
+            serde_json::from_str(&snapshot.snapshot_json).map_err(|failure| {
+                error(
+                    ErrorCode::LayoutInvalid,
+                    &format!("Persisted template is invalid: {failure}"),
+                )
+            })?;
+        definition
+            .compile_for_output(PixelSize {
+                width: document.render_settings.output_size.width,
+                height: document.render_settings.output_size.height,
+            })
+            .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?
     } else {
         CompiledTemplateTopology {
             identity: TemplateIdentity {
                 template_id: "source-frame-partition".into(),
-                template_version: document.partition_provenance.as_ref()
-                    .map_or_else(|| "authored".into(), |value| value.recipe.recipe_version.to_string()),
+                template_version: document.partition_provenance.as_ref().map_or_else(
+                    || "authored".into(),
+                    |value| value.recipe.recipe_version.to_string(),
+                ),
                 compatibility_key: document.topology.compatibility_key.clone(),
             },
             output_size: document.render_settings.output_size,
-            slots: document.topology.regions.iter().map(|region| CompiledTemplateSlot {
-                slot_key: region.id.to_string(), allocation: region.allocation_rect, hotspot: region.hotspot_rect,
-            }).collect(),
+            slots: document
+                .topology
+                .regions
+                .iter()
+                .map(|region| CompiledTemplateSlot {
+                    slot_key: region.id.to_string(),
+                    allocation: region.allocation_rect,
+                    hotspot: region.hotspot_rect,
+                })
+                .collect(),
         }
     };
     let resolved = hot_trimmer_sheet_compiler::resolve_compile_plan(document, &selected)
@@ -1202,94 +1680,311 @@ fn removed_preview_specific_fabrication(
 
     let mut plans = Vec::new();
     for (index, slot) in topology.slots.iter().enumerate() {
-        let region = document.topology.regions.get(index).ok_or_else(|| error(ErrorCode::LayoutInvalid, "Stage 9 slot order drifted from the document."))?;
-        let mode = match region.orientation { hot_trimmer_domain::RegionOrientation::Horizontal => SamplingMode::RepeatX,
-            hot_trimmer_domain::RegionOrientation::Vertical => SamplingMode::RepeatY, _ => SamplingMode::PeriodicTile };
+        let region = document.topology.regions.get(index).ok_or_else(|| {
+            error(
+                ErrorCode::LayoutInvalid,
+                "Stage 9 slot order drifted from the document.",
+            )
+        })?;
+        let mode = match region.orientation {
+            hot_trimmer_domain::RegionOrientation::Horizontal => SamplingMode::RepeatX,
+            hot_trimmer_domain::RegionOrientation::Vertical => SamplingMode::RepeatY,
+            _ => SamplingMode::PeriodicTile,
+        };
         let period = [domain.width.max(1), domain.height.max(1)];
-        let candidate = CropCandidate { candidate_id: ContentDigest::sha256(format!("{}|{}|stage-11", slot.slot_key, domain_id.0).as_bytes()),
-            source_id: domain.prepared_source_digest.clone(), domain_id: domain_id.clone(), slot_id: region.id,
-            crop: Some(SourceCrop { x: 0, y: 0, width: domain.width, height: domain.height }),
-            transform: CandidateTransform { rotation: hot_trimmer_domain::QuarterTurn::Zero, mirror: MirrorTransform::None }, isotropic_scale: 1.0,
-            mapping_mode: mode, family: match mode { SamplingMode::RepeatX => CandidateFamily::RepeatXSegment,
-                SamplingMode::RepeatY => CandidateFamily::RepeatYSegment, _ => CandidateFamily::PanelSeamlessTile },
-            route: CandidateRoute::Repeat, position_strategy: PositionStrategy::PeriodAligned, period_pixels: Some(period), seam_indices: Vec::new(),
-            correspondence_reference: domain_id.clone(), descriptors: CandidateDescriptors { saliency_milli: 0, stationarity_milli: 1000,
-                feature_strength_milli: 0, usability_milli: 1000 }, seed: 14,
-            eligibility: EligibilityEvidence { mapping_permitted: true, transform_permitted: true, isotropic_scale: true,
-                exact_aspect: true, entire_crop_usable: Some(true), cross_axis_preserved: Some(true), lattice_aligned: Some(true),
-                direct_crop_applicable: true, direct_crop_rejection: None, reasons: vec!["selected by the bounded Stage 14 preview route".into()] } };
-        plans.push(SamplingPlan { slot_id: region.id, role: region.role, variation_group: region.material_group.clone(),
-            prepared_domain_dimensions: [domain.width, domain.height], candidate,
-            slot_physical_size: [f64::from(slot.allocation.width), f64::from(slot.allocation.height)], source_pixels_per_physical_unit: 1.0,
-            sampling_policy: SamplingPolicy { filter: SourceSamplingMode::Linear, scale: 1.0, correct_tangent_normals: true },
-            stretch_override: StretchOverrideProvenance::NotAuthorized, slice_geometry: SliceGeometry::None,
-            maximum_seam_cost_milli: 450, unary_cost: 0.0 });
+        let candidate = CropCandidate {
+            candidate_id: ContentDigest::sha256(
+                format!("{}|{}|stage-11", slot.slot_key, domain_id.0).as_bytes(),
+            ),
+            source_id: domain.prepared_source_digest.clone(),
+            domain_id: domain_id.clone(),
+            slot_id: region.id,
+            crop: Some(SourceCrop {
+                x: 0,
+                y: 0,
+                width: domain.width,
+                height: domain.height,
+            }),
+            transform: CandidateTransform {
+                rotation: hot_trimmer_domain::QuarterTurn::Zero,
+                mirror: MirrorTransform::None,
+            },
+            isotropic_scale: 1.0,
+            mapping_mode: mode,
+            family: match mode {
+                SamplingMode::RepeatX => CandidateFamily::RepeatXSegment,
+                SamplingMode::RepeatY => CandidateFamily::RepeatYSegment,
+                _ => CandidateFamily::PanelSeamlessTile,
+            },
+            route: CandidateRoute::Repeat,
+            position_strategy: PositionStrategy::PeriodAligned,
+            period_pixels: Some(period),
+            seam_indices: Vec::new(),
+            correspondence_reference: domain_id.clone(),
+            descriptors: CandidateDescriptors {
+                saliency_milli: 0,
+                stationarity_milli: 1000,
+                feature_strength_milli: 0,
+                usability_milli: 1000,
+            },
+            seed: 14,
+            eligibility: EligibilityEvidence {
+                mapping_permitted: true,
+                transform_permitted: true,
+                isotropic_scale: true,
+                exact_aspect: true,
+                entire_crop_usable: Some(true),
+                cross_axis_preserved: Some(true),
+                lattice_aligned: Some(true),
+                direct_crop_applicable: true,
+                direct_crop_rejection: None,
+                reasons: vec!["selected by the bounded Stage 14 preview route".into()],
+            },
+        };
+        plans.push(SamplingPlan {
+            slot_id: region.id,
+            role: region.role,
+            variation_group: region.material_group.clone(),
+            prepared_domain_dimensions: [domain.width, domain.height],
+            candidate,
+            slot_physical_size: [
+                f64::from(slot.allocation.width),
+                f64::from(slot.allocation.height),
+            ],
+            source_pixels_per_physical_unit: 1.0,
+            sampling_policy: SamplingPolicy {
+                filter: SourceSamplingMode::Linear,
+                scale: 1.0,
+                correct_tangent_normals: true,
+            },
+            stretch_override: StretchOverrideProvenance::NotAuthorized,
+            slice_geometry: SliceGeometry::None,
+            maximum_seam_cost_milli: 450,
+            unary_cost: 0.0,
+        });
     }
-    let placement = PlacementPlan { stage_result: StageResult::Executed { algorithm: AlgorithmProvenance {
-        algorithm_id: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_ID.into(), version: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_VERSION.into() },
-        settings_hash: ContentDigest::sha256(b"stage-14-preview-a-selected-placement"), diagnostics: Vec::new() },
-        solver: AlgorithmProvenance { algorithm_id: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_ID.into(),
-            version: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_VERSION.into() }, seed: 14, placements: plans.clone(),
-        objective: PlacementObjectiveBreakdown { unary_cost: 0.0, pairwise_cost: 0.0, pairwise_lambda: 1.0,
-            weighted_pairwise_cost: 0.0, total_cost: 0.0 }, pairwise_decisions: Vec::new(), crop_reuse_heatmap: Vec::new(),
-        validation: PlacementValidationSummary { complete_assignment: true, required_slots_present: true,
-            isotropic_scale_only: true, registered_mapping_only: true, slot_count: u32::try_from(plans.len()).unwrap_or(u32::MAX) },
-        qa_views: vec![PlacementPlanQaView::SelectedPlacements, PlacementPlanQaView::Validation] };
+    let placement = PlacementPlan {
+        stage_result: StageResult::Executed {
+            algorithm: AlgorithmProvenance {
+                algorithm_id: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_ID.into(),
+                version: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_VERSION.into(),
+            },
+            settings_hash: ContentDigest::sha256(b"stage-14-preview-a-selected-placement"),
+            diagnostics: Vec::new(),
+        },
+        solver: AlgorithmProvenance {
+            algorithm_id: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_ID.into(),
+            version: hot_trimmer_placement_solver::STAGE_13_ALGORITHM_VERSION.into(),
+        },
+        seed: 14,
+        placements: plans.clone(),
+        objective: PlacementObjectiveBreakdown {
+            unary_cost: 0.0,
+            pairwise_cost: 0.0,
+            pairwise_lambda: 1.0,
+            weighted_pairwise_cost: 0.0,
+            total_cost: 0.0,
+        },
+        pairwise_decisions: Vec::new(),
+        crop_reuse_heatmap: Vec::new(),
+        validation: PlacementValidationSummary {
+            complete_assignment: true,
+            required_slots_present: true,
+            isotropic_scale_only: true,
+            registered_mapping_only: true,
+            slot_count: u32::try_from(plans.len()).unwrap_or(u32::MAX),
+        },
+        qa_views: vec![
+            PlacementPlanQaView::SelectedPlacements,
+            PlacementPlanQaView::Validation,
+        ],
+    };
     let render_cancellation = RenderCancellationToken::new();
     let mut results = Vec::new();
     for (slot, plan) in topology.slots.iter().zip(&plans) {
         if preview_service.latest_draft_id.load(Ordering::Acquire) != job {
-            return Err(error(ErrorCode::OperationCancelled, "A newer Stage 14 preview superseded this request."));
+            return Err(error(
+                ErrorCode::OperationCancelled,
+                "A newer Stage 14 preview superseded this request.",
+            ));
         }
-        results.push(synthesize_slot_material(SlotSynthesisRequest { plan, domain: &domain,
-            output_dimensions: [slot.allocation.width, slot.allocation.height], limits: SlotSynthesisLimits::default() },
-            &render_cancellation).map_err(|failure| error(ErrorCode::InvalidInput, &format!("Required Stage 14 slot failed: {failure}")))?);
+        results.push(
+            synthesize_slot_material(
+                SlotSynthesisRequest {
+                    plan,
+                    domain: &domain,
+                    output_dimensions: [slot.allocation.width, slot.allocation.height],
+                    limits: SlotSynthesisLimits::default(),
+                },
+                &render_cancellation,
+            )
+            .map_err(|failure| {
+                error(
+                    ErrorCode::InvalidInput,
+                    &format!("Required Stage 14 slot failed: {failure}"),
+                )
+            })?,
+        );
     }
-    let patch_id = summary.patches.iter().find(|patch| summary.sources.iter().any(|source| source.input.id == patch.source_id
-        && source.source_set_id.to_string() == primary.to_string())).map(|patch| patch.id.to_string());
-    let slot_inputs = topology.slots.iter().zip(document.topology.regions.iter()).zip(plans.iter().zip(results.iter()))
-        .map(|((slot, region), (plan, result))| IntermediateSlotInput { region_id: region.id, slot_key: slot.slot_key.as_str(),
-            display_name: region.display_name.as_str(), required: true, patch_id: patch_id.as_deref(), domain: &domain, plan, result, grid_rect: region.grid_rect }).collect();
-    let algorithms = (1..=14).map(|stage| (stage, AlgorithmProvenance { algorithm_id: format!("installed-stage-{stage:02}"),
-        version: if stage == 14 { hot_trimmer_sheet_compiler::STAGE_14_ALGORITHM_VERSION.into() } else { "installed".into() } })).collect();
-    let atlas_request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement, slots: slot_inputs,
-        revision: requested_revision, algorithm_versions: algorithms, diagnostics: Vec::new(), regions: Vec::new() };
+    let patch_id = summary
+        .patches
+        .iter()
+        .find(|patch| {
+            summary.sources.iter().any(|source| {
+                source.input.id == patch.source_id
+                    && source.source_set_id.to_string() == primary.to_string()
+            })
+        })
+        .map(|patch| patch.id.to_string());
+    let slot_inputs = topology
+        .slots
+        .iter()
+        .zip(document.topology.regions.iter())
+        .zip(plans.iter().zip(results.iter()))
+        .map(|((slot, region), (plan, result))| IntermediateSlotInput {
+            region_id: region.id,
+            slot_key: slot.slot_key.as_str(),
+            display_name: region.display_name.as_str(),
+            required: true,
+            patch_id: patch_id.as_deref(),
+            domain: &domain,
+            plan,
+            result,
+            grid_rect: region.grid_rect,
+        })
+        .collect();
+    let algorithms = (1..=14)
+        .map(|stage| {
+            (
+                stage,
+                AlgorithmProvenance {
+                    algorithm_id: format!("installed-stage-{stage:02}"),
+                    version: if stage == 14 {
+                        hot_trimmer_sheet_compiler::STAGE_14_ALGORITHM_VERSION.into()
+                    } else {
+                        "installed".into()
+                    },
+                },
+            )
+        })
+        .collect();
+    let atlas_request = IntermediateAtlasRequest {
+        topology: &topology,
+        placement_plan: &placement,
+        slots: slot_inputs,
+        revision: requested_revision,
+        algorithm_versions: algorithms,
+        diagnostics: Vec::new(),
+        regions: Vec::new(),
+    };
     let cancellation = EngineCancellationToken::new();
-    let artifact = AlgorithmCompiler::new().compile_intermediate_atlas(&atlas_request, &cancellation, || {
-        session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document.map(|value| value.document_revision)).unwrap_or(0)
-    }).map_err(|failure| {
-        preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
-        error(ErrorCode::OperationCancelled, &failure.to_string())
-    })?;
+    let artifact = AlgorithmCompiler::new()
+        .compile_intermediate_atlas(&atlas_request, &cancellation, || {
+            session
+                .lock()
+                .ok()
+                .and_then(|guard| {
+                    guard
+                        .store
+                        .as_ref()?
+                        .summary()
+                        .ok()?
+                        .document
+                        .map(|value| value.document_revision)
+                })
+                .unwrap_or(0)
+        })
+        .map_err(|failure| {
+            preview_service
+                .cancellation_count
+                .fetch_add(1, Ordering::AcqRel);
+            error(ErrorCode::OperationCancelled, &failure.to_string())
+        })?;
     let mut maps = BTreeMap::new();
     for channel in &artifact.channels {
-        maps.insert(channel_key(channel.role).into(), png_data_url(topology.output_size.width,
-            topology.output_size.height, channel.rgba8.clone())?);
+        maps.insert(
+            channel_key(channel.role).into(),
+            png_data_url(
+                topology.output_size.width,
+                topology.output_size.height,
+                channel.rgba8.clone(),
+            )?,
+        );
     }
-    let slots = artifact.slots.iter().filter_map(|slot| resolved.regions.iter().find(|region| region.region_id == slot.region_id).map(|region| Stage14SlotProjection { region_id: region.region_id,
-        slot_key: slot.slot_key.clone(),
-        display_name: slot.display_name.clone(), allocation_bounds: slot.allocation, hotspot_bounds: slot.hotspot,
-        mapping_mode: format!("{:?}", slot.mapping_mode), source_transform: slot.source_transform,
-        isotropic_scale: slot.isotropic_scale, sampling_scale: slot.sampling_scale,
-        validity: format!("{} valid pixels", slot.valid_pixel_count),
-        correspondence: "authoritative Stage 14 correspondence".into(), source_id: slot.source_id.0.clone(), patch_id: slot.patch_id.clone(),
-        domain_id: slot.domain_id.0.clone(), candidate_id: slot.candidate_id.0.clone(), sampling_plan_id: slot.sampling_plan_id.0.clone(),
-        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.source_bounds, mapping_origin: region.mapping_origin, grid_rect: slot.grid_rect })).collect();
-    Ok(IntermediateAtlasProjection { label: artifact.label, non_exportable: true, incomplete_after_stage: 14,
-        revision: artifact.revision, document_revision: artifact.revision,
+    let slots = artifact
+        .slots
+        .iter()
+        .filter_map(|slot| {
+            resolved
+                .regions
+                .iter()
+                .find(|region| region.region_id == slot.region_id)
+                .map(|region| Stage14SlotProjection {
+                    region_id: region.region_id,
+                    slot_key: slot.slot_key.clone(),
+                    display_name: slot.display_name.clone(),
+                    allocation_bounds: slot.allocation,
+                    hotspot_bounds: slot.hotspot,
+                    mapping_mode: format!("{:?}", slot.mapping_mode),
+                    source_transform: slot.source_transform,
+                    isotropic_scale: slot.isotropic_scale,
+                    sampling_scale: slot.sampling_scale,
+                    validity: format!("{} valid pixels", slot.valid_pixel_count),
+                    correspondence: "authoritative Stage 14 correspondence".into(),
+                    source_id: slot.source_id.0.clone(),
+                    patch_id: slot.patch_id.clone(),
+                    domain_id: slot.domain_id.0.clone(),
+                    candidate_id: slot.candidate_id.0.clone(),
+                    sampling_plan_id: slot.sampling_plan_id.0.clone(),
+                    stage_14_result_id: slot.stage_14_result_id.0.clone(),
+                    source_crop: slot.source_crop,
+                    source_bounds: region.source_bounds,
+                    mapping_origin: region.mapping_origin,
+                    grid_rect: slot.grid_rect,
+                })
+        })
+        .collect();
+    Ok(IntermediateAtlasProjection {
+        label: artifact.label,
+        non_exportable: true,
+        incomplete_after_stage: 14,
+        revision: artifact.revision,
+        document_revision: artifact.revision,
         topology_hash: hash_hex(document.topology.topology_hash),
-        appearance_hash: hash_hex(document.appearance_hash().map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?),
-        renderer_version: "intermediate-stage-14", width: topology.output_size.width, height: topology.output_size.height,
-        topology: artifact.topology, placement_plan_id: artifact.placement_plan_id.0, maps,
+        appearance_hash: hash_hex(
+            document
+                .appearance_hash()
+                .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?,
+        ),
+        renderer_version: "intermediate-stage-14",
+        width: topology.output_size.width,
+        height: topology.output_size.height,
+        topology: artifact.topology,
+        placement_plan_id: artifact.placement_plan_id.0,
+        maps,
         regions: resolved.regions,
-        unavailable_channels: artifact.unavailable_channels.iter().map(|role| format!("{role:?}")).collect(),
-        slots, pending: artifact.pending, telemetry: artifact.telemetry, final_compile_available: false, export_available: false, blender_available: false,
-        source_frame: document.source_frame.clone() })
+        unavailable_channels: artifact
+            .unavailable_channels
+            .iter()
+            .map(|role| format!("{role:?}"))
+            .collect(),
+        slots,
+        pending: artifact.pending,
+        telemetry: artifact.telemetry,
+        final_compile_available: false,
+        export_available: false,
+        blender_available: false,
+        source_frame: document.source_frame.clone(),
+    })
 }
 
 fn srgb_to_linear(value: u8) -> f32 {
     let value = f32::from(value) / 255.0;
-    if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn build_stage_14_preview(
@@ -1300,21 +1995,39 @@ fn build_stage_14_preview(
 ) -> Result<IntermediateAtlasProjection, UserFacingError> {
     let mut summary = {
         let guard = session.lock().map_err(|_| poisoned())?;
-        guard.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
+        guard
+            .store
+            .as_ref()
+            .ok_or_else(no_project)?
+            .summary()
+            .map_err(store_error)?
     };
-    let accepted_document = summary.document.as_ref()
-        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?.clone();
+    let accepted_document = summary
+        .document
+        .as_ref()
+        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?
+        .clone();
     if accepted_document.document_revision != request.revision {
-        return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "A newer document revision superseded this preview.",
+        ));
     }
     if request.region_id.is_some() != request.transient_projection.is_some() {
-        return Err(error(ErrorCode::InvalidInput, "Transient crop requests require both regionId and transientProjection."));
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Transient crop requests require both regionId and transientProjection.",
+        ));
     }
     if let Some(recipe) = request.candidate_recipe.clone() {
         if request.region_id.is_some() {
-            return Err(error(ErrorCode::InvalidInput, "Candidate topology previews cannot be combined with a transient crop."));
+            return Err(error(
+                ErrorCode::InvalidInput,
+                "Candidate topology previews cannot be combined with a transient crop.",
+            ));
         }
-        let candidate = accepted_document.accept_source_frame_partition(recipe)
+        let candidate = accepted_document
+            .accept_source_frame_partition(recipe)
             .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
         // This is an in-memory candidate snapshot.  Match the accepted revision only so the
         // compiler's persisted-revision guard continues to protect cancellation/publication.
@@ -1324,105 +2037,249 @@ fn build_stage_14_preview(
         candidate.topology_revision = accepted_document.topology_revision;
         summary.document = Some(candidate);
     }
-    if let (Some(region_id), Some(projection)) = (request.region_id, request.transient_projection.clone()) {
-        let mut transient_document = summary.document.as_ref().expect("summary document was present").clone();
-        let binding = transient_document.region_bindings.get_mut(&region_id)
-            .ok_or_else(|| error(ErrorCode::InvalidInput, "Transient crop region is not in the persisted topology."))?;
+    if let (Some(region_id), Some(projection)) =
+        (request.region_id, request.transient_projection.clone())
+    {
+        let mut transient_document = summary
+            .document
+            .as_ref()
+            .expect("summary document was present")
+            .clone();
+        let binding = transient_document
+            .region_bindings
+            .get_mut(&region_id)
+            .ok_or_else(|| {
+                error(
+                    ErrorCode::InvalidInput,
+                    "Transient crop region is not in the persisted topology.",
+                )
+            })?;
         binding.mapping.projection = projection;
         binding.mapping.source_crop_intent = Some(hot_trimmer_domain::SourceCropIntent::Authored);
         summary.document = Some(transient_document);
     }
-    let document = summary.document.as_ref().expect("summary document was present");
+    let document = summary
+        .document
+        .as_ref()
+        .expect("summary document was present");
     let revision_current = AtomicBool::new(true);
     let monitoring_complete = AtomicBool::new(false);
     let cancellation = EngineCancellationToken::new();
     let artifact = std::thread::scope(|scope| {
         scope.spawn(|| {
             while !monitoring_complete.load(Ordering::Acquire) {
-                let live = session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
-                    .map(|document| document.document_revision == request.revision)).unwrap_or(false);
-                if !live { revision_current.store(false, Ordering::Release); return; }
+                let live = session
+                    .lock()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .store
+                            .as_ref()?
+                            .summary()
+                            .ok()?
+                            .document
+                            .map(|document| document.document_revision == request.revision)
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    revision_current.store(false, Ordering::Release);
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
         let result = AlgorithmCompiler::new().compile_persisted_stage_14_preview_with_cache(
-            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &summary, revision: request.revision, draft_id: request.draft_id, input_hash: request.input_hash.clone(), profile: request.profile.into() },
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                project: &summary,
+                revision: request.revision,
+                draft_id: request.draft_id,
+                input_hash: request.input_hash.clone(),
+                profile: request.profile.into(),
+            },
             &cancellation,
-            || preview_service.latest_draft_id.load(Ordering::Acquire) == job
-                && revision_current.load(Ordering::Acquire),
+            || {
+                preview_service.latest_draft_id.load(Ordering::Acquire) == job
+                    && revision_current.load(Ordering::Acquire)
+            },
             Some(&preview_service.source_frame_cache),
         );
         monitoring_complete.store(true, Ordering::Release);
         result
-    }).map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
-    let preview_is_current = || session.lock().ok().and_then(|guard| guard.store.as_ref()?.summary().ok()?.document
-        .map(|document| document.document_revision == request.revision)).unwrap_or(false)
-        && preview_service.latest_draft_id.load(Ordering::Acquire) == job;
+    })
+    .map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
+    let preview_is_current = || {
+        session
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .store
+                    .as_ref()?
+                    .summary()
+                    .ok()?
+                    .document
+                    .map(|document| document.document_revision == request.revision)
+            })
+            .unwrap_or(false)
+            && preview_service.latest_draft_id.load(Ordering::Acquire) == job
+    };
     if !preview_is_current() {
-        preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
-        return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview."));
+        preview_service
+            .cancellation_count
+            .fetch_add(1, Ordering::AcqRel);
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "A newer document revision superseded this preview.",
+        ));
     }
     if document.source_frame.is_some() && artifact.regions.is_empty() {
-        return Err(error(ErrorCode::LayoutInvalid, "The compiled SourceFrame artifact did not publish profile-local region metadata."));
+        return Err(error(
+            ErrorCode::LayoutInvalid,
+            "The compiled SourceFrame artifact did not publish profile-local region metadata.",
+        ));
     }
     let output_size = artifact.topology.output_size;
-    let expected_bytes = usize::try_from(u64::from(output_size.width) * u64::from(output_size.height) * 4)
-        .map_err(|_| error(ErrorCode::InvalidInput, "Compiled preview dimensions exceed the bounded publication limit."))?;
+    let expected_bytes = usize::try_from(
+        u64::from(output_size.width) * u64::from(output_size.height) * 4,
+    )
+    .map_err(|_| {
+        error(
+            ErrorCode::InvalidInput,
+            "Compiled preview dimensions exceed the bounded publication limit.",
+        )
+    })?;
     let encode_started = Instant::now();
     let mut maps = BTreeMap::new();
     for channel in &artifact.channels {
         if channel.rgba8.len() != expected_bytes {
-            return Err(error(ErrorCode::LayoutInvalid, "Compiled preview pixels do not match the published profile dimensions."));
+            return Err(error(
+                ErrorCode::LayoutInvalid,
+                "Compiled preview pixels do not match the published profile dimensions.",
+            ));
         }
         if !preview_is_current() {
             cancellation.cancel();
-            preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
-            return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview during publication."));
+            preview_service
+                .cancellation_count
+                .fetch_add(1, Ordering::AcqRel);
+            return Err(error(
+                ErrorCode::OperationCancelled,
+                "A newer document revision superseded this preview during publication.",
+            ));
         }
-        maps.insert(channel_key(channel.role).into(), png_data_url_cancellable(
-            output_size.width, output_size.height, channel.rgba8.clone(), &cancellation,
-            || preview_is_current(),
-        )?);
+        maps.insert(
+            channel_key(channel.role).into(),
+            png_data_url_cancellable(
+                output_size.width,
+                output_size.height,
+                channel.rgba8.clone(),
+                &cancellation,
+                || preview_is_current(),
+            )?,
+        );
     }
     let encode_ms = encode_started.elapsed().as_millis();
     if !preview_is_current() {
         cancellation.cancel();
-        preview_service.cancellation_count.fetch_add(1, Ordering::AcqRel);
-        return Err(error(ErrorCode::OperationCancelled, "A newer document revision superseded this preview after publication."));
+        preview_service
+            .cancellation_count
+            .fetch_add(1, Ordering::AcqRel);
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "A newer document revision superseded this preview after publication.",
+        ));
     }
     let ipc_payload_chars: usize = maps.values().map(String::len).sum();
     let mut artifact = artifact;
-    let base_color_bounds = artifact.channels.iter().find(|channel| channel.role == MaterialChannelRole::BaseColor)
-        .map(|channel| rgba_nontransparent_bounds(&channel.rgba8, output_size.width, output_size.height))
-        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Compiled SourceFrame artifact did not publish Base Color pixels."))?;
+    let base_color_bounds = artifact
+        .channels
+        .iter()
+        .find(|channel| channel.role == MaterialChannelRole::BaseColor)
+        .map(|channel| {
+            rgba_nontransparent_bounds(&channel.rgba8, output_size.width, output_size.height)
+        })
+        .ok_or_else(|| {
+            error(
+                ErrorCode::LayoutInvalid,
+                "Compiled SourceFrame artifact did not publish Base Color pixels.",
+            )
+        })?;
     artifact.telemetry.push(format!("publish_encode_ms={encode_ms}; ipc_payload_chars={ipc_payload_chars}; png_encoded_dimensions={}x{}; rgba_nontransparent_bounds={}; cancellation_count={}",
         output_size.width, output_size.height, base_color_bounds,
         preview_service.cancellation_count.load(Ordering::Acquire)));
-    let slots = artifact.slots.iter().map(|slot| {
-        let region = artifact.regions.iter().find(|region| region.region_id == slot.region_id);
-        Ok(Stage14SlotProjection {
-        region_id: slot.region_id, slot_key: slot.slot_key.clone(), display_name: region.map_or_else(|| slot.display_name.clone(), |region| region.display_name.clone()),
-        allocation_bounds: slot.allocation, hotspot_bounds: slot.hotspot, mapping_mode: format!("{:?}", slot.mapping_mode),
-        source_transform: slot.source_transform, isotropic_scale: slot.isotropic_scale, sampling_scale: slot.sampling_scale,
-        validity: format!("{} valid pixels", slot.valid_pixel_count), correspondence: "authoritative Stage 14 correspondence".into(),
-        source_id: slot.source_id.0.clone(), patch_id: slot.patch_id.clone(), domain_id: slot.domain_id.0.clone(),
-        candidate_id: slot.candidate_id.0.clone(), sampling_plan_id: slot.sampling_plan_id.0.clone(),
-        stage_14_result_id: slot.stage_14_result_id.0.clone(), source_crop: slot.source_crop, source_bounds: region.and_then(|region| region.source_bounds), mapping_origin: region.and_then(|region| region.mapping_origin), grid_rect: slot.grid_rect,
-    })
-    }).collect::<Result<Vec<_>, UserFacingError>>()?;
+    let slots = artifact
+        .slots
+        .iter()
+        .map(|slot| {
+            let region = artifact
+                .regions
+                .iter()
+                .find(|region| region.region_id == slot.region_id);
+            Ok(Stage14SlotProjection {
+                region_id: slot.region_id,
+                slot_key: slot.slot_key.clone(),
+                display_name: region.map_or_else(
+                    || slot.display_name.clone(),
+                    |region| region.display_name.clone(),
+                ),
+                allocation_bounds: slot.allocation,
+                hotspot_bounds: slot.hotspot,
+                mapping_mode: format!("{:?}", slot.mapping_mode),
+                source_transform: slot.source_transform,
+                isotropic_scale: slot.isotropic_scale,
+                sampling_scale: slot.sampling_scale,
+                validity: format!("{} valid pixels", slot.valid_pixel_count),
+                correspondence: "authoritative Stage 14 correspondence".into(),
+                source_id: slot.source_id.0.clone(),
+                patch_id: slot.patch_id.clone(),
+                domain_id: slot.domain_id.0.clone(),
+                candidate_id: slot.candidate_id.0.clone(),
+                sampling_plan_id: slot.sampling_plan_id.0.clone(),
+                stage_14_result_id: slot.stage_14_result_id.0.clone(),
+                source_crop: slot.source_crop,
+                source_bounds: region.and_then(|region| region.source_bounds),
+                mapping_origin: region.and_then(|region| region.mapping_origin),
+                grid_rect: slot.grid_rect,
+            })
+        })
+        .collect::<Result<Vec<_>, UserFacingError>>()?;
     if let Some(recipe) = request.candidate_recipe.as_ref() {
-        preview_service.previewed_candidate_recipes.lock().map_err(|_| poisoned())?
+        preview_service
+            .previewed_candidate_recipes
+            .lock()
+            .map_err(|_| poisoned())?
             .insert((request.revision, recipe.hash()));
     }
     Ok(IntermediateAtlasProjection {
-        label: artifact.label, non_exportable: true, incomplete_after_stage: 14, revision: artifact.revision,
-        document_revision: artifact.revision, topology_hash: hash_hex(document.topology.topology_hash),
-        appearance_hash: hash_hex(document.appearance_hash().map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?),
-        renderer_version: "intermediate-stage-14", width: artifact.topology.output_size.width,
-         height: output_size.height, topology: artifact.topology,
-         placement_plan_id: artifact.placement_plan_id.0, maps, regions: artifact.regions,
-        unavailable_channels: artifact.unavailable_channels.iter().map(|role| format!("{role:?}")).collect(),
-        slots, pending: artifact.pending, telemetry: artifact.telemetry, final_compile_available: false, export_available: false, blender_available: false,
+        label: artifact.label,
+        non_exportable: true,
+        incomplete_after_stage: 14,
+        revision: artifact.revision,
+        document_revision: artifact.revision,
+        topology_hash: hash_hex(document.topology.topology_hash),
+        appearance_hash: hash_hex(
+            document
+                .appearance_hash()
+                .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?,
+        ),
+        renderer_version: "intermediate-stage-14",
+        width: artifact.topology.output_size.width,
+        height: output_size.height,
+        topology: artifact.topology,
+        placement_plan_id: artifact.placement_plan_id.0,
+        maps,
+        regions: artifact.regions,
+        unavailable_channels: artifact
+            .unavailable_channels
+            .iter()
+            .map(|role| format!("{role:?}"))
+            .collect(),
+        slots,
+        pending: artifact.pending,
+        telemetry: artifact.telemetry,
+        final_compile_available: false,
+        export_available: false,
+        blender_available: false,
         source_frame: document.source_frame.clone(),
     })
 }
@@ -1430,11 +2287,16 @@ fn build_stage_14_preview(
 const fn channel_key(role: hot_trimmer_domain::MaterialChannelRole) -> &'static str {
     use hot_trimmer_domain::MaterialChannelRole;
     match role {
-        MaterialChannelRole::BaseColor => "baseColor", MaterialChannelRole::Normal => "normal",
-        MaterialChannelRole::Height => "height", MaterialChannelRole::Roughness => "roughness",
-        MaterialChannelRole::Metallic => "metallic", MaterialChannelRole::AmbientOcclusion => "ambientOcclusion",
-        MaterialChannelRole::Specular => "specular", MaterialChannelRole::Opacity => "opacity",
-        MaterialChannelRole::EdgeMask => "edgeMask", MaterialChannelRole::MaterialId => "materialId",
+        MaterialChannelRole::BaseColor => "baseColor",
+        MaterialChannelRole::Normal => "normal",
+        MaterialChannelRole::Height => "height",
+        MaterialChannelRole::Roughness => "roughness",
+        MaterialChannelRole::Metallic => "metallic",
+        MaterialChannelRole::AmbientOcclusion => "ambientOcclusion",
+        MaterialChannelRole::Specular => "specular",
+        MaterialChannelRole::Opacity => "opacity",
+        MaterialChannelRole::EdgeMask => "edgeMask",
+        MaterialChannelRole::MaterialId => "materialId",
     }
 }
 
@@ -1444,22 +2306,40 @@ fn compile_trim_sheet_document_impl(
 ) -> Result<CompiledSheetProjection, UserFacingError> {
     let summary = {
         let session = session.lock().map_err(|_| poisoned())?;
-        session.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
+        session
+            .store
+            .as_ref()
+            .ok_or_else(no_project)?
+            .summary()
+            .map_err(store_error)?
     };
-    let document = summary.document.as_ref()
+    let document = summary
+        .document
+        .as_ref()
         .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
     let request = CompilerRequestHeader {
         contract_version: ALGORITHM_STACK_CONTRACT_VERSION,
-        source_digests: summary.sources.iter()
+        source_digests: summary
+            .sources
+            .iter()
             .map(|source| ContentDigest(source.input.sha256.clone()))
             .collect(),
-        settings_hash: ContentDigest(hash_hex(document.appearance_hash().map_err(|invalid| {
-            error(ErrorCode::LayoutInvalid, &invalid.to_string())
-        })?)),
-        algorithm_versions: (1_u8..=20).map(|stage| (stage, AlgorithmProvenance {
-            algorithm_id: format!("stage-{stage:02}"),
-            version: String::from("0.0.0-unsupported"),
-        })).collect::<BTreeMap<_, _>>(),
+        settings_hash: ContentDigest(hash_hex(
+            document
+                .appearance_hash()
+                .map_err(|invalid| error(ErrorCode::LayoutInvalid, &invalid.to_string()))?,
+        )),
+        algorithm_versions: (1_u8..=20)
+            .map(|stage| {
+                (
+                    stage,
+                    AlgorithmProvenance {
+                        algorithm_id: format!("stage-{stage:02}"),
+                        version: String::from("0.0.0-unsupported"),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
         template_topology_hash: ContentDigest(hash_hex(document.topology.topology_hash)),
         output: OutputSpecHeader {
             width: document.render_settings.output_size.width,
@@ -1503,17 +2383,31 @@ fn preview_trim_sheet_document_impl(
 ) -> Result<PreviewSheetProjection, UserFacingError> {
     let summary = {
         let session = session.lock().map_err(|_| poisoned())?;
-        session.store.as_ref().ok_or_else(no_project)?.summary().map_err(store_error)?
+        session
+            .store
+            .as_ref()
+            .ok_or_else(no_project)?
+            .summary()
+            .map_err(store_error)?
     };
-    let mut document = summary.document
+    let mut document = summary
+        .document
         .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?;
     let max_edge = request.max_edge.unwrap_or(1024).clamp(512, 1024);
     // Topology identifies the compositing surface. Appearance edits deliberately reuse the
     // previous pixels and repaint only their dirty region.
-    let settled_key = (hash_hex(document.topology.topology_hash), request.map_view, max_edge);
+    let settled_key = (
+        hash_hex(document.topology.topology_hash),
+        request.map_view,
+        max_edge,
+    );
     let base_pixels = if request.region_id.is_some() {
-        preview_service.settled_previews.lock().map_err(|_| poisoned())?
-            .get(&settled_key).map(|preview| preview.pixels.clone())
+        preview_service
+            .settled_previews
+            .lock()
+            .map_err(|_| poisoned())?
+            .get(&settled_key)
+            .map(|preview| preview.pixels.clone())
     } else {
         None
     };
@@ -1522,11 +2416,20 @@ fn preview_trim_sheet_document_impl(
     // of promoting a one-region image with a black background into the settled cache.
     let effective_dirty_region = request.region_id.filter(|_| base_pixels.is_some());
     if let (Some(region_id), Some(projection)) = (request.region_id, request.projection) {
-        let binding = document.region_bindings.get_mut(&region_id)
-            .ok_or_else(|| error(ErrorCode::InvalidInput, "The preview region no longer exists."))?;
+        let binding = document
+            .region_bindings
+            .get_mut(&region_id)
+            .ok_or_else(|| {
+                error(
+                    ErrorCode::InvalidInput,
+                    "The preview region no longer exists.",
+                )
+            })?;
         binding.mapping.projection = projection;
     }
-    let maps = summary.sources.iter()
+    let maps = summary
+        .sources
+        .iter()
         .map(|source| registered_map_cached(source, &preview_service))
         .collect::<Result<Vec<_>, _>>()?;
     let compiled = compile_preview_map_incremental(
@@ -1537,17 +2440,28 @@ fn preview_trim_sheet_document_impl(
         base_pixels,
         effective_dirty_region,
         || preview_service.latest_draft_id.load(Ordering::Acquire) != request.draft_id,
-    ).map_err(|compile| match compile {
-        hot_trimmer_sheet_compiler::SheetCompileError::Cancelled => {
-            error(ErrorCode::OperationCancelled, "A newer preview superseded this draft.")
-        }
-        _ => error(ErrorCode::LayoutInvalid, &format!("Preview failed: {compile}")),
+    )
+    .map_err(|compile| match compile {
+        hot_trimmer_sheet_compiler::SheetCompileError::Cancelled => error(
+            ErrorCode::OperationCancelled,
+            "A newer preview superseded this draft.",
+        ),
+        _ => error(
+            ErrorCode::LayoutInvalid,
+            &format!("Preview failed: {compile}"),
+        ),
     })?;
     if preview_service.latest_draft_id.load(Ordering::Acquire) != request.draft_id {
-        return Err(error(ErrorCode::OperationCancelled, "A newer preview superseded this draft."));
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "A newer preview superseded this draft.",
+        ));
     }
     {
-        let mut cache = preview_service.settled_previews.lock().map_err(|_| poisoned())?;
+        let mut cache = preview_service
+            .settled_previews
+            .lock()
+            .map_err(|_| poisoned())?;
         if cache.len() >= 16 {
             cache.clear();
         }
@@ -1561,7 +2475,11 @@ fn preview_trim_sheet_document_impl(
         width: compiled.dimensions.width,
         height: compiled.dimensions.height,
         map_view: request.map_view,
-        data_url: png_data_url(compiled.dimensions.width, compiled.dimensions.height, compiled.pixels)?,
+        data_url: png_data_url(
+            compiled.dimensions.width,
+            compiled.dimensions.height,
+            compiled.pixels,
+        )?,
         regions: compiled.regions,
     })
 }
@@ -1652,34 +2570,47 @@ pub fn take_pending_project_path(
 fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, UserFacingError> {
     let store = session.store.as_ref().ok_or_else(no_project)?;
     let summary = store.summary().map_err(store_error)?;
-    let material_sources = summary.source_sets.iter().map(|material| {
-        let channels = summary.sources.iter()
-            .filter(|source| source.source_set_id.to_string() == material.id.to_string())
-            .map(|source| session.source_projection_cached(source))
-            .collect::<Result<Vec<_>, _>>()?;
-        let registered_channels = if channels.is_empty() {
-            None
-        } else {
-            let anchor = channels.iter().find(|source| source.channel == SourceChannel::BaseColor)
-                .ok_or_else(|| error(ErrorCode::ProjectInvalid, "A registered channel set has no Base Color anchor."))?;
-            Some(RegisteredChannelSetProjection {
-                oriented_size: anchor.oriented_size,
-                orientation: anchor.orientation,
-                channels,
+    let material_sources = summary
+        .source_sets
+        .iter()
+        .map(|material| {
+            let channels = summary
+                .sources
+                .iter()
+                .filter(|source| source.source_set_id.to_string() == material.id.to_string())
+                .map(|source| session.source_projection_cached(source))
+                .collect::<Result<Vec<_>, _>>()?;
+            let registered_channels = if channels.is_empty() {
+                None
+            } else {
+                let anchor = channels
+                    .iter()
+                    .find(|source| source.channel == SourceChannel::BaseColor)
+                    .ok_or_else(|| {
+                        error(
+                            ErrorCode::ProjectInvalid,
+                            "A registered channel set has no Base Color anchor.",
+                        )
+                    })?;
+                Some(RegisteredChannelSetProjection {
+                    oriented_size: anchor.oriented_size,
+                    orientation: anchor.orientation,
+                    channels,
+                })
+            };
+            Ok(MaterialSourceProjection {
+                id: material.id.to_string(),
+                name: material.name.clone(),
+                exemplar_group: material.exemplar_group.clone(),
+                source_revision: material.source_revision,
+                registration_digest: material.registration_digest.0.clone(),
+                delighting: material.delighting.clone(),
+                classification: material.classification,
+                calibration: material.calibration,
+                registered_channels,
             })
-        };
-        Ok(MaterialSourceProjection {
-            id: material.id.to_string(),
-            name: material.name.clone(),
-            exemplar_group: material.exemplar_group.clone(),
-            source_revision: material.source_revision,
-            registration_digest: material.registration_digest.0.clone(),
-            delighting: material.delighting.clone(),
-            classification: material.classification,
-            calibration: material.calibration,
-            registered_channels,
         })
-    }).collect::<Result<Vec<_>, UserFacingError>>()?;
+        .collect::<Result<Vec<_>, UserFacingError>>()?;
     Ok(ProjectProjection {
         id: summary.id.to_string(),
         name: summary.name,
@@ -1714,9 +2645,16 @@ fn source_projection(source: &StoredSource) -> Result<SourceProjection, UserFaci
         },
         storage: SourceStorageProjection {
             ownership: source.input.ownership,
-            external_path: source.input.external_path.as_ref().map(|path| path.display().to_string()),
+            external_path: source
+                .input
+                .external_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
         },
-        oriented_size: OrientedSizeProjection { width: inspected.info.width, height: inspected.info.height },
+        oriented_size: OrientedSizeProjection {
+            width: inspected.info.width,
+            height: inspected.info.height,
+        },
         orientation: source.input.exif_orientation,
         interpretation: source.registration.interpretation,
         normal_convention: source.registration.normal_convention,
@@ -1767,27 +2705,55 @@ fn preview_registered_channel_set(
     sources: &[StoredSource],
     source_set_id: Uuid,
 ) -> Result<(RegisteredChannelSet, BTreeMap<SourceId, Vec<u8>>), UserFacingError> {
-    let mut selected: Vec<_> = sources.iter()
+    let mut selected: Vec<_> = sources
+        .iter()
         .filter(|source| source.source_set_id == source_set_id)
         .collect();
     selected.sort_by_key(|source| source.registration.role);
-    if !selected.iter().any(|source| source.registration.role == MaterialChannelRole::BaseColor) {
-        return Err(error(ErrorCode::ProjectInvalid, "A prepared patch requires Base Color."));
+    if !selected
+        .iter()
+        .any(|source| source.registration.role == MaterialChannelRole::BaseColor)
+    {
+        return Err(error(
+            ErrorCode::ProjectInvalid,
+            "A prepared patch requires Base Color.",
+        ));
     }
     let mut encoded_sources = BTreeMap::new();
     let mut channels = Vec::with_capacity(selected.len());
     let mut oriented_size = None;
     for source in selected {
         let projection = session.source_projection_cached(source)?;
-        let (_, payload) = projection.thumbnail_data_url.split_once(',')
-            .ok_or_else(|| error(ErrorCode::Internal, "The cached source preview is malformed."))?;
-        let bytes = STANDARD.decode(payload)
-            .map_err(|failure| error(ErrorCode::Internal, &format!("The cached source preview is invalid: {failure}")))?;
-        let image = image::load_from_memory(&bytes)
-            .map_err(|failure| error(ErrorCode::ImageImportFailed, &format!("The cached source preview could not be decoded: {failure}")))?;
-        let dimensions = OrientedPixelSize { width: image.width(), height: image.height() };
+        let (_, payload) = projection
+            .thumbnail_data_url
+            .split_once(',')
+            .ok_or_else(|| {
+                error(
+                    ErrorCode::Internal,
+                    "The cached source preview is malformed.",
+                )
+            })?;
+        let bytes = STANDARD.decode(payload).map_err(|failure| {
+            error(
+                ErrorCode::Internal,
+                &format!("The cached source preview is invalid: {failure}"),
+            )
+        })?;
+        let image = image::load_from_memory(&bytes).map_err(|failure| {
+            error(
+                ErrorCode::ImageImportFailed,
+                &format!("The cached source preview could not be decoded: {failure}"),
+            )
+        })?;
+        let dimensions = OrientedPixelSize {
+            width: image.width(),
+            height: image.height(),
+        };
         if oriented_size.is_some_and(|expected| expected != dimensions) {
-            return Err(error(ErrorCode::SourceRegistrationFailed, "Registered preview channels no longer share dimensions."));
+            return Err(error(
+                ErrorCode::SourceRegistrationFailed,
+                "Registered preview channels no longer share dimensions.",
+            ));
         }
         oriented_size = Some(dimensions);
         channels.push(RegisteredChannel {
@@ -1805,7 +2771,12 @@ fn preview_registered_channel_set(
         encoded_sources.insert(source.input.id, bytes);
     }
     let registered = RegisteredChannelSet {
-        oriented_size: oriented_size.ok_or_else(|| error(ErrorCode::ProjectInvalid, "A prepared patch requires registered channels."))?,
+        oriented_size: oriented_size.ok_or_else(|| {
+            error(
+                ErrorCode::ProjectInvalid,
+                "A prepared patch requires registered channels.",
+            )
+        })?,
         orientation: 1,
         channels,
     };
@@ -1841,7 +2812,10 @@ fn prepared_preview_projection(
         }
     }
     Ok(PreparedPatchPreviewProjection {
-        patch_id: exemplar.scope.patch_id.ok_or_else(|| error(ErrorCode::Internal, "Prepared patch scope is missing."))?,
+        patch_id: exemplar
+            .scope
+            .patch_id
+            .ok_or_else(|| error(ErrorCode::Internal, "Prepared patch scope is missing."))?,
         material_source_id,
         width: exemplar.width,
         height: exemplar.height,
@@ -1891,7 +2865,10 @@ fn png_data_url_cancellable(
     active: impl Fn() -> bool,
 ) -> Result<String, UserFacingError> {
     if cancellation.is_cancelled() || !active() {
-        return Err(error(ErrorCode::OperationCancelled, "Preview publication was superseded."));
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "Preview publication was superseded.",
+        ));
     }
     let image = RgbaImage::from_raw(width, height, pixels)
         .ok_or_else(|| error(ErrorCode::Internal, "Compiled pixels are invalid."))?;
@@ -1900,9 +2877,15 @@ fn png_data_url_cancellable(
         .write_to(&mut encoded, ImageFormat::Png)
         .map_err(|e| error(ErrorCode::Internal, &e.to_string()))?;
     if cancellation.is_cancelled() || !active() {
-        return Err(error(ErrorCode::OperationCancelled, "Preview publication was superseded."));
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "Preview publication was superseded.",
+        ));
     }
-    Ok(format!("data:image/png;base64,{}", STANDARD.encode(encoded.into_inner())))
+    Ok(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(encoded.into_inner())
+    ))
 }
 
 fn rgba_nontransparent_bounds(pixels: &[u8], width: u32, height: u32) -> String {
@@ -1910,14 +2893,21 @@ fn rgba_nontransparent_bounds(pixels: &[u8], width: u32, height: u32) -> String 
     for y in 0..height {
         for x in 0..width {
             let index = ((y * width + x) * 4 + 3) as usize;
-            if pixels.get(index).copied().unwrap_or(0) == 0 { continue; }
+            if pixels.get(index).copied().unwrap_or(0) == 0 {
+                continue;
+            }
             bounds = Some(match bounds {
-                Some((left, top, right, bottom)) => (left.min(x), top.min(y), right.max(x + 1), bottom.max(y + 1)),
+                Some((left, top, right, bottom)) => {
+                    (left.min(x), top.min(y), right.max(x + 1), bottom.max(y + 1))
+                }
                 None => (x, y, x + 1, y + 1),
             });
         }
     }
-    bounds.map_or_else(|| "none".into(), |(x, y, right, bottom)| format!("{x},{y} {}x{}", right - x, bottom - y))
+    bounds.map_or_else(
+        || "none".into(),
+        |(x, y, right, bottom)| format!("{x},{y} {}x{}", right - x, bottom - y),
+    )
 }
 
 fn source_input(path: &Path, ownership: SourceOwnership, image: &InspectedImage) -> SourceInput {
@@ -1958,9 +2948,9 @@ mod algorithm_stage_14_preview_a_tests {
 
     use hot_trimmer_domain::{
         AlgorithmProvenance, CancellationToken, CanonicalRect, CompiledTemplateSlot,
-        CompiledTemplateTopology, ContentDigest, MaterialChannelRole, NormalConvention,
-        PixelSize, QuarterTurn, RegionId, SamplingMode, SamplingPolicy, SourceSamplingMode,
-        StageResult, TemplateIdentity, TemplateSlotRole,
+        CompiledTemplateTopology, ContentDigest, MaterialChannelRole, NormalConvention, PixelSize,
+        QuarterTurn, RegionId, SamplingMode, SamplingPolicy, SourceSamplingMode, StageResult,
+        TemplateIdentity, TemplateSlotRole,
     };
     use hot_trimmer_image_io::{ImagePlane, LinearColor, NormalAlphaPolicy, ResolvedAlphaMode};
     use hot_trimmer_material_synthesis::PreparedMaterialDomain;
@@ -1977,7 +2967,13 @@ mod algorithm_stage_14_preview_a_tests {
     };
 
     fn domain(marker: f32, name: &[u8]) -> PreparedMaterialDomain {
-        let colors = vec![LinearColor { rgb: [marker, marker * 0.5, 0.25], alpha: 1.0 }; 16];
+        let colors = vec![
+            LinearColor {
+                rgb: [marker, marker * 0.5, 0.25],
+                alpha: 1.0
+            };
+            16
+        ];
         let channel = PreparedExemplarChannel::BaseColor {
             plane: ImagePlane::from_row_major(4, 4, 4, &colors).unwrap(),
             alpha_mode: ResolvedAlphaMode::Opaque,
@@ -1986,49 +2982,110 @@ mod algorithm_stage_14_preview_a_tests {
             ContentDigest::sha256([name, b"-domain"].concat().as_slice()),
             ContentDigest::sha256([name, b"-source"].concat().as_slice()),
             vec![channel],
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     fn plan(id: u8, domain: &PreparedMaterialDomain) -> SamplingPlan {
         let slot_id = RegionId::from_bytes([id; 16]);
         SamplingPlan {
-            slot_id, role: TemplateSlotRole::Planar, variation_group: format!("slot-{id}"),
+            slot_id,
+            role: TemplateSlotRole::Planar,
+            variation_group: format!("slot-{id}"),
             prepared_domain_dimensions: [4, 4],
             candidate: CropCandidate {
                 candidate_id: ContentDigest::sha256(&[id, 1]),
-                source_id: domain.prepared_source_digest.clone(), domain_id: domain.cache_key.clone(),
-                slot_id, crop: Some(SourceCrop { x: 0, y: 0, width: 4, height: 4 }),
-                transform: CandidateTransform { rotation: QuarterTurn::Zero, mirror: MirrorTransform::None },
-                isotropic_scale: 1.0, mapping_mode: SamplingMode::DirectCrop,
-                family: CandidateFamily::PanelDirect, route: CandidateRoute::Direct,
-                position_strategy: PositionStrategy::FeatureAware, period_pixels: None,
-                seam_indices: Vec::new(), correspondence_reference: domain.cache_key.clone(),
-                descriptors: CandidateDescriptors { saliency_milli: 0, stationarity_milli: 1000,
-                    feature_strength_milli: 0, usability_milli: 1000 }, seed: 14,
-                eligibility: EligibilityEvidence { mapping_permitted: true, transform_permitted: true,
-                    isotropic_scale: true, exact_aspect: true, entire_crop_usable: Some(true),
-                    cross_axis_preserved: None, lattice_aligned: None, direct_crop_applicable: true,
-                    direct_crop_rejection: None, reasons: Vec::new() },
+                source_id: domain.prepared_source_digest.clone(),
+                domain_id: domain.cache_key.clone(),
+                slot_id,
+                crop: Some(SourceCrop {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                }),
+                transform: CandidateTransform {
+                    rotation: QuarterTurn::Zero,
+                    mirror: MirrorTransform::None,
+                },
+                isotropic_scale: 1.0,
+                mapping_mode: SamplingMode::DirectCrop,
+                family: CandidateFamily::PanelDirect,
+                route: CandidateRoute::Direct,
+                position_strategy: PositionStrategy::FeatureAware,
+                period_pixels: None,
+                seam_indices: Vec::new(),
+                correspondence_reference: domain.cache_key.clone(),
+                descriptors: CandidateDescriptors {
+                    saliency_milli: 0,
+                    stationarity_milli: 1000,
+                    feature_strength_milli: 0,
+                    usability_milli: 1000,
+                },
+                seed: 14,
+                eligibility: EligibilityEvidence {
+                    mapping_permitted: true,
+                    transform_permitted: true,
+                    isotropic_scale: true,
+                    exact_aspect: true,
+                    entire_crop_usable: Some(true),
+                    cross_axis_preserved: None,
+                    lattice_aligned: None,
+                    direct_crop_applicable: true,
+                    direct_crop_rejection: None,
+                    reasons: Vec::new(),
+                },
             },
-            slot_physical_size: [1.0, 1.0], source_pixels_per_physical_unit: 4.0,
-            sampling_policy: SamplingPolicy { filter: SourceSamplingMode::Nearest, scale: 1.0,
-                correct_tangent_normals: true }, stretch_override: StretchOverrideProvenance::NotAuthorized,
-            slice_geometry: SliceGeometry::None, maximum_seam_cost_milli: 450, unary_cost: 0.0,
+            slot_physical_size: [1.0, 1.0],
+            source_pixels_per_physical_unit: 4.0,
+            sampling_policy: SamplingPolicy {
+                filter: SourceSamplingMode::Nearest,
+                scale: 1.0,
+                correct_tangent_normals: true,
+            },
+            stretch_override: StretchOverrideProvenance::NotAuthorized,
+            slice_geometry: SliceGeometry::None,
+            maximum_seam_cost_milli: 450,
+            unary_cost: 0.0,
         }
     }
 
     fn placement(plans: Vec<SamplingPlan>) -> PlacementPlan {
         PlacementPlan {
-            stage_result: StageResult::Executed { algorithm: AlgorithmProvenance {
-                algorithm_id: "hot-trimmer.stage-13.global-placement".into(), version: "1.0.0".into(),
-            }, settings_hash: ContentDigest::sha256(b"preview-placement"), diagnostics: Vec::new() },
-            solver: AlgorithmProvenance { algorithm_id: "hot-trimmer.stage-13.global-placement".into(), version: "1.0.0".into() },
-            seed: 14, placements: plans, objective: PlacementObjectiveBreakdown { unary_cost: 0.0,
-                pairwise_cost: 0.0, pairwise_lambda: 1.0, weighted_pairwise_cost: 0.0, total_cost: 0.0 },
-            pairwise_decisions: Vec::new(), crop_reuse_heatmap: Vec::new(),
-            validation: PlacementValidationSummary { complete_assignment: true, required_slots_present: true,
-                isotropic_scale_only: true, registered_mapping_only: true, slot_count: 2 },
-            qa_views: vec![PlacementPlanQaView::SelectedPlacements, PlacementPlanQaView::Validation],
+            stage_result: StageResult::Executed {
+                algorithm: AlgorithmProvenance {
+                    algorithm_id: "hot-trimmer.stage-13.global-placement".into(),
+                    version: "1.0.0".into(),
+                },
+                settings_hash: ContentDigest::sha256(b"preview-placement"),
+                diagnostics: Vec::new(),
+            },
+            solver: AlgorithmProvenance {
+                algorithm_id: "hot-trimmer.stage-13.global-placement".into(),
+                version: "1.0.0".into(),
+            },
+            seed: 14,
+            placements: plans,
+            objective: PlacementObjectiveBreakdown {
+                unary_cost: 0.0,
+                pairwise_cost: 0.0,
+                pairwise_lambda: 1.0,
+                weighted_pairwise_cost: 0.0,
+                total_cost: 0.0,
+            },
+            pairwise_decisions: Vec::new(),
+            crop_reuse_heatmap: Vec::new(),
+            validation: PlacementValidationSummary {
+                complete_assignment: true,
+                required_slots_present: true,
+                isotropic_scale_only: true,
+                registered_mapping_only: true,
+                slot_count: 2,
+            },
+            qa_views: vec![
+                PlacementPlanQaView::SelectedPlacements,
+                PlacementPlanQaView::Validation,
+            ],
         }
     }
 
@@ -2038,60 +3095,167 @@ mod algorithm_stage_14_preview_a_tests {
         let second_domain = domain(0.8, b"persisted-authored-patch-b");
         let first_plan = plan(1, &first_domain);
         let second_plan = plan(2, &second_domain);
-        let first = synthesize_slot_material(SlotSynthesisRequest { plan: &first_plan,
-            domain: &first_domain, output_dimensions: [4, 4], limits: SlotSynthesisLimits::default() },
-            &RenderCancellationToken::new()).unwrap();
-        let second = synthesize_slot_material(SlotSynthesisRequest { plan: &second_plan,
-            domain: &second_domain, output_dimensions: [4, 4], limits: SlotSynthesisLimits::default() },
-            &RenderCancellationToken::new()).unwrap();
+        let first = synthesize_slot_material(
+            SlotSynthesisRequest {
+                plan: &first_plan,
+                domain: &first_domain,
+                output_dimensions: [4, 4],
+                limits: SlotSynthesisLimits::default(),
+            },
+            &RenderCancellationToken::new(),
+        )
+        .unwrap();
+        let second = synthesize_slot_material(
+            SlotSynthesisRequest {
+                plan: &second_plan,
+                domain: &second_domain,
+                output_dimensions: [4, 4],
+                limits: SlotSynthesisLimits::default(),
+            },
+            &RenderCancellationToken::new(),
+        )
+        .unwrap();
         let topology = CompiledTemplateTopology {
-            identity: TemplateIdentity { template_id: "representative-persisted".into(),
-                template_version: "1.0.0".into(), compatibility_key: "stage-14-preview-a".into() },
-            output_size: PixelSize { width: 8, height: 4 },
+            identity: TemplateIdentity {
+                template_id: "representative-persisted".into(),
+                template_version: "1.0.0".into(),
+                compatibility_key: "stage-14-preview-a".into(),
+            },
+            output_size: PixelSize {
+                width: 8,
+                height: 4,
+            },
             slots: vec![
-                CompiledTemplateSlot { slot_key: "authored-patch-a".into(),
-                    allocation: CanonicalRect { x: 0, y: 0, width: 4, height: 4 },
-                    hotspot: CanonicalRect { x: 1, y: 1, width: 2, height: 2 } },
-                CompiledTemplateSlot { slot_key: "authored-patch-b".into(),
-                    allocation: CanonicalRect { x: 4, y: 0, width: 4, height: 4 },
-                    hotspot: CanonicalRect { x: 5, y: 1, width: 2, height: 2 } },
+                CompiledTemplateSlot {
+                    slot_key: "authored-patch-a".into(),
+                    allocation: CanonicalRect {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                    },
+                    hotspot: CanonicalRect {
+                        x: 1,
+                        y: 1,
+                        width: 2,
+                        height: 2,
+                    },
+                },
+                CompiledTemplateSlot {
+                    slot_key: "authored-patch-b".into(),
+                    allocation: CanonicalRect {
+                        x: 4,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                    },
+                    hotspot: CanonicalRect {
+                        x: 5,
+                        y: 1,
+                        width: 2,
+                        height: 2,
+                    },
+                },
             ],
         };
         let placement = placement(vec![first_plan.clone(), second_plan.clone()]);
-        let algorithms = (1..=14).map(|stage| (stage, AlgorithmProvenance {
-            algorithm_id: format!("installed-stage-{stage}"), version: "1.0.0".into(),
-        })).collect::<BTreeMap<_, _>>();
-        let request = IntermediateAtlasRequest { topology: &topology, placement_plan: &placement,
+        let algorithms = (1..=14)
+            .map(|stage| {
+                (
+                    stage,
+                    AlgorithmProvenance {
+                        algorithm_id: format!("installed-stage-{stage}"),
+                        version: "1.0.0".into(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let request = IntermediateAtlasRequest {
+            topology: &topology,
+            placement_plan: &placement,
             slots: vec![
-                IntermediateSlotInput { region_id: first_plan.slot_id, slot_key: "authored-patch-a", display_name: "Authored Patch A",
-                    required: true, patch_id: Some("patch-a".into()), domain: &first_domain, plan: &first_plan, result: &first, grid_rect: None },
-                IntermediateSlotInput { region_id: second_plan.slot_id, slot_key: "authored-patch-b", display_name: "Authored Patch B",
-                    required: true, patch_id: Some("patch-b".into()), domain: &second_domain, plan: &second_plan, result: &second, grid_rect: None },
-            ], revision: 7, algorithm_versions: algorithms, diagnostics: Vec::new(), regions: Vec::new() };
+                IntermediateSlotInput {
+                    region_id: first_plan.slot_id,
+                    slot_key: "authored-patch-a",
+                    display_name: "Authored Patch A",
+                    required: true,
+                    patch_id: Some("patch-a".into()),
+                    domain: &first_domain,
+                    plan: &first_plan,
+                    result: &first,
+                    grid_rect: None,
+                },
+                IntermediateSlotInput {
+                    region_id: second_plan.slot_id,
+                    slot_key: "authored-patch-b",
+                    display_name: "Authored Patch B",
+                    required: true,
+                    patch_id: Some("patch-b".into()),
+                    domain: &second_domain,
+                    plan: &second_plan,
+                    result: &second,
+                    grid_rect: None,
+                },
+            ],
+            revision: 7,
+            algorithm_versions: algorithms,
+            diagnostics: Vec::new(),
+            regions: Vec::new(),
+        };
         let compiler = AlgorithmCompiler::new();
-        let artifact = compiler.compile_intermediate_atlas(&request, &CancellationToken::new(), || 7).unwrap();
+        let artifact = compiler
+            .compile_intermediate_atlas(&request, &CancellationToken::new(), || 7)
+            .unwrap();
         assert_eq!(artifact.topology, topology);
         assert_eq!(artifact.incomplete_after_stage, 14);
         assert!(artifact.non_exportable);
         assert_eq!(artifact.slots.len(), 2);
         assert!(artifact.slots.iter().all(|slot| slot.patch_id.is_some()
-            && slot.valid_pixel_count == 16 && slot.mapping_mode == SamplingMode::DirectCrop));
+            && slot.valid_pixel_count == 16
+            && slot.mapping_mode == SamplingMode::DirectCrop));
         assert_eq!(artifact.channels.len(), 1);
         assert_eq!(artifact.channels[0].role, MaterialChannelRole::BaseColor);
-        assert!(artifact.unavailable_channels.contains(&MaterialChannelRole::Height));
+        assert!(
+            artifact
+                .unavailable_channels
+                .contains(&MaterialChannelRole::Height)
+        );
         assert!(artifact.pending.contains(&"final PBR composition"));
-        assert_ne!(&artifact.channels[0].rgba8[0..4], &artifact.channels[0].rgba8[4 * 4..4 * 4 + 4]);
+        assert_ne!(
+            &artifact.channels[0].rgba8[0..4],
+            &artifact.channels[0].rgba8[4 * 4..4 * 4 + 4]
+        );
 
-        let cancelled = CancellationToken::new(); cancelled.cancel();
-        assert!(matches!(compiler.compile_intermediate_atlas(&request, &cancelled, || 7),
-            Err(hot_trimmer_sheet_compiler::CompilerFacadeError::Intermediate(IntermediateAtlasError::Cancelled))));
-        assert!(matches!(compiler.compile_intermediate_atlas(&request, &CancellationToken::new(), || 8),
-            Err(hot_trimmer_sheet_compiler::CompilerFacadeError::Intermediate(IntermediateAtlasError::RevisionSuperseded))));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            compiler.compile_intermediate_atlas(&request, &cancelled, || 7),
+            Err(
+                hot_trimmer_sheet_compiler::CompilerFacadeError::Intermediate(
+                    IntermediateAtlasError::Cancelled
+                )
+            )
+        ));
+        assert!(matches!(
+            compiler.compile_intermediate_atlas(&request, &CancellationToken::new(), || 8),
+            Err(
+                hot_trimmer_sheet_compiler::CompilerFacadeError::Intermediate(
+                    IntermediateAtlasError::RevisionSuperseded
+                )
+            )
+        ));
 
         let mut failed_placement = placement.clone();
         failed_placement.validation.required_slots_present = false;
-        let failed = IntermediateAtlasRequest { placement_plan: &failed_placement, ..request };
-        assert!(compiler.compile_intermediate_atlas(&failed, &CancellationToken::new(), || 7).is_err());
+        let failed = IntermediateAtlasRequest {
+            placement_plan: &failed_placement,
+            ..request
+        };
+        assert!(
+            compiler
+                .compile_intermediate_atlas(&failed, &CancellationToken::new(), || 7)
+                .is_err()
+        );
 
         let _normal_semantics_are_registered_not_color = NormalConvention::OpenGl;
         let _normal_alpha_is_preserved = NormalAlphaPolicy::Preserve;
@@ -2100,11 +3264,17 @@ mod algorithm_stage_14_preview_a_tests {
 
 #[cfg(test)]
 mod persisted_algorithm_stage_14_preview_a_tests {
-    use std::{collections::HashSet, io::Cursor, path::PathBuf, sync::{Arc, Mutex}};
+    use std::{
+        collections::HashSet,
+        io::Cursor,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use hot_trimmer_domain::{
-        ContentDigest, ContentReference, MaterialBehaviorClass, MaterialClassificationCommand, NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId,
-        PatchProperties, PixelSize, RectificationSettings, SourceId, TrimSheetDocumentCommand,
+        ContentDigest, ContentReference, MaterialBehaviorClass, MaterialClassificationCommand,
+        NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId, PatchProperties, PixelSize,
+        RectificationSettings, SourceId, TrimSheetDocumentCommand,
     };
     use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -2114,11 +3284,19 @@ mod persisted_algorithm_stage_14_preview_a_tests {
 
     fn encoded_source() -> Vec<u8> {
         let image = RgbaImage::from_fn(192, 128, |x, y| {
-            let course = (y / 12) % 2; let joint = ((x + course * 18) / 36) % 2;
-            Rgba([120 + (x % 70) as u8, 45 + (y % 35) as u8, 30 + (joint * 25) as u8, 255])
+            let course = (y / 12) % 2;
+            let joint = ((x + course * 18) / 36) % 2;
+            Rgba([
+                120 + (x % 70) as u8,
+                45 + (y % 35) as u8,
+                30 + (joint * 25) as u8,
+                255,
+            ])
         });
         let mut bytes = Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(image).write_to(&mut bytes, ImageFormat::Png).unwrap();
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
         bytes.into_inner()
     }
 
@@ -2129,112 +3307,301 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         let project_path = root.join("persisted.hottrimmer");
         let mut store = ProjectStore::create(&project_path, "Persisted Stage 14").unwrap();
         let supplied_path = std::env::var_os("HOT_TRIMMER_STAGE14_SOURCE").map(PathBuf::from);
-        let bytes = supplied_path.as_ref().map_or_else(encoded_source, |path| fs::read(path).unwrap());
+        let bytes = supplied_path
+            .as_ref()
+            .map_or_else(encoded_source, |path| fs::read(path).unwrap());
         let decoded = image::load_from_memory(&bytes).unwrap();
-        let source_width = decoded.width(); let source_height = decoded.height();
+        let source_width = decoded.width();
+        let source_height = decoded.height();
         let base_color_source_id = SourceId::new();
-        store.replace_source(SourceChannel::BaseColor, &SourceInput {
-            id: base_color_source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
-            origin_path: supplied_path.clone().unwrap_or_else(|| PathBuf::from("authored-brick.png")),
-            sha256: ContentDigest::sha256(&bytes).0, width: source_width, height: source_height,
-            format: if supplied_path.is_some() { "JPEG".into() } else { "PNG".into() },
-            color_type: if supplied_path.is_some() { "Rgb8".into() } else { "Rgba8".into() },
-            has_alpha: supplied_path.is_none(), exif_orientation: 1, has_embedded_icc_profile: false,
-            encoded_bytes: u64::try_from(bytes.len()).unwrap(), owned_bytes: Some(bytes),
-        }).unwrap();
-        let patch_source_id = if supplied_path.is_some() { base_color_source_id } else {
-            let roughness_bytes = encoded_source(); let patch_source_id = SourceId::new();
-            store.replace_source(SourceChannel::Roughness, &SourceInput {
-                id: patch_source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
-                origin_path: PathBuf::from("authored-brick-roughness.png"),
-                sha256: ContentDigest::sha256(&roughness_bytes).0, width: 192, height: 128,
-                format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
-                exif_orientation: 1, has_embedded_icc_profile: false,
-                encoded_bytes: u64::try_from(roughness_bytes.len()).unwrap(), owned_bytes: Some(roughness_bytes),
-            }).unwrap(); patch_source_id
+        store
+            .replace_source(
+                SourceChannel::BaseColor,
+                &SourceInput {
+                    id: base_color_source_id,
+                    ownership: SourceOwnership::OwnedCopy,
+                    external_path: None,
+                    origin_path: supplied_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("authored-brick.png")),
+                    sha256: ContentDigest::sha256(&bytes).0,
+                    width: source_width,
+                    height: source_height,
+                    format: if supplied_path.is_some() {
+                        "JPEG".into()
+                    } else {
+                        "PNG".into()
+                    },
+                    color_type: if supplied_path.is_some() {
+                        "Rgb8".into()
+                    } else {
+                        "Rgba8".into()
+                    },
+                    has_alpha: supplied_path.is_none(),
+                    exif_orientation: 1,
+                    has_embedded_icc_profile: false,
+                    encoded_bytes: u64::try_from(bytes.len()).unwrap(),
+                    owned_bytes: Some(bytes),
+                },
+            )
+            .unwrap();
+        let patch_source_id = if supplied_path.is_some() {
+            base_color_source_id
+        } else {
+            let roughness_bytes = encoded_source();
+            let patch_source_id = SourceId::new();
+            store
+                .replace_source(
+                    SourceChannel::Roughness,
+                    &SourceInput {
+                        id: patch_source_id,
+                        ownership: SourceOwnership::OwnedCopy,
+                        external_path: None,
+                        origin_path: PathBuf::from("authored-brick-roughness.png"),
+                        sha256: ContentDigest::sha256(&roughness_bytes).0,
+                        width: 192,
+                        height: 128,
+                        format: "PNG".into(),
+                        color_type: "Rgba8".into(),
+                        has_alpha: true,
+                        exif_orientation: 1,
+                        has_embedded_icc_profile: false,
+                        encoded_bytes: u64::try_from(roughness_bytes.len()).unwrap(),
+                        owned_bytes: Some(roughness_bytes),
+                    },
+                )
+                .unwrap();
+            patch_source_id
         };
         let primary = store.summary().unwrap().source_sets[0].id;
-        store.apply_material_classification_command(Uuid::from_bytes(primary.to_bytes()),
-            MaterialClassificationCommand::Override { class: MaterialBehaviorClass::AlreadyTileable }).unwrap();
+        store
+            .apply_material_classification_command(
+                Uuid::from_bytes(primary.to_bytes()),
+                MaterialClassificationCommand::Override {
+                    class: MaterialBehaviorClass::AlreadyTileable,
+                },
+            )
+            .unwrap();
         let point = |x, y| NormalizedPoint::new(x, y).unwrap();
-        let patch = Patch { id: PatchId::new(), source_id: patch_source_id, name: "Authored brick field".into(), enabled: true,
-            geometry: PatchGeometry { corners: [point(0.05, 0.05), point(0.95, 0.05),
-                point(0.95, 0.95), point(0.05, 0.95)], assistance_mask: None },
-            properties: PatchProperties::default(), rectification: RectificationSettings::default() };
-        store.execute_patch_command(&PatchCommand::Create { patch: patch.clone(), index: None }, None).unwrap();
-        store.create_trim_sheet_document("ht.generic_architecture", "1.0.0").unwrap();
+        let patch = Patch {
+            id: PatchId::new(),
+            source_id: patch_source_id,
+            name: "Authored brick field".into(),
+            enabled: true,
+            geometry: PatchGeometry {
+                corners: [
+                    point(0.05, 0.05),
+                    point(0.95, 0.05),
+                    point(0.95, 0.95),
+                    point(0.05, 0.95),
+                ],
+                assistance_mask: None,
+            },
+            properties: PatchProperties::default(),
+            rectification: RectificationSettings::default(),
+        };
+        store
+            .execute_patch_command(
+                &PatchCommand::Create {
+                    patch: patch.clone(),
+                    index: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .create_trim_sheet_document("ht.generic_architecture", "1.0.0")
+            .unwrap();
         let patch_region_id = store.summary().unwrap().document.unwrap().topology.regions[0].id;
-        store.execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
-            region_id: patch_region_id, content: ContentReference::Patch(patch.id),
-        }).unwrap();
-        store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
-            output_size: PixelSize { width: 128, height: 128 },
-        }).unwrap();
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
+                region_id: patch_region_id,
+                content: ContentReference::Patch(patch.id),
+            })
+            .unwrap();
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
+                output_size: PixelSize {
+                    width: 128,
+                    height: 128,
+                },
+            })
+            .unwrap();
         let revision = store.summary().unwrap().document.unwrap().document_revision;
         let session: SharedProjectSession = Arc::new(Mutex::new(ProjectSession {
-            store: Some(store), dirty: false, is_draft: false, baseline: None,
-            app_data_dir: root.join("app"), recovery_dir: root.join("recovery"), draft_dir: root.join("draft"),
-            source_projection_cache: Mutex::new(HashMap::new()), preview_prepared_sources: HashMap::new(),
-            prepared_exemplars: PreparedExemplarCache::default(), source_analysis_cache: SourceAnalysisCache::default(),
+            store: Some(store),
+            dirty: false,
+            is_draft: false,
+            baseline: None,
+            app_data_dir: root.join("app"),
+            recovery_dir: root.join("recovery"),
+            draft_dir: root.join("draft"),
+            source_projection_cache: Mutex::new(HashMap::new()),
+            preview_prepared_sources: HashMap::new(),
+            prepared_exemplars: PreparedExemplarCache::default(),
+            source_analysis_cache: SourceAnalysisCache::default(),
             scale_orientation_cache: ScaleOrientationCache::default(),
         }));
         let service = PreviewService::default();
-        let job = service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-        let artifact = build_stage_14_preview(&session, &service, Stage14PreviewRequest {
-            protocol_version: IPC_PROTOCOL_VERSION, revision, region_id: None,
-            transient_projection: None, draft_id: Some(job), input_hash: None, profile: PreviewProfile::Authoritative, candidate_recipe: None,
-        }, job).expect("persisted Stage 1-14 preview");
-        assert_eq!(artifact.slots.len(), 53, "Generic Architecture must publish every fixed-template slot");
-        assert_eq!(artifact.slots.iter().map(|slot| slot.region_id).collect::<HashSet<_>>().len(), 53,
-            "fixed-template region identities must be stable and unique");
-        assert!(artifact.slots.iter().all(|slot| slot.mapping_mode != "TextureSynthesis" && !slot.candidate_id.is_empty()
-            && !slot.sampling_plan_id.is_empty() && !slot.stage_14_result_id.is_empty()
-            && slot.isotropic_scale.is_finite() && slot.isotropic_scale > 0.0
-            && slot.sampling_scale.is_finite() && slot.sampling_scale > 0.0),
-            "unsupported synthesis candidates must not reach the published artifact");
+        let job = service
+            .latest_draft_id
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let artifact = build_stage_14_preview(
+            &session,
+            &service,
+            Stage14PreviewRequest {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                revision,
+                region_id: None,
+                transient_projection: None,
+                draft_id: Some(job),
+                input_hash: None,
+                profile: PreviewProfile::Authoritative,
+                candidate_recipe: None,
+            },
+            job,
+        )
+        .expect("persisted Stage 1-14 preview");
+        assert_eq!(
+            artifact.slots.len(),
+            53,
+            "Generic Architecture must publish every fixed-template slot"
+        );
+        assert_eq!(
+            artifact
+                .slots
+                .iter()
+                .map(|slot| slot.region_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            53,
+            "fixed-template region identities must be stable and unique"
+        );
+        assert!(
+            artifact
+                .slots
+                .iter()
+                .all(|slot| slot.mapping_mode != "TextureSynthesis"
+                    && !slot.candidate_id.is_empty()
+                    && !slot.sampling_plan_id.is_empty()
+                    && !slot.stage_14_result_id.is_empty()
+                    && slot.isotropic_scale.is_finite()
+                    && slot.isotropic_scale > 0.0
+                    && slot.sampling_scale.is_finite()
+                    && slot.sampling_scale > 0.0),
+            "unsupported synthesis candidates must not reach the published artifact"
+        );
         for (index, left) in artifact.slots.iter().enumerate() {
             for right in &artifact.slots[index + 1..] {
-                let separated = left.allocation_bounds.x + left.allocation_bounds.width <= right.allocation_bounds.x
-                    || right.allocation_bounds.x + right.allocation_bounds.width <= left.allocation_bounds.x
-                    || left.allocation_bounds.y + left.allocation_bounds.height <= right.allocation_bounds.y
-                    || right.allocation_bounds.y + right.allocation_bounds.height <= left.allocation_bounds.y;
+                let separated = left.allocation_bounds.x + left.allocation_bounds.width
+                    <= right.allocation_bounds.x
+                    || right.allocation_bounds.x + right.allocation_bounds.width
+                        <= left.allocation_bounds.x
+                    || left.allocation_bounds.y + left.allocation_bounds.height
+                        <= right.allocation_bounds.y
+                    || right.allocation_bounds.y + right.allocation_bounds.height
+                        <= left.allocation_bounds.y;
                 assert!(separated, "fixed-template atlas allocations overlap");
             }
         }
         assert_eq!(artifact.incomplete_after_stage, 14);
-        assert!(artifact.non_exportable && !artifact.final_compile_available && !artifact.export_available && !artifact.blender_available);
+        assert!(
+            artifact.non_exportable
+                && !artifact.final_compile_available
+                && !artifact.export_available
+                && !artifact.blender_available
+        );
         let expected_patch_id = patch.id.to_string();
-        assert_eq!(artifact.slots.iter().find(|slot| slot.region_id == patch_region_id).unwrap()
-            .patch_id.as_deref(), Some(expected_patch_id.as_str()));
-        assert!(artifact.slots.iter().filter(|slot| slot.region_id != patch_region_id)
-            .all(|slot| slot.patch_id.is_none()), "inherited material regions must not claim patch lineage");
+        assert_eq!(
+            artifact
+                .slots
+                .iter()
+                .find(|slot| slot.region_id == patch_region_id)
+                .unwrap()
+                .patch_id
+                .as_deref(),
+            Some(expected_patch_id.as_str())
+        );
+        assert!(
+            artifact
+                .slots
+                .iter()
+                .filter(|slot| slot.region_id != patch_region_id)
+                .all(|slot| slot.patch_id.is_none()),
+            "inherited material regions must not claim patch lineage"
+        );
         assert!(artifact.maps.contains_key("baseColor"));
-        let crops = artifact.slots.iter().filter_map(|slot| slot.source_crop)
-            .map(|crop| (crop.x, crop.y, crop.width, crop.height)).collect::<HashSet<_>>();
-        assert!(crops.len() > 8, "Stage 11-13 must select purposeful spatially distinct crops across the persisted topology");
-        let unplaced_crops = artifact.slots.iter().filter(|slot| slot.region_id != patch_region_id)
-            .filter_map(|slot| slot.source_crop).collect::<Vec<_>>();
-        assert!(unplaced_crops.iter().all(|crop| crop.width < source_width || crop.height < source_height),
-            "unplaced Gate 1 slots must not consume the complete prepared source domain");
-        let cornice = artifact.slots.iter().find(|slot| slot.slot_key == "cornice_long")
+        let crops = artifact
+            .slots
+            .iter()
+            .filter_map(|slot| slot.source_crop)
+            .map(|crop| (crop.x, crop.y, crop.width, crop.height))
+            .collect::<HashSet<_>>();
+        assert!(
+            crops.len() > 8,
+            "Stage 11-13 must select purposeful spatially distinct crops across the persisted topology"
+        );
+        let unplaced_crops = artifact
+            .slots
+            .iter()
+            .filter(|slot| slot.region_id != patch_region_id)
+            .filter_map(|slot| slot.source_crop)
+            .collect::<Vec<_>>();
+        assert!(
+            unplaced_crops
+                .iter()
+                .all(|crop| crop.width < source_width || crop.height < source_height),
+            "unplaced Gate 1 slots must not consume the complete prepared source domain"
+        );
+        let cornice = artifact
+            .slots
+            .iter()
+            .find(|slot| slot.slot_key == "cornice_long")
             .expect("Generic Architecture cornice slot");
-        let cornice_crop = cornice.source_crop.expect("cornice must carry a selected crop");
-        assert!(cornice_crop.width > cornice_crop.height.saturating_mul(4)
-            && (cornice.mapping_mode == "RepeatX" || cornice.mapping_mode == "DirectCrop"),
-            "long strips must carry a horizontal source cut or repeat route");
-        let detail = artifact.slots.iter().find(|slot| slot.slot_key == "detail_cell_a")
+        let cornice_crop = cornice
+            .source_crop
+            .expect("cornice must carry a selected crop");
+        assert!(
+            cornice_crop.width > cornice_crop.height.saturating_mul(4)
+                && (cornice.mapping_mode == "RepeatX" || cornice.mapping_mode == "DirectCrop"),
+            "long strips must carry a horizontal source cut or repeat route"
+        );
+        let detail = artifact
+            .slots
+            .iter()
+            .find(|slot| slot.slot_key == "detail_cell_a")
             .expect("Generic Architecture detail slot");
-        let detail_crop = detail.source_crop.expect("detail must carry a selected crop");
-        assert!(detail_crop.width < source_width && detail_crop.height < source_height,
-            "detail slots must carry a selected source detail, not the full source sheet");
-        let radial = artifact.slots.iter().find(|slot| slot.slot_key == "radial_fixture_a")
+        let detail_crop = detail
+            .source_crop
+            .expect("detail must carry a selected crop");
+        assert!(
+            detail_crop.width < source_width && detail_crop.height < source_height,
+            "detail slots must carry a selected source detail, not the full source sheet"
+        );
+        let radial = artifact
+            .slots
+            .iter()
+            .find(|slot| slot.slot_key == "radial_fixture_a")
             .expect("Generic Architecture radial slot");
-        let radial_crop = radial.source_crop.expect("radial must carry a selected crop");
-        assert!(radial_crop.width < source_width && radial_crop.height < source_height
-            && radial_crop.width.abs_diff(radial_crop.height) <= source_width.max(source_height) / 2,
-            "radial slots must carry a bounded radial/detail source area");
-        assert!(artifact.slots.iter().all(|slot| !slot.candidate_id.is_empty()
-            && !slot.sampling_plan_id.is_empty() && !slot.stage_14_result_id.is_empty()));
+        let radial_crop = radial
+            .source_crop
+            .expect("radial must carry a selected crop");
+        assert!(
+            radial_crop.width < source_width
+                && radial_crop.height < source_height
+                && radial_crop.width.abs_diff(radial_crop.height)
+                    <= source_width.max(source_height) / 2,
+            "radial slots must carry a bounded radial/detail source area"
+        );
+        assert!(
+            artifact
+                .slots
+                .iter()
+                .all(|slot| !slot.candidate_id.is_empty()
+                    && !slot.sampling_plan_id.is_empty()
+                    && !slot.stage_14_result_id.is_empty())
+        );
         drop(session);
         let _ = fs::remove_dir_all(root);
     }
@@ -2275,6 +3642,82 @@ fn remember_open_project_best_effort(session: &ProjectSession) {
     }
 }
 
+fn read_authored_layout_preset_library(
+    paths: &AppPaths,
+) -> Result<AuthoredLayoutPresetLibrary, UserFacingError> {
+    let path = paths.app_data.join(USER_LAYOUT_PRESET_LIBRARY_FILE);
+    if !path.exists() {
+        return Ok(AuthoredLayoutPresetLibrary {
+            schema_version: 1,
+            presets: Vec::new(),
+        });
+    }
+    let bytes = fs::read(&path).map_err(|reason| {
+        error(
+            ErrorCode::Internal,
+            &format!("Could not read saved layout presets: {reason}"),
+        )
+    })?;
+    let library: AuthoredLayoutPresetLibrary =
+        serde_json::from_slice(&bytes).map_err(|reason| {
+            error(
+                ErrorCode::InvalidInput,
+                &format!("Saved layout preset library is invalid: {reason}"),
+            )
+        })?;
+    if library.schema_version != 1 || library.presets.len() > 1_024 {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Saved layout preset library has an unsupported version or size.",
+        ));
+    }
+    for preset in &library.presets {
+        if preset.preset_id.starts_with("builtin.") {
+            return Err(error(
+                ErrorCode::InvalidInput,
+                "Saved layout preset library attempts to replace a built-in preset.",
+            ));
+        }
+        hot_trimmer_domain::validate_authored_layout_preset(preset).map_err(|reason| {
+            error(
+                ErrorCode::InvalidInput,
+                &format!(
+                    "Saved layout preset {} is invalid: {reason}",
+                    preset.preset_id
+                ),
+            )
+        })?;
+    }
+    Ok(library)
+}
+
+fn write_authored_layout_preset_library(
+    paths: &AppPaths,
+    library: &AuthoredLayoutPresetLibrary,
+) -> Result<(), UserFacingError> {
+    let path = paths.app_data.join(USER_LAYOUT_PRESET_LIBRARY_FILE);
+    let bytes = serde_json::to_vec_pretty(library).map_err(|reason| {
+        error(
+            ErrorCode::Internal,
+            &format!("Could not encode saved layout presets: {reason}"),
+        )
+    })?;
+    let mut file = fs::File::create(&path).map_err(|reason| {
+        error(
+            ErrorCode::Internal,
+            &format!("Could not save layout presets: {reason}"),
+        )
+    })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|reason| {
+            error(
+                ErrorCode::Internal,
+                &format!("Could not finish saving layout presets: {reason}"),
+            )
+        })
+}
+
 fn read_recent_projects(app_data: &Path) -> Result<Vec<RecentProject>, UserFacingError> {
     let path = app_data.join("recent-projects.json");
     if !path.exists() {
@@ -2313,7 +3756,6 @@ fn write_recent_projects(
     fs::rename(temporary, path).map_err(recent_error)
 }
 
-
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2343,7 +3785,9 @@ fn source_registration_error(error_value: StoreError, channel: SourceChannel) ->
     UserFacingError {
         code: ErrorCode::SourceRegistrationFailed,
         message: diagnostic.message,
-        recovery: diagnostic.recovery_choices.iter()
+        recovery: diagnostic
+            .recovery_choices
+            .iter()
             .map(|choice| format!("{choice:?}"))
             .collect::<Vec<_>>()
             .join(", "),
