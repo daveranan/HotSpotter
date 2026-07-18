@@ -2023,7 +2023,7 @@ function SheetWorkbench(props: {
   const requestedFloor = hierarchical ? hierarchical.targetRegionMin : requestedFamilies + requestedBudget + (requestedFamilies > 0 ? 1 : 0);
   const requestedMaximum = hierarchical?.targetRegionMax ?? props.candidateRecipe.targetRegionCount;
   const candidateValid = hierarchical
-    ? requestedArea === 1000 && hierarchical.targetRegionMin > 0 && hierarchical.targetRegionMin <= hierarchical.targetRegionMax
+    ? requestedArea === 1000 && hierarchical.targetRegionMin >= 24 && hierarchical.targetRegionMin <= hierarchical.targetRegionMax
       && hierarchical.protectedParentCount + hierarchical.subdividableParentCount <= hierarchical.macroParentCount
       && hierarchical.allowedSplitRatios.length > 0 && hierarchical.stripThicknessLadder.length > 0
     : requestedFloor <= props.candidateRecipe.targetRegionCount && requestedArea <= 1000;
@@ -2270,11 +2270,13 @@ function SheetWorkbench(props: {
 function HierarchicalRecipeControls(props: { recipe: PartitionRecipe; setRecipe: React.Dispatch<React.SetStateAction<PartitionRecipe>> }) {
   const hierarchy = props.recipe.hierarchical!;
   const aspectOptions = ["square", "wide2", "tall2", "wide4", "tall4", "wide8", "tall8"] as const;
+  const symmetryOptions = ["identity", "rotate90", "rotate180", "rotate270", "mirror_x", "mirror_y", "mirror_diagonal", "mirror_anti_diagonal"] as const;
   return <>
-    <label>Complexity<input aria-label="Layout complexity" type="range" min={12} max={80} value={hierarchy.targetRegionMax} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalComplexity(recipe, Number(event.target.value)))} /><output>{hierarchy.targetRegionMin}–{hierarchy.targetRegionMax} regions</output></label>
+    <label>Complexity<input aria-label="Layout complexity" type="range" min={24} max={80} value={hierarchy.targetRegionMax} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalComplexity(recipe, Number(event.target.value)))} /><output>{hierarchy.targetRegionMin}–{hierarchy.targetRegionMax} regions</output></label>
     <label>Large panel share<input aria-label="Large panel share" type="range" min={20} max={85} value={hierarchy.largeShareMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalShare(recipe, "largeShareMilli", Number(event.target.value) * 10))} /><output>{hierarchy.largeShareMilli / 10}%</output></label>
     <label>Strip share<input aria-label="Strip share" type="range" min={0} max={40} value={hierarchy.stripShareMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalShare(recipe, "stripShareMilli", Number(event.target.value) * 10))} /><output>{hierarchy.stripShareMilli / 10}%</output></label>
-    <label>Radial slots<input aria-label="Radial slots" type="number" min={0} max={16} value={hierarchy.radialCount} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRadialSlots(recipe, Number(event.target.value)))} /></label>
+    <label>Radial slots<input aria-label="Radial slots" type="number" min={0} max={4} value={hierarchy.radialCount} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRadialSlots(recipe, Number(event.target.value)))} /></label>
+    <label>Orientation<select aria-label="Layout orientation" value={hierarchy.symmetry} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { symmetry: event.target.value as typeof hierarchy.symmetry }))}>{symmetryOptions.map((option) => <option key={option} value={option}>{option.replaceAll("_", " ")}</option>)}</select></label>
     <label>Variation<input aria-label="Hierarchical variation" type="range" min={0} max={100} value={hierarchy.variationMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { variationMilli: Number(event.target.value) * 10 }, { varianceMilli: Number(event.target.value) * 10 }))} /><output>{hierarchy.variationMilli / 10}%</output></label>
     <details className="layout-advanced"><summary>Advanced hierarchy</summary>
       <div className="layout-pair"><label>Hierarchy depth<input aria-label="Hierarchy depth" type="number" min={1} max={8} value={hierarchy.hierarchyDepth} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { hierarchyDepth: Number(event.target.value) }))} /></label><label>Scale falloff %<input aria-label="Scale falloff" type="number" min={10} max={90} value={hierarchy.scaleFalloffMilli / 10} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { scaleFalloffMilli: Number(event.target.value) * 10 }))} /></label></div>
@@ -2285,7 +2287,7 @@ function HierarchicalRecipeControls(props: { recipe: PartitionRecipe; setRecipe:
       <label>Major aspect palette<select multiple aria-label="Major aspect palette" value={hierarchy.majorAspects} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { majorAspects: Array.from(event.target.selectedOptions, (option) => option.value as typeof hierarchy.majorAspects[number]) }))}>{aspectOptions.map((aspect) => <option key={aspect} value={aspect}>{aspect}</option>)}</select></label>
       <label>Medium aspect palette<select multiple aria-label="Medium aspect palette" value={hierarchy.mediumAspects} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { mediumAspects: Array.from(event.target.selectedOptions, (option) => option.value as typeof hierarchy.mediumAspects[number]) }))}>{aspectOptions.map((aspect) => <option key={aspect} value={aspect}>{aspect}</option>)}</select></label>
       <label>Detail aspect palette<select multiple aria-label="Detail aspect palette" value={hierarchy.detailAspects} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { detailAspects: Array.from(event.target.selectedOptions, (option) => option.value as typeof hierarchy.detailAspects[number]) }))}>{aspectOptions.map((aspect) => <option key={aspect} value={aspect}>{aspect}</option>)}</select></label>
-      <div className="layout-pair"><label>Soft region minimum<input aria-label="Soft region minimum" type="number" min={1} max={hierarchy.targetRegionMax} value={hierarchy.targetRegionMin} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { targetRegionMin: Number(event.target.value) }))} /></label><label>Soft region maximum<input aria-label="Soft region maximum" type="number" min={hierarchy.targetRegionMin} max={256} value={hierarchy.targetRegionMax} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { targetRegionMax: Number(event.target.value) }, { targetRegionCount: Number(event.target.value) }))} /></label></div>
+      <div className="layout-pair"><label>Soft region minimum<input aria-label="Soft region minimum" type="number" min={24} max={hierarchy.targetRegionMax} value={hierarchy.targetRegionMin} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { targetRegionMin: Number(event.target.value) }))} /></label><label>Soft region maximum<input aria-label="Soft region maximum" type="number" min={Math.max(24, hierarchy.targetRegionMin)} max={256} value={hierarchy.targetRegionMax} onChange={(event) => props.setRecipe((recipe) => updateHierarchicalRecipe(recipe, { targetRegionMax: Number(event.target.value) }, { targetRegionCount: Number(event.target.value) }))} /></label></div>
     </details>
   </>;
 }
@@ -2296,8 +2298,8 @@ function updateHierarchicalRecipe(recipe: PartitionRecipe, patch: Partial<NonNul
 }
 
 function updateHierarchicalComplexity(recipe: PartitionRecipe, maximum: number): PartitionRecipe {
-  const targetRegionMax = Math.max(1, Math.min(256, maximum));
-  const targetRegionMin = Math.max(1, Math.min(targetRegionMax, Math.round(targetRegionMax * 0.75)));
+  const targetRegionMax = Math.max(24, Math.min(256, maximum));
+  const targetRegionMin = Math.max(24, Math.min(targetRegionMax, Math.round(targetRegionMax * 0.75)));
   return updateHierarchicalRecipe(recipe, { targetRegionMin, targetRegionMax }, { targetRegionCount: targetRegionMax });
 }
 
@@ -2312,7 +2314,7 @@ function updateHierarchicalShare(recipe: PartitionRecipe, field: "largeShareMill
 function updateHierarchicalRadialSlots(recipe: PartitionRecipe, count: number): PartitionRecipe {
   const hierarchy = recipe.hierarchical;
   if (!hierarchy) return recipe;
-  const radialCount = Math.max(0, Math.min(16, count));
+  const radialCount = Math.max(0, Math.min(4, count));
   if (radialCount === 0) return updateHierarchicalRecipe(recipe, { radialCount, radialShareMilli: 0, largeShareMilli: hierarchy.largeShareMilli + hierarchy.radialShareMilli });
   if (hierarchy.radialShareMilli > 0) return updateHierarchicalRecipe(recipe, { radialCount });
   const radialShareMilli = Math.min(100, hierarchy.mediumShareMilli);

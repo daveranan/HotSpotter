@@ -34,11 +34,12 @@ test("hierarchical layout recipes keep a versioned camel-case wire shape while l
     horizontalStripWeightMilli: 550, verticalStripWeightMilli: 450, stripThicknessLadder: [1, 1, 2, 2, 3, 4],
     radialCount: 2, radialMinDiameter: 6, radialMaxDiameter: 10,
     majorAspects: ["square", "wide2", "tall2"], mediumAspects: ["square", "wide2", "tall2", "wide4", "tall4"],
-    detailAspects: ["square", "wide2", "tall2", "wide4", "tall4"],
+    detailAspects: ["square", "wide2", "tall2", "wide4", "tall4"], symmetry: "identity",
   };
   const wire = JSON.parse(JSON.stringify(hierarchy)) as HierarchicalLayoutRecipe;
   assert.equal(wire.macroStyle, "mixed_hierarchy");
   assert.deepEqual(wire.allowedSplitRatios, ["half", "one_third", "two_third"]);
+  assert.equal(wire.symmetry, "identity");
   assert.equal(wire.largeShareMilli + wire.mediumShareMilli + wire.smallShareMilli + wire.stripShareMilli + wire.radialShareMilli, 1_000);
   const legacy: Pick<PartitionRecipe, "hierarchical"> = {};
   assert.equal(legacy.hierarchical, undefined);

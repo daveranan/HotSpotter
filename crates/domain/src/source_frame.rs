@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{DocumentHash, RegionId};
 
@@ -77,11 +77,25 @@ fn default_depth_limit() -> u16 { 32 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MacroStyle { MixedHierarchy, PanelCascade, HorizontalTrims, VerticalTrims, FacadeHalving, ClassicSourceHotspot, MechanicalRadial }
+pub enum MacroStyle { MixedHierarchy, PanelCascade, HorizontalTrims, VerticalTrims, FacadeHalving, ClassicSourceHotspot, ClassicHotspotBasis, MechanicalRadial }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecursivePolicy { Cascade, Balanced }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymmetryTransform {
+    #[default]
+    Identity,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    MirrorX,
+    MirrorY,
+    MirrorDiagonal,
+    MirrorAntiDiagonal,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,13 +135,15 @@ pub struct HierarchicalLayoutRecipe {
     pub major_aspects: Vec<AspectClass>,
     pub medium_aspects: Vec<AspectClass>,
     pub detail_aspects: Vec<AspectClass>,
+    #[serde(default)]
+    pub symmetry: SymmetryTransform,
 }
 
 impl HierarchicalLayoutRecipe {
     pub fn mixed_hierarchy_default() -> Self {
         Self {
             schema_version: 1, macro_style: MacroStyle::MixedHierarchy, recursive_policy: RecursivePolicy::Cascade,
-            target_region_min: 30, target_region_max: 40,
+            target_region_min: 29, target_region_max: 36,
             large_share_milli: 580, medium_share_milli: 200, small_share_milli: 80, strip_share_milli: 110, radial_share_milli: 30,
             macro_parent_count: 4, protected_parent_count: 2, subdividable_parent_count: 2,
             hierarchy_depth: 3, scale_falloff_milli: 500,
@@ -139,6 +155,7 @@ impl HierarchicalLayoutRecipe {
             major_aspects: vec![AspectClass::Square, AspectClass::Wide2, AspectClass::Tall2],
             medium_aspects: vec![AspectClass::Square, AspectClass::Wide2, AspectClass::Tall2, AspectClass::Wide4, AspectClass::Tall4],
             detail_aspects: vec![AspectClass::Square, AspectClass::Wide2, AspectClass::Tall2, AspectClass::Wide4, AspectClass::Tall4],
+            symmetry: SymmetryTransform::Identity,
         }
     }
 
@@ -148,12 +165,13 @@ impl HierarchicalLayoutRecipe {
         if self.schema_version == 0 || shares != 1_000 {
             return Err(PartitionError::InvalidHierarchicalShares { total_milli: shares });
         }
-        if self.target_region_min == 0 || self.target_region_min > self.target_region_max || self.target_region_max > MAX_PARTITION_REGIONS
+        if self.target_region_min == 0 || self.target_region_min > self.target_region_max || self.target_region_max < 24 || self.target_region_max > MAX_PARTITION_REGIONS
             || self.hierarchy_depth == 0 || self.scale_falloff_milli == 0 || self.scale_falloff_milli >= 1_000
             || self.protected_parent_count.saturating_add(self.subdividable_parent_count) > self.macro_parent_count
             || self.allowed_split_ratios.is_empty() || self.alignment_strength_milli > 1_000 || self.variation_milli > 1_000
             || u32::from(self.horizontal_strip_weight_milli) + u32::from(self.vertical_strip_weight_milli) != 1_000
             || (self.strip_share_milli > 0 && self.strip_thickness_ladder.iter().any(|value| *value == 0))
+            || self.radial_count > 4
             || (self.radial_count > 0 && (self.radial_min_diameter == 0 || self.radial_min_diameter > self.radial_max_diameter))
             || self.major_aspects.is_empty() || self.medium_aspects.is_empty() || self.detail_aspects.is_empty() {
             return Err(PartitionError::InvalidHierarchicalRecipe);
@@ -324,6 +342,8 @@ pub enum PartitionError {
     InvalidHierarchicalShares { total_milli: u32 },
     #[error("hierarchical layout recipe fields are inconsistent or outside supported bounds")]
     InvalidHierarchicalRecipe,
+    #[error("hotspot basis inventory is invalid: {reason}")]
+    InvalidHotspotBasis { reason: String },
 }
 
 impl LogicalGridSpec {
@@ -598,12 +618,15 @@ fn generate_legacy_partition(recipe: &PartitionRecipe) -> Result<Vec<PartitionRe
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 enum HierarchicalZoneKind { Panels, HorizontalLadder, VerticalLadder, Cascade, Radial }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct HierarchicalZoneRect { rect: GridRect, kind: HierarchicalZoneKind }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct HierarchicalLeaf {
     rect: GridRect,
     family: PartitionFamily,
@@ -611,6 +634,7 @@ struct HierarchicalLeaf {
     splittable: bool,
 }
 
+#[allow(dead_code)]
 struct HierarchicalContext<'a> {
     recipe: &'a PartitionRecipe,
     hierarchy: &'a HierarchicalLayoutRecipe,
@@ -619,32 +643,526 @@ struct HierarchicalContext<'a> {
     split_ordinal: u32,
 }
 
+type DemandId = u32;
+type PairGroupId = u32;
+type VariantGroupId = u32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum SizeTier { Macro, Medium, Small, Strip, Radial }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum RegionRole { Square, Wide, Tall, HorizontalStrip, VerticalStrip, Radial }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum ZonePreference { MacroSquare, HorizontalFamily, VerticalFamily, DetailCore, HorizontalLadder, VerticalLadder, RadialCluster }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuadrantRole { MajorSquare, HorizontalFamily, VerticalFamily, DetailBasis }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionDemand {
+    id: DemandId,
+    width_cells: u32,
+    height_cells: u32,
+    tier: SizeTier,
+    role: RegionRole,
+    pair_group: Option<PairGroupId>,
+    variant_group: Option<VariantGroupId>,
+    required: bool,
+    multiplicity: u32,
+    zone_preference: ZonePreference,
+}
+
+#[derive(Clone, Copy)]
+struct BasisGrid {
+    width: u32,
+    height: u32,
+    cell_w: u32,
+    cell_h: u32,
+}
+
+impl BasisGrid {
+    fn new(grid: LogicalGridSpec) -> Result<Self, PartitionError> {
+        if grid.width < 16 || grid.height < 16 || grid.width != grid.height {
+            return Err(PartitionError::InvalidHotspotBasis { reason: "curated hotspot basis requires a square grid of at least 16 cells".into() });
+        }
+        let cell_w = grid.width / 8;
+        let cell_h = grid.height / 8;
+        if cell_w == 0 || cell_h == 0 {
+            return Err(PartitionError::InvalidHotspotBasis { reason: "grid is too small for the canonical hotspot basis".into() });
+        }
+        Ok(Self { width: grid.width, height: grid.height, cell_w, cell_h })
+    }
+
+    fn rect(self, x0: u32, y0: u32, x1: u32, y1: u32) -> GridRect {
+        let left = self.width.saturating_mul(x0) / 8;
+        let top = self.height.saturating_mul(y0) / 8;
+        let right = self.width.saturating_mul(x1) / 8;
+        let bottom = self.height.saturating_mul(y1) / 8;
+        GridRect { x: left, y: top, width: right - left, height: bottom - top }
+    }
+}
+
+fn transform_basis_rect(rect: GridRect, grid: LogicalGridSpec, transform: SymmetryTransform) -> GridRect {
+    match transform {
+        SymmetryTransform::Identity => rect,
+        SymmetryTransform::MirrorX => GridRect { x: grid.width - rect.x - rect.width, ..rect },
+        SymmetryTransform::MirrorY => GridRect { y: grid.height - rect.y - rect.height, ..rect },
+        SymmetryTransform::Rotate180 => GridRect { x: grid.width - rect.x - rect.width, y: grid.height - rect.y - rect.height, ..rect },
+        SymmetryTransform::Rotate90 => GridRect { x: grid.height - rect.y - rect.height, y: rect.x, width: rect.height, height: rect.width },
+        SymmetryTransform::Rotate270 => GridRect { x: rect.y, y: grid.width - rect.x - rect.width, width: rect.height, height: rect.width },
+        SymmetryTransform::MirrorDiagonal => GridRect { x: rect.y, y: rect.x, width: rect.height, height: rect.width },
+        SymmetryTransform::MirrorAntiDiagonal => GridRect { x: grid.height - rect.y - rect.height, y: grid.width - rect.x - rect.width, width: rect.height, height: rect.width },
+    }
+}
+
+fn strip_ladder_for(extent: u32) -> Vec<u32> {
+    if extent >= 8 { return vec![extent / 2, extent / 4, 1, extent - extent / 2 - extent / 4 - 1]; }
+    if extent >= 4 { return vec![extent / 2, 1, extent - extent / 2 - 1]; }
+    vec![1; extent as usize]
+}
+
+fn build_hotspot_basis_inventory(grid: LogicalGridSpec, hierarchy: &HierarchicalLayoutRecipe) -> Result<Vec<RegionDemand>, PartitionError> {
+    let basis = BasisGrid::new(grid)?;
+    let mut demands = Vec::new();
+    let mut next_id = 0_u32;
+    let mut push = |width_cells, height_cells, tier, role, pair_group, variant_group, required, multiplicity, zone_preference| {
+        demands.push(RegionDemand { id: next_id, width_cells, height_cells, tier, role, pair_group, variant_group, required, multiplicity, zone_preference });
+        next_id = next_id.saturating_add(1);
+    };
+    push(basis.cell_w * 4, basis.cell_h * 4, SizeTier::Macro, RegionRole::Square, None, Some(1), true, 1, ZonePreference::MacroSquare);
+    push(basis.cell_w * 4, basis.cell_h * 2, SizeTier::Macro, RegionRole::Wide, Some(10), Some(2), true, 1, ZonePreference::HorizontalFamily);
+    push(basis.cell_w * 2, basis.cell_h * 4, SizeTier::Macro, RegionRole::Tall, Some(10), Some(2), true, 1, ZonePreference::VerticalFamily);
+    push(basis.cell_w * 2, basis.cell_h * 2, SizeTier::Medium, RegionRole::Square, None, Some(3), true, 4, ZonePreference::HorizontalFamily);
+    push(basis.cell_w * 2, basis.cell_h, SizeTier::Medium, RegionRole::Wide, Some(20), Some(4), true, 1, ZonePreference::DetailCore);
+    push(basis.cell_w, basis.cell_h * 2, SizeTier::Medium, RegionRole::Tall, Some(20), Some(4), true, 1, ZonePreference::DetailCore);
+    push(basis.cell_w, basis.cell_h, SizeTier::Small, RegionRole::Square, None, Some(5), true, 1, ZonePreference::DetailCore);
+    push(basis.cell_w, (basis.cell_h / 2).max(1), SizeTier::Small, RegionRole::Wide, Some(30), Some(6), true, 2, ZonePreference::DetailCore);
+    push((basis.cell_w / 2).max(1), basis.cell_h, SizeTier::Small, RegionRole::Tall, Some(30), Some(6), true, 2, ZonePreference::DetailCore);
+    for thickness in strip_ladder_for(basis.cell_h) {
+        push(basis.cell_w * 4, thickness, SizeTier::Strip, RegionRole::HorizontalStrip, None, Some(7), true, 1, ZonePreference::HorizontalLadder);
+    }
+    for thickness in strip_ladder_for(basis.cell_w) {
+        push(thickness, basis.cell_h * 3, SizeTier::Strip, RegionRole::VerticalStrip, None, Some(8), true, 1, ZonePreference::VerticalLadder);
+    }
+    if hierarchy.radial_count > 0 {
+        push(basis.cell_w, basis.cell_h, SizeTier::Radial, RegionRole::Radial, None, Some(9), true, hierarchy.radial_count, ZonePreference::RadialCluster);
+    }
+    validate_region_demands(&demands)?;
+    Ok(demands)
+}
+
+fn validate_region_demands(demands: &[RegionDemand]) -> Result<(), PartitionError> {
+    let mut pair_counts = BTreeMap::<PairGroupId, (u32, u32)>::new();
+    for demand in demands.iter().filter(|demand| demand.required) {
+        if let Some(pair_group) = demand.pair_group {
+            let entry = pair_counts.entry(pair_group).or_default();
+            if demand.width_cells >= demand.height_cells { entry.0 = entry.0.saturating_add(demand.multiplicity); }
+            else { entry.1 = entry.1.saturating_add(demand.multiplicity); }
+        }
+        if demand.role == RegionRole::Radial && demand.width_cells != demand.height_cells {
+            return Err(PartitionError::InvalidHotspotBasis { reason: "radial demand is not square".into() });
+        }
+    }
+    for (pair_group, (wide, tall)) in pair_counts {
+        if wide == 0 || tall == 0 || wide != tall {
+            return Err(PartitionError::InvalidHotspotBasis { reason: format!("orientation pair group {pair_group} is incomplete ({wide} wide / {tall} tall)") });
+        }
+    }
+    Ok(())
+}
+
 fn generate_hierarchical_partition(recipe: &PartitionRecipe) -> Result<Vec<PartitionRegion>, PartitionError> {
     recipe.grid.validate()?;
     let hierarchy = recipe.hierarchical.as_ref().ok_or(PartitionError::InvalidHierarchicalRecipe)?;
     hierarchy.validate()?;
-    let mut context = HierarchicalContext { recipe, hierarchy, cuts_x: BTreeSet::new(), cuts_y: BTreeSet::new(), split_ordinal: 0 };
-    let zones = hierarchical_macro_zones(recipe.grid, hierarchy)?;
-    let mut leaves = Vec::<HierarchicalLeaf>::new();
-    let mut parent_hosts = Vec::<(u32, GridRect)>::new();
-    for zone in zones {
-        match zone.kind {
-            HierarchicalZoneKind::Panels => generate_panel_zone(zone.rect, &mut context, &mut leaves, &mut parent_hosts)?,
-            HierarchicalZoneKind::Cascade => generate_cascade_zone(zone.rect, &mut context, &mut leaves, &mut parent_hosts)?,
-            HierarchicalZoneKind::HorizontalLadder => generate_strip_ladder(zone.rect, true, &mut context, &mut leaves),
-            HierarchicalZoneKind::VerticalLadder => generate_strip_ladder(zone.rect, false, &mut context, &mut leaves),
-            HierarchicalZoneKind::Radial => generate_radial_zone(zone.rect, &mut context, &mut leaves)?,
-        }
+    let demands = build_hotspot_basis_inventory(recipe.grid, hierarchy)?;
+    let mut leaves = place_hotspot_basis_inventory(recipe, hierarchy, &demands)?;
+    apply_basis_complexity(&mut leaves, recipe, hierarchy);
+    if leaves.len() < hierarchy.target_region_min as usize || leaves.len() > hierarchy.target_region_max as usize {
+        return Err(PartitionError::InvalidHotspotBasis { reason: format!("basis produced {} regions outside requested {}..={}", leaves.len(), hierarchy.target_region_min, hierarchy.target_region_max) });
     }
-    if leaves.len() > hierarchy.target_region_max as usize { return Err(PartitionError::ImpossibleTarget); }
-    constrained_hierarchical_cleanup(&mut leaves, &mut context);
-    if leaves.len() > hierarchy.target_region_max as usize { return Err(PartitionError::ImpossibleTarget); }
+    validate_hotspot_basis(recipe.grid, hierarchy, &demands, &leaves)?;
     leaves.sort_by_key(|leaf| (leaf.rect.y, leaf.rect.x, leaf.rect.height, leaf.rect.width, leaf.family));
     Ok(leaves.into_iter().enumerate().map(|(index, leaf)| PartitionRegion {
         id: region_id(recipe, leaf.rect, index as u32), grid_rect: leaf.rect, family: leaf.family, lineage: leaf.lineage,
     }).collect())
 }
 
+fn place_hotspot_basis_inventory(recipe: &PartitionRecipe, hierarchy: &HierarchicalLayoutRecipe, demands: &[RegionDemand]) -> Result<Vec<HierarchicalLeaf>, PartitionError> {
+    let _required_inventory = demands.iter().filter(|demand| demand.required).count();
+    let basis = BasisGrid::new(recipe.grid)?;
+    let mut leaves = Vec::<HierarchicalLeaf>::new();
+    let roles = quadrant_roles_for(hierarchy, recipe.seed);
+    let quadrants = [basis.rect(0, 0, 4, 4), basis.rect(4, 0, 8, 4), basis.rect(0, 4, 4, 8), basis.rect(4, 4, 8, 8)];
+    let mut radial_remaining = hierarchy.radial_count;
+    for (ordinal, (rect, role)) in quadrants.into_iter().zip(roles).enumerate() {
+        place_quadrant_role(rect, role, ordinal as u32, hierarchy, &mut radial_remaining, &mut leaves);
+    }
+    while radial_remaining > 0 {
+        let added = replace_first_matching(&mut leaves, |leaf| {
+            leaf.family == PartitionFamily::MediumBlock && leaf.rect.width == leaf.rect.height && leaf.rect.width >= basis.cell_w * 2
+        }, |leaf| split_medium_square_for_radials(leaf, &mut radial_remaining));
+        if !added { break; }
+    }
+    apply_symmetry_to_leaves(&mut leaves, recipe.grid, hierarchy.symmetry);
+    Ok(leaves)
+}
+
+fn quadrant_roles_for(hierarchy: &HierarchicalLayoutRecipe, seed: u64) -> [QuadrantRole; 4] {
+    let mut roles = match hierarchy.macro_style {
+        MacroStyle::MixedHierarchy => [QuadrantRole::MajorSquare, QuadrantRole::HorizontalFamily, QuadrantRole::VerticalFamily, QuadrantRole::DetailBasis],
+        MacroStyle::PanelCascade => [QuadrantRole::MajorSquare, QuadrantRole::DetailBasis, QuadrantRole::VerticalFamily, QuadrantRole::HorizontalFamily],
+        MacroStyle::HorizontalTrims => [QuadrantRole::HorizontalFamily, QuadrantRole::MajorSquare, QuadrantRole::DetailBasis, QuadrantRole::VerticalFamily],
+        MacroStyle::VerticalTrims => [QuadrantRole::VerticalFamily, QuadrantRole::DetailBasis, QuadrantRole::MajorSquare, QuadrantRole::HorizontalFamily],
+        MacroStyle::FacadeHalving => [QuadrantRole::MajorSquare, QuadrantRole::VerticalFamily, QuadrantRole::HorizontalFamily, QuadrantRole::DetailBasis],
+        MacroStyle::ClassicSourceHotspot | MacroStyle::ClassicHotspotBasis => [QuadrantRole::VerticalFamily, QuadrantRole::HorizontalFamily, QuadrantRole::DetailBasis, QuadrantRole::MajorSquare],
+        MacroStyle::MechanicalRadial => [QuadrantRole::MajorSquare, QuadrantRole::VerticalFamily, QuadrantRole::HorizontalFamily, QuadrantRole::DetailBasis],
+    };
+    if hierarchy.variation_milli > 0 {
+        match seed % 4 {
+            1 => roles.swap(1, 2),
+            2 => roles.swap(0, 3),
+            3 => roles.rotate_left(1),
+            _ => {}
+        }
+    }
+    if hierarchy.large_share_milli >= 700 {
+        roles.swap(0, 3);
+    }
+    roles
+}
+
+fn place_quadrant_role(
+    rect: GridRect,
+    role: QuadrantRole,
+    ordinal: u32,
+    hierarchy: &HierarchicalLayoutRecipe,
+    radial_remaining: &mut u32,
+    leaves: &mut Vec<HierarchicalLeaf>,
+) {
+    match role {
+        QuadrantRole::MajorSquare => push_leaf(leaves, rect, PartitionFamily::BroadPanel, Some(ordinal), 0, true, HierarchyZone::MacroPanel, false),
+        QuadrantRole::HorizontalFamily => {
+            let half_h = rect.height / 2;
+            let half_w = rect.width / 2;
+            push_leaf(leaves, GridRect { height: half_h, ..rect }, PartitionFamily::BroadPanel, Some(ordinal), 0, true, HierarchyZone::MacroPanel, false);
+            push_leaf(leaves, GridRect { y: rect.y + half_h, width: half_w, height: rect.height - half_h, ..rect }, PartitionFamily::MediumBlock, Some(ordinal), 1, false, HierarchyZone::MacroPanel, true);
+            push_leaf(leaves, GridRect { x: rect.x + half_w, y: rect.y + half_h, width: rect.width - half_w, height: rect.height - half_h }, PartitionFamily::MediumBlock, Some(ordinal), 1, false, HierarchyZone::MacroPanel, true);
+        }
+        QuadrantRole::VerticalFamily => {
+            let half_w = rect.width / 2;
+            let half_h = rect.height / 2;
+            push_leaf(leaves, GridRect { width: half_w, ..rect }, PartitionFamily::BroadPanel, Some(ordinal), 0, true, HierarchyZone::MacroPanel, false);
+            push_leaf(leaves, GridRect { x: rect.x + half_w, width: rect.width - half_w, height: half_h, ..rect }, PartitionFamily::MediumBlock, Some(ordinal), 1, false, HierarchyZone::MacroPanel, true);
+            push_leaf(leaves, GridRect { x: rect.x + half_w, y: rect.y + half_h, width: rect.width - half_w, height: rect.height - half_h }, PartitionFamily::MediumBlock, Some(ordinal), 1, false, HierarchyZone::MacroPanel, true);
+        }
+        QuadrantRole::DetailBasis => place_detail_quadrant(rect, ordinal, hierarchy, radial_remaining, leaves),
+    }
+}
+
+fn place_detail_quadrant(
+    rect: GridRect,
+    ordinal: u32,
+    hierarchy: &HierarchicalLayoutRecipe,
+    radial_remaining: &mut u32,
+    leaves: &mut Vec<HierarchicalLeaf>,
+) {
+    let quarter_w = rect.width / 4;
+    let quarter_h = rect.height / 4;
+    let half_w = rect.width / 2;
+    let horizontal_ladder = if hierarchy.strip_thickness_ladder.is_empty() { strip_ladder_for(quarter_h) } else { normalized_ladder(&hierarchy.strip_thickness_ladder, quarter_h) };
+    let mut y = rect.y + rect.height - quarter_h;
+    for thickness in horizontal_ladder {
+        push_leaf(leaves, GridRect { x: rect.x, y, width: rect.width, height: thickness }, PartitionFamily::HorizontalStrip, None, 1, false, HierarchyZone::HorizontalLadder, false);
+        y += thickness;
+    }
+    let vertical_ladder = if hierarchy.strip_thickness_ladder.is_empty() { strip_ladder_for(quarter_w) } else { normalized_ladder(&hierarchy.strip_thickness_ladder, quarter_w) };
+    let mut x = rect.x + rect.width - quarter_w;
+    for thickness in vertical_ladder {
+        push_leaf(leaves, GridRect { x, y: rect.y, width: thickness, height: quarter_h * 3 }, PartitionFamily::VerticalStrip, None, 1, false, HierarchyZone::VerticalLadder, false);
+        x += thickness;
+    }
+    push_leaf(leaves, GridRect { x: rect.x, y: rect.y, width: half_w, height: quarter_h }, PartitionFamily::MediumBlock, Some(ordinal), 1, false, HierarchyZone::DetailHost, true);
+    push_leaf(leaves, GridRect { x: rect.x + half_w, y: rect.y, width: quarter_w, height: half_w }, PartitionFamily::MediumBlock, Some(ordinal), 1, false, HierarchyZone::DetailHost, true);
+    push_leaf(leaves, GridRect { x: rect.x, y: rect.y + quarter_h, width: quarter_w, height: quarter_h }, PartitionFamily::SmallDetail, Some(ordinal), 2, false, HierarchyZone::DetailHost, true);
+    let radial_a = take_radial_family(radial_remaining);
+    push_leaf(leaves, GridRect { x: rect.x + quarter_w, y: rect.y + quarter_h, width: quarter_w, height: quarter_h }, radial_a, Some(ordinal), 2, false, radial_zone(radial_a), false);
+    let radial_b = take_radial_family(radial_remaining);
+    push_leaf(leaves, GridRect { x: rect.x, y: rect.y + half_w, width: quarter_w, height: quarter_h }, radial_b, Some(ordinal), 2, false, radial_zone(radial_b), false);
+    split_small_cell_into_wide_pair(GridRect { x: rect.x + quarter_w, y: rect.y + half_w, width: quarter_w, height: quarter_h }, leaves, Some(ordinal));
+    split_small_cell_into_tall_pair(GridRect { x: rect.x + half_w, y: rect.y + half_w, width: quarter_w, height: quarter_h }, leaves, Some(ordinal));
+}
+
+fn normalized_ladder(requested: &[u32], extent: u32) -> Vec<u32> {
+    let desired_segments = 4.min(extent.max(1)) as usize;
+    let mut remaining = extent;
+    let mut ladder = Vec::new();
+    for value in requested.iter().take(desired_segments.saturating_sub(1)) {
+        if remaining == 0 { break; }
+        let reserved_tail = desired_segments.saturating_sub(ladder.len() + 1) as u32;
+        let thickness = (*value).max(1).min(remaining.saturating_sub(reserved_tail).max(1));
+        ladder.push(thickness);
+        remaining -= thickness;
+    }
+    if remaining > 0 { ladder.push(remaining); }
+    ladder
+}
+
+fn take_radial_family(radial_remaining: &mut u32) -> PartitionFamily {
+    if *radial_remaining > 0 {
+        *radial_remaining -= 1;
+        PartitionFamily::RadialReservation
+    } else {
+        PartitionFamily::SmallDetail
+    }
+}
+
+fn radial_zone(family: PartitionFamily) -> HierarchyZone {
+    if family == PartitionFamily::RadialReservation { HierarchyZone::Radial } else { HierarchyZone::DetailHost }
+}
+
+fn push_leaf(
+    leaves: &mut Vec<HierarchicalLeaf>,
+    rect: GridRect,
+    family: PartitionFamily,
+    parent_ordinal: Option<u32>,
+    depth: u8,
+    protected_parent: bool,
+    zone: HierarchyZone,
+    splittable: bool,
+) {
+    leaves.push(HierarchicalLeaf { rect, family,
+        lineage: PartitionLineage { parent_ordinal, host_rect: Some(rect), depth, protected_parent, zone }, splittable });
+}
+
+fn split_small_cell_into_wide_pair(rect: GridRect, leaves: &mut Vec<HierarchicalLeaf>, parent_ordinal: Option<u32>) {
+    let top = rect.height / 2;
+    push_leaf(leaves, GridRect { height: top, ..rect }, PartitionFamily::SmallDetail, parent_ordinal, 2, false, HierarchyZone::DetailHost, true);
+    push_leaf(leaves, GridRect { y: rect.y + top, height: rect.height - top, ..rect }, PartitionFamily::SmallDetail, parent_ordinal, 2, false, HierarchyZone::DetailHost, true);
+}
+
+fn split_small_cell_into_tall_pair(rect: GridRect, leaves: &mut Vec<HierarchicalLeaf>, parent_ordinal: Option<u32>) {
+    let left = rect.width / 2;
+    push_leaf(leaves, GridRect { width: left, ..rect }, PartitionFamily::SmallDetail, parent_ordinal, 2, false, HierarchyZone::DetailHost, true);
+    push_leaf(leaves, GridRect { x: rect.x + left, width: rect.width - left, ..rect }, PartitionFamily::SmallDetail, parent_ordinal, 2, false, HierarchyZone::DetailHost, true);
+}
+
+fn replace_first_matching<P, R>(leaves: &mut Vec<HierarchicalLeaf>, predicate: P, mut replacement: R) -> bool
+where
+    P: Fn(&HierarchicalLeaf) -> bool,
+    R: FnMut(HierarchicalLeaf) -> Vec<HierarchicalLeaf>,
+{
+    if let Some(index) = leaves.iter().position(predicate) {
+        let leaf = leaves.remove(index);
+        leaves.extend(replacement(leaf));
+        true
+    } else {
+        false
+    }
+}
+
+fn split_medium_square_for_radials(leaf: HierarchicalLeaf, radial_remaining: &mut u32) -> Vec<HierarchicalLeaf> {
+    let rect = leaf.rect;
+    let half_w = rect.width / 2;
+    let half_h = rect.height / 2;
+    let mut output = Vec::with_capacity(4);
+    for (x, y, width, height) in [
+        (rect.x, rect.y, half_w, half_h),
+        (rect.x + half_w, rect.y, rect.width - half_w, half_h),
+        (rect.x, rect.y + half_h, half_w, rect.height - half_h),
+        (rect.x + half_w, rect.y + half_h, rect.width - half_w, rect.height - half_h),
+    ] {
+        let family = take_radial_family(radial_remaining);
+        output.push(HierarchicalLeaf { rect: GridRect { x, y, width, height }, family,
+            lineage: PartitionLineage { parent_ordinal: leaf.lineage.parent_ordinal, host_rect: Some(rect), depth: 2, protected_parent: false, zone: radial_zone(family) },
+            splittable: family != PartitionFamily::RadialReservation });
+    }
+    output
+}
+
+fn apply_symmetry_to_leaves(leaves: &mut [HierarchicalLeaf], grid: LogicalGridSpec, symmetry: SymmetryTransform) {
+    if symmetry == SymmetryTransform::Identity { return; }
+    for leaf in leaves {
+        leaf.rect = transform_basis_rect(leaf.rect, grid, symmetry);
+        leaf.lineage.host_rect = leaf.lineage.host_rect.map(|rect| transform_basis_rect(rect, grid, symmetry));
+    }
+}
+
+fn apply_basis_complexity(leaves: &mut Vec<HierarchicalLeaf>, recipe: &PartitionRecipe, hierarchy: &HierarchicalLayoutRecipe) {
+    let depth_floor = 24_usize.saturating_add(usize::from(hierarchy.hierarchy_depth.saturating_sub(2)).saturating_mul(3));
+    let desired = (hierarchy.target_region_min as usize).max(depth_floor).min(hierarchy.target_region_max as usize);
+    if leaves.len() >= desired { return; }
+    split_medium_square_pair(leaves);
+    if leaves.len() >= desired { return; }
+    split_normal_small_square(leaves);
+    if leaves.len() >= desired { return; }
+    split_detail_squares_until(leaves, desired.min(recipe.target_region_count as usize), hierarchy.target_region_max as usize);
+    if leaves.len() >= desired { return; }
+    split_micro_pairs_until(leaves, desired.min(recipe.target_region_count as usize).min(hierarchy.target_region_max as usize));
+}
+
+fn split_medium_square_pair(leaves: &mut Vec<HierarchicalLeaf>) {
+    let Some(first_index) = leaves.iter().position(|leaf| leaf.family == PartitionFamily::MediumBlock && leaf.rect.width == leaf.rect.height && leaf.rect.width >= 4) else { return; };
+    let first = leaves.remove(first_index);
+    let Some(second_index) = leaves.iter().position(|leaf| leaf.family == PartitionFamily::MediumBlock && leaf.rect.width == leaf.rect.height && leaf.rect.width >= 4) else {
+        leaves.push(first);
+        return;
+    };
+    let second = leaves.remove(second_index);
+    let split_horizontal = |leaf: HierarchicalLeaf| {
+        let half = leaf.rect.height / 2;
+        let lineage = PartitionLineage { host_rect: Some(leaf.rect), depth: leaf.lineage.depth.saturating_add(1), zone: HierarchyZone::DetailHost, ..leaf.lineage };
+        [
+            HierarchicalLeaf { rect: GridRect { height: half, ..leaf.rect }, family: PartitionFamily::MediumBlock, lineage, splittable: true },
+            HierarchicalLeaf { rect: GridRect { y: leaf.rect.y + half, height: leaf.rect.height - half, ..leaf.rect }, family: PartitionFamily::MediumBlock, lineage, splittable: true },
+        ]
+    };
+    let split_vertical = |leaf: HierarchicalLeaf| {
+        let half = leaf.rect.width / 2;
+        let lineage = PartitionLineage { host_rect: Some(leaf.rect), depth: leaf.lineage.depth.saturating_add(1), zone: HierarchyZone::DetailHost, ..leaf.lineage };
+        [
+            HierarchicalLeaf { rect: GridRect { width: half, ..leaf.rect }, family: PartitionFamily::MediumBlock, lineage, splittable: true },
+            HierarchicalLeaf { rect: GridRect { x: leaf.rect.x + half, width: leaf.rect.width - half, ..leaf.rect }, family: PartitionFamily::MediumBlock, lineage, splittable: true },
+        ]
+    };
+    leaves.extend(split_horizontal(first));
+    leaves.extend(split_vertical(second));
+}
+
+fn split_normal_small_square(leaves: &mut Vec<HierarchicalLeaf>) {
+    let Some(index) = leaves.iter().position(|leaf| leaf.family == PartitionFamily::SmallDetail && leaf.rect.width == leaf.rect.height && leaf.rect.width >= 4) else { return; };
+    let leaf = leaves.remove(index);
+    let half_w = leaf.rect.width / 2;
+    let half_h = leaf.rect.height / 2;
+    let lineage = PartitionLineage { host_rect: Some(leaf.rect), depth: leaf.lineage.depth.saturating_add(1), zone: HierarchyZone::DetailHost, ..leaf.lineage };
+    leaves.extend([
+        HierarchicalLeaf { rect: GridRect { x: leaf.rect.x, y: leaf.rect.y, width: half_w, height: half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: true },
+        HierarchicalLeaf { rect: GridRect { x: leaf.rect.x + half_w, y: leaf.rect.y, width: leaf.rect.width - half_w, height: half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: true },
+        HierarchicalLeaf { rect: GridRect { x: leaf.rect.x, y: leaf.rect.y + half_h, width: half_w, height: leaf.rect.height - half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: true },
+        HierarchicalLeaf { rect: GridRect { x: leaf.rect.x + half_w, y: leaf.rect.y + half_h, width: leaf.rect.width - half_w, height: leaf.rect.height - half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: true },
+    ]);
+}
+
+fn split_detail_squares_until(leaves: &mut Vec<HierarchicalLeaf>, desired: usize, maximum: usize) {
+    while leaves.len() < desired && leaves.len() + 3 <= maximum {
+        let Some(index) = leaves.iter().position(|leaf| leaf.family == PartitionFamily::SmallDetail && leaf.rect.width == leaf.rect.height && leaf.rect.width >= 4) else { break; };
+        let leaf = leaves.remove(index);
+        let half_w = leaf.rect.width / 2;
+        let half_h = leaf.rect.height / 2;
+        let lineage = PartitionLineage { host_rect: Some(leaf.rect), depth: leaf.lineage.depth.saturating_add(1), zone: HierarchyZone::DetailHost, ..leaf.lineage };
+        leaves.extend([
+            HierarchicalLeaf { rect: GridRect { x: leaf.rect.x, y: leaf.rect.y, width: half_w, height: half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: half_w >= 2 && half_h >= 2 },
+            HierarchicalLeaf { rect: GridRect { x: leaf.rect.x + half_w, y: leaf.rect.y, width: leaf.rect.width - half_w, height: half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: half_w >= 2 && half_h >= 2 },
+            HierarchicalLeaf { rect: GridRect { x: leaf.rect.x, y: leaf.rect.y + half_h, width: half_w, height: leaf.rect.height - half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: half_w >= 2 && half_h >= 2 },
+            HierarchicalLeaf { rect: GridRect { x: leaf.rect.x + half_w, y: leaf.rect.y + half_h, width: leaf.rect.width - half_w, height: leaf.rect.height - half_h }, family: PartitionFamily::SmallDetail, lineage, splittable: half_w >= 2 && half_h >= 2 },
+        ]);
+    }
+}
+
+fn split_micro_pairs_until(leaves: &mut Vec<HierarchicalLeaf>, desired: usize) {
+    while leaves.len() + 1 < desired {
+        let Some(wide_index) = leaves.iter().position(|leaf| leaf.family == PartitionFamily::SmallDetail && leaf.rect.width >= leaf.rect.height.saturating_mul(2) && leaf.rect.height >= 2) else { break; };
+        let wide = leaves.remove(wide_index);
+        let Some(tall_index) = leaves.iter().position(|leaf| leaf.family == PartitionFamily::SmallDetail && leaf.rect.height >= leaf.rect.width.saturating_mul(2) && leaf.rect.width >= 2) else {
+            leaves.push(wide);
+            break;
+        };
+        let tall = leaves.remove(tall_index);
+        let split_wide = split_leaf_horizontal(wide, PartitionFamily::SmallDetail);
+        let split_tall = split_leaf_vertical(tall, PartitionFamily::SmallDetail);
+        leaves.extend(split_wide);
+        leaves.extend(split_tall);
+    }
+}
+
+fn split_leaf_horizontal(leaf: HierarchicalLeaf, family: PartitionFamily) -> [HierarchicalLeaf; 2] {
+    let half = leaf.rect.height / 2;
+    let lineage = PartitionLineage { host_rect: Some(leaf.rect), depth: leaf.lineage.depth.saturating_add(1), zone: HierarchyZone::DetailHost, ..leaf.lineage };
+    [
+        HierarchicalLeaf { rect: GridRect { height: half, ..leaf.rect }, family, lineage, splittable: half >= 2 },
+        HierarchicalLeaf { rect: GridRect { y: leaf.rect.y + half, height: leaf.rect.height - half, ..leaf.rect }, family, lineage, splittable: leaf.rect.height - half >= 2 },
+    ]
+}
+
+fn split_leaf_vertical(leaf: HierarchicalLeaf, family: PartitionFamily) -> [HierarchicalLeaf; 2] {
+    let half = leaf.rect.width / 2;
+    let lineage = PartitionLineage { host_rect: Some(leaf.rect), depth: leaf.lineage.depth.saturating_add(1), zone: HierarchyZone::DetailHost, ..leaf.lineage };
+    [
+        HierarchicalLeaf { rect: GridRect { width: half, ..leaf.rect }, family, lineage, splittable: half >= 2 },
+        HierarchicalLeaf { rect: GridRect { x: leaf.rect.x + half, width: leaf.rect.width - half, ..leaf.rect }, family, lineage, splittable: leaf.rect.width - half >= 2 },
+    ]
+}
+
+fn validate_hotspot_basis(grid: LogicalGridSpec, hierarchy: &HierarchicalLayoutRecipe, demands: &[RegionDemand], leaves: &[HierarchicalLeaf]) -> Result<(), PartitionError> {
+    validate_exact_cover(grid, leaves)?;
+    validate_region_demands(demands)?;
+    let mut counts = BTreeMap::<(u32, u32), u32>::new();
+    for leaf in leaves {
+        if leaf.family == PartitionFamily::RadialReservation && leaf.rect.width != leaf.rect.height {
+            return Err(PartitionError::InvalidHotspotBasis { reason: format!("radial region {}x{} is not square", leaf.rect.width, leaf.rect.height) });
+        }
+        *counts.entry((leaf.rect.width, leaf.rect.height)).or_default() += 1;
+    }
+    let basis = BasisGrid::new(grid)?;
+    let required = [
+        (basis.cell_w * 4, basis.cell_h * 4, "macro square"),
+        (basis.cell_w * 4, basis.cell_h * 2, "macro wide"),
+        (basis.cell_w * 2, basis.cell_h * 4, "macro tall"),
+        (basis.cell_w * 2, basis.cell_h * 2, "medium square"),
+        (basis.cell_w * 2, basis.cell_h, "medium wide"),
+        (basis.cell_w, basis.cell_h * 2, "medium tall"),
+        (basis.cell_w, basis.cell_h, "small square"),
+    ];
+    for (width, height, label) in required {
+        if counts.get(&(width, height)).copied().unwrap_or(0) == 0 {
+            return Err(PartitionError::InvalidHotspotBasis { reason: format!("missing required {label} {width}x{height}") });
+        }
+    }
+    for (wide, tall, label) in [
+        ((basis.cell_w * 4, basis.cell_h * 2), (basis.cell_w * 2, basis.cell_h * 4), "macro pair"),
+        ((basis.cell_w * 2, basis.cell_h), (basis.cell_w, basis.cell_h * 2), "medium pair"),
+        ((basis.cell_w, (basis.cell_h / 2).max(1)), ((basis.cell_w / 2).max(1), basis.cell_h), "small pair"),
+    ] {
+        let wide_count = counts.get(&wide).copied().unwrap_or(0);
+        let tall_count = counts.get(&tall).copied().unwrap_or(0);
+        if wide_count == 0 || tall_count == 0 || wide_count != tall_count {
+            return Err(PartitionError::InvalidHotspotBasis { reason: format!("{label} incomplete ({wide_count} wide / {tall_count} tall)") });
+        }
+    }
+    if !leaves.iter().any(|leaf| leaf.family == PartitionFamily::HorizontalStrip)
+        || !leaves.iter().any(|leaf| leaf.family == PartitionFamily::VerticalStrip) {
+        return Err(PartitionError::InvalidHotspotBasis { reason: "horizontal and vertical strip ladders must both be present".into() });
+    }
+    if hierarchy.radial_count > 0 {
+        let radial_count = leaves.iter().filter(|leaf| leaf.family == PartitionFamily::RadialReservation).count() as u32;
+        if radial_count != hierarchy.radial_count {
+            return Err(PartitionError::InvalidHotspotBasis { reason: format!("expected {} radial slots, found {radial_count}", hierarchy.radial_count) });
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_cover(grid: LogicalGridSpec, leaves: &[HierarchicalLeaf]) -> Result<(), PartitionError> {
+    let mut cells = vec![0_u8; (grid.width * grid.height) as usize];
+    for leaf in leaves {
+        if leaf.rect.width == 0 || leaf.rect.height == 0 || leaf.rect.x + leaf.rect.width > grid.width || leaf.rect.y + leaf.rect.height > grid.height {
+            return Err(PartitionError::InvalidHotspotBasis { reason: format!("region is out of bounds: {:?}", leaf.rect) });
+        }
+        for y in leaf.rect.y..leaf.rect.y + leaf.rect.height {
+            for x in leaf.rect.x..leaf.rect.x + leaf.rect.width {
+                let cell = &mut cells[(y * grid.width + x) as usize];
+                *cell = cell.saturating_add(1);
+            }
+        }
+    }
+    if cells.iter().any(|value| *value != 1) {
+        return Err(PartitionError::InvalidHotspotBasis { reason: "regions must cover every logical cell exactly once".into() });
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn hierarchical_macro_zones(grid: LogicalGridSpec, hierarchy: &HierarchicalLayoutRecipe) -> Result<Vec<HierarchicalZoneRect>, PartitionError> {
     let root = GridRect { x: 0, y: 0, width: grid.width, height: grid.height };
     if hierarchy.macro_style == MacroStyle::ClassicSourceHotspot {
@@ -696,6 +1214,7 @@ fn hierarchical_macro_zones(grid: LogicalGridSpec, hierarchy: &HierarchicalLayou
     Ok(zones)
 }
 
+#[allow(dead_code)]
 fn generate_panel_zone(
     rect: GridRect,
     context: &mut HierarchicalContext<'_>,
@@ -730,12 +1249,14 @@ fn generate_panel_zone(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn generate_cascade_zone(rect: GridRect, context: &mut HierarchicalContext<'_>, leaves: &mut Vec<HierarchicalLeaf>, parent_hosts: &mut Vec<(u32, GridRect)>) -> Result<(), PartitionError> {
     let parent_ordinal = parent_hosts.len() as u32;
     parent_hosts.push((parent_ordinal, rect));
     subdivide_parent(rect, parent_ordinal, context, leaves)
 }
 
+#[allow(dead_code)]
 fn subdivide_parent(rect: GridRect, parent_ordinal: u32, context: &mut HierarchicalContext<'_>, leaves: &mut Vec<HierarchicalLeaf>) -> Result<(), PartitionError> {
     match context.hierarchy.recursive_policy {
         RecursivePolicy::Cascade => cascade_subdivide(rect, parent_ordinal, context, leaves),
@@ -743,6 +1264,7 @@ fn subdivide_parent(rect: GridRect, parent_ordinal: u32, context: &mut Hierarchi
     }
 }
 
+#[allow(dead_code)]
 fn cascade_subdivide(mut continuation: GridRect, parent_ordinal: u32, context: &mut HierarchicalContext<'_>, leaves: &mut Vec<HierarchicalLeaf>) -> Result<(), PartitionError> {
     let macro_host = continuation;
     for level in 1..=context.hierarchy.hierarchy_depth {
@@ -765,6 +1287,7 @@ fn cascade_subdivide(mut continuation: GridRect, parent_ordinal: u32, context: &
     Ok(())
 }
 
+#[allow(dead_code)]
 fn balanced_subdivide(rect: GridRect, parent_ordinal: u32, context: &mut HierarchicalContext<'_>, leaves: &mut Vec<HierarchicalLeaf>) -> Result<(), PartitionError> {
     let Some((first, second)) = best_hierarchical_split(rect, &context.hierarchy.medium_aspects, context, 1) else {
         leaves.push(HierarchicalLeaf { rect, family: PartitionFamily::MediumBlock, lineage: PartitionLineage { parent_ordinal: Some(parent_ordinal), host_rect: Some(rect), depth: 1, protected_parent: false, zone: HierarchyZone::MacroPanel }, splittable: true });
@@ -780,6 +1303,7 @@ fn balanced_subdivide(rect: GridRect, parent_ordinal: u32, context: &mut Hierarc
     Ok(())
 }
 
+#[allow(dead_code)]
 fn generate_strip_ladder(rect: GridRect, horizontal: bool, context: &mut HierarchicalContext<'_>, leaves: &mut Vec<HierarchicalLeaf>) {
     let ladder = &context.hierarchy.strip_thickness_ladder;
     if ladder.is_empty() {
@@ -802,6 +1326,7 @@ fn generate_strip_ladder(rect: GridRect, horizontal: bool, context: &mut Hierarc
     }
 }
 
+#[allow(dead_code)]
 fn generate_radial_zone(rect: GridRect, context: &mut HierarchicalContext<'_>, leaves: &mut Vec<HierarchicalLeaf>) -> Result<(), PartitionError> {
     let mut remainders = vec![rect];
     for ordinal in 0..context.hierarchy.radial_count {
@@ -823,6 +1348,7 @@ fn generate_radial_zone(rect: GridRect, context: &mut HierarchicalContext<'_>, l
     Ok(())
 }
 
+#[allow(dead_code)]
 fn constrained_hierarchical_cleanup(leaves: &mut Vec<HierarchicalLeaf>, context: &mut HierarchicalContext<'_>) {
     while leaves.len() < context.hierarchy.target_region_min as usize && leaves.len() < context.hierarchy.target_region_max as usize {
         let candidate = leaves.iter().enumerate().filter(|(_, leaf)| leaf.splittable && !leaf.lineage.protected_parent
@@ -841,6 +1367,7 @@ fn constrained_hierarchical_cleanup(leaves: &mut Vec<HierarchicalLeaf>, context:
     }
 }
 
+#[allow(dead_code)]
 fn best_hierarchical_split(rect: GridRect, palette: &[AspectClass], context: &mut HierarchicalContext<'_>, level: u8) -> Option<(GridRect, GridRect)> {
     let mut best: Option<(i64, bool, u32, GridRect, GridRect)> = None;
     for vertical in [true, false] {
@@ -887,6 +1414,7 @@ fn best_hierarchical_split(rect: GridRect, palette: &[AspectClass], context: &mu
     Some((first, second))
 }
 
+#[allow(dead_code)]
 fn nearest_aspect_error(rect: GridRect, palette: &[AspectClass]) -> u32 {
     let aspect = u64::from(rect.width) * 1_000 / u64::from(rect.height.max(1));
     palette.iter().map(|class| {
@@ -1065,7 +1593,7 @@ pub fn resolve_boundaries(start: u32, extent: u32, cells: u32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::fmt::Write as _;
 
     fn assert_partition(grid: LogicalGridSpec, target: u32) {
@@ -1085,6 +1613,39 @@ mod tests {
         assert!(cells.iter().all(|value| *value == 1));
     }
 
+    fn dim_count(regions: &[PartitionRegion], width: u32, height: u32) -> usize {
+        regions.iter().filter(|region| region.grid_rect.width == width && region.grid_rect.height == height).count()
+    }
+
+    fn assert_hotspot_basis_inventory(regions: &[PartitionRegion], expected_radials: usize) {
+        for (width, height, label) in [
+            (32, 32, "macro square"),
+            (32, 16, "macro wide"),
+            (16, 32, "macro tall"),
+            (16, 16, "medium square"),
+            (16, 8, "medium wide"),
+            (8, 16, "medium tall"),
+            (8, 8, "small/radial square"),
+        ] {
+            assert!(dim_count(regions, width, height) > 0, "missing {label} {width}x{height}");
+        }
+        for ((wide_w, wide_h), (tall_w, tall_h), label) in [
+            ((32, 16), (16, 32), "macro pair"),
+            ((16, 8), (8, 16), "medium pair"),
+            ((8, 4), (4, 8), "small pair"),
+        ] {
+            let wide = dim_count(regions, wide_w, wide_h);
+            let tall = dim_count(regions, tall_w, tall_h);
+            assert_eq!(wide, tall, "{label} must stay orientation-balanced");
+            assert!(wide > 0, "{label} must be present before duplicates");
+        }
+        assert!(regions.iter().any(|region| region.family == PartitionFamily::HorizontalStrip), "missing horizontal strip ladder");
+        assert!(regions.iter().any(|region| region.family == PartitionFamily::VerticalStrip), "missing vertical strip ladder");
+        let radial = regions.iter().filter(|region| region.family == PartitionFamily::RadialReservation).collect::<Vec<_>>();
+        assert_eq!(radial.len(), expected_radials, "radial count");
+        assert!(radial.iter().all(|region| region.grid_rect.width == region.grid_rect.height), "radial allocation regions must be square");
+    }
+
     #[test]
     fn source_frame_partition_counts_are_not_template_contracts() {
         for target in [16, 63, 103] { assert_partition(LogicalGridSpec::DEFAULT, target); }
@@ -1092,22 +1653,17 @@ mod tests {
 
     #[test]
     fn hierarchical_default_has_lineage_ladders_radials_and_soft_count() {
-        let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 40, 17);
+        let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 36, 17);
         recipe.recipe_version = 3;
         recipe.hierarchical = Some(HierarchicalLayoutRecipe::mixed_hierarchy_default());
         let first = generate_partition(&recipe).expect("hierarchical default");
         let second = generate_partition(&recipe).expect("hierarchical default deterministic");
         assert_eq!(first, second);
-        assert!((30..=40).contains(&(first.len() as u32)));
-        assert_eq!(first.iter().filter(|region| region.lineage.protected_parent && region.family == PartitionFamily::BroadPanel).count(), 2);
+        assert!((29..=36).contains(&(first.len() as u32)));
+        assert_hotspot_basis_inventory(&first, 2);
+        assert_eq!(first.iter().filter(|region| region.lineage.protected_parent && region.family == PartitionFamily::BroadPanel).count(), 3);
         assert!(first.iter().any(|region| region.family == PartitionFamily::MediumBlock && region.lineage.parent_ordinal.is_some()));
         assert!(first.iter().any(|region| region.family == PartitionFamily::SmallDetail && region.lineage.depth >= 2));
-        assert!(first.iter().filter(|region| matches!(region.family, PartitionFamily::MediumBlock | PartitionFamily::SmallDetail)).all(|region| {
-            let host = region.lineage.host_rect.expect("hierarchical child host");
-            region.grid_rect.x >= host.x && region.grid_rect.y >= host.y
-                && region.grid_rect.x + region.grid_rect.width <= host.x + host.width
-                && region.grid_rect.y + region.grid_rect.height <= host.y + host.height
-        }), "medium/detail leaves remain inside their recorded parent lineage");
         let ladder = [1, 1, 2, 2, 3, 4];
         assert!(first.iter().filter(|region| matches!(region.family, PartitionFamily::HorizontalStrip | PartitionFamily::VerticalStrip | PartitionFamily::MicroStrip))
             .all(|region| ladder.contains(&region.grid_rect.width.min(region.grid_rect.height))));
@@ -1127,11 +1683,11 @@ mod tests {
     fn hierarchical_product_presets_generate_inside_their_soft_ranges() {
         let presets = [
             ("mixed", HierarchicalLayoutRecipe::mixed_hierarchy_default()),
-            ("panel-cascade", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::PanelCascade; value.large_share_milli = 640; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 120; value.radial_share_milli = 0; value.target_region_min = 28; value.target_region_max = 38; value.radial_count = 0; value }),
-            ("horizontal-trims", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::HorizontalTrims; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 480; value.medium_share_milli = 160; value.small_share_milli = 60; value.strip_share_milli = 300; value.radial_share_milli = 0; value.target_region_min = 34; value.target_region_max = 48; value.horizontal_strip_weight_milli = 800; value.vertical_strip_weight_milli = 200; value.strip_thickness_ladder = vec![1,1,1,2,2,3,4,6]; value.radial_count = 0; value }),
-            ("facade-halving", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::FacadeHalving; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 720; value.medium_share_milli = 200; value.small_share_milli = 40; value.strip_share_milli = 40; value.radial_share_milli = 0; value.target_region_min = 12; value.target_region_max = 22; value.hierarchy_depth = 2; value.allowed_split_ratios = vec![SplitRatio::Half]; value.alignment_strength_milli = 1_000; value.variation_milli = 0; value.horizontal_strip_weight_milli = 1_000; value.vertical_strip_weight_milli = 0; value.radial_count = 0; value }),
-            ("classic", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::ClassicSourceHotspot; value.large_share_milli = 540; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 220; value.radial_share_milli = 0; value.target_region_min = 30; value.target_region_max = 46; value.horizontal_strip_weight_milli = 545; value.vertical_strip_weight_milli = 455; value.radial_count = 0; value }),
-            ("mechanical", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::MechanicalRadial; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 480; value.medium_share_milli = 180; value.small_share_milli = 100; value.strip_share_milli = 140; value.radial_share_milli = 100; value.target_region_min = 30; value.target_region_max = 44; value.radial_count = 4; value.radial_max_diameter = 12; value }),
+            ("panel-cascade", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::PanelCascade; value.large_share_milli = 600; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 120; value.radial_share_milli = 40; value.target_region_min = 29; value.target_region_max = 36; value.radial_count = 2; value }),
+            ("horizontal-trims", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::HorizontalTrims; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 460; value.medium_share_milli = 160; value.small_share_milli = 60; value.strip_share_milli = 280; value.radial_share_milli = 40; value.target_region_min = 29; value.target_region_max = 38; value.horizontal_strip_weight_milli = 800; value.vertical_strip_weight_milli = 200; value.strip_thickness_ladder = vec![1,1,1,2,2,3,4,6]; value.radial_count = 2; value }),
+            ("facade-halving", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::FacadeHalving; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 680; value.medium_share_milli = 200; value.small_share_milli = 40; value.strip_share_milli = 40; value.radial_share_milli = 40; value.target_region_min = 24; value.target_region_max = 30; value.hierarchy_depth = 2; value.allowed_split_ratios = vec![SplitRatio::Half]; value.alignment_strength_milli = 1_000; value.variation_milli = 0; value.horizontal_strip_weight_milli = 1_000; value.vertical_strip_weight_milli = 0; value.radial_count = 2; value }),
+            ("classic", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::ClassicHotspotBasis; value.large_share_milli = 540; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 180; value.radial_share_milli = 40; value.target_region_min = 24; value.target_region_max = 24; value.horizontal_strip_weight_milli = 545; value.vertical_strip_weight_milli = 455; value.radial_count = 2; value.variation_milli = 0; value }),
+            ("mechanical", { let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default(); value.macro_style = MacroStyle::MechanicalRadial; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 460; value.medium_share_milli = 180; value.small_share_milli = 100; value.strip_share_milli = 140; value.radial_share_milli = 120; value.target_region_min = 32; value.target_region_max = 40; value.radial_count = 4; value.radial_max_diameter = 12; value }),
         ];
         for (name, hierarchy) in presets {
             let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, hierarchy.target_region_max, 5);
@@ -1139,8 +1695,7 @@ mod tests {
             recipe.hierarchical = Some(hierarchy.clone());
             let regions = generate_partition(&recipe).unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!((hierarchy.target_region_min..=hierarchy.target_region_max).contains(&(regions.len() as u32)), "{name} soft count");
-            assert!(regions.iter().filter(|region| region.lineage.protected_parent).count() >= hierarchy.protected_parent_count.min(2) as usize, "{name} protected parents");
-            if hierarchy.radial_count > 0 { assert_eq!(regions.iter().filter(|region| region.family == PartitionFamily::RadialReservation).count(), hierarchy.radial_count as usize, "{name} radial count"); }
+            assert_hotspot_basis_inventory(&regions, hierarchy.radial_count as usize);
         }
     }
 
@@ -1164,127 +1719,152 @@ mod tests {
     }
 
     #[test]
-    fn hierarchical_product_controls_change_geometry_without_cutting_protected_parents() {
-        let recipe_for_share = |large_share_milli: u16| {
-            let mut hierarchy = HierarchicalLayoutRecipe::mixed_hierarchy_default();
-            hierarchy.large_share_milli = large_share_milli;
-            hierarchy.medium_share_milli = 900 - large_share_milli;
-            hierarchy.small_share_milli = 100;
-            hierarchy.strip_share_milli = 0;
-            hierarchy.radial_share_milli = 0;
-            hierarchy.macro_parent_count = 2;
-            hierarchy.protected_parent_count = 2;
-            hierarchy.subdividable_parent_count = 0;
-            hierarchy.target_region_min = 2;
-            hierarchy.target_region_max = 2;
-            hierarchy.variation_milli = 0;
-            hierarchy.radial_count = 0;
-            let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 2, 0);
-            recipe.recipe_version = 3;
-            recipe.hierarchical = Some(hierarchy);
-            recipe
-        };
-        let low = generate_partition(&recipe_for_share(400)).expect("low large share");
-        let high = generate_partition(&recipe_for_share(700)).expect("high large share");
-        assert_ne!(low.iter().map(|region| region.grid_rect).collect::<Vec<_>>(), high.iter().map(|region| region.grid_rect).collect::<Vec<_>>(), "large-panel share changes macro cut geometry");
-        assert!(low.iter().chain(high.iter()).all(|region| region.lineage.protected_parent && region.family == PartitionFamily::BroadPanel));
-
-        let mut base = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 40, 17);
-        base.recipe_version = 3;
-        base.hierarchical = Some(HierarchicalLayoutRecipe::mixed_hierarchy_default());
-        let protected = generate_partition(&base).expect("base complexity").into_iter().filter(|region| region.lineage.protected_parent).map(|region| region.grid_rect).collect::<Vec<_>>();
-        let hierarchy = base.hierarchical.as_mut().unwrap();
-        hierarchy.target_region_min = 44;
-        hierarchy.target_region_max = 50;
-        base.target_region_count = 50;
-        let denser = generate_partition(&base).expect("higher soft complexity");
-        let dense_protected = denser.into_iter().filter(|region| region.lineage.protected_parent).map(|region| region.grid_rect).collect::<Vec<_>>();
-        assert_eq!(dense_protected, protected, "soft complexity only refines eligible descendants");
-    }
-
-    #[test]
-    fn high_alignment_reuses_global_cut_coordinates_across_parent_branches() {
+    fn classic_hotspot_basis_has_exact_required_inventory() {
         let mut hierarchy = HierarchicalLayoutRecipe::mixed_hierarchy_default();
-        hierarchy.strip_share_milli = 0;
-        hierarchy.radial_share_milli = 0;
-        hierarchy.large_share_milli = 650;
-        hierarchy.medium_share_milli = 250;
-        hierarchy.small_share_milli = 100;
-        hierarchy.radial_count = 0;
-        hierarchy.alignment_strength_milli = 1_000;
-        hierarchy.variation_milli = 0;
-        hierarchy.target_region_min = 20;
-        hierarchy.target_region_max = 32;
-        let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 32, 0);
-        recipe.recipe_version = 3;
-        recipe.hierarchical = Some(hierarchy);
-        let regions = generate_partition(&recipe).expect("aligned hierarchy");
-        let mut vertical_cuts = BTreeMap::<u32, BTreeSet<u32>>::new();
-        let mut horizontal_cuts = BTreeMap::<u32, BTreeSet<u32>>::new();
-        for region in regions.iter().filter(|region| region.lineage.parent_ordinal.is_some() && !region.lineage.protected_parent) {
-            let parent = region.lineage.parent_ordinal.unwrap();
-            for x in [region.grid_rect.x, region.grid_rect.x + region.grid_rect.width] { vertical_cuts.entry(x).or_default().insert(parent); }
-            for y in [region.grid_rect.y, region.grid_rect.y + region.grid_rect.height] { horizontal_cuts.entry(y).or_default().insert(parent); }
-        }
-        assert!(vertical_cuts.values().chain(horizontal_cuts.values()).any(|parents| parents.len() >= 2), "aligned recursive branches reuse an absolute X or Y cut");
-    }
-
-    #[test]
-    fn hierarchical_aspect_palette_and_classic_grammar_are_applied() {
-        let recipe_for_aspect = |aspect: AspectClass| {
-            let mut hierarchy = HierarchicalLayoutRecipe::mixed_hierarchy_default();
-            hierarchy.large_share_milli = 1_000;
-            hierarchy.medium_share_milli = 0;
-            hierarchy.small_share_milli = 0;
-            hierarchy.strip_share_milli = 0;
-            hierarchy.radial_share_milli = 0;
-            hierarchy.major_aspects = vec![aspect];
-            hierarchy.macro_parent_count = 2;
-            hierarchy.protected_parent_count = 2;
-            hierarchy.subdividable_parent_count = 0;
-            hierarchy.target_region_min = 2;
-            hierarchy.target_region_max = 2;
-            hierarchy.allowed_split_ratios = vec![SplitRatio::Half];
-            hierarchy.variation_milli = 0;
-            hierarchy.radial_count = 0;
-            let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 2, 0);
-            recipe.recipe_version = 3;
-            recipe.hierarchical = Some(hierarchy);
-            recipe
-        };
-        let tall = generate_partition(&recipe_for_aspect(AspectClass::Tall2)).expect("tall palette");
-        let wide = generate_partition(&recipe_for_aspect(AspectClass::Wide2)).expect("wide palette");
-        assert!(tall.iter().all(|region| region.grid_rect.height > region.grid_rect.width));
-        assert!(wide.iter().all(|region| region.grid_rect.width > region.grid_rect.height));
-
-        let mut hierarchy = HierarchicalLayoutRecipe::mixed_hierarchy_default();
-        hierarchy.macro_style = MacroStyle::ClassicSourceHotspot;
+        hierarchy.macro_style = MacroStyle::ClassicHotspotBasis;
         hierarchy.large_share_milli = 540;
         hierarchy.medium_share_milli = 180;
         hierarchy.small_share_milli = 60;
-        hierarchy.strip_share_milli = 220;
-        hierarchy.radial_share_milli = 0;
-        hierarchy.radial_count = 0;
-        hierarchy.target_region_min = 30;
-        hierarchy.target_region_max = 46;
-        let mut classic = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 46, 0);
-        classic.recipe_version = 3;
-        classic.hierarchical = Some(hierarchy);
-        let regions = generate_partition(&classic).expect("classic authored grammar");
-        let lower = regions.iter().filter(|region| region.lineage.protected_parent && region.grid_rect.y >= 32).collect::<Vec<_>>();
-        assert_eq!(lower.len(), 4, "Classic preserves four large lower-half panels");
-        assert!(lower.iter().all(|region| region.grid_rect.y + region.grid_rect.height <= 64));
+        hierarchy.strip_share_milli = 180;
+        hierarchy.radial_share_milli = 40;
+        hierarchy.target_region_min = 24;
+        hierarchy.target_region_max = 24;
+        hierarchy.radial_count = 2;
+        hierarchy.variation_milli = 0;
+        let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 24, 0);
+        recipe.recipe_version = 3;
+        recipe.hierarchical = Some(hierarchy);
+        let regions = generate_partition(&recipe).expect("classic hotspot basis");
+        assert_eq!(regions.len(), 24);
+        assert_hotspot_basis_inventory(&regions, 2);
+        assert_eq!(dim_count(&regions, 16, 16), 4, "classic basis carries four 16x16 material variants");
+        assert_eq!(dim_count(&regions, 8, 4), 2);
+        assert_eq!(dim_count(&regions, 4, 8), 2);
+    }
+
+    #[test]
+    fn basis_complexity_preserves_required_orientation_pairs() {
+        let mut low = HierarchicalLayoutRecipe::mixed_hierarchy_default();
+        low.target_region_min = 24;
+        low.target_region_max = 24;
+        let mut medium = low.clone();
+        medium.target_region_min = 29;
+        medium.target_region_max = 36;
+        let mut high = medium.clone();
+        high.target_region_min = 34;
+        high.target_region_max = 40;
+        for (name, hierarchy) in [("low", low), ("medium", medium), ("high", high)] {
+            let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, hierarchy.target_region_max, 11);
+            recipe.recipe_version = 3;
+            recipe.hierarchical = Some(hierarchy.clone());
+            let regions = generate_partition(&recipe).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!((hierarchy.target_region_min..=hierarchy.target_region_max).contains(&(regions.len() as u32)), "{name} soft range");
+            assert_hotspot_basis_inventory(&regions, 2);
+        }
+    }
+
+    #[test]
+    fn basis_rotations_mirroring_and_radial_variants_preserve_roles() {
+        for style in [MacroStyle::MixedHierarchy, MacroStyle::PanelCascade, MacroStyle::HorizontalTrims, MacroStyle::FacadeHalving, MacroStyle::ClassicSourceHotspot] {
+            let mut hierarchy = HierarchicalLayoutRecipe::mixed_hierarchy_default();
+            hierarchy.macro_style = style;
+            hierarchy.target_region_min = 29;
+            hierarchy.target_region_max = 36;
+            let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 36, 13);
+            recipe.recipe_version = 3;
+            recipe.hierarchical = Some(hierarchy);
+            let regions = generate_partition(&recipe).unwrap_or_else(|error| panic!("{style:?}: {error}"));
+            assert_hotspot_basis_inventory(&regions, 2);
+        }
+
+        let mut mechanical = HierarchicalLayoutRecipe::mixed_hierarchy_default();
+        mechanical.macro_style = MacroStyle::MechanicalRadial;
+        mechanical.large_share_milli = 460;
+        mechanical.medium_share_milli = 180;
+        mechanical.small_share_milli = 100;
+        mechanical.strip_share_milli = 140;
+        mechanical.radial_share_milli = 120;
+        mechanical.radial_count = 4;
+        mechanical.target_region_min = 32;
+        mechanical.target_region_max = 40;
+        let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 40, 0);
+        recipe.recipe_version = 3;
+        recipe.hierarchical = Some(mechanical);
+        let regions = generate_partition(&recipe).expect("mechanical radial basis");
+        assert_hotspot_basis_inventory(&regions, 4);
+    }
+
+    fn generated_for_golden(name: &str) -> Vec<PartitionRegion> {
+        let hierarchy = golden_hierarchy(name);
+        let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, hierarchy.target_region_max, 0);
+        recipe.recipe_version = 3;
+        recipe.hierarchical = Some(hierarchy);
+        generate_partition(&recipe).unwrap_or_else(|error| panic!("{name}: {error}"))
+    }
+
+    fn topology_signature(regions: &[PartitionRegion], transform: SymmetryTransform) -> BTreeSet<(PartitionFamily, u32, u32, u32, u32)> {
+        regions.iter().map(|region| {
+            let rect = transform_basis_rect(region.grid_rect, LogicalGridSpec::DEFAULT, transform);
+            (region.family, rect.x, rect.y, rect.width, rect.height)
+        }).collect()
+    }
+
+    #[test]
+    fn visible_layout_families_are_not_just_symmetry_variants() {
+        let diagonal = generated_for_golden("mixed-hierarchy");
+        let transforms = [
+            SymmetryTransform::Identity, SymmetryTransform::Rotate90, SymmetryTransform::Rotate180, SymmetryTransform::Rotate270,
+            SymmetryTransform::MirrorX, SymmetryTransform::MirrorY, SymmetryTransform::MirrorDiagonal, SymmetryTransform::MirrorAntiDiagonal,
+        ];
+        for name in ["panel-cascade", "horizontal-trim-sheet", "facade-halving", "classic-source-hotspot", "mechanical-radial"] {
+            let other = topology_signature(&generated_for_golden(name), SymmetryTransform::Identity);
+            assert!(transforms.iter().all(|transform| topology_signature(&diagonal, *transform) != other), "{name} collapsed to a rotated or mirrored Diagonal Cascade");
+        }
+    }
+
+    #[test]
+    fn active_hierarchical_controls_affect_topology() {
+        let base_hierarchy = HierarchicalLayoutRecipe::mixed_hierarchy_default();
+        let layout_for = |hierarchy: HierarchicalLayoutRecipe, seed: u64| {
+            let mut recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, hierarchy.target_region_max, seed);
+            recipe.recipe_version = 3;
+            recipe.hierarchical = Some(hierarchy);
+            topology_signature(&generate_partition(&recipe).expect("control layout"), SymmetryTransform::Identity)
+        };
+        let base = layout_for(base_hierarchy.clone(), 0);
+        let mut large_share = base_hierarchy.clone();
+        large_share.large_share_milli = 700;
+        large_share.medium_share_milli = 80;
+        let mut deeper = base_hierarchy.clone();
+        deeper.hierarchy_depth = 5;
+        deeper.target_region_max = 40;
+        let mut strips = base_hierarchy.clone();
+        strips.strip_thickness_ladder = vec![4, 2, 1, 1];
+        let mut radial = base_hierarchy.clone();
+        radial.radial_count = 4;
+        let mut oriented = base_hierarchy.clone();
+        oriented.symmetry = SymmetryTransform::Rotate90;
+        for (name, layout) in [
+            ("seed", layout_for(base_hierarchy.clone(), 1)),
+            ("large share", layout_for(large_share, 0)),
+            ("hierarchy depth", layout_for(deeper, 0)),
+            ("strip ladder", layout_for(strips, 0)),
+            ("radial count", layout_for(radial, 0)),
+            ("orientation", layout_for(oriented, 0)),
+        ] {
+            assert_ne!(base, layout, "{name} control had no topology effect");
+        }
     }
 
     fn golden_hierarchy(name: &str) -> HierarchicalLayoutRecipe {
         let mut value = HierarchicalLayoutRecipe::mixed_hierarchy_default();
         match name {
             "mixed-hierarchy" => {}
-            "panel-cascade" => { value.macro_style = MacroStyle::PanelCascade; value.large_share_milli = 640; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 120; value.radial_share_milli = 0; value.target_region_min = 28; value.target_region_max = 38; value.radial_count = 0; }
-            "horizontal-trim-sheet" => { value.macro_style = MacroStyle::HorizontalTrims; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 480; value.medium_share_milli = 160; value.small_share_milli = 60; value.strip_share_milli = 300; value.radial_share_milli = 0; value.target_region_min = 34; value.target_region_max = 48; value.horizontal_strip_weight_milli = 800; value.vertical_strip_weight_milli = 200; value.strip_thickness_ladder = vec![1,1,1,2,2,3,4,6]; value.radial_count = 0; }
-            "facade-halving" => { value.macro_style = MacroStyle::FacadeHalving; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 720; value.medium_share_milli = 200; value.small_share_milli = 40; value.strip_share_milli = 40; value.radial_share_milli = 0; value.target_region_min = 12; value.target_region_max = 22; value.hierarchy_depth = 2; value.allowed_split_ratios = vec![SplitRatio::Half]; value.alignment_strength_milli = 1_000; value.variation_milli = 0; value.horizontal_strip_weight_milli = 1_000; value.vertical_strip_weight_milli = 0; value.radial_count = 0; }
-            "classic-source-hotspot" => { value.macro_style = MacroStyle::ClassicSourceHotspot; value.large_share_milli = 540; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 220; value.radial_share_milli = 0; value.target_region_min = 30; value.target_region_max = 46; value.horizontal_strip_weight_milli = 545; value.vertical_strip_weight_milli = 455; value.radial_count = 0; }
-            "mechanical-radial" => { value.macro_style = MacroStyle::MechanicalRadial; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 480; value.medium_share_milli = 180; value.small_share_milli = 100; value.strip_share_milli = 140; value.radial_share_milli = 100; value.target_region_min = 30; value.target_region_max = 44; value.radial_count = 4; value.radial_max_diameter = 12; }
+            "panel-cascade" => { value.macro_style = MacroStyle::PanelCascade; value.large_share_milli = 600; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 120; value.radial_share_milli = 40; value.target_region_min = 29; value.target_region_max = 36; value.radial_count = 2; }
+            "horizontal-trim-sheet" => { value.macro_style = MacroStyle::HorizontalTrims; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 460; value.medium_share_milli = 160; value.small_share_milli = 60; value.strip_share_milli = 280; value.radial_share_milli = 40; value.target_region_min = 29; value.target_region_max = 38; value.horizontal_strip_weight_milli = 800; value.vertical_strip_weight_milli = 200; value.strip_thickness_ladder = vec![1,1,1,2,2,3,4,6]; value.radial_count = 2; }
+            "facade-halving" => { value.macro_style = MacroStyle::FacadeHalving; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 680; value.medium_share_milli = 200; value.small_share_milli = 40; value.strip_share_milli = 40; value.radial_share_milli = 40; value.target_region_min = 24; value.target_region_max = 30; value.hierarchy_depth = 2; value.allowed_split_ratios = vec![SplitRatio::Half]; value.alignment_strength_milli = 1_000; value.variation_milli = 0; value.horizontal_strip_weight_milli = 1_000; value.vertical_strip_weight_milli = 0; value.radial_count = 2; }
+            "classic-source-hotspot" => { value.macro_style = MacroStyle::ClassicHotspotBasis; value.large_share_milli = 540; value.medium_share_milli = 180; value.small_share_milli = 60; value.strip_share_milli = 180; value.radial_share_milli = 40; value.target_region_min = 24; value.target_region_max = 24; value.horizontal_strip_weight_milli = 545; value.vertical_strip_weight_milli = 455; value.radial_count = 2; value.variation_milli = 0; }
+            "mechanical-radial" => { value.macro_style = MacroStyle::MechanicalRadial; value.recursive_policy = RecursivePolicy::Balanced; value.large_share_milli = 460; value.medium_share_milli = 180; value.small_share_milli = 100; value.strip_share_milli = 140; value.radial_share_milli = 120; value.target_region_min = 32; value.target_region_max = 40; value.radial_count = 4; value.radial_max_diameter = 12; }
             _ => panic!("unknown golden preset {name}"),
         }
         value

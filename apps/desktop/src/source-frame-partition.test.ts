@@ -111,8 +111,9 @@ test("six hierarchical composition presets expose valid, distinct product recipe
   assert.equal(recipes[1]!.hierarchical!.recursivePolicy, "cascade", "panel cascade follows one continuation branch");
   assert.equal(recipes[2]!.hierarchical!.horizontalStripWeightMilli, 800, "horizontal template is band-dominant");
   assert.deepEqual(recipes[3]!.hierarchical!.allowedSplitRatios, ["half"], "facade template aligns exact halvings");
-  assert.equal(recipes[4]!.hierarchical!.macroStyle, "classic_source_hotspot", "classic template uses its authored quadrant grammar");
+  assert.equal(recipes[4]!.hierarchical!.macroStyle, "classic_hotspot_basis", "classic template uses its authored basis grammar");
   assert.equal(recipes[5]!.hierarchical!.radialCount, 4, "mechanical template reserves four radial slots");
+  assert.ok(recipes.every((recipe) => recipe.hierarchical!.symmetry === "identity"));
 });
 
 test("accepted and discarded recipes settle auto-preview so direct editing stays unlocked", () => {
@@ -153,6 +154,7 @@ test("source-frame layout exposes the patch workbench and product-facing composi
   assert.match(app, /Large panel share/);
   assert.match(app, /Strip share/);
   assert.match(app, /Radial slots/);
+  assert.match(app, /Orientation/);
   assert.match(app, /Hierarchy depth/);
   assert.match(app, /Protected parents/);
   assert.match(app, /Split ratio palette/);

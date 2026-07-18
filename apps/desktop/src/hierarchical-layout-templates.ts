@@ -3,10 +3,10 @@ import type { CompositionProfile, HierarchicalLayoutRecipe, PartitionRecipe } fr
 export type LayoutTemplateId = "mixed-hierarchy" | "panel-cascade" | "horizontal-trim-sheet" | "facade-halving" | "classic-source-hotspot" | "mechanical-radial";
 
 export const layoutTemplateOptions: readonly { id: LayoutTemplateId; label: string }[] = [
-  { id: "mixed-hierarchy", label: "Mixed Hierarchy" },
+  { id: "mixed-hierarchy", label: "Diagonal Cascade" },
   { id: "panel-cascade", label: "Panel Cascade" },
-  { id: "horizontal-trim-sheet", label: "Horizontal Trim Sheet" },
-  { id: "facade-halving", label: "Facade Halving" },
+  { id: "horizontal-trim-sheet", label: "Horizontal Bands" },
+  { id: "facade-halving", label: "Quadrant Basis" },
   { id: "classic-source-hotspot", label: "Classic Source Hotspot" },
   { id: "mechanical-radial", label: "Mechanical / Radial" },
 ] as const;
@@ -24,14 +24,14 @@ function legacyComposition(): CompositionProfile {
 
 function mixedHierarchy(): HierarchicalLayoutRecipe {
   return {
-    schemaVersion: 1, macroStyle: "mixed_hierarchy", recursivePolicy: "cascade", targetRegionMin: 30, targetRegionMax: 40,
+    schemaVersion: 1, macroStyle: "mixed_hierarchy", recursivePolicy: "cascade", targetRegionMin: 29, targetRegionMax: 36,
     largeShareMilli: 580, mediumShareMilli: 200, smallShareMilli: 80, stripShareMilli: 110, radialShareMilli: 30,
     macroParentCount: 4, protectedParentCount: 2, subdividableParentCount: 2, hierarchyDepth: 3, scaleFalloffMilli: 500,
     allowedSplitRatios: ["half", "one_third", "two_third"], alignmentStrengthMilli: 900, variationMilli: 80,
     horizontalStripWeightMilli: 550, verticalStripWeightMilli: 450, stripThicknessLadder: [1, 1, 2, 2, 3, 4],
     radialCount: 2, radialMinDiameter: 6, radialMaxDiameter: 10,
     majorAspects: ["square", "wide2", "tall2"], mediumAspects: ["square", "wide2", "tall2", "wide4", "tall4"],
-    detailAspects: ["square", "wide2", "tall2", "wide4", "tall4"],
+    detailAspects: ["square", "wide2", "tall2", "wide4", "tall4"], symmetry: "identity",
   };
 }
 
@@ -53,11 +53,11 @@ export function layoutTemplateRecipe(_current: PartitionRecipe, id: LayoutTempla
   let hierarchical = mixedHierarchy();
   switch (id) {
     case "mixed-hierarchy": break;
-    case "panel-cascade": hierarchical = { ...withShares(hierarchical, 640, 180, 60, 120, 0), macroStyle: "panel_cascade", recursivePolicy: "cascade", targetRegionMin: 28, targetRegionMax: 38, hierarchyDepth: 3, protectedParentCount: 2, subdividableParentCount: 2, radialCount: 0, variationMilli: 80 }; break;
-    case "horizontal-trim-sheet": hierarchical = { ...withShares(hierarchical, 480, 160, 60, 300, 0), macroStyle: "horizontal_trims", recursivePolicy: "balanced", targetRegionMin: 34, targetRegionMax: 48, horizontalStripWeightMilli: 800, verticalStripWeightMilli: 200, stripThicknessLadder: [1, 1, 1, 2, 2, 3, 4, 6], radialCount: 0, variationMilli: 60 }; break;
-    case "facade-halving": hierarchical = { ...withShares(hierarchical, 720, 200, 40, 40, 0), macroStyle: "facade_halving", recursivePolicy: "balanced", targetRegionMin: 12, targetRegionMax: 22, hierarchyDepth: 2, allowedSplitRatios: ["half"], alignmentStrengthMilli: 1_000, variationMilli: 0, horizontalStripWeightMilli: 1_000, verticalStripWeightMilli: 0, radialCount: 0 }; break;
-    case "classic-source-hotspot": hierarchical = { ...withShares(hierarchical, 540, 180, 60, 220, 0), macroStyle: "classic_source_hotspot", recursivePolicy: "cascade", targetRegionMin: 30, targetRegionMax: 46, horizontalStripWeightMilli: 545, verticalStripWeightMilli: 455, radialCount: 0, variationMilli: 40 }; break;
-    case "mechanical-radial": hierarchical = { ...withShares(hierarchical, 480, 180, 100, 140, 100), macroStyle: "mechanical_radial", recursivePolicy: "balanced", targetRegionMin: 30, targetRegionMax: 44, radialCount: 4, radialMinDiameter: 6, radialMaxDiameter: 12, variationMilli: 60 }; break;
+    case "panel-cascade": hierarchical = { ...withShares(hierarchical, 600, 180, 60, 120, 40), macroStyle: "panel_cascade", recursivePolicy: "cascade", targetRegionMin: 29, targetRegionMax: 36, hierarchyDepth: 3, protectedParentCount: 2, subdividableParentCount: 2, radialCount: 2, variationMilli: 80 }; break;
+    case "horizontal-trim-sheet": hierarchical = { ...withShares(hierarchical, 460, 160, 60, 280, 40), macroStyle: "horizontal_trims", recursivePolicy: "balanced", targetRegionMin: 29, targetRegionMax: 38, horizontalStripWeightMilli: 800, verticalStripWeightMilli: 200, stripThicknessLadder: [1, 1, 1, 2, 2, 3, 4, 6], radialCount: 2, variationMilli: 60 }; break;
+    case "facade-halving": hierarchical = { ...withShares(hierarchical, 680, 200, 40, 40, 40), macroStyle: "facade_halving", recursivePolicy: "balanced", targetRegionMin: 24, targetRegionMax: 30, hierarchyDepth: 2, allowedSplitRatios: ["half"], alignmentStrengthMilli: 1_000, variationMilli: 0, horizontalStripWeightMilli: 1_000, verticalStripWeightMilli: 0, radialCount: 2 }; break;
+    case "classic-source-hotspot": hierarchical = { ...withShares(hierarchical, 540, 180, 60, 180, 40), macroStyle: "classic_hotspot_basis", recursivePolicy: "cascade", targetRegionMin: 24, targetRegionMax: 24, horizontalStripWeightMilli: 545, verticalStripWeightMilli: 455, radialCount: 2, variationMilli: 0 }; break;
+    case "mechanical-radial": hierarchical = { ...withShares(hierarchical, 460, 180, 100, 140, 120), macroStyle: "mechanical_radial", recursivePolicy: "balanced", targetRegionMin: 32, targetRegionMax: 40, radialCount: 4, radialMinDiameter: 6, radialMaxDiameter: 12, variationMilli: 60 }; break;
   }
   return { ...base, targetRegionCount: hierarchical.targetRegionMax, horizontalSplitBiasMilli: hierarchical.horizontalStripWeightMilli,
     verticalSplitBiasMilli: hierarchical.verticalStripWeightMilli, varianceMilli: hierarchical.variationMilli,

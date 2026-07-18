@@ -1,89 +1,86 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="768" height="768" viewBox="0 0 64 64" aria-label="mechanical-radial hierarchical layout">
 <rect width="64" height="64" fill="#10141b"/>
-<g><rect x="0" y="0" width="14" height="27" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M00 7a1769bc-d3dc-4865-14c1-40607c57e51f parent=Some(3) depth=1</title>
-<text x="1" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">M00</text>
+<g><rect x="0" y="0" width="32" height="32" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L00 031d742e-2595-fcc0-909a-be06e9819693 parent=Some(0) depth=0</title>
+<text x="1" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">L00</text>
 </g>
-<g><rect x="14" y="0" width="6" height="27" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M01 1092064a-f04c-fd92-8986-8009df03bed3 parent=Some(3) depth=1</title>
-<text x="15" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">M01</text>
+<g><rect x="32" y="0" width="16" height="32" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L01 7e5158ec-829c-1dc1-1022-dc0507915564 parent=Some(1) depth=0</title>
+<text x="33" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">L01</text>
 </g>
-<g><rect x="20" y="0" width="3" height="14" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D02 f786cef2-cb43-45c3-46c5-6d96608f9e35 parent=Some(3) depth=3</title>
+<g><rect x="48" y="0" width="8" height="8" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R02 67110204-8cbb-7d49-5b4d-c2198634d219 parent=Some(1) depth=2</title>
+<text x="49" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">R02</text>
 </g>
-<g><rect x="23" y="0" width="3" height="14" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D03 96dab05a-caac-bf1c-31b3-eeba428f1298 parent=Some(3) depth=3</title>
+<g><rect x="56" y="0" width="8" height="8" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R03 37ab111f-60a2-bf0a-afba-10026d035a31 parent=Some(1) depth=2</title>
+<text x="57" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">R03</text>
 </g>
-<g><rect x="26" y="0" width="31" height="26" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L04 bd836712-98d3-0702-1ac3-5d08e703070e parent=Some(1) depth=0</title>
-<text x="27" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">L04</text>
+<g><rect x="48" y="8" width="8" height="8" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D04 8b422754-96ce-ea0c-0955-b8f5bd82fcfd parent=Some(1) depth=2</title>
+<text x="49" y="9.7" font-size="1.15" fill="#ffffff" font-family="monospace">D04</text>
 </g>
-<g><rect x="57" y="0" width="6" height="6" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R05 c2e1247e-333b-b5e2-d5e0-c31fa645a6e9 parent=None depth=1</title>
-<text x="58" y="1.7" font-size="1.15" fill="#ffffff" font-family="monospace">R05</text>
+<g><rect x="56" y="8" width="8" height="8" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D05 264ee5b3-c3b2-e995-a7fa-422ea215895c parent=Some(1) depth=2</title>
+<text x="57" y="9.7" font-size="1.15" fill="#ffffff" font-family="monospace">D05</text>
 </g>
-<g><rect x="63" y="0" width="1" height="64" fill="#343b46" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>C06 fa9c1873-729e-275e-e27d-517a1907df69 parent=None depth=0</title>
+<g><rect x="48" y="16" width="16" height="8" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M06 21825827-1d76-c77f-70b1-cd7790507efc parent=Some(1) depth=2</title>
+<text x="49" y="17.7" font-size="1.15" fill="#ffffff" font-family="monospace">M06</text>
 </g>
-<g><rect x="57" y="6" width="6" height="6" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R07 4c4688b7-c939-daf9-92bf-24b87c2f2ad9 parent=None depth=1</title>
-<text x="58" y="7.7" font-size="1.15" fill="#ffffff" font-family="monospace">R07</text>
+<g><rect x="48" y="24" width="16" height="8" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M07 e2a5b1aa-89f5-2a68-da27-f9ed31983925 parent=Some(1) depth=2</title>
+<text x="49" y="25.7" font-size="1.15" fill="#ffffff" font-family="monospace">M07</text>
 </g>
-<g><rect x="57" y="12" width="6" height="6" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R08 50ba0af3-642f-49e6-3753-d287a0bf1f06 parent=None depth=1</title>
-<text x="58" y="13.7" font-size="1.15" fill="#ffffff" font-family="monospace">R08</text>
+<g><rect x="0" y="32" width="32" height="16" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L08 44a7270a-f217-c133-6805-fee93865c79b parent=Some(2) depth=0</title>
+<text x="1" y="33.7" font-size="1.15" fill="#ffffff" font-family="monospace">L08</text>
 </g>
-<g><rect x="20" y="14" width="6" height="13" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M09 b7d73a9a-5668-2558-07bf-5fe1f217f485 parent=Some(3) depth=2</title>
-<text x="21" y="15.7" font-size="1.15" fill="#ffffff" font-family="monospace">M09</text>
+<g><rect x="32" y="32" width="16" height="8" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M09 f73d5000-e2a2-6122-98a0-0f58161c1d70 parent=Some(3) depth=1</title>
+<text x="33" y="33.7" font-size="1.15" fill="#ffffff" font-family="monospace">M09</text>
 </g>
-<g><rect x="57" y="18" width="6" height="6" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R10 1387ae70-c444-0fa6-ab6f-2b7020a28e74 parent=None depth=1</title>
-<text x="58" y="19.7" font-size="1.15" fill="#ffffff" font-family="monospace">R10</text>
+<g><rect x="48" y="32" width="8" height="16" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M10 6053768d-ff7c-5648-9d04-18cfd8277aad parent=Some(3) depth=1</title>
+<text x="49" y="33.7" font-size="1.15" fill="#ffffff" font-family="monospace">M10</text>
 </g>
-<g><rect x="57" y="24" width="6" height="40" fill="#343b46" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>C11 7500144c-4bf5-3160-50be-72d9a96d7fc1 parent=None depth=0</title>
-<text x="58" y="25.7" font-size="1.15" fill="#ffffff" font-family="monospace">C11</text>
+<g><rect x="56" y="32" width="1" height="24" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V11 f2d6f230-2259-44d7-6ccc-6484ea47e53b parent=None depth=1</title>
 </g>
-<g><rect x="26" y="26" width="31" height="29" fill="#385a7c" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>L12 927d780a-0ac3-283c-d9f7-9a219245fcb1 parent=Some(0) depth=0</title>
-<text x="27" y="27.7" font-size="1.15" fill="#ffffff" font-family="monospace">L12</text>
+<g><rect x="57" y="32" width="1" height="24" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V12 389c0050-4fd4-78e0-acb8-d2c3e9595d0d parent=None depth=1</title>
 </g>
-<g><rect x="0" y="27" width="13" height="28" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M13 278f0a2f-7761-b593-0ffc-149ee79412da parent=Some(2) depth=1</title>
-<text x="1" y="28.7" font-size="1.15" fill="#ffffff" font-family="monospace">M13</text>
+<g><rect x="58" y="32" width="2" height="24" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V13 a1ea5f92-4151-c486-421b-f3ea0bdc2de3 parent=None depth=1</title>
 </g>
-<g><rect x="13" y="27" width="6" height="28" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M14 421a99c2-8e8e-f96e-f825-b95b1bf6bc4c parent=Some(2) depth=1</title>
-<text x="14" y="28.7" font-size="1.15" fill="#ffffff" font-family="monospace">M14</text>
+<g><rect x="60" y="32" width="4" height="24" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V14 33398e51-b761-34dc-a3bf-ab6909c1c040 parent=None depth=1</title>
 </g>
-<g><rect x="19" y="27" width="7" height="14" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M15 ceaabb22-0f9b-bfbe-9e45-e37fb23f8e79 parent=Some(2) depth=2</title>
-<text x="20" y="28.7" font-size="1.15" fill="#ffffff" font-family="monospace">M15</text>
+<g><rect x="32" y="40" width="4" height="4" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D15 20693eff-3f5e-8987-c7d8-e8678aa8a331 parent=Some(3) depth=3</title>
 </g>
-<g><rect x="19" y="41" width="7" height="7" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D16 fb2f1299-84aa-474c-b2ef-3169ec116107 parent=Some(2) depth=3</title>
-<text x="20" y="42.7" font-size="1.15" fill="#ffffff" font-family="monospace">D16</text>
+<g><rect x="36" y="40" width="4" height="4" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D16 58eac1b0-b2b5-d27a-67db-1de7dadddd7a parent=Some(3) depth=3</title>
 </g>
-<g><rect x="19" y="48" width="7" height="7" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D17 da04f51e-12e1-9538-b34a-e64268e1113a parent=Some(2) depth=3</title>
-<text x="20" y="49.7" font-size="1.15" fill="#ffffff" font-family="monospace">D17</text>
+<g><rect x="40" y="40" width="8" height="8" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R17 325bcd19-232a-f164-a644-851694e0c61f parent=Some(3) depth=2</title>
+<text x="41" y="41.7" font-size="1.15" fill="#ffffff" font-family="monospace">R17</text>
 </g>
-<g><rect x="0" y="55" width="31" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H18 650a4394-9f8c-a36c-92cb-9804de5c7b2b parent=None depth=1</title>
+<g><rect x="32" y="44" width="4" height="4" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D18 0b45fb69-012f-f76c-83ef-2177cd8b1310 parent=Some(3) depth=3</title>
 </g>
-<g><rect x="31" y="55" width="1" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V19 4fdb09e4-93f4-f241-3367-40090505c71e parent=None depth=1</title>
+<g><rect x="36" y="44" width="4" height="4" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D19 40c7ca0f-efe5-0afd-a2b3-9a22f3a4f4b8 parent=Some(3) depth=3</title>
 </g>
-<g><rect x="32" y="55" width="1" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V20 b39b65a5-ec6c-23d4-d6f3-c685dd66930f parent=None depth=1</title>
+<g><rect x="0" y="48" width="8" height="16" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M20 a459691a-11f5-0471-9f6b-ac65b5e9be48 parent=Some(2) depth=2</title>
+<text x="1" y="49.7" font-size="1.15" fill="#ffffff" font-family="monospace">M20</text>
 </g>
-<g><rect x="33" y="55" width="2" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V21 6f9e1017-3a55-4566-cb20-43041bff7445 parent=None depth=1</title>
+<g><rect x="8" y="48" width="8" height="16" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M21 5c2a3881-91a8-13c1-4010-a94398e30460 parent=Some(2) depth=2</title>
+<text x="9" y="49.7" font-size="1.15" fill="#ffffff" font-family="monospace">M21</text>
 </g>
-<g><rect x="35" y="55" width="2" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V22 ef53aa66-b76c-1d28-7323-369e39f2d886 parent=None depth=1</title>
+<g><rect x="16" y="48" width="16" height="16" fill="#557d67" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>M22 89fc1f3c-1d95-a2e3-9c26-b5c9b4795e71 parent=Some(2) depth=1</title>
+<text x="17" y="49.7" font-size="1.15" fill="#ffffff" font-family="monospace">M22</text>
 </g>
-<g><rect x="37" y="55" width="3" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V23 765a25a9-f8d3-6e6a-ccf5-45981acc3700 parent=None depth=1</title>
+<g><rect x="32" y="48" width="8" height="8" fill="#b0713d" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>R23 f9f01a5e-9b85-81cc-7bb8-2b60d58725ff parent=Some(3) depth=2</title>
+<text x="33" y="49.7" font-size="1.15" fill="#ffffff" font-family="monospace">R23</text>
 </g>
-<g><rect x="40" y="55" width="4" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V24 1e0a1809-5235-c23e-bb09-18343684f7a9 parent=None depth=1</title>
+<g><rect x="40" y="48" width="8" height="4" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D24 d957bad5-8440-a415-c734-049f0c150c5d parent=Some(3) depth=2</title>
+<text x="41" y="49.7" font-size="1.15" fill="#ffffff" font-family="monospace">D24</text>
 </g>
-<g><rect x="44" y="55" width="1" height="9" fill="#b1778f" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>u25 8b3308d9-79b4-6a60-d895-ca593929b677 parent=None depth=1</title>
+<g><rect x="48" y="48" width="4" height="8" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D25 1b471971-2cb7-39fa-8f03-80b6ec98f357 parent=Some(3) depth=2</title>
 </g>
-<g><rect x="45" y="55" width="1" height="9" fill="#b1778f" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>u26 9dfd674f-36fb-cd52-d073-f4e127a1bc74 parent=None depth=1</title>
+<g><rect x="52" y="48" width="4" height="8" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D26 2cf1df81-3d42-2580-27ed-cb2a8757a680 parent=Some(3) depth=2</title>
 </g>
-<g><rect x="46" y="55" width="2" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V27 5c2f7473-4c81-709c-c762-d0e52365a603 parent=None depth=1</title>
+<g><rect x="40" y="52" width="8" height="4" fill="#9b6c58" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>D27 e345490a-16fc-38fb-fa36-11f8648b19f5 parent=Some(3) depth=2</title>
+<text x="41" y="53.7" font-size="1.15" fill="#ffffff" font-family="monospace">D27</text>
 </g>
-<g><rect x="48" y="55" width="2" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V28 79189d0a-caaf-552c-42da-475395829bc2 parent=None depth=1</title>
+<g><rect x="32" y="56" width="32" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H28 110a1a46-6267-d461-2057-7768d3575568 parent=None depth=1</title>
 </g>
-<g><rect x="50" y="55" width="3" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V29 2a221e62-313d-a94c-27d0-c4b47ab125bf parent=None depth=1</title>
+<g><rect x="32" y="57" width="32" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H29 ed0b625f-a602-9e9c-1ebd-05f3664d97fa parent=None depth=1</title>
 </g>
-<g><rect x="53" y="55" width="4" height="9" fill="#8b884b" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>V30 a46f2a8d-8cc5-1203-e180-2db59023c2b2 parent=None depth=1</title>
+<g><rect x="32" y="58" width="32" height="2" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H30 01525dad-4858-acd5-f4eb-b14c69bc26e0 parent=None depth=1</title>
 </g>
-<g><rect x="0" y="56" width="31" height="1" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H31 ed31f620-5052-94c6-74d3-04c019344c88 parent=None depth=1</title>
-</g>
-<g><rect x="0" y="57" width="31" height="2" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H32 34f1d18f-992c-0ec0-08e5-0dfc9b8ce8c5 parent=None depth=1</title>
-</g>
-<g><rect x="0" y="59" width="31" height="2" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H33 9c29f541-8e25-3f7b-52e1-1cf71a9350d2 parent=None depth=1</title>
-</g>
-<g><rect x="0" y="61" width="31" height="3" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H34 26d329c1-6bd4-05c0-1d36-8ba7a3ffcfd7 parent=None depth=1</title>
-<text x="1" y="62.7" font-size="1.15" fill="#ffffff" font-family="monospace">H34</text>
+<g><rect x="32" y="60" width="32" height="4" fill="#876a9e" fill-opacity="0.78" stroke="#d9e2ee" stroke-width="0.16"/><title>H31 37d314c0-d229-9a25-cbc3-c1476500e8b5 parent=None depth=1</title>
+<text x="33" y="61.7" font-size="1.15" fill="#ffffff" font-family="monospace">H31</text>
 </g>
 </svg>

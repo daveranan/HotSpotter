@@ -106,8 +106,9 @@ export interface CompositionProfile {
   microStrips: StripQuota;
   radialReservations: RadialQuota;
 }
-export type MacroStyle = "mixed_hierarchy" | "panel_cascade" | "horizontal_trims" | "vertical_trims" | "facade_halving" | "classic_source_hotspot" | "mechanical_radial";
+export type MacroStyle = "mixed_hierarchy" | "panel_cascade" | "horizontal_trims" | "vertical_trims" | "facade_halving" | "classic_source_hotspot" | "classic_hotspot_basis" | "mechanical_radial";
 export type RecursivePolicy = "cascade" | "balanced";
+export type SymmetryTransform = "identity" | "rotate90" | "rotate180" | "rotate270" | "mirror_x" | "mirror_y" | "mirror_diagonal" | "mirror_anti_diagonal";
 export type SplitRatio = "half" | "one_third" | "two_third";
 export type AspectClass = "square" | "wide2" | "tall2" | "wide4" | "tall4" | "wide8" | "tall8" | "wide16" | "tall16";
 export interface HierarchicalLayoutRecipe {
@@ -138,6 +139,7 @@ export interface HierarchicalLayoutRecipe {
   majorAspects: AspectClass[];
   mediumAspects: AspectClass[];
   detailAspects: AspectClass[];
+  symmetry: SymmetryTransform;
 }
 export interface PartitionRecipe {
   schemaVersion: number;
