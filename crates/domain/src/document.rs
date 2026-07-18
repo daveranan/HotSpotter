@@ -1530,6 +1530,13 @@ impl TrimSheetDocument {
                     .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
                     .content = content.clone();
             }
+            TrimSheetDocumentCommand::SetRegionAddressMode { region_id, address_mode } => {
+                next.region_bindings
+                    .get_mut(region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
+                    .mapping
+                    .address_mode = *address_mode;
+            }
             TrimSheetDocumentCommand::SetSheetFraming { framing } => {
                 next.sheet_framing = framing.clone();
             }
@@ -2437,6 +2444,10 @@ pub enum TrimSheetDocumentCommand {
     SetRegionContent {
         region_id: RegionId,
         content: ContentReference,
+    },
+    SetRegionAddressMode {
+        region_id: RegionId,
+        address_mode: AddressMode,
     },
     SetSheetFraming {
         framing: SheetFraming,

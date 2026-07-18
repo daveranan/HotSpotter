@@ -208,10 +208,17 @@ function App() {
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [activePatchId, setActivePatchId] = useState<string | null>(null);
+  const [regionPatchEditId, setRegionPatchEditId] = useState<string | null>(null);
   const [preparedPatchPreview, setPreparedPatchPreview] = useState<PreparedPatchPreviewProjection | null>(null);
+  const [preparedPatchPreviews, setPreparedPatchPreviews] = useState<Record<string, PreparedPatchPreviewProjection>>({});
   const [draftPatchPreview, setDraftPatchPreview] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
   const [patchTool, setPatchTool] = useState<"rectangle" | "four-point" | null>(null);
   const [sourceWorkbenchOpen, setSourceWorkbenchOpen] = useState(true);
+  const [hotspotSheetOpen, setHotspotSheetOpen] = useState(true);
+  const [sourceSheetShare, setSourceSheetShare] = useState(() => {
+    const saved = Number(localStorage.getItem("hot-trimmer.source-sheet-share.v1") ?? "0.46");
+    return Number.isFinite(saved) ? Math.max(0.2, Math.min(0.8, saved)) : 0.46;
+  });
   const started = useRef(false);
   const documentHistoryBusy = useRef(false);
   const previewDraftId = useRef(0);
@@ -258,20 +265,15 @@ function App() {
   const buildState = buildStatus(project, artifact, activity, problem, stale);
   const paneMode = paneLayoutMode(workbenchWidth);
   const sourceFrameLayout = !!project?.document?.sourceFrame;
-  const showSourceWorkspace = paneMode !== "sheet-only" && (!sourceFrameLayout || sourceWorkbenchOpen);
-  const workbenchColumns = sourceFrameLayout
-    ? paneMode === "full"
-      ? sourceWorkbenchOpen ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr) 6px ${panes.inspector}px` : `${panes.library}px 6px minmax(0, 1fr) 6px ${panes.inspector}px`
-      : paneMode === "without-inspector"
-      ? sourceWorkbenchOpen ? `${Math.min(240, panes.library)}px 6px ${Math.min(430, panes.source)}px 6px minmax(0, 1fr)` : `${Math.min(260, panes.library)}px 6px minmax(0, 1fr)`
-      : paneMode === "without-library" && sourceWorkbenchOpen ? `${Math.min(430, panes.source)}px 6px minmax(0, 1fr)` : "minmax(0, 1fr)"
-    : paneMode === "full"
-    ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr) 6px ${panes.inspector}px`
-    : paneMode === "without-inspector"
-      ? `${panes.library}px 6px ${panes.source}px 6px minmax(0, 1fr)`
-      : paneMode === "without-library"
-        ? `${panes.source}px 6px minmax(0, 1fr)`
-        : "minmax(0, 1fr)";
+  const showLibrary = sourceWorkbenchOpen && (paneMode === "full" || paneMode === "without-inspector");
+  const showSourceWorkspace = sourceWorkbenchOpen && paneMode !== "sheet-only";
+  const showInspector = paneMode === "full";
+  const visibleTracks: string[] = [];
+  if (showLibrary) visibleTracks.push(`${paneMode === "without-inspector" ? Math.min(240, panes.library) : panes.library}px`);
+  if (showSourceWorkspace && hotspotSheetOpen) visibleTracks.push(`minmax(280px, ${sourceSheetShare}fr)`, `minmax(320px, ${1 - sourceSheetShare}fr)`);
+  else if (showSourceWorkspace || hotspotSheetOpen) visibleTracks.push("minmax(0, 1fr)");
+  if (showInspector) visibleTracks.push(`${panes.inspector}px`);
+  const workbenchColumns = visibleTracks.length ? visibleTracks.join(" 6px ") : "minmax(0, 1fr)";
 
   useEffect(() => {
     previewDraftId.current += 1;
@@ -288,9 +290,10 @@ function App() {
     }
     if (lastAutomaticPreviewRevision.current === project.document.documentRevision) return;
     lastAutomaticPreviewRevision.current = project.document.documentRevision;
-    const dirtyRegion = dirtyPreviewRegion.current;
     dirtyPreviewRegion.current = null;
-    void requestPreview(dirtyRegion ?? undefined);
+    // Persisted appearance edits are not transient crop requests. The compiler's content
+    // hashes reuse every unchanged region while the request remains contract-valid.
+    void requestPreview(undefined);
   }, [native, project?.document?.documentRevision]);
 
   useEffect(() => {
@@ -314,6 +317,7 @@ function App() {
       }).then((value) => {
         if (request.requestId === patchPreviewRequestId.current && value.patchId === request.patchId) {
           setPreparedPatchPreview(value);
+          setPreparedPatchPreviews((current) => ({ ...current, [value.patchId]: value }));
           if (request.maxEdge === 256) {
             const completedAt = performance.now();
             if (lastTransientCompletionAt.current > 0) {
@@ -365,6 +369,7 @@ function App() {
   useEffect(() => {
     localStorage.setItem("hot-trimmer.workbench-panes.v1", JSON.stringify(panes));
   }, [panes]);
+  useEffect(() => { localStorage.setItem("hot-trimmer.source-sheet-share.v1", String(sourceSheetShare)); }, [sourceSheetShare]);
 
   useEffect(() => {
     const content = selectedBinding?.content;
@@ -378,6 +383,10 @@ function App() {
     } else if (content.type === "inherit_primary_material" && project?.document?.primaryMaterial) {
       setSelectedSourceSetId(project.document.primaryMaterial); setSelectedChannel("base_color"); setActivePatchId(null);
     }
+  }, [selectedRegionId]);
+
+  useEffect(() => {
+    setRegionPatchEditId((current) => current && current !== selectedRegionId ? null : current);
   }, [selectedRegionId]);
 
   useEffect(() => {
@@ -757,10 +766,22 @@ function App() {
     if (!project?.document || activity !== "idle" || candidatePreviewing) return null;
     setActivity("editing"); setProblem(null);
     try {
+      const assignedRegionId = commandValue.type === "set_region_content" ? commandValue.regionId : null;
+      if (assignedRegionId) dirtyPreviewRegion.current = assignedRegionId;
       const current = await applyCommand(commandValue);
       setProject(current);
-      setArtifact((prior) => retopologizeArtifact(prior, current));
+      // Content assignment changes pixels, not topology. Keep the last published artifact at
+      // its truthful revision so the prepared patch overlay remains visible until Stage 14
+      // publishes the new pixels. Advancing its revision here suppressed that fast path.
+      if (!assignedRegionId) setArtifact((prior) => retopologizeArtifact(prior, current));
       setSelectedRegionId((selected) => current.document!.topology.regions.some((region) => region.id === selected) ? selected : null);
+      if (assignedRegionId) {
+        dirtyPreviewRegion.current = null;
+        lastAutomaticPreviewRevision.current = current.document!.documentRevision;
+        // Region identity without a projection is not a transient crop request. Compile the
+        // persisted binding revision; the immediate overlay above covers publication latency.
+        void requestPreview(undefined, undefined, "draft512", current.document!.documentRevision, false);
+      }
       return current;
     } catch (reason) { setProblem(failure(reason)); return null; }
     finally { setActivity("idle"); }
@@ -953,6 +974,16 @@ function App() {
     return next;
   }
 
+  function nextPatchName(sourceId: string) {
+    const used = new Set((project?.patches ?? [])
+      .filter((patch) => patch.sourceId === sourceId)
+      .flatMap((patch) => /^Patch (\d+)$/.exec(patch.name)?.[1] ?? [])
+      .map(Number));
+    let index = 1;
+    while (used.has(index)) index += 1;
+    return `Patch ${index}`;
+  }
+
   async function createPatch(geometry: PatchGeometry, fourPoint: boolean) {
     if (!selectedSource) return;
     const id = crypto.randomUUID();
@@ -960,13 +991,61 @@ function App() {
       await patchCommand({
         type: "create",
         patch: {
-          id, sourceId: selectedSource.id, name: fourPoint ? "Four Point Patch" : "Rectangle Patch", enabled: true, geometry,
+          id, sourceId: selectedSource.id, name: nextPatchName(selectedSource.id), enabled: true, geometry,
           properties: { repeatMode: "unique", trimCap: false, paddingPx: 4, bleedPx: 8, mapParticipation: "all" },
           rectification: { scale: 1 },
         },
       });
       setActivePatchId(id);
       setPatchTool(null);
+    } catch (reason) { setProblem(failure(reason)); }
+  }
+
+  async function editSelectedRegionAsPatch() {
+    const document = project?.document;
+    const regionId = selectedRegionId;
+    if (!document || !regionId || activity !== "idle") return;
+    const binding = document.regionBindings[regionId];
+    const definition = document.topology.regions.find((region) => region.id === regionId);
+    if (!binding || !definition) return;
+    if (binding.content.type === "patch") {
+      const patch = project?.patches.find((candidate) => candidate.id === binding.content.id);
+      const owner = patch && project?.materialSources.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
+      if (patch && owner) {
+        setSelectedSourceSetId(owner.id); setSelectedChannel("base_color"); setActivePatchId(patch.id);
+        setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
+      }
+      return;
+    }
+    const sourceSetId = binding.content.type === "material_source" ? binding.content.id : document.primaryMaterial;
+    const owner = project?.materialSources.find((set) => set.id === sourceSetId);
+    const base = owner?.registeredChannels?.channels.find((source) => source.channel === "base_color");
+    if (!owner || !base) {
+      setProblem({ code: "source_missing", message: `The source for ${definition.displayName} is unavailable.`, recovery: "Assign a valid Base Color source before converting this region to a patch." });
+      return;
+    }
+    const bounds = binding.mapping.projection.type === "crop"
+      ? binding.mapping.projection.bounds
+      : document.sourceFrame?.sourceSetId === sourceSetId && document.logicalGrid && definition.gridRect
+        ? sourceFrameGridBounds(document.sourceFrame.bounds, document.logicalGrid, definition.gridRect)
+        : { x: 0, y: 0, width: 1, height: 1 };
+    const patchId = crypto.randomUUID();
+    try {
+      await patchCommand({
+        type: "create",
+        patch: {
+          id: patchId, sourceId: base.id, name: nextPatchName(base.id), enabled: true,
+          geometry: { corners: [
+            { x: bounds.x, y: bounds.y }, { x: bounds.x + bounds.width, y: bounds.y },
+            { x: bounds.x + bounds.width, y: bounds.y + bounds.height }, { x: bounds.x, y: bounds.y + bounds.height },
+          ] },
+          properties: { repeatMode: "unique", trimCap: false, paddingPx: 4, bleedPx: 8, mapParticipation: "all" },
+          rectification: { scale: 1 },
+        },
+      });
+      await assignPatchToRegion(patchId, regionId);
+      setSelectedSourceSetId(owner.id); setSelectedChannel("base_color"); setActivePatchId(patchId);
+      setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
     } catch (reason) { setProblem(failure(reason)); }
   }
 
@@ -977,7 +1056,6 @@ function App() {
       dirtyPreviewRegion.current = regionId;
       const next = await applyCommand({ type: "set_region_content", regionId, content: { type: "patch", id: patchId } });
       setProject(next);
-      setArtifact((prior) => retopologizeArtifact(prior, next));
       setSelectedRegionId(regionId);
     } catch (reason) {
       dirtyPreviewRegion.current = null;
@@ -991,11 +1069,16 @@ function App() {
     try {
       const next = await applyCommand({ type: "set_region_content", regionId, content });
       setProject(next);
-      setArtifact((prior) => retopologizeArtifact(prior, next));
     } catch (reason) {
       dirtyPreviewRegion.current = null;
       setProblem(failure(reason));
     }
+  }
+
+  async function setRegionAddressMode(regionId: string, addressMode: RegionMapping["addressMode"]) {
+    if (!project?.document || activity !== "idle") return;
+    try { await command({ type: "set_region_address_mode", regionId, addressMode }); }
+    catch (reason) { setProblem(failure(reason)); }
   }
 
   async function setPrimaryMaterialExplicit(sourceSetId: string) {
@@ -1152,8 +1235,8 @@ function App() {
           <span>{project?.isDraft ? "Draft" : project?.dirty ? "Unsaved" : "Saved"}</span>
         </div>
         <nav className="workflow" aria-label="Workbench tabs">
-          <button className="mode active">Workbench & Hotspot Sheet</button>
-          {sourceFrameLayout ? <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} onClick={() => setSourceWorkbenchOpen((open) => !open)}>{sourceWorkbenchOpen ? "Hide Source Workbench" : "Show Source Workbench"}</button> : null}
+          <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} aria-pressed={sourceWorkbenchOpen} onClick={() => setSourceWorkbenchOpen((open) => !open)}>Workbench</button>
+          <button className={`mode ${hotspotSheetOpen ? "active" : ""}`} aria-pressed={hotspotSheetOpen} onClick={() => setHotspotSheetOpen((open) => !open)}>Hotspot Sheet</button>
           <button className="mode" disabled title="Layer and map editing has no document command in this slice.">Layers & Maps</button>
         </nav>
         <span className="window-drag-space" data-tauri-drag-region />
@@ -1169,7 +1252,7 @@ function App() {
       </header>
 
       <section ref={workbenchRef} className={`workbench pane-layout-${paneMode} ${sourceFrameLayout ? "source-frame-layout" : ""}`} style={{ gridTemplateColumns: workbenchColumns }}>
-        {paneMode === "full" || paneMode === "without-inspector" ? <SourceLibrary
+        {showLibrary ? <SourceLibrary
           project={project}
           activeSourceSetId={activeSourceSetId}
           selectedSource={selectedSource}
@@ -1185,8 +1268,9 @@ function App() {
           onRenamePatch={(id) => void renamePatch(id)}
           onDeletePatch={(id) => void deletePatch(id)}
         /> : null}
-        {paneMode === "full" || paneMode === "without-inspector" ? <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
-        {showSourceWorkspace ? <section className="source-workspace">
+        {showLibrary && showSourceWorkspace ? <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {showSourceWorkspace ? <section className={`source-workspace ${regionPatchEditId ? "region-patch-isolation" : ""}`}>
+          {regionPatchEditId ? <div className="region-edit-banner"><strong>Editing selected region as an isolated patch</strong><span>Transform this crop without changing any other region.</span><button onClick={() => setRegionPatchEditId(null)}>Done</button></div> : null}
           <MapSlots
             sources={activeSources}
             selectedChannel={selectedChannel}
@@ -1199,6 +1283,7 @@ function App() {
             <button className={patchTool === "four-point" ? "active" : ""} onClick={() => setPatchTool((tool) => tool === "four-point" ? null : "four-point")} disabled={!selectedSource}>Four Point</button>
             <button onClick={() => activePatchId && void deletePatch(activePatchId)} disabled={!activePatchId}>Delete Patch</button>
             <button onClick={() => activePatchId && selectedRegionId && void assignPatchToRegion(activePatchId, selectedRegionId)} disabled={!activePatchId || !selectedRegionId || activity !== "idle"}>Assign patch to region</button>
+            <button className={regionPatchEditId ? "active" : ""} onClick={() => regionPatchEditId ? setRegionPatchEditId(null) : void editSelectedRegionAsPatch()} disabled={!selectedRegionId || activity !== "idle"}>{regionPatchEditId ? "Finish region edit" : "Edit region as patch"}</button>
             <label className="normal-setting" title="Applied explicitly when importing or replacing a tangent-space Normal map.">
               Normal convention
               <select value={normalConvention} onChange={(event) => setNormalConvention(event.currentTarget.value as "open_gl" | "direct_x")}>
@@ -1218,11 +1303,11 @@ function App() {
           </div>
           <SourceCanvas
             source={selectedSource}
-            sourceFrame={project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.sourceFrame : undefined}
-            logicalGrid={project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.logicalGrid : undefined}
-            partitionRegions={project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? artifact?.regions ?? [] : []}
-            selectedSlot={selectedSlot}
-            crop={selectedCrop}
+            sourceFrame={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.sourceFrame : undefined}
+            logicalGrid={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.logicalGrid : undefined}
+            partitionRegions={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? artifact?.regions ?? [] : []}
+            selectedSlot={regionPatchEditId ? null : selectedSlot}
+            crop={regionPatchEditId ? null : selectedCrop}
             selectedRegion={selectedRegion}
             sourceFrameEditing={sourceFrameEditing}
             importing={activity === "importing"}
@@ -1230,24 +1315,25 @@ function App() {
             onCommitCrop={(bounds) => void setSelectedCrop(bounds)}
             onDraftCrop={previewSelectedCrop}
             onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
-            patches={project?.patches.filter((patch) => patch.sourceId === selectedSource?.id) ?? []}
+            patches={project?.patches.filter((patch) => patch.sourceId === selectedSource?.id && (!regionPatchEditId || patch.id === activePatchId)) ?? []}
             activePatchId={activePatchId}
             onEditPatch={setActivePatchId}
             onCommitPatch={(patchId, geometry) => void replacePatchGeometry(patchId, geometry)}
             onDraftPatch={setDraftPatchPreview}
             onDeletePatch={(patchId) => void deletePatch(patchId)}
-            onExitPatch={() => { setDraftPatchPreview(null); setActivePatchId(null); }}
+            onExitPatch={() => { setDraftPatchPreview(null); setActivePatchId(null); setRegionPatchEditId(null); }}
             tool={patchTool}
             onCreatePatch={(geometry, fourPoint) => void createPatch(geometry, fourPoint)}
             onCancelTool={() => setPatchTool(null)}
           />
         </section> : null}
-        {showSourceWorkspace ? <PaneSplitter kind="source-sheet" sourceOnly={paneMode === "without-library"} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
-        <SheetWorkbench
+        {showSourceWorkspace && hotspotSheetOpen ? <PaneSplitter kind="source-sheet" proportional libraryVisible={showLibrary} inspectorVisible={showInspector} onSourceShareChange={setSourceSheetShare} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {hotspotSheetOpen ? <SheetWorkbench
           project={project}
           artifact={artifact}
           preview={preview}
           preparedPatchPreview={activePatchId ? preparedPatchPreview : null}
+          preparedPatchPreviews={preparedPatchPreviews}
           activePatchId={activePatchId}
           mapView={mapView}
           selectedRegionId={selectedRegionId}
@@ -1284,9 +1370,9 @@ function App() {
                ]);
              }
            }}
-         />
-        {paneMode === "full" ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
-        {paneMode === "full" ? <Inspector
+         /> : null}
+        {showInspector && (showSourceWorkspace || hotspotSheetOpen) ? <PaneSplitter kind="sheet-inspector" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
+        {showInspector ? <Inspector
           project={project}
           artifact={artifact}
           sourceAnalysis={activePatchId ? preparedPatchPreview : null}
@@ -1308,6 +1394,7 @@ function App() {
           onSetExemplarGroup={(id, group) => void setExemplarGroup(id, group)}
           onSetDelightingIntent={(id, intent) => void setDelightingIntent(id, intent)}
           onSetRegionContent={(regionId, content) => void assignContentToRegion(regionId, content)}
+          onSetRegionAddressMode={(regionId, addressMode) => void setRegionAddressMode(regionId, addressMode)}
         /> : null}
       </section>
       <footer className="statusbar">
@@ -1341,9 +1428,8 @@ function SourceLibrary(props: {
   const sourceSets = props.project?.materialSources ?? [];
   const [sourceMenu, setSourceMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [patchMenu, setPatchMenu] = useState<{ id: string; x: number; y: number } | null>(null);
-  const [patchFilter, setPatchFilter] = useState("all");
   const sourceSetForPatch = (patch: Patch) => sourceSets.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
-  const patches = (props.project?.patches ?? []).filter((patch) => patchFilter === "all" || sourceSetForPatch(patch)?.id === patchFilter);
+  const patches = (props.project?.patches ?? []).filter((patch) => sourceSetForPatch(patch)?.id === props.activeSourceSetId);
   return <aside className="source-library">
     <header className="panel-title"><span>WORKPLACE</span></header>
     <section className="library-section source-list"><div className="section-head"><span>SOURCES</span><b>{sourceSets.length}</b></div>
@@ -1359,10 +1445,9 @@ function SourceLibrary(props: {
         </div>;
       })}
       <button className="new-source" onClick={props.onAddSourceSet}>+ Add independent source…</button>
-      <button className="new-source" onClick={() => props.activeSourceSetId && props.onAddMaps(props.activeSourceSetId)} disabled={!props.activeSourceSetId}>+ Add maps to selected source…</button>
+      <button className="new-source" title="Add or replace Normal, Height, Roughness, AO, and other channel files for this material source." onClick={() => props.activeSourceSetId && props.onAddMaps(props.activeSourceSetId)} disabled={!props.activeSourceSetId}>+ Add/replace channel maps…</button>
     </section>
-    <section className="library-section patches"><div className="section-head"><span>PATCHES</span><b>{props.project?.patches.length ?? 0}</b></div>
-      <select aria-label="Filter patches by source" value={patchFilter} onChange={(event) => setPatchFilter(event.currentTarget.value)}><option value="all">All sources</option>{sourceSets.map((set) => <option key={set.id} value={set.id}>{set.name}</option>)}</select>
+    <section className="library-section patches"><div className="section-head"><span>PATCHES · SELECTED SOURCE</span><b>{patches.length}</b></div>
       <div className="patch-list">{patches.map((patch) => {
         const owner = sourceSetForPatch(patch); const base = owner?.registeredChannels?.channels.find((source) => source.channel === "base_color");
         const xs = patch.geometry.corners.map((point) => point.x); const ys = patch.geometry.corners.map((point) => point.y);
@@ -1370,7 +1455,7 @@ function SourceLibrary(props: {
         const assigned = props.project?.document && Object.values(props.project.document.regionBindings).some((binding) => binding.content.type === "patch" && binding.content.id === patch.id);
         return <button key={patch.id} className={`patch-row ${props.activePatchId === patch.id ? "active" : ""}`} onClick={() => owner && props.onSelectPatch(patch.id, owner.id)} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setPatchMenu({ id: patch.id, x: event.clientX, y: event.clientY }); }}><span className="thumb">{base ? <img src={base.thumbnailDataUrl} alt="" /> : "?"}</span><span><strong>{patch.name}</strong><small>{owner?.name ?? "Missing source"} · {dimensions}</small><small>{patch.enabled ? "Enabled" : "Disabled"}{assigned ? " · assigned" : ""}</small></span></button>;
       })}</div>
-      {!patches.length ? <p>Choose Rectangle or Four Point, then author patches on the selected source.</p> : null}
+      {!patches.length ? <p>Choose Rectangle or Four Point, then author patches on the selected source. Selecting another source switches this list.</p> : null}
     </section>
     {sourceMenu ? createPortal(<div className="patch-context-menu source-context-menu" role="menu" style={{ left: sourceMenu.x, top: sourceMenu.y }} onContextMenu={(event) => event.preventDefault()}><button role="menuitem" onClick={() => { props.onRenameSource(sourceMenu.id); setSourceMenu(null); }}>Rename…</button><button role="menuitem" onClick={() => { props.onReplaceBase(sourceMenu.id); setSourceMenu(null); }}>Replace Base Color / File…</button><button role="menuitem" onClick={() => { props.onAddMaps(sourceMenu.id); setSourceMenu(null); }}>Add or replace channel maps…</button><button role="menuitem" onClick={() => { props.onSetPrimary(sourceMenu.id); setSourceMenu(null); }}>Set as primary / Rebase layout…</button><button role="menuitem" onClick={() => { const base = sourceSets.find((set) => set.id === sourceMenu.id)?.registeredChannels?.channels.find((source) => source.channel === "base_color"); if (base) void revealItemInDir(base.original.path); setSourceMenu(null); }}>Reveal source</button><button role="menuitem" className="danger" onClick={() => { props.onRemove(sourceMenu.id); setSourceMenu(null); }}>Remove…</button></div>, document.body) : null}
     {patchMenu ? createPortal(<div className="patch-context-menu" role="menu" style={{ left: patchMenu.x, top: patchMenu.y }} onContextMenu={(event) => event.preventDefault()}><button onClick={() => { props.onRenamePatch(patchMenu.id); setPatchMenu(null); }}>Rename…</button><button className="danger" onClick={() => { props.onDeletePatch(patchMenu.id); setPatchMenu(null); }}>Remove…</button></div>, document.body) : null}
@@ -2016,6 +2101,10 @@ function cornerLoupeStyle(source: SourceProjection, point: { x: number; y: numbe
 function PaneSplitter(props: {
   kind: PaneDragKind;
   sourceOnly?: boolean;
+  proportional?: boolean;
+  libraryVisible?: boolean;
+  inspectorVisible?: boolean;
+  onSourceShareChange?: (share: number) => void;
   paneDrag: React.MutableRefObject<{ kind: PaneDragKind; start: PaneState } | null>;
   setPanes: (next: PaneState | ((current: PaneState) => PaneState)) => void;
   workbenchRef: React.RefObject<HTMLElement | null>;
@@ -2032,6 +2121,14 @@ function PaneSplitter(props: {
     if (!active || active.kind !== props.kind) return;
     const rect = props.workbenchRef.current?.getBoundingClientRect();
     if (!rect) return;
+    if (props.proportional && props.onSourceShareChange) {
+      const leftOffset = props.libraryVisible ? active.start.library + 6 : 0;
+      const rightOffset = props.inspectorVisible ? active.start.inspector + 6 : 0;
+      const available = Math.max(1, rect.width - leftOffset - rightOffset - 6);
+      const share = Math.max(0.2, Math.min(0.8, (event.clientX - rect.left - leftOffset) / available));
+      props.onSourceShareChange(share);
+      return;
+    }
     if (props.sourceOnly) {
       const maximum = Math.max(240, rect.width - 266);
       const source = Math.min(maximum, Math.max(240, event.clientX - rect.left));
@@ -2051,6 +2148,7 @@ function SheetWorkbench(props: {
   artifact: IntermediateAtlasProjection | null;
   preview: PreviewSheetProjection | null;
   preparedPatchPreview: PreparedPatchPreviewProjection | null;
+  preparedPatchPreviews: Readonly<Record<string, PreparedPatchPreviewProjection>>;
   activePatchId: string | null;
   mapView: CompiledMapView;
   selectedRegionId: string | null;
@@ -2109,13 +2207,19 @@ function SheetWorkbench(props: {
   const [pendingGridChange, setPendingGridChange] = useState<{ preset: AuthoredLayoutPreset; size: number } | null>(null);
   const [userPresets, setUserPresets] = useState<AuthoredLayoutPreset[]>([]);
   const [presetLibraryProblem, setPresetLibraryProblem] = useState<string | null>(null);
+  const nativePresetLibraryAvailable = useRef(true);
   const [resizeDraft, setResizeDraft] = useState<{ pointerId: number; regionId: string; handle: ResizeHandle; origin: LogicalRect; rect: LogicalRect } | null>(null);
   const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startCellX: number; startCellY: number; endCellX: number; endCellY: number } | null>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
   const displayRegions = sheet?.regions ?? [];
   const selectedGridRect = resizeDraft?.rect ?? displayRegions.find((region) => region.regionId === props.selectedRegionId)?.gridRect;
-  const selectedContent = props.selectedRegionId ? props.project?.document?.regionBindings[props.selectedRegionId]?.content : null;
-  const selectedPatchAssigned = !!props.activePatchId && selectedContent?.type === "patch" && selectedContent.id === props.activePatchId;
+  const pendingPatchRegions = props.artifact?.documentRevision !== props.project?.document?.documentRevision
+    ? displayRegions.flatMap((region) => {
+        const content = props.project?.document?.regionBindings[region.regionId]?.content;
+        const patchPreview = content?.type === "patch" ? props.preparedPatchPreviews[content.id] : null;
+        return patchPreview ? [{ region, patchPreview }] : [];
+      })
+    : [];
   const drawRect = drawDraft ? cellDragRect(drawDraft.startCellX, drawDraft.startCellY, drawDraft.endCellX, drawDraft.endCellY) : null;
   const resizeTransfers = useMemo(() => resizeDraft ? previewResizeOwnershipTransfers(displayRegions, resizeDraft.regionId, resizeDraft.origin, resizeDraft.rect, displayedGrid) : [], [displayRegions, resizeDraft, displayedGrid]);
   const resizeAffectedIds = useMemo(() => new Set(resizeTransfers.flatMap((transfer) => [transfer.fromId, transfer.toId])), [resizeTransfers]);
@@ -2155,13 +2259,19 @@ function SheetWorkbench(props: {
         localStorage.removeItem("hot-trimmer.authored-layout-presets.v1");
         if (!disposed) { setUserPresets(presets); setPresetLibraryProblem(null); }
       } catch (reason) {
-        if (!disposed) setPresetLibraryProblem(failure(reason).message);
+        const message = failure(reason).message;
+        if (/list_authored_layout_presets.*not found|command .*not found/i.test(message)) {
+          nativePresetLibraryAvailable.current = false;
+          try { if (!disposed) setUserPresets(JSON.parse(localStorage.getItem("hot-trimmer.authored-layout-presets.v1") ?? "[]") as AuthoredLayoutPreset[]); }
+          catch { if (!disposed) setUserPresets([]); }
+          if (!disposed) setPresetLibraryProblem(null);
+        } else if (!disposed) setPresetLibraryProblem(message);
       }
     })();
     return () => { disposed = true; };
   }, []);
   async function saveUserPreset(preset: AuthoredLayoutPreset) {
-    if (!isNativeRuntime()) {
+    if (!isNativeRuntime() || !nativePresetLibraryAvailable.current) {
       const next = [...userPresets.filter((saved) => saved.presetId !== preset.presetId), preset];
       setUserPresets(next); localStorage.setItem("hot-trimmer.authored-layout-presets.v1", JSON.stringify(next)); return true;
     }
@@ -2171,7 +2281,7 @@ function SheetWorkbench(props: {
     } catch (reason) { setPresetLibraryProblem(failure(reason).message); return false; }
   }
   async function deleteUserPreset(presetId: string) {
-    if (!isNativeRuntime()) {
+    if (!isNativeRuntime() || !nativePresetLibraryAvailable.current) {
       const next = userPresets.filter((saved) => saved.presetId !== presetId);
       setUserPresets(next); localStorage.setItem("hot-trimmer.authored-layout-presets.v1", JSON.stringify(next)); return true;
     }
@@ -2403,7 +2513,7 @@ function SheetWorkbench(props: {
         }}
       >
         {textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
-        {selectedPatchAssigned && props.preparedPatchPreview && selectedGridRect ? <div className="assigned-patch-preview" style={gridRectOverlayStyle(selectedGridRect, displayedGrid)}><img src={props.preparedPatchPreview.dataUrl} alt="Assigned patch preview" /></div> : null}
+        {pendingPatchRegions.map(({ region, patchPreview }) => <div key={`assigned-${region.regionId}`} className="assigned-patch-preview" style={gridRectOverlayStyle(region.gridRect, displayedGrid)}><img src={patchPreview.dataUrl} alt={`Immediate assigned patch preview for ${region.displayName}`} /></div>)}
         {layoutTool === "draw" && hoverSnap && !drawDraft ? <div className="draw-hover-cell" style={gridRectOverlayStyle({ x: hoverSnap.cellX, y: hoverSnap.cellY, width: 1, height: 1 }, displayedGrid)}><div className="draw-snap-crosshair"><span>cell {hoverSnap.cellX}, {hoverSnap.cellY}</span></div></div> : null}
         {(sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}
         <div className={`overlays ${layoutTool === "draw" ? "drawing" : ""}`}>{displayRegions.map((region) => <button key={region.regionId}
@@ -2420,8 +2530,12 @@ function SheetWorkbench(props: {
         {resizeTransfers.map((transfer, index) => { const owner = displayRegions.find((region) => region.regionId === transfer.toId); const from = displayRegions.find((region) => region.regionId === transfer.fromId); return <div key={`${transfer.fromId}-${transfer.toId}-${index}`} className={`ownership-transfer ${transfer.toId === resizeDraft?.regionId ? "gained" : "released"}`} style={{ ...gridRectOverlayStyle(transfer.rect, displayedGrid), borderColor: owner ? `rgb(${owner.idColor.join(" ")})` : undefined, backgroundColor: owner ? `rgb(${owner.idColor.join(" ")} / .38)` : undefined }}><span>{from?.displayName ?? "Region"} → {owner?.displayName ?? "Region"}</span></div>; })}
         {resizeDraft && !sameGridRect(resizeDraft.origin, resizeDraft.rect) ? <div className="resize-region-preview" style={gridRectOverlayStyle(resizeDraft.rect, displayedGrid)}><span>{resizeDraft.rect.x}, {resizeDraft.rect.y} / {resizeDraft.rect.width} x {resizeDraft.rect.height}</span></div> : null}
         {pendingGridChange ? <div className="grid-change-preview" aria-label={`Quantized ${pendingGridChange.size} by ${pendingGridChange.size} layout preview`}>{pendingGridChange.preset.regions.map((region) => <i key={region.presetRegionKey} style={gridRectOverlayStyle(region.gridRect, pendingGridChange.preset.logicalGrid)} />)}</div> : null}
-        {!props.candidatePreviewing && layoutMenu ? createPortal(<div className="layout-menu" style={{ left: layoutMenu.x, top: layoutMenu.y }} role="menu" onPointerDown={(event) => event.stopPropagation()}><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "horizontal" }); setLayoutMenu(null); }}>Split horizontal</button><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "vertical" }); setLayoutMenu(null); }}>Split vertical</button>{mergeCandidate(sheet.regions, layoutMenu.regionId) ? <><button onClick={() => { const sibling = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: layoutMenu.regionId, siblingId: sibling.regionId }); setLayoutMenu(null); }}>Merge / Remove Divider</button><button onClick={() => { const neighbor = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: neighbor.regionId, siblingId: layoutMenu.regionId }); setLayoutMenu(null); }}>Delete / Return area to neighbor</button></> : <button disabled title="No legal ownership transfer: this region does not share one complete divider with a neighbor.">Delete unavailable — no legal neighbor</button>}</div>, document.body) : null}
-        {!props.candidatePreviewing && layoutMenu ? createPortal(<div className="layout-menu region-content-menu" style={{ left: Math.min(layoutMenu.x + 196, window.innerWidth - 220), top: layoutMenu.y }} role="menu" onContextMenu={(event) => event.preventDefault()}><strong>Content</strong><button onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "inherit_primary_material" } }); setLayoutMenu(null); }}>Inherit primary</button>{props.project?.materialSources.map((source) => <button key={source.id} onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "material_source", id: source.id } }); setLayoutMenu(null); }}>Whole source · {source.name}</button>)}{props.project?.patches.filter((patch) => patch.enabled).map((patch) => <button key={patch.id} onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "patch", id: patch.id } }); setLayoutMenu(null); }}>Patch · {patch.name}</button>)}</div>, document.body) : null}
+        {!props.candidatePreviewing && layoutMenu ? createPortal(<div className="layout-menu" style={{ left: layoutMenu.x, top: layoutMenu.y }} role="menu" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "horizontal" }); setLayoutMenu(null); }}>Split horizontal</button><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "vertical" }); setLayoutMenu(null); }}>Split vertical</button>{mergeCandidate(sheet.regions, layoutMenu.regionId) ? <><button onClick={() => { const sibling = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: layoutMenu.regionId, siblingId: sibling.regionId }); setLayoutMenu(null); }}>Merge / Remove Divider</button><button onClick={() => { const neighbor = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: neighbor.regionId, siblingId: layoutMenu.regionId }); setLayoutMenu(null); }}>Delete / Return area to neighbor</button></> : <button disabled title="No legal ownership transfer: this region does not share one complete divider with a neighbor.">Delete unavailable — no legal neighbor</button>}</div>, document.body) : null}
+        {!props.candidatePreviewing && layoutMenu ? createPortal(<div className="layout-menu region-content-menu" style={{ left: Math.min(layoutMenu.x + 196, window.innerWidth - 260), top: layoutMenu.y }} role="menu" onContextMenu={(event) => event.preventDefault()} onWheel={(event) => event.stopPropagation()}><strong>Content</strong><button onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "inherit_primary_material" } }); setLayoutMenu(null); }}>Inherit primary</button>{props.project?.materialSources.map((source) => {
+          const base = source.registeredChannels?.channels.find((channel) => channel.channel === "base_color");
+          const sourcePatches = props.project?.patches.filter((patch) => patch.enabled && source.registeredChannels?.channels.some((channel) => channel.id === patch.sourceId)) ?? [];
+          return <div className="content-source-group" key={source.id}><strong>{base?.displayName ?? source.name}</strong><button onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "material_source", id: source.id } }); setLayoutMenu(null); }}>Whole source</button>{sourcePatches.map((patch) => <button key={patch.id} onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "patch", id: patch.id } }); setLayoutMenu(null); }}>{patch.name}</button>)}</div>;
+        })}</div>, document.body) : null}
       </div>}
       {workpieceSize ? <div className="viewport-tools">
         <button onClick={() => viewport.zoom(0.8)}>-</button>
@@ -2530,6 +2644,7 @@ function Inspector(props: {
   onSetExemplarGroup: (materialSourceId: string, exemplarGroup: string | null) => void;
   onSetDelightingIntent: (materialSourceId: string, delighting: DelightingIntent) => void;
   onSetRegionContent: (regionId: string, content: { type: "inherit_primary_material" } | { type: "material_source"; id: string } | { type: "patch"; id: string }) => void;
+  onSetRegionAddressMode: (regionId: string, addressMode: RegionMapping["addressMode"]) => void;
 }) {
   const binding = props.selectedRegion && props.project?.document?.regionBindings[props.selectedRegion.regionId];
   const stage14Slot = props.selectedRegion && props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegion!.regionId);
@@ -2541,9 +2656,21 @@ function Inspector(props: {
     : undefined;
   const layoutMode = !!props.project?.document?.sourceFrame;
   const selectedMaterial = props.project?.materialSources.find((source) => source.id === props.selectedSourceSetId);
+  const boundPatch = binding?.content.type === "patch" ? props.project?.patches.find((patch) => patch.id === binding.content.id) : undefined;
+  const boundSource = binding?.content.type === "material_source"
+    ? props.project?.materialSources.find((source) => source.id === binding.content.id)
+    : binding?.content.type === "patch"
+      ? props.project?.materialSources.find((source) => source.registeredChannels?.channels.some((channel) => channel.id === boundPatch?.sourceId))
+      : props.project?.materialSources.find((source) => source.id === props.project?.document?.primaryMaterial);
   return <aside className={`context-inspector ${layoutMode ? "layout-mode" : ""}`}>
     <header className="inspector-actions"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument}>Redo</button></header>
     {layoutMode ? <section className="inspector-section layout-summary"><span>LAYOUT MODE</span><p>Composition, candidate state, and atlas editing are in the Layout sidebar. Undo and redo remain available here.</p></section> : null}
+    {props.selectedRegion ? <section className="inspector-section region-controls-primary">
+      <span>REGION CONTROLS</span><h2>{props.selectedRegion.displayName}</h2>
+      <label>Content source<select value={binding?.content.type === "material_source" ? `source:${binding.content.id}` : binding?.content.type === "patch" ? `patch:${binding.content.id}` : "inherit"} onChange={(event) => { const value = event.currentTarget.value; if (value === "inherit") props.onSetRegionContent(props.selectedRegion!.regionId, { type: "inherit_primary_material" }); else if (value.startsWith("source:")) props.onSetRegionContent(props.selectedRegion!.regionId, { type: "material_source", id: value.slice(7) }); else if (value.startsWith("patch:")) props.onSetRegionContent(props.selectedRegion!.regionId, { type: "patch", id: value.slice(6) }); }}><option value="inherit">Primary source</option>{props.project?.materialSources.map((source) => <optgroup key={source.id} label={source.registeredChannels?.channels.find((channel) => channel.channel === "base_color")?.displayName ?? source.name}><option value={`source:${source.id}`}>Whole source</option>{props.project?.patches.filter((patch) => patch.enabled && source.registeredChannels?.channels.some((channel) => channel.id === patch.sourceId)).map((patch) => <option key={patch.id} value={`patch:${patch.id}`}>{patch.name}</option>)}</optgroup>)}</select></label>
+      <label>Sampling<select value={binding?.mapping.addressMode ?? "clamp"} onChange={(event) => props.onSetRegionAddressMode(props.selectedRegion!.regionId, event.currentTarget.value as RegionMapping["addressMode"])}><option value="clamp">One-shot / no loop</option><option value="repeat">Loop XY</option></select></label>
+      <dl><dt>Points to</dt><dd>{boundPatch ? `${boundSource?.name ?? "Missing source"} / ${boundPatch.name}` : boundSource?.name ?? "Missing source"}</dd><dt>Role</dt><dd>{props.selectedRegion.role}</dd><dt>Orientation</dt><dd>{props.selectedRegion.orientation}</dd></dl>
+    </section> : null}
     <section className="inspector-section">
       <span>MAP VIEW</span>
       <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact?.maps[id]} title={props.artifact && !props.artifact.maps[id] ? "Unavailable through Stage 14" : undefined}>{label}</button>)}</div>
@@ -2617,7 +2744,6 @@ function Inspector(props: {
       {props.selectedRegion ? <>
         <h2>{props.selectedRegion.displayName}</h2>
         <code>{props.selectedRegion.regionId}</code>
-        <label>Content<select value={binding?.content.type === "material_source" ? `source:${binding.content.id}` : binding?.content.type === "patch" ? `patch:${binding.content.id}` : "inherit"} onChange={(event) => { const value = event.currentTarget.value; if (value === "inherit") props.onSetRegionContent(props.selectedRegion!.regionId, { type: "inherit_primary_material" }); else if (value.startsWith("source:")) props.onSetRegionContent(props.selectedRegion!.regionId, { type: "material_source", id: value.slice(7) }); else if (value.startsWith("patch:")) props.onSetRegionContent(props.selectedRegion!.regionId, { type: "patch", id: value.slice(6) }); }}><option value="inherit">Inherit primary</option><optgroup label="Whole source">{props.project?.materialSources.map((source) => <option key={source.id} value={`source:${source.id}`}>{source.name}</option>)}</optgroup><optgroup label="Patch">{props.project?.patches.filter((patch) => patch.enabled).map((patch) => <option key={patch.id} value={`patch:${patch.id}`}>{patch.name}</option>)}</optgroup></select></label>
         <dl>
           <dt>Content</dt><dd>{contentLabel(binding?.content.type)}</dd>
           <dt>Projection</dt><dd>{stage14Slot?.mappingOrigin === "partition" ? "Partition crop" : binding?.mapping.projection.type ?? "-"}</dd>

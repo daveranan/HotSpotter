@@ -410,6 +410,10 @@ button:disabled {
 .source-context-menu { position: fixed; }
 .region-content-menu { max-height: min(420px, 70vh); overflow: auto; }
 .region-content-menu > strong { display: block; padding: 5px 7px; color: #aaa; font-size: 9px; text-transform: uppercase; }
+.content-source-group { display: grid; gap: 3px; margin-top: 4px; padding-top: 5px; border-top: 1px solid #3a3a3a; }
+.content-source-group > strong { padding: 2px 7px; overflow: hidden; color: #d7d7d7; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.content-source-group > button { margin-left: 12px; position: relative; }
+.content-source-group > button::before { content: "↳"; margin-right: 6px; color: #7f91b8; }
 
 .grid-change-confirm { display: grid; gap: 6px; padding: 8px; border: 1px solid #d39b3a; background: #3a3020; color: #f4d69a; font-size: 10px; }
 .grid-change-confirm > div { display: flex; gap: 6px; }
@@ -422,6 +426,13 @@ button:disabled {
   background: #1f1f1f;
   border-right: 1px solid #111;
 }
+.region-edit-banner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 7px 9px; border-bottom: 1px solid #76943f; background: #28321d; color: #d7ff79; }
+.region-edit-banner strong { font-size: 11px; }
+.region-edit-banner span { grid-column: 1; color: #b8c89a; font-size: 9px; }
+.region-edit-banner button { grid-column: 2; grid-row: 1 / span 2; min-width: 58px; }
+.region-patch-isolation .source-stage { box-shadow: inset 0 0 0 2px #d7ff79; }
+.region-controls-primary { border-color: #6f8d3b; background: #22281c; }
+.region-controls-primary > span { color: #d7ff79; }
 
 .patch-toolbar { display: flex; gap: 4px; padding: 3px 5px; background: #242424; border-bottom: 1px solid #111; }
 .patch-toolbar button { padding: 3px 8px; font-size: 10px; }

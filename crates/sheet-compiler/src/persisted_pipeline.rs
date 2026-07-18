@@ -161,7 +161,9 @@ impl SourceFramePreviewCache {
         key: ContentDigest,
         domain: Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>,
     ) {
-        const MAX_DIRECT_DOMAINS: usize = 2;
+        // Keep the pinned SourceFrame plus a small working set of authored patch domains.
+        // Patch assignment must not redo Stages 2-8 every time the same patch is rebound.
+        const MAX_DIRECT_DOMAINS: usize = 8;
         if self.direct_domains.len() >= MAX_DIRECT_DOMAINS
             && !self.direct_domains.contains_key(&key)
         {
@@ -793,9 +795,9 @@ fn compile_source_frame(
         document
             .region_bindings
             .get(&region.id)
-            .is_none_or(|binding| binding.mapping.address_mode != AddressMode::Clamp)
+            .is_none_or(|binding| binding.mapping.address_mode == AddressMode::MirroredRepeat)
     }) {
-        return Err("SourceFrame workflow requires clamp address mode for every region".into());
+        return Err("SourceFrame workflow does not yet support mirrored-repeat address mode".into());
     }
     let cell_count = usize::try_from(u64::from(grid.width) * u64::from(grid.height))
         .map_err(|_| "logical grid is too large")?;
@@ -880,18 +882,25 @@ fn compile_source_frame(
         let (source_set_id, patch) =
             resolve_region_content(request.project, document, primary, &binding.content)?;
         let domain = if let Some(patch) = patch.as_ref() {
-            Arc::new(
-                build_domain(
+            let preserve_source_resolution = matches!(request.profile, SourceFramePreviewProfile::Authoritative);
+            let patch_key = patch_domain_cache_key(request.project, source_set_id, patch, preserve_source_resolution)?;
+            if let Some(found) = source_frame_cache.and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&patch_key))) {
+                found
+            } else {
+                let domain = Arc::new(build_direct_patch_domain(
                     request.project,
                     source_set_id,
-                    Some(patch),
-                    request.revision,
-                    true,
+                    patch,
+                    patch_key.clone(),
+                    preserve_source_resolution,
                     image_cancellation,
                     _render_cancellation,
-                )?
-                .domain,
-            )
+                )?);
+                if let Some(cache) = source_frame_cache {
+                    if let Ok(mut guard) = cache.lock() { guard.insert(patch_key, Arc::clone(&domain)); }
+                }
+                domain
+            }
         } else if let Some(domain) = direct_domains.get(&source_set_id) {
             Arc::clone(domain)
         } else {
@@ -1014,7 +1023,7 @@ fn compile_source_frame(
         };
         let candidate_id = hot_trimmer_domain::ContentDigest::sha256(
             format!(
-                "source-frame|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
+                "source-frame|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|address={:?}",
                 frame
                     .identity
                     .0
@@ -1028,10 +1037,12 @@ fn compile_source_frame(
                 crop.height,
                 mapping_origin,
                 source_set_id,
-                patch_id
+                patch_id,
+                binding.mapping.address_mode
             )
             .as_bytes(),
         );
+        let authored_repeat = binding.mapping.address_mode == AddressMode::Repeat;
         let candidate = CropCandidate {
             candidate_id: candidate_id.clone(),
             source_id: domain.prepared_source_digest.clone(),
@@ -1043,11 +1054,11 @@ fn compile_source_frame(
                 mirror: MirrorTransform::None,
             },
             isotropic_scale: 1.0,
-            mapping_mode: hot_trimmer_domain::SamplingMode::DirectCrop,
+            mapping_mode: if authored_repeat { hot_trimmer_domain::SamplingMode::PeriodicTile } else { hot_trimmer_domain::SamplingMode::DirectCrop },
             family: CandidateFamily::PanelDirect,
             route: CandidateRoute::Direct,
             position_strategy: PositionStrategy::DenseLowResolution,
-            period_pixels: None,
+            period_pixels: authored_repeat.then_some([crop.width, crop.height]),
             seam_indices: Vec::new(),
             correspondence_reference: domain.cache_key.clone(),
             descriptors: CandidateDescriptors {
@@ -1416,6 +1427,86 @@ fn resolve_region_content(
             Err("Stage 14 intermediate preview cannot represent procedural region content".into())
         }
     }
+}
+
+fn patch_domain_cache_key(
+    project: &ProjectSummary,
+    source_set_id: hot_trimmer_domain::SourceSetId,
+    patch: &Patch,
+    preserve_source_resolution: bool,
+) -> Result<ContentDigest, String> {
+    let source_set = project.source_sets.iter().find(|set| set.id == source_set_id)
+        .ok_or_else(|| format!("material source set {source_set_id} is missing"))?;
+    let identity = format!(
+        "stage-02-08-patch-domain-v1|source={source_set:?}|patch={patch:?}|preserve={preserve_source_resolution}"
+    );
+    Ok(ContentDigest::sha256(identity.as_bytes()))
+}
+
+fn build_direct_patch_domain(
+    project: &ProjectSummary,
+    source_set_id: hot_trimmer_domain::SourceSetId,
+    patch: &Patch,
+    cache_key: ContentDigest,
+    preserve_source_resolution: bool,
+    image_cancellation: &ImageCancellationToken,
+    render_cancellation: &RenderCancellationToken,
+) -> Result<hot_trimmer_material_synthesis::PreparedMaterialDomain, String> {
+    let source_set = project.source_sets.iter().find(|set| set.id == source_set_id)
+        .ok_or_else(|| format!("material source set {source_set_id} is missing"))?;
+    let sources = project.sources.iter()
+        .filter(|source| source.source_set_id.to_string() == source_set_id.to_string())
+        .collect::<Vec<_>>();
+    if !sources.iter().any(|source| source.input.id == patch.source_id) {
+        return Err(format!("patch {} does not belong to material source set {source_set_id}", patch.id));
+    }
+    let (registered, encoded) = registered_inputs(&sources)?;
+    let prepared = prepare_registered_channel_set(
+        &registered,
+        &encoded,
+        &NormalizationSettings {
+            max_levels: 1,
+            max_memory_bytes: 1_073_741_824,
+            max_level_zero_edge: (!preserve_source_resolution).then_some(1024),
+            ..NormalizationSettings::default()
+        },
+        image_cancellation,
+    ).map_err(|error| format!("Stage 2 direct patch preparation failed: {error}"))?;
+    let patch_revision = u64::from_str_radix(&cache_key.0[..16], 16)
+        .map_err(|error| format!("direct patch revision failed: {error}"))?;
+    let exemplar = prepare_registered_exemplar(
+        &prepared,
+        &PreparedExemplarRequest {
+            exemplar_id: patch.id.to_string(),
+            area: PlanarArea::FourPoint { corners: patch.geometry.corners },
+            lens_correction: None,
+            mask: ExemplarMaskIntent {
+                crop_polygon: patch.geometry.assistance_mask.clone(),
+                minimum_alpha: Some(1.0 / 255.0),
+            },
+            rectification: patch.rectification,
+            physical_aspect_ratio: None,
+            quality: RectificationQuality::Authoritative,
+            limits: RectificationWorkLimits {
+                preview_max_edge: 1024,
+                authoritative_max_edge: if preserve_source_resolution { 8192 } else { 1024 },
+                max_pixels: if preserve_source_resolution { 67_108_864 } else { 1_048_576 },
+                tile_edge: 128,
+            },
+            scope: PreparedExemplarScope {
+                source_set_id,
+                source_revision: source_set.source_revision,
+                patch_id: Some(patch.id),
+                patch_revision,
+            },
+        },
+        render_cancellation,
+    ).map_err(|error| format!("Stage 3 direct patch rectification failed: {error}"))?;
+    hot_trimmer_material_synthesis::PreparedMaterialDomain::from_registered_channels(
+        cache_key,
+        exemplar.cache_key.0,
+        exemplar.channels,
+    ).map_err(|error| format!("direct patch domain failed: {error}"))
 }
 
 fn build_domain(

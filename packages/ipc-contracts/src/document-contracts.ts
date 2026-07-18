@@ -490,6 +490,7 @@ export type TrimSheetDocumentCommand =
   | { type: "resize_source_frame_region"; regionId: string; gridRect: { x: number; y: number; width: number; height: number } }
   | { type: "set_primary_material"; materialId: string }
   | { type: "set_region_content"; regionId: string; content: ContentReference }
+  | { type: "set_region_address_mode"; regionId: string; addressMode: RegionMapping["addressMode"] }
   | { type: "set_sheet_framing"; framing: unknown }
   | { type: "set_region_projection"; regionId: string; projection: RegionMapping["projection"] }
   | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }

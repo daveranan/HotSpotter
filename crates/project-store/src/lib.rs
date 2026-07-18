@@ -2127,6 +2127,7 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::ResizeSourceFrameRegion { .. } => "resize_source_frame_region",
         TrimSheetDocumentCommand::SetPrimaryMaterial { .. } => "set_primary_material",
         TrimSheetDocumentCommand::SetRegionContent { .. } => "set_region_content",
+        TrimSheetDocumentCommand::SetRegionAddressMode { .. } => "set_region_address_mode",
         TrimSheetDocumentCommand::SetSheetFraming { .. } => "set_sheet_framing",
         TrimSheetDocumentCommand::SetRegionProjection { .. } => "set_region_projection",
         TrimSheetDocumentCommand::SetRegionRadial { .. } => "set_region_radial",
