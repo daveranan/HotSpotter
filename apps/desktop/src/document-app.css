@@ -1141,3 +1141,16 @@ button:disabled {
   display: grid;
   gap: 3px;
 }
+
+.layout-presets { display: grid; gap: 7px; padding: 9px 0; border-top: 1px solid #3b4047; border-bottom: 1px solid #3b4047; }
+.layout-presets .layout-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.grid-resolution-slider { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; align-items: center; }
+.grid-resolution-slider output { color: #d7ff79; font: 10px ui-monospace, Consolas, monospace; }
+.grid-resolution-slider input { grid-column: 1 / -1; }
+.legacy-generator-controls[hidden] { display: none !important; }
+.draw-hover-cell { position: absolute; z-index: 8; pointer-events: none; box-sizing: border-box; border: 2px solid #e9ff6d; background: rgb(233 255 109 / .18); box-shadow: inset 0 0 0 1px #111, 0 0 5px #000; }
+.draw-snap-crosshair { position: absolute; left: 50%; top: 50%; width: 0; height: 0; pointer-events: none; color: #e9ff6d; }
+.draw-snap-crosshair::before, .draw-snap-crosshair::after { content: ""; position: absolute; background: currentColor; box-shadow: 0 0 4px #000; }
+.draw-snap-crosshair::before { width: 25px; height: 1px; left: -12px; }
+.draw-snap-crosshair::after { width: 1px; height: 25px; top: -12px; }
+.draw-snap-crosshair span { position: absolute; left: 8px; top: 8px; white-space: nowrap; padding: 2px 5px; background: #111d; border: 1px solid currentColor; font: 11px monospace; }

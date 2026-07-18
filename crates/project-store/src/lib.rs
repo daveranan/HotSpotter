@@ -942,8 +942,9 @@ impl ProjectStore {
             .ok_or(StoreError::BaseColorRequired)?;
         let frame = SourceFrame::centered_largest(primary,
             OrientedPixelSize { width: source.input.width, height: source.input.height }, [1, 1], source_set.source_revision);
-        let recipe = PartitionRecipe::default_for(LogicalGridSpec::DEFAULT, 63, 0);
-        let document = TrimSheetDocument::from_source_frame(LayoutId::new(), frame, recipe,
+        let document_id = LayoutId::new();
+        let document = TrimSheetDocument::from_authored_layout_preset(document_id, frame,
+            hot_trimmer_domain::diagonal_cascade_authored_preset(), document_id.to_string(),
             hot_trimmer_domain::PixelSize { width: 2_048, height: 2_048 }, materials,
             self.patch_set.patches().to_vec()).map_err(|error| StoreError::Document(error.to_string()))?;
         persist_document_state(&mut self.connection, Some(&document), "create_source_frame_document")?;
@@ -1850,6 +1851,7 @@ fn persist_document_state_in_transaction(
 
 fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
     match command {
+        TrimSheetDocumentCommand::ApplyAuthoredLayoutPreset { .. } => "apply_authored_layout_preset",
         TrimSheetDocumentCommand::AcceptSourceFramePartition { .. } => "accept_source_frame_partition",
         TrimSheetDocumentCommand::SplitSourceFrameRegion { .. } => "split_source_frame_region",
         TrimSheetDocumentCommand::MergeSourceFrameRegions { .. } => "merge_source_frame_regions",

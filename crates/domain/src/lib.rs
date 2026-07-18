@@ -13,7 +13,7 @@ mod units;
 
 pub use channel::{Channel, ChannelDataKind};
 pub use document::{
-    AcceptedTopology, AddressMode, AppearanceHashInputs, BlendPolicy, ChangeClassification,
+    AcceptedTopology, AddressMode, AppearanceHashInputs, AuthoredLayoutPreset, AuthoredLayoutPresetRegion, BlendPolicy, ChangeClassification,
     ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, FitAxis,
     GeneratorProvenance, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, ProceduralMaterial, Projection, QuarterTurn,
@@ -23,7 +23,8 @@ pub use document::{
     TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, TopologyHashInputs, TopologyKind, TopologySnapshot,
     TreatmentLayer, TreatmentParameter, TrimSheetChange, TrimSheetDocument,
     PartitionAxis, TrimSheetDocumentCommand, TrimSheetDocumentError, TrimSheetId, UvFitKind, UvFitPolicy,
-    WARP_OPERATION_VERSION, WarpOperation,
+    WARP_OPERATION_VERSION, WarpOperation, AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
+    diagonal_cascade_authored_preset, new_blank_authored_preset,
 };
 pub use error::{DomainError, ErrorCode, UserFacingError};
 pub use id::{LayerId, LayoutId, MapId, PatchId, ProjectId, RegionId, SourceId, SourceSetId};

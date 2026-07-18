@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -9,6 +10,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   IPC_PROTOCOL_VERSION,
   type CommandFailure,
+  type AuthoredLayoutPreset,
   type DelightingIntent,
   type MaterialBehaviorClass,
   type MaterialClassificationCommand,
@@ -36,6 +38,7 @@ import { assignSourceFiles } from "./source-assignment";
 import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, gridRectToPreviewBounds, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
 import { SourceFramePreviewController } from "./source-frame-preview-controller";
 import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
+import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
@@ -207,6 +210,7 @@ function App() {
   const [patchTool, setPatchTool] = useState<"rectangle" | "four-point" | null>(null);
   const [sourceWorkbenchOpen, setSourceWorkbenchOpen] = useState(true);
   const started = useRef(false);
+  const documentHistoryBusy = useRef(false);
   const previewDraftId = useRef(0);
   const dirtyPreviewRegion = useRef<string | null>(null);
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
@@ -848,6 +852,9 @@ function App() {
   }
 
   async function history(redo: boolean) {
+    if (documentHistoryBusy.current || activity !== "idle") return;
+    documentHistoryBusy.current = true;
+    setActivity("editing");
     try {
       const priorTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
       const next = await invoke<ProjectProjection>(redo ? "redo_document_command" : "undo_document_command", { request: protocol });
@@ -855,11 +862,14 @@ function App() {
       if (next.document && priorTopologyHash !== nextTopologyHash) suppressAutomaticPreviewRevision.current = next.document.documentRevision;
       setProject(next);
       setPreview(null);
-      setArtifact((prior) => priorTopologyHash !== nextTopologyHash ? retopologizeArtifact(prior, next) : null);
+      setArtifact((prior) => retopologizeArtifact(prior, next));
       setSelectedRegionId((selected) => next.document?.topology.regions.some((region) => region.id === selected) ? selected : null);
       setProblem(null);
     } catch (reason) {
       setProblem(failure(reason));
+    } finally {
+      documentHistoryBusy.current = false;
+      setActivity("idle");
     }
   }
 
@@ -2012,41 +2022,32 @@ function SheetWorkbench(props: {
   const sheet = validPreview ?? artifact;
   const imageUrl = validPreview?.dataUrl ?? artifact?.maps[props.mapView];
   const sheetMatchesDocument = !!sheet && sheet.topologyHash === topologyHash;
-  const requestedFamilies = Object.values(props.candidateRecipe.composition).reduce((total, value) => total + (typeof value === "object" && "count" in value ? value.count : 0), 0);
-  const requestedBudget = props.candidateRecipe.composition.broadPanels.count * props.candidateRecipe.composition.broadPanels.subdivisionBudget
-    + props.candidateRecipe.composition.mediumBlocks.count * props.candidateRecipe.composition.mediumBlocks.subdivisionBudget
-    + props.candidateRecipe.composition.smallDetails.count * props.candidateRecipe.composition.smallDetails.subdivisionBudget;
+  const displayedGrid = props.project?.document?.logicalGrid ?? diagonalCascadePreset.logicalGrid;
+  // Generator state is retained only for legacy-document migration code below; it has no
+  // visible product authority and no automatic preview effect.
   const hierarchical = props.candidateRecipe.hierarchical;
-  const requestedArea = hierarchical
-    ? hierarchical.largeShareMilli + hierarchical.mediumShareMilli + hierarchical.smallShareMilli + hierarchical.stripShareMilli + hierarchical.radialShareMilli
-    : props.candidateRecipe.composition.broadPanels.areaShareMilli + props.candidateRecipe.composition.mediumBlocks.areaShareMilli + props.candidateRecipe.composition.smallDetails.areaShareMilli;
-  const requestedFloor = hierarchical ? hierarchical.targetRegionMin : requestedFamilies + requestedBudget + (requestedFamilies > 0 ? 1 : 0);
-  const requestedMaximum = hierarchical?.targetRegionMax ?? props.candidateRecipe.targetRegionCount;
-  const candidateValid = hierarchical
-    ? requestedArea === 1000 && hierarchical.targetRegionMin >= 24 && hierarchical.targetRegionMin <= hierarchical.targetRegionMax
-      && hierarchical.protectedParentCount + hierarchical.subdividableParentCount <= hierarchical.macroParentCount
-      && hierarchical.allowedSplitRatios.length > 0 && hierarchical.stripThicknessLadder.length > 0
-    : requestedFloor <= props.candidateRecipe.targetRegionCount && requestedArea <= 1000;
-  const displayedGrid = props.candidatePreviewing ? props.candidatePreviewRecipe?.grid ?? props.candidateRecipe.grid : props.project?.document?.logicalGrid ?? props.candidateRecipe.grid;
-  const candidateState = props.activity === "compiling" ? "Generating"
-    : !candidateValid ? "Invalid"
-    : props.candidatePreviewing && props.candidateIsCurrent ? "Candidate ready"
-    : props.candidatePreviewing ? "Draft changed"
-    : "Accepted";
+  const requestedFamilies = 0, requestedBudget = 0, requestedArea = 0, requestedFloor = 0, requestedMaximum = 0;
+  const candidateValid = false;
+  const candidateState = props.activity === "editing" ? "Editing" : "Authored";
   const [layoutMenu, setLayoutMenu] = useState<{ regionId: string; x: number; y: number } | null>(null);
   const [layoutTool, setLayoutTool] = useState<"select" | "draw">("select");
   const [gridVisible, setGridVisible] = useState(true);
   const [gridOpacity, setGridOpacity] = useState(10);
   const [textureVisible, setTextureVisible] = useState(true);
   const [regionFillVisible, setRegionFillVisible] = useState(true);
+  const [hoverSnap, setHoverSnap] = useState<ReturnType<typeof snappedGridPoint> | null>(null);
+  const [userPresets, setUserPresets] = useState<AuthoredLayoutPreset[]>(() => {
+    try { return JSON.parse(localStorage.getItem("hot-trimmer.authored-layout-presets.v1") ?? "[]") as AuthoredLayoutPreset[]; }
+    catch { return []; }
+  });
   const [resizeDraft, setResizeDraft] = useState<{ pointerId: number; regionId: string; handle: ResizeHandle; origin: LogicalRect; rect: LogicalRect } | null>(null);
-  const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startX: number; startY: number; endX: number; endY: number } | null>(null);
+  const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startCellX: number; startCellY: number; endCellX: number; endCellY: number } | null>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
   const displayRegions = sheet?.regions ?? [];
   const selectedGridRect = resizeDraft?.rect ?? displayRegions.find((region) => region.regionId === props.selectedRegionId)?.gridRect;
   const selectedContent = props.selectedRegionId ? props.project?.document?.regionBindings[props.selectedRegionId]?.content : null;
   const selectedPatchAssigned = !!props.activePatchId && selectedContent?.type === "patch" && selectedContent.id === props.activePatchId;
-  const drawRect = drawDraft ? normalizedGridRect(drawDraft) : null;
+  const drawRect = drawDraft ? cellDragRect(drawDraft.startCellX, drawDraft.startCellY, drawDraft.endCellX, drawDraft.endCellY) : null;
   const resizeTransfers = useMemo(() => resizeDraft ? previewResizeOwnershipTransfers(displayRegions, resizeDraft.regionId, resizeDraft.origin, resizeDraft.rect, displayedGrid) : [], [displayRegions, resizeDraft, displayedGrid]);
   const resizeAffectedIds = useMemo(() => new Set(resizeTransfers.flatMap((transfer) => [transfer.fromId, transfer.toId])), [resizeTransfers]);
   const sourceFrame = props.project?.document?.sourceFrame;
@@ -2058,8 +2059,6 @@ function SheetWorkbench(props: {
   const sourceTextureProblem = props.mapView === "baseColor" && sourceFrame && !continuousTexture
     ? "The complete oriented Source Frame Base Color is unavailable. Layout editing will not display a partial Stage 14 map. Re-register Base Color for this Source Frame."
     : null;
-  const candidateFingerprint = partitionRecipeFingerprint(props.candidateRecipe);
-  const lastAutoPreviewFingerprint = useRef<string | null>(null);
   const workpieceSize = sheet
     ? { width: sheet.width, height: sheet.height }
     : props.preparedPatchPreview
@@ -2067,22 +2066,24 @@ function SheetWorkbench(props: {
       : null;
   const viewport = useViewportController(workpieceSize);
   const gridSteps = adaptiveGridSteps(displayedGrid, sheet?.width ?? 1, sheet?.height ?? 1, viewport.view.scale);
-  useEffect(() => {
-    if (!props.project?.document || !candidateValid || props.activity !== "idle" || props.candidateIsCurrent) return;
-    if (lastAutoPreviewFingerprint.current === candidateFingerprint) return;
-    const timer = window.setTimeout(() => {
-      lastAutoPreviewFingerprint.current = candidateFingerprint;
-      props.previewCandidate(props.candidateRecipe);
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [candidateFingerprint, candidateValid, props.activity, props.candidateIsCurrent, props.project?.document]);
+  function persistUserPresets(next: AuthoredLayoutPreset[]) {
+    setUserPresets(next);
+    localStorage.setItem("hot-trimmer.authored-layout-presets.v1", JSON.stringify(next));
+  }
+  function applyPreset(preset: AuthoredLayoutPreset) {
+    const instanceId = props.project?.document?.authoredLayoutInstanceId ?? props.project?.document?.id ?? crypto.randomUUID();
+    void props.onLayoutCommand({ type: "apply_authored_layout_preset", preset, instanceId });
+  }
+  function changeGridResolution(size: number) {
+    const snapshot = props.project?.document ? snapshotDocumentPreset(props.project.document, "embedded.grid-change", "Grid change") : diagonalCascadePreset;
+    const quantized = rescalePreset(snapshot, size);
+    if (!quantized.exact && !window.confirm(`Some boundaries are not representable on a ${size} × ${size} grid. Apply the shown quantized layout?`)) return;
+    applyPreset(quantized.preset);
+  }
   function pointerGridPoint(clientX: number, clientY: number) {
     const bounds = sheetRef.current?.getBoundingClientRect();
     if (!bounds) return null;
-    return {
-      x: Math.max(0, Math.min(displayedGrid.width, Math.round((clientX - bounds.left) / bounds.width * displayedGrid.width))),
-      y: Math.max(0, Math.min(displayedGrid.height, Math.round((clientY - bounds.top) / bounds.height * displayedGrid.height))),
-    };
+    return snappedGridPoint(clientX, clientY, bounds, displayedGrid.width, displayedGrid.height);
   }
   function moveDirectEdit(event: React.PointerEvent<HTMLElement>) {
     const point = pointerGridPoint(event.clientX, event.clientY);
@@ -2092,7 +2093,7 @@ function SheetWorkbench(props: {
       return true;
     }
     if (drawDraft?.pointerId === event.pointerId) {
-      setDrawDraft((current) => current ? { ...current, endX: point.x, endY: point.y } : null);
+      setDrawDraft((current) => current ? { ...current, endCellX: point.cellX, endCellY: point.cellY } : null);
       return true;
     }
     return false;
@@ -2107,14 +2108,47 @@ function SheetWorkbench(props: {
       return;
     }
     if (drawDraft?.pointerId === pointerId) {
-      const rect = normalizedGridRect(drawDraft);
-      if (cancel || rect.width === 0 || rect.height === 0) { setDrawDraft(null); return; }
+      const rect = cellDragRect(drawDraft.startCellX, drawDraft.startCellY, drawDraft.endCellX, drawDraft.endCellY);
+      if (cancel) { setDrawDraft(null); return; }
       void props.onLayoutCommand({ type: "draw_source_frame_region", gridRect: rect }).then((next) => {
         const drawn = next?.document?.topology.regions.find((region) => region.gridRect && sameGridRect(region.gridRect, rect));
         if (drawn) props.setSelectedRegionId(drawn.id);
       }).finally(() => setDrawDraft(null));
     }
   }
+  useEffect(() => {
+    const cancel = (event: KeyboardEvent) => { if (event.key === "Escape") { setDrawDraft(null); setResizeDraft(null); setLayoutMenu(null); } };
+    window.addEventListener("keydown", cancel); return () => window.removeEventListener("keydown", cancel);
+  }, []);
+  useEffect(() => {
+    const historyShortcut = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.matches("input, textarea, select, [contenteditable=true]")) return;
+      const key = event.key.toLowerCase();
+      const undo = key === "z" && !event.shiftKey;
+      const redo = key === "y" || (key === "z" && event.shiftKey);
+      if (!undo && !redo) return;
+      if (props.activity !== "idle" || (undo && !props.project?.canUndoDocument) || (redo && !props.project?.canRedoDocument)) return;
+      event.preventDefault();
+      if (undo) props.onUndo(); else props.onRedo();
+    };
+    window.addEventListener("keydown", historyShortcut);
+    return () => window.removeEventListener("keydown", historyShortcut);
+  }, [props.activity, props.onUndo, props.onRedo, props.project?.canRedoDocument, props.project?.canUndoDocument]);
+  useEffect(() => {
+    if (!layoutMenu) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!(event.target as Element | null)?.closest(".layout-menu")) setLayoutMenu(null);
+    };
+    const dismissBlur = () => setLayoutMenu(null);
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("blur", dismissBlur);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("blur", dismissBlur);
+    };
+  }, [layoutMenu]);
   return <section className="sheet-workbench">
     <header className="sheet-header">
       <div><strong>HOTSPOT SHEET</strong></div>
@@ -2128,7 +2162,29 @@ function SheetWorkbench(props: {
       <div className="display-controls"><label><input type="checkbox" checked={textureVisible} onChange={(event) => setTextureVisible(event.target.checked)} /> Texture</label><label><input type="checkbox" checked={regionFillVisible} onChange={(event) => setRegionFillVisible(event.target.checked)} /> Region colors</label></div>
       <div className="grid-controls"><label><input type="checkbox" checked={gridVisible} onChange={(event) => setGridVisible(event.target.checked)} /> Grid</label><label>Opacity <input aria-label="Grid opacity" type="range" min={0} max={100} value={gridOpacity} onChange={(event) => setGridOpacity(Number(event.target.value))} /></label></div>
       {selectedGridRect ? <output className="selection-readout">Selected: x {selectedGridRect.x}, y {selectedGridRect.y} · {selectedGridRect.width} × {selectedGridRect.height}</output> : drawRect ? <output className="selection-readout draw">Drawing: x {drawRect.x}, y {drawRect.y} · {drawRect.width} × {drawRect.height}</output> : <output className="selection-readout">No region selected</output>}
-      <p className={`layout-capacity ${candidateValid ? "" : "invalid"}`} aria-live="polite">{hierarchical ? `${requestedFloor}–${requestedMaximum} soft region range` : `${requestedFloor} minimum leaves / ${props.candidateRecipe.targetRegionCount} Count`} · {requestedArea / 10}% unified area</p>
+      <section className="layout-presets" aria-label="Authored layout presets">
+        <strong>Authored preset</strong>
+        <select aria-label="Authored layout preset" value={props.project?.document?.authoredLayoutPreset?.presetId ?? diagonalCascadePreset.presetId} onChange={(event) => {
+          const preset = [diagonalCascadePreset, newBlankPreset(displayedGrid.width), ...userPresets].find((value) => value.presetId === event.target.value); if (preset) applyPreset(preset);
+        }}><option value={diagonalCascadePreset.presetId}>Diagonal Cascade (Built-in)</option><option value="builtin.new-blank">New Blank</option>{userPresets.map((preset) => <option key={preset.presetId} value={preset.presetId}>{preset.name}</option>)}</select>
+        <label className="grid-resolution-slider">Grid resolution <output>{displayedGrid.width} × {displayedGrid.height}</output><input aria-label="Logical grid resolution" type="range" min={0} max={authoredGridResolutions.length - 1} step={1} value={Math.max(0, authoredGridResolutions.indexOf(displayedGrid.width as typeof authoredGridResolutions[number]))} onChange={(event) => changeGridResolution(authoredGridResolutions[Number(event.target.value)]!)} /></label>
+        <div className="layout-actions"><button onClick={() => applyPreset(newBlankPreset(displayedGrid.width))}>New</button><button onClick={() => {
+          if (!props.project?.document) return; const name = window.prompt("Preset name", `${props.project.document.authoredLayoutPreset?.name ?? "Layout"} Copy`); if (!name) return;
+          const preset = snapshotDocumentPreset(props.project.document, `user.${crypto.randomUUID()}`, name); persistUserPresets([...userPresets, preset]); applyPreset(preset);
+        }}>Duplicate / Save As</button><button onClick={() => {
+          const active = props.project?.document?.authoredLayoutPreset; if (!active || active.presetId.startsWith("builtin.")) return; const name = window.prompt("Rename preset", active.name); if (!name) return;
+          persistUserPresets(userPresets.map((preset) => preset.presetId === active.presetId ? { ...preset, name } : preset));
+        }}>Rename</button><button onClick={() => {
+          const active = props.project?.document?.authoredLayoutPreset; if (!active || active.presetId.startsWith("builtin.") || !props.project?.document) return;
+          const saved = snapshotDocumentPreset(props.project.document, active.presetId, active.name); persistUserPresets(userPresets.map((preset) => preset.presetId === active.presetId ? saved : preset));
+        }}>Save</button><button onClick={() => {
+          const active = props.project?.document?.authoredLayoutPreset; const saved = active && userPresets.find((preset) => preset.presetId === active.presetId); if (saved) applyPreset(saved);
+        }}>Revert</button><button onClick={() => {
+          const active = props.project?.document?.authoredLayoutPreset; if (!active || active.presetId.startsWith("builtin.") || !window.confirm(`Delete ${active.name}?`)) return;
+          persistUserPresets(userPresets.filter((preset) => preset.presetId !== active.presetId)); applyPreset(diagonalCascadePreset);
+        }}>Delete</button></div>
+      </section>
+      <fieldset className="legacy-generator-controls" hidden aria-hidden="true"><p className={`layout-capacity ${candidateValid ? "" : "invalid"}`} aria-live="polite">{hierarchical ? `${requestedFloor}–${requestedMaximum} soft region range` : `${requestedFloor} minimum leaves / ${props.candidateRecipe.targetRegionCount} Count`} · {requestedArea / 10}% unified area</p>
       {props.problem ? <p className="layout-diagnostic" role="alert">{props.problem.message}<small>{props.problem.recovery}</small></p> : null}
       {sourceTextureProblem ? <p className="layout-diagnostic" role="alert">{sourceTextureProblem}</p> : null}
       <span>SOURCE FRAME PARTITION</span>
@@ -2162,6 +2218,7 @@ function SheetWorkbench(props: {
         <button onClick={props.discardCandidate} disabled={!props.candidatePreviewing || props.activity !== "idle"}>Discard</button>
         <button className="primary" onClick={() => props.acceptCandidate(props.candidateRecipe)} disabled={!props.candidatePreviewing || !props.candidateIsCurrent || props.activity !== "idle"}>Accept</button>
       </footer>
+      </fieldset>
       <details className="layout-advanced material-preview-settings"><summary>Optional material preview</summary>
         <label>Output resolution<select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document}>
           <option value={1024}>1024</option><option value={2048}>2048</option><option value={4096}>4096</option>
@@ -2175,7 +2232,6 @@ function SheetWorkbench(props: {
           ? "This generated candidate is read-only. Accept it to resize, draw, split, or merge its regions."
           : layoutTool === "draw" ? "Drag anywhere on the atlas to place an exact snapped rectangle." : "Select a region, drag an edge handle continuously, or right-click for split/merge."}</p>
         {props.candidatePreviewing ? <button className="primary" onClick={() => props.acceptCandidate(props.candidateRecipe)} disabled={!props.candidateIsCurrent || props.activity !== "idle"}>Accept candidate and edit</button> : null}
-        <div className="layout-history"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument || props.activity !== "idle"}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument || props.activity !== "idle"}>Redo</button></div>
         <button onClick={() => props.selectedRegionId && props.onLayoutCommand({ type: "split_source_frame_region", regionId: props.selectedRegionId, axis: "horizontal" })} disabled={!props.selectedRegionId || props.candidatePreviewing || props.activity !== "idle"}>Split horizontally</button>
         <button onClick={() => props.selectedRegionId && props.onLayoutCommand({ type: "split_source_frame_region", regionId: props.selectedRegionId, axis: "vertical" })} disabled={!props.selectedRegionId || props.candidatePreviewing || props.activity !== "idle"}>Split vertically</button>
       </section>
@@ -2215,6 +2271,8 @@ function SheetWorkbench(props: {
         ref={sheetRef}
         className="sheet"
         style={{ width: sheet.width, height: sheet.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
+        onPointerMove={(event) => { if (layoutTool === "draw" && !drawDraft) setHoverSnap(pointerGridPoint(event.clientX, event.clientY)); }}
+        onPointerLeave={() => { if (!drawDraft) setHoverSnap(null); }}
         onPointerDown={(event) => {
           if (event.button !== 0) return;
           if (layoutTool === "draw" && !props.candidatePreviewing && props.activity === "idle") {
@@ -2223,12 +2281,13 @@ function SheetWorkbench(props: {
             event.preventDefault();
             event.currentTarget.setPointerCapture(event.pointerId);
             props.setSelectedRegionId(null);
-            setDrawDraft({ pointerId: event.pointerId, startX: point.x, startY: point.y, endX: point.x, endY: point.y });
+            setDrawDraft({ pointerId: event.pointerId, startCellX: point.cellX, startCellY: point.cellY, endCellX: point.cellX, endCellY: point.cellY });
           } else if (!(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
         }}
       >
         {textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
         {selectedPatchAssigned && props.preparedPatchPreview && selectedGridRect ? <div className="assigned-patch-preview" style={gridRectOverlayStyle(selectedGridRect, displayedGrid)}><img src={props.preparedPatchPreview.dataUrl} alt="Assigned patch preview" /></div> : null}
+        {layoutTool === "draw" && hoverSnap && !drawDraft ? <div className="draw-hover-cell" style={gridRectOverlayStyle({ x: hoverSnap.cellX, y: hoverSnap.cellY, width: 1, height: 1 }, displayedGrid)}><div className="draw-snap-crosshair"><span>cell {hoverSnap.cellX}, {hoverSnap.cellY}</span></div></div> : null}
         {(sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}
         <div className={`overlays ${layoutTool === "draw" ? "drawing" : ""}`}>{displayRegions.map((region) => <button key={region.regionId}
           data-region-id={region.regionId}
@@ -2238,12 +2297,12 @@ function SheetWorkbench(props: {
           className={`region ${region.regionId === props.selectedRegionId ? "selected" : ""} ${resizeDraft && (region.regionId === resizeDraft.regionId || resizeAffectedIds.has(region.regionId)) ? "affected" : ""}`}
           style={overlayStyle(region, sheet, viewport.view.scale, regionFillVisible ? 0.2 : 0)}
           onClick={(event) => { event.stopPropagation(); if (!props.candidatePreviewing && layoutTool !== "draw") props.setSelectedRegionId(region.regionId); }}
-          onContextMenu={(event) => { event.preventDefault(); if (props.candidatePreviewing) return; event.stopPropagation(); props.setSelectedRegionId(region.regionId); setLayoutMenu({ regionId: region.regionId, x: event.clientX, y: event.clientY }); }}
+          onContextMenu={(event) => { event.preventDefault(); if (props.candidatePreviewing) return; event.stopPropagation(); props.setSelectedRegionId(region.regionId); setLayoutMenu({ regionId: region.regionId, x: Math.min(event.clientX, window.innerWidth - 196), y: Math.min(event.clientY, window.innerHeight - 156) }); }}
         ><span className="region-label">{region.displayName}</span>{region.regionId === props.selectedRegionId && region.gridRect && layoutTool === "select" && !props.candidatePreviewing ? resizeHandles.map((handle) => <i key={handle} className={`selection-handle ${handle}`} aria-label={`Resize ${handle}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); setResizeDraft({ pointerId: event.pointerId, regionId: region.regionId, handle, origin: region.gridRect!, rect: region.gridRect! }); }} />) : null}</button>)}</div>
         {drawRect && drawRect.width > 0 && drawRect.height > 0 ? <div className="draw-region-preview" style={gridRectOverlayStyle(drawRect, displayedGrid)}><span>{drawRect.x}, {drawRect.y} · {drawRect.width} × {drawRect.height}</span></div> : null}
         {resizeTransfers.map((transfer, index) => { const owner = displayRegions.find((region) => region.regionId === transfer.toId); const from = displayRegions.find((region) => region.regionId === transfer.fromId); return <div key={`${transfer.fromId}-${transfer.toId}-${index}`} className={`ownership-transfer ${transfer.toId === resizeDraft?.regionId ? "gained" : "released"}`} style={{ ...gridRectOverlayStyle(transfer.rect, displayedGrid), borderColor: owner ? `rgb(${owner.idColor.join(" ")})` : undefined, backgroundColor: owner ? `rgb(${owner.idColor.join(" ")} / .38)` : undefined }}><span>{from?.displayName ?? "Region"} → {owner?.displayName ?? "Region"}</span></div>; })}
         {resizeDraft && !sameGridRect(resizeDraft.origin, resizeDraft.rect) ? <div className="resize-region-preview" style={gridRectOverlayStyle(resizeDraft.rect, displayedGrid)}><span>{resizeDraft.rect.x}, {resizeDraft.rect.y} / {resizeDraft.rect.width} x {resizeDraft.rect.height}</span></div> : null}
-        {!props.candidatePreviewing && layoutMenu ? <div className="layout-menu" style={{ left: layoutMenu.x, top: layoutMenu.y }} role="menu"><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "horizontal" }); setLayoutMenu(null); }}>Split horizontally</button><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "vertical" }); setLayoutMenu(null); }}>Split vertically</button>{mergeCandidate(sheet.regions, layoutMenu.regionId) ? <button onClick={() => { const sibling = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: layoutMenu.regionId, siblingId: sibling.regionId }); setLayoutMenu(null); }}>Merge / Remove Divider</button> : null}</div> : null}
+        {!props.candidatePreviewing && layoutMenu ? createPortal(<div className="layout-menu" style={{ left: layoutMenu.x, top: layoutMenu.y }} role="menu" onPointerDown={(event) => event.stopPropagation()}><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "horizontal" }); setLayoutMenu(null); }}>Split horizontal</button><button onClick={() => { props.onLayoutCommand({ type: "split_source_frame_region", regionId: layoutMenu.regionId, axis: "vertical" }); setLayoutMenu(null); }}>Split vertical</button>{mergeCandidate(sheet.regions, layoutMenu.regionId) ? <><button onClick={() => { const sibling = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: layoutMenu.regionId, siblingId: sibling.regionId }); setLayoutMenu(null); }}>Merge / Remove Divider</button><button onClick={() => { const neighbor = mergeCandidate(sheet.regions, layoutMenu.regionId)!; props.onLayoutCommand({ type: "merge_source_frame_regions", regionId: neighbor.regionId, siblingId: layoutMenu.regionId }); setLayoutMenu(null); }}>Delete / Return area to neighbor</button></> : <button disabled title="No legal ownership transfer: this region does not share one complete divider with a neighbor.">Delete unavailable — no legal neighbor</button>}</div>, document.body) : null}
       </div>}
       {workpieceSize ? <div className="viewport-tools">
         <button onClick={() => viewport.zoom(0.8)}>-</button>
@@ -2675,6 +2734,9 @@ function retopologizeArtifact(prior: IntermediateAtlasProjection | null, project
           width: Math.round(definition.allocationRect.width / document.renderSettings.outputSize.width * prior.width),
           height: Math.round(definition.allocationRect.height / document.renderSettings.outputSize.height * prior.height),
         };
+    const partitionSourceBounds = definition.gridRect
+      ? sourceFrameGridBounds(document.sourceFrame!.bounds, document.logicalGrid!, definition.gridRect)
+      : undefined;
     return {
       regionId: definition.id,
       displayName: definition.displayName,
@@ -2687,11 +2749,13 @@ function retopologizeArtifact(prior: IntermediateAtlasProjection | null, project
       role: definition.role,
       gridRect: definition.gridRect,
       sourceCrop: existing?.sourceCrop,
-      sourceBounds: existing?.sourceBounds,
+      sourceBounds: existing?.mappingOrigin === "explicit_override" ? existing.sourceBounds : partitionSourceBounds,
       mappingOrigin: existing?.mappingOrigin ?? "partition",
     };
   });
   const regionById = new Map(regions.map((region) => [region.regionId, region]));
+  const priorSlotById = new Map(prior.slots.map((slot) => [slot.regionId, slot]));
+  const fallbackSlot = prior.slots[0];
   return {
     ...prior,
     revision: document.documentRevision,
@@ -2699,9 +2763,11 @@ function retopologizeArtifact(prior: IntermediateAtlasProjection | null, project
     topologyHash: hashBytes(document.topology.topologyHash),
     topology: document.topology,
     regions,
-    slots: prior.slots.flatMap((slot) => {
-      const region = regionById.get(slot.regionId);
-      return region ? [{ ...slot, displayName: region.displayName, allocationBounds: region.allocationBounds, hotspotBounds: region.hotspotBounds, gridRect: region.gridRect }] : [];
+    slots: regions.flatMap((region) => {
+      const slot = priorSlotById.get(region.regionId) ?? fallbackSlot;
+      return slot ? [{ ...slot, regionId: region.regionId, slotKey: `authored:${region.regionId}`, displayName: region.displayName,
+        allocationBounds: region.allocationBounds, hotspotBounds: region.hotspotBounds, gridRect: region.gridRect,
+        sourceBounds: region.sourceBounds, mappingOrigin: region.mappingOrigin ?? "partition" }] : [];
     }),
     telemetry: [...prior.telemetry, "local topology edit: retained compiled map pixels; metadata committed asynchronously"],
   };
@@ -2736,10 +2802,6 @@ function normalizedBoundsOverlap(a: NormalizedBounds, b: NormalizedBounds) {
 type LogicalRect = { x: number; y: number; width: number; height: number };
 type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 const resizeHandles: readonly ResizeHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
-
-function normalizedGridRect(draft: { startX: number; startY: number; endX: number; endY: number }): LogicalRect {
-  return { x: Math.min(draft.startX, draft.endX), y: Math.min(draft.startY, draft.endY), width: Math.abs(draft.endX - draft.startX), height: Math.abs(draft.endY - draft.startY) };
-}
 
 function sameGridRect(first: LogicalRect, second: LogicalRect) {
   return first.x === second.x && first.y === second.y && first.width === second.width && first.height === second.height;

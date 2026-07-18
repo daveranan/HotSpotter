@@ -373,6 +373,34 @@ pub struct RegionDefinition {
     pub grid_rect: Option<GridRect>,
 }
 
+pub const AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION: u16 = 1;
+
+/// A reusable layout asset contains topology and semantic defaults only. Project content
+/// references deliberately remain in `RegionBinding` on the instantiated document.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoredLayoutPresetRegion {
+    pub preset_region_key: String,
+    pub display_name: String,
+    pub grid_rect: GridRect,
+    pub role: TemplateSlotRole,
+    pub orientation: RegionOrientation,
+    pub uv_fit: UvFitPolicy,
+    pub structural_profile: StructuralProfile,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoredLayoutPreset {
+    pub preset_id: String,
+    pub schema_version: u16,
+    pub name: String,
+    pub logical_grid: LogicalGridSpec,
+    pub canonical_aspect: [u32; 2],
+    pub regions: Vec<AuthoredLayoutPresetRegion>,
+    pub provenance: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopologyKind {
@@ -673,6 +701,11 @@ pub struct TrimSheetDocument {
     pub logical_grid: Option<LogicalGridSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_provenance: Option<PartitionProvenance>,
+    /// The exact applied asset snapshot. Reopening never consults a mutable preset library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_layout_preset: Option<AuthoredLayoutPreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_layout_instance_id: Option<String>,
 }
 
 impl TrimSheetDocument {
@@ -1047,9 +1080,112 @@ impl TrimSheetDocument {
                 region_id: partition.id, content: ContentReference::InheritPrimaryMaterial, mapping: RegionMapping::default(),
                 variation: VariationSettings::default(), blend: BlendPolicy::default() })).collect(), decorations: Vec::new(), treatments: Vec::new(),
             sheet_framing: SheetFraming::default(), render_settings: RenderSettings { output_size, ..RenderSettings::default() },
-            generator_provenance: None, source_frame: Some(source_frame), source_overrides: BTreeMap::new(), logical_grid: Some(recipe.grid), partition_provenance: Some(provenance) };
+            generator_provenance: None, source_frame: Some(source_frame), source_overrides: BTreeMap::new(), logical_grid: Some(recipe.grid), partition_provenance: Some(provenance),
+            authored_layout_preset: None, authored_layout_instance_id: None };
         document.validate()?;
         Ok(document)
+    }
+
+    /// Instantiates a versioned authored snapshot without consulting the partition generator.
+    pub fn from_authored_layout_preset(
+        id: TrimSheetId,
+        source_frame: SourceFrame,
+        preset: AuthoredLayoutPreset,
+        instance_id: String,
+        output_size: PixelSize,
+        materials: Vec<MaterialSourceSet>,
+        patches: Vec<Patch>,
+    ) -> Result<Self, TrimSheetDocumentError> {
+        validate_authored_layout_preset(&preset)?;
+        let mut regions = Vec::with_capacity(preset.regions.len());
+        let mut bindings = BTreeMap::new();
+        for authored in &preset.regions {
+            let region_id = deterministic_region_id(
+                &format!("{}:{}", preset.preset_id, instance_id),
+                &authored.preset_region_key,
+            );
+            let allocation = grid_rect_to_output(authored.grid_rect, preset.logical_grid, output_size);
+            regions.push(RegionDefinition {
+                id: region_id,
+                display_name: authored.display_name.clone(),
+                id_color: IdColor::for_region(region_id),
+                allocation_rect: allocation,
+                hotspot_rect: allocation,
+                role: authored.role,
+                orientation: authored.orientation,
+                uv_fit: authored.uv_fit.clone(),
+                structural_profile: authored.structural_profile,
+                material_group: "primary".into(),
+                weathering_group: "neutral".into(),
+                radial_parameters: None,
+                enabled: true,
+                grid_rect: Some(authored.grid_rect),
+            });
+            bindings.insert(region_id, RegionBinding {
+                region_id,
+                content: ContentReference::InheritPrimaryMaterial,
+                mapping: RegionMapping::default(),
+                variation: VariationSettings::default(),
+                blend: BlendPolicy::default(),
+            });
+        }
+        let compatibility_key = format!("authored-layout:{}:{}", preset.preset_id, instance_id);
+        let topology = AcceptedTopology::new(
+            TopologyKind::CustomAtlas,
+            TopologySnapshot { schema_version: TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, canonical_size: output_size, template: None },
+            compatibility_key,
+            regions,
+        )?;
+        // Direct editing still uses the old tree journal as an implementation detail. It is a
+        // snapshot of authored rectangles and is never evaluated as a generator recipe.
+        let recipe = PartitionRecipe::default_for(preset.logical_grid, preset.regions.len() as u32, 0);
+        let tree = preset.regions.iter().enumerate().map(|(ordinal, region)| PartitionTreeNode {
+            grid_rect: region.grid_rect,
+            family: PartitionFamily::Remainder,
+            ordinal: ordinal as u32,
+            lineage: crate::PartitionLineage::default(),
+        }).collect::<Vec<_>>();
+        let partition_provenance = PartitionProvenance {
+            schema_version: crate::PARTITION_RECIPE_SCHEMA_VERSION,
+            recipe: recipe.clone(),
+            recipe_hash: recipe.hash(),
+            accepted_region_ids: topology.regions.iter().map(|region| region.id).collect(),
+            tree,
+            topology_hash: topology.topology_hash,
+        };
+        let document = Self {
+            id, document_revision: 1, topology_revision: 1, appearance_revision: 1, topology,
+            primary_material: materials.first().map(|material| material.id), materials, patches,
+            procedural_materials: Vec::new(), region_bindings: bindings, decorations: Vec::new(), treatments: Vec::new(),
+            sheet_framing: SheetFraming::default(), render_settings: RenderSettings { output_size, ..RenderSettings::default() },
+            generator_provenance: None, source_frame: Some(source_frame), source_overrides: BTreeMap::new(),
+            logical_grid: Some(preset.logical_grid), partition_provenance: Some(partition_provenance),
+            authored_layout_preset: Some(preset), authored_layout_instance_id: Some(instance_id),
+        };
+        document.validate()?;
+        Ok(document)
+    }
+
+    pub fn apply_authored_layout_preset(
+        &self,
+        preset: AuthoredLayoutPreset,
+        instance_id: String,
+    ) -> Result<Self, TrimSheetDocumentError> {
+        let mut next = Self::from_authored_layout_preset(
+            self.id,
+            self.source_frame.clone().ok_or(TrimSheetDocumentError::InvalidSourceFrame)?,
+            preset,
+            instance_id,
+            self.render_settings.output_size,
+            self.materials.clone(),
+            self.patches.clone(),
+        )?;
+        next.document_revision = self.document_revision.saturating_add(1);
+        next.topology_revision = self.topology_revision.saturating_add(1);
+        next.appearance_revision = next.document_revision;
+        next.primary_material = self.primary_material;
+        next.validate()?;
+        Ok(next)
     }
 
     fn from_pinned_template(
@@ -1122,6 +1258,8 @@ impl TrimSheetDocument {
             source_frame: None,
             logical_grid: None,
             partition_provenance: None,
+            authored_layout_preset: None,
+            authored_layout_instance_id: None,
         };
         document.validate()?;
         Ok(document)
@@ -1144,6 +1282,9 @@ impl TrimSheetDocument {
     ) -> Result<Self, TrimSheetDocumentError> {
         let mut next = self.clone();
         match command {
+            TrimSheetDocumentCommand::ApplyAuthoredLayoutPreset { preset, instance_id } => {
+                return self.apply_authored_layout_preset(preset.clone(), instance_id.clone());
+            }
             TrimSheetDocumentCommand::AcceptSourceFramePartition { recipe } => {
                 return self.accept_source_frame_partition(recipe.clone());
             }
@@ -1696,6 +1837,10 @@ fn template_region_mapping(_mapping: TemplateSourceMapping) -> RegionMapping {
     rename_all_fields = "camelCase"
 )]
 pub enum TrimSheetDocumentCommand {
+    ApplyAuthoredLayoutPreset {
+        preset: AuthoredLayoutPreset,
+        instance_id: String,
+    },
     AcceptSourceFramePartition {
         recipe: PartitionRecipe,
     },
@@ -1761,6 +1906,83 @@ fn deterministic_region_id(template_key: &str, region_key: &str) -> RegionId {
     let mut bytes = [0; 16];
     bytes.copy_from_slice(&digest[..16]);
     RegionId::from_bytes(bytes)
+}
+
+fn authored_region(ordinal: u32, rect: GridRect) -> AuthoredLayoutPresetRegion {
+    let orientation = if rect.width > rect.height { RegionOrientation::Horizontal }
+        else if rect.height > rect.width { RegionOrientation::Vertical } else { RegionOrientation::Unspecified };
+    AuthoredLayoutPresetRegion {
+        preset_region_key: format!("cascade-{ordinal:02}"),
+        display_name: format!("Region {:03}", ordinal + 1),
+        grid_rect: rect,
+        role: TemplateSlotRole::Planar,
+        orientation,
+        uv_fit: UvFitPolicy { kind: UvFitKind::Rectangular, fit_axis: FitAxis::Automatic,
+            keep_proportion: true, allowed_rotations: vec![QuarterTurn::Zero], mirror_allowed: false,
+            world_size_meters: [f64::from(rect.width), f64::from(rect.height)], classification_tags: vec!["AUTHORED_LAYOUT".into()] },
+        structural_profile: StructuralProfile::Flat,
+    }
+}
+
+#[must_use]
+pub fn diagonal_cascade_authored_preset() -> AuthoredLayoutPreset {
+    let rects = [
+        GridRect { x: 0, y: 0, width: 16, height: 32 }, GridRect { x: 16, y: 0, width: 16, height: 16 },
+        GridRect { x: 32, y: 0, width: 32, height: 16 }, GridRect { x: 16, y: 16, width: 16, height: 16 },
+        GridRect { x: 32, y: 16, width: 16, height: 16 }, GridRect { x: 48, y: 16, width: 16, height: 16 },
+        GridRect { x: 0, y: 32, width: 16, height: 8 }, GridRect { x: 16, y: 32, width: 8, height: 16 },
+        GridRect { x: 24, y: 32, width: 1, height: 24 }, GridRect { x: 25, y: 32, width: 1, height: 24 },
+        GridRect { x: 26, y: 32, width: 2, height: 24 }, GridRect { x: 28, y: 32, width: 4, height: 24 },
+        GridRect { x: 32, y: 32, width: 32, height: 32 }, GridRect { x: 0, y: 40, width: 8, height: 8 },
+        GridRect { x: 8, y: 40, width: 8, height: 8 }, GridRect { x: 0, y: 48, width: 8, height: 8 },
+        GridRect { x: 8, y: 48, width: 8, height: 4 }, GridRect { x: 16, y: 48, width: 4, height: 8 },
+        GridRect { x: 20, y: 48, width: 4, height: 8 }, GridRect { x: 8, y: 52, width: 8, height: 4 },
+        GridRect { x: 0, y: 56, width: 32, height: 1 }, GridRect { x: 0, y: 57, width: 32, height: 1 },
+        GridRect { x: 0, y: 58, width: 32, height: 2 }, GridRect { x: 0, y: 60, width: 32, height: 4 },
+    ];
+    AuthoredLayoutPreset {
+        preset_id: "builtin.diagonal-cascade".into(), schema_version: AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
+        name: "Diagonal Cascade".into(), logical_grid: LogicalGridSpec::DEFAULT, canonical_aspect: [1, 1],
+        regions: rects.into_iter().enumerate().map(|(i, rect)| authored_region(i as u32, rect)).collect(),
+        provenance: "checked_in_authored_fixture".into(),
+    }
+}
+
+#[must_use]
+pub fn new_blank_authored_preset(grid: LogicalGridSpec) -> AuthoredLayoutPreset {
+    AuthoredLayoutPreset {
+        preset_id: "builtin.new-blank".into(), schema_version: AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
+        name: "New Blank".into(), logical_grid: grid, canonical_aspect: [1, 1],
+        regions: vec![authored_region(0, GridRect { x: 0, y: 0, width: grid.width, height: grid.height })],
+        provenance: "built_in_blank".into(),
+    }
+}
+
+fn validate_authored_layout_preset(preset: &AuthoredLayoutPreset) -> Result<(), TrimSheetDocumentError> {
+    if preset.schema_version != AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION || preset.preset_id.trim().is_empty()
+        || preset.name.trim().is_empty() || preset.canonical_aspect.contains(&0) || preset.regions.is_empty()
+        || preset.logical_grid.width == 0 || preset.logical_grid.height == 0 {
+        return Err(TrimSheetDocumentError::InvalidPartitionEdit("authored layout preset metadata is invalid".into()));
+    }
+    let cell_count = (preset.logical_grid.width as usize).saturating_mul(preset.logical_grid.height as usize);
+    let mut owners = vec![0_u8; cell_count];
+    let mut keys = BTreeSet::new();
+    for region in &preset.regions {
+        let rect = region.grid_rect;
+        if !keys.insert(region.preset_region_key.as_str()) || region.preset_region_key.trim().is_empty()
+            || rect.width == 0 || rect.height == 0 || rect.x + rect.width > preset.logical_grid.width
+            || rect.y + rect.height > preset.logical_grid.height {
+            return Err(TrimSheetDocumentError::InvalidPartitionEdit("authored layout preset region is invalid".into()));
+        }
+        for y in rect.y..rect.y + rect.height { for x in rect.x..rect.x + rect.width {
+            let index = (y * preset.logical_grid.width + x) as usize;
+            owners[index] = owners[index].saturating_add(1);
+        }}
+    }
+    if owners.iter().any(|count| *count != 1) {
+        return Err(TrimSheetDocumentError::InvalidPartitionEdit("authored layout preset must exactly cover its grid".into()));
+    }
+    Ok(())
 }
 
 fn rects_overlap(left: CanonicalRect, right: CanonicalRect) -> bool {
@@ -2334,6 +2556,8 @@ mod tests {
             source_overrides: BTreeMap::new(),
             logical_grid: None,
             partition_provenance: None,
+            authored_layout_preset: None,
+            authored_layout_instance_id: None,
         }
     }
 

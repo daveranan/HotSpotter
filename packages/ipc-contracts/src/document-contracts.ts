@@ -72,6 +72,26 @@ export interface RegionDefinition {
   gridRect?: { x: number; y: number; width: number; height: number };
 }
 
+export interface AuthoredLayoutPresetRegion {
+  presetRegionKey: string;
+  displayName: string;
+  gridRect: { x: number; y: number; width: number; height: number };
+  role: string;
+  orientation: string;
+  uvFit: unknown;
+  structuralProfile: string;
+}
+
+export interface AuthoredLayoutPreset {
+  presetId: string;
+  schemaVersion: number;
+  name: string;
+  logicalGrid: { schemaVersion: number; width: number; height: number };
+  canonicalAspect: readonly [number, number];
+  regions: readonly AuthoredLayoutPresetRegion[];
+  provenance: string;
+}
+
 export interface SourceFrame {
   schemaVersion: number;
   sourceSetId: string;
@@ -187,6 +207,8 @@ export interface TrimSheetDocument {
   sourceFrame?: SourceFrame;
   logicalGrid?: { schemaVersion: number; width: number; height: number };
   partitionProvenance?: unknown;
+  authoredLayoutPreset?: AuthoredLayoutPreset;
+  authoredLayoutInstanceId?: string;
   sourceOverrides?: Record<string, RegionSourceOverride>;
 }
 
@@ -458,6 +480,7 @@ export interface PreviewSheetProjection {
 }
 
 export type TrimSheetDocumentCommand =
+  | { type: "apply_authored_layout_preset"; preset: AuthoredLayoutPreset; instanceId: string }
   | { type: "accept_source_frame_partition"; recipe: PartitionRecipe }
   | { type: "split_source_frame_region"; regionId: string; axis: "horizontal" | "vertical" }
   | { type: "merge_source_frame_regions"; regionId: string; siblingId: string }
