@@ -154,6 +154,28 @@ export function fitView(container: { width: number; height: number }, content: {
   };
 }
 
+/** Keeps the same normalized content point under the viewport center when only render resolution changes. */
+export function preserveViewAcrossContentResize(
+  view: CanvasView,
+  previous: { width: number; height: number },
+  next: { width: number; height: number },
+  container: { width: number; height: number },
+): CanvasView {
+  if (previous.width <= 0 || previous.height <= 0 || next.width <= 0 || next.height <= 0 || view.scale <= 0) return view;
+  const center = { x: container.width / 2, y: container.height / 2 };
+  const anchor = {
+    x: (center.x - view.x) / (view.scale * previous.width),
+    y: (center.y - view.y) / (view.scale * previous.height),
+  };
+  const resolutionRatio = Math.min(previous.width / next.width, previous.height / next.height);
+  const scale = Math.min(8, Math.max(0.02, view.scale * resolutionRatio));
+  return {
+    scale,
+    x: center.x - anchor.x * next.width * scale,
+    y: center.y - anchor.y * next.height * scale,
+  };
+}
+
 export function clamp01(value: number): number {
   return clamp(value, 0, 1);
 }

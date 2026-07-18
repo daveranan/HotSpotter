@@ -32,24 +32,47 @@ export interface PixelBounds { x: number; y: number; width: number; height: numb
 export interface NormalizedBounds { x: number; y: number; width: number; height: number }
 export interface NormalizedPoint { x: number; y: number }
 
+export interface SolidChannelValues {
+  baseColor?: readonly [number, number, number, number];
+  scalarChannels?: Partial<Record<SourceChannel, number>>;
+}
+
 export type ContentReference =
   | { type: "inherit_primary_material" }
   | { type: "material_source"; id: string }
   | { type: "patch"; id: string }
   | { type: "procedural"; id: string }
-  | { type: "solid"; id: unknown };
+  | { type: "solid"; id: SolidChannelValues };
+
+export type ManualRegionRole = "panel" | "horizontal_strip" | "vertical_strip" | "unique" | "radial";
+export type RegionContinuity = "none" | "x" | "y" | "xy";
+export type RegionSampling = "one_shot" | "loop_x" | "loop_y" | "loop_xy";
+export type RegionQuarterTurn = "zero" | "ninety" | "one_eighty" | "two_seventy";
+export interface EdgeEligibility { left: boolean; right: boolean; top: boolean; bottom: boolean }
+export interface RadialMappingSettings { centerX: number; centerY: number; innerRadius: number; outerRadius: number; falloff: number }
+export interface RegionBehavior {
+  version: number;
+  role: ManualRegionRole;
+  continuity: RegionContinuity;
+  sampling: RegionSampling;
+  periodPixels?: readonly [number, number];
+  orientation: RegionQuarterTurn;
+  edgeEligibility: EdgeEligibility;
+  radial?: RadialMappingSettings;
+}
 
 export interface RegionMapping {
   projection: { type: "crop"; bounds: NormalizedBounds; focus: NormalizedPoint }
     | { type: "perspective"; quad: readonly NormalizedPoint[] };
   sourceCropIntent?: "unplaced" | "authored";
   warps: readonly unknown[];
-  radial?: { centerX: number; centerY: number; innerRadius: number; outerRadius: number; falloff: number };
+  radial?: RadialMappingSettings;
   transform: {
     scale: readonly [number, number]; rotationDegrees: number;
     mirrorX: boolean; mirrorY: boolean; offset: readonly [number, number];
   };
   addressMode: "clamp" | "repeat" | "mirrored_repeat";
+  behavior: RegionBehavior;
 }
 
 export interface RegionBinding {
@@ -80,6 +103,7 @@ export interface AuthoredLayoutPresetRegion {
   orientation: string;
   uvFit: unknown;
   structuralProfile: string;
+  defaultBehavior: RegionBehavior;
 }
 
 export interface AuthoredLayoutPreset {
@@ -384,6 +408,7 @@ export interface ResolvedRegion {
   materialIdColor: readonly [number, number, number];
   mapping: RegionMapping;
   role: string;
+  behavior: RegionBehavior;
   gridRect?: { x: number; y: number; width: number; height: number };
   sourceCrop?: PixelBounds;
   sourceBounds?: NormalizedBounds;
@@ -427,6 +452,14 @@ export interface Stage14SlotProjection {
   sourceBounds?: NormalizedBounds;
   mappingOrigin?: MappingOrigin;
   gridRect?: { x: number; y: number; width: number; height: number };
+  behaviorVersion: number;
+  role: ManualRegionRole;
+  continuity: RegionContinuity;
+  requestedSampling: RegionSampling;
+  executedMode: string;
+  edgeEligibility: EdgeEligibility;
+  periodPixels?: readonly [number, number];
+  addressMode: "clamp" | "repeat_x" | "repeat_y" | "repeat_xy";
 }
 
 export interface IntermediateAtlasProjection {
@@ -491,6 +524,7 @@ export type TrimSheetDocumentCommand =
   | { type: "set_primary_material"; materialId: string }
   | { type: "set_region_content"; regionId: string; content: ContentReference }
   | { type: "set_region_address_mode"; regionId: string; addressMode: RegionMapping["addressMode"] }
+  | { type: "set_region_behavior"; regionId: string; behavior: RegionBehavior }
   | { type: "set_sheet_framing"; framing: unknown }
   | { type: "set_region_projection"; regionId: string; projection: RegionMapping["projection"] }
   | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }

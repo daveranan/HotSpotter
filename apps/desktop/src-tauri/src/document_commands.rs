@@ -581,6 +581,14 @@ pub struct Stage14SlotProjection {
     source_bounds: Option<hot_trimmer_domain::NormalizedBounds>,
     mapping_origin: Option<hot_trimmer_domain::MappingOrigin>,
     grid_rect: Option<hot_trimmer_domain::GridRect>,
+    behavior_version: u16,
+    role: hot_trimmer_domain::ManualRegionRole,
+    continuity: hot_trimmer_domain::RegionContinuity,
+    requested_sampling: hot_trimmer_domain::RegionSampling,
+    executed_mode: String,
+    edge_eligibility: hot_trimmer_domain::EdgeEligibility,
+    period_pixels: Option<[u32; 2]>,
+    address_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1851,6 +1859,7 @@ fn removed_preview_specific_fabrication(
             plan,
             result,
             grid_rect: region.grid_rect,
+            behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
         })
         .collect();
     let algorithms = (1..=14)
@@ -1941,6 +1950,14 @@ fn removed_preview_specific_fabrication(
                     source_bounds: region.source_bounds,
                     mapping_origin: region.mapping_origin,
                     grid_rect: slot.grid_rect,
+                    behavior_version: slot.behavior_version,
+                    role: slot.role,
+                    continuity: slot.continuity,
+                    requested_sampling: slot.requested_sampling,
+                    executed_mode: format!("{:?}", slot.executed_mode),
+                    edge_eligibility: slot.edge_eligibility,
+                    period_pixels: slot.period_pixels,
+                    address_mode: slot.address_mode.into(),
                 })
         })
         .collect();
@@ -2240,6 +2257,14 @@ fn build_stage_14_preview(
                 source_bounds: region.and_then(|region| region.source_bounds),
                 mapping_origin: region.and_then(|region| region.mapping_origin),
                 grid_rect: slot.grid_rect,
+                behavior_version: slot.behavior_version,
+                role: slot.role,
+                continuity: slot.continuity,
+                requested_sampling: slot.requested_sampling,
+                executed_mode: format!("{:?}", slot.executed_mode),
+                edge_eligibility: slot.edge_eligibility,
+                period_pixels: slot.period_pixels,
+                address_mode: slot.address_mode.into(),
             })
         })
         .collect::<Result<Vec<_>, UserFacingError>>()?;
@@ -3184,6 +3209,7 @@ mod algorithm_stage_14_preview_a_tests {
                     plan: &first_plan,
                     result: &first,
                     grid_rect: None,
+                    behavior: hot_trimmer_domain::RegionBehavior::default(),
                 },
                 IntermediateSlotInput {
                     region_id: second_plan.slot_id,
@@ -3195,6 +3221,7 @@ mod algorithm_stage_14_preview_a_tests {
                     plan: &second_plan,
                     result: &second,
                     grid_rect: None,
+                    behavior: hot_trimmer_domain::RegionBehavior::default(),
                 },
             ],
             revision: 7,

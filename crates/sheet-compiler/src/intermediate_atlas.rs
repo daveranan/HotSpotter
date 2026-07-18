@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, CompiledTemplateTopology, ContentDigest,
-    GridRect, MaterialChannelRole, RegionId, SamplingMode,
+    EdgeEligibility, GridRect, ManualRegionRole, MaterialChannelRole, RegionContinuity, RegionId,
+    RegionSampling, SamplingMode,
 };
 use crate::ResolvedRegion;
 use hot_trimmer_material_synthesis::PreparedMaterialDomain;
@@ -38,6 +39,7 @@ pub struct IntermediateSlotInput<'a> {
     pub plan: &'a SamplingPlan,
     pub result: &'a SynthesizedSlotMaterial,
     pub grid_rect: Option<GridRect>,
+    pub behavior: hot_trimmer_domain::RegionBehavior,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +69,14 @@ pub struct IntermediateSlotInspection {
     pub stage_14_result_id: ContentDigest,
     pub source_crop: Option<SourceCrop>,
     pub grid_rect: Option<GridRect>,
+    pub behavior_version: u16,
+    pub role: ManualRegionRole,
+    pub continuity: RegionContinuity,
+    pub requested_sampling: RegionSampling,
+    pub executed_mode: SamplingMode,
+    pub edge_eligibility: EdgeEligibility,
+    pub period_pixels: Option<[u32; 2]>,
+    pub address_mode: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -201,6 +211,19 @@ pub(crate) fn compose_intermediate_atlas(
             patch_id: input.patch_id.clone(), domain_id: input.domain.cache_key.clone(),
             candidate_id: input.plan.candidate.candidate_id.clone(), sampling_plan_id: plan_id,
             stage_14_result_id: result_id, source_crop: input.plan.candidate.crop, grid_rect: input.grid_rect,
+            behavior_version: input.behavior.version,
+            role: input.behavior.role,
+            continuity: input.behavior.continuity,
+            requested_sampling: input.behavior.sampling,
+            executed_mode: input.result.diagnostics.executed_mode,
+            edge_eligibility: input.behavior.edge_eligibility,
+            period_pixels: input.plan.candidate.period_pixels,
+            address_mode: match input.behavior.sampling {
+                RegionSampling::OneShot => "clamp",
+                RegionSampling::LoopX => "repeat_x",
+                RegionSampling::LoopY => "repeat_y",
+                RegionSampling::LoopXy => "repeat_xy",
+            },
         });
     }
     if cancelled() { return Err(IntermediateAtlasError::Cancelled); }

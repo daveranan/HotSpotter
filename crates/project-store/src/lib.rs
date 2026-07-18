@@ -1855,6 +1855,11 @@ fn snapshot_legacy_authored_layout(document: &mut TrimSheetDocument) -> Result<b
             orientation: region.orientation,
             uv_fit: region.uv_fit.clone(),
             structural_profile: region.structural_profile,
+            default_behavior: document
+                .region_bindings
+                .get(&region.id)
+                .map(|binding| binding.mapping.behavior.clone())
+                .unwrap_or_default(),
         })
     }).collect::<Result<Vec<_>, StoreError>>()?;
     let preset = AuthoredLayoutPreset {
@@ -2128,6 +2133,7 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::SetPrimaryMaterial { .. } => "set_primary_material",
         TrimSheetDocumentCommand::SetRegionContent { .. } => "set_region_content",
         TrimSheetDocumentCommand::SetRegionAddressMode { .. } => "set_region_address_mode",
+        TrimSheetDocumentCommand::SetRegionBehavior { .. } => "set_region_behavior",
         TrimSheetDocumentCommand::SetSheetFraming { .. } => "set_sheet_framing",
         TrimSheetDocumentCommand::SetRegionProjection { .. } => "set_region_projection",
         TrimSheetDocumentCommand::SetRegionRadial { .. } => "set_region_radial",

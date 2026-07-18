@@ -9,16 +9,18 @@ use std::{
 
 use hot_trimmer_domain::{
     AddressMode, AlgorithmProvenance, CancellationToken, ContentDigest, ContentReference,
-    MaterialChannelRole, OrientedPixelSize, OriginalAssetProvenance, Patch, PhysicalScaleEvidence,
-    Projection, QuarterTurn, RegionMapping, RegisteredChannel, RegisteredChannelSet,
-    SamplingPolicy, SourceOwnershipIntent, StageResult,
+    ManualRegionRole, MaterialChannelRole, OrientedPixelSize, OriginalAssetProvenance, Patch,
+    PhysicalScaleEvidence, Projection, QuarterTurn, RegionMapping, RegionSampling, SolidChannelValues,
+    RegisteredChannel, RegisteredChannelSet, SamplingMode, SamplingPolicy, SourceOwnershipIntent,
+    StageResult, TemplateSlotRole,
 };
 use hot_trimmer_effect_compiler::{
     RequiredSourceFootprint, SlotDemandIntent, SourceFootprintUnit, VisualImportance,
     WorldDimensionSource, resolve_slot_demands_with_guard,
 };
 use hot_trimmer_image_io::{
-    CancellationToken as ImageCancellationToken, NormalizationSettings,
+    CancellationToken as ImageCancellationToken, ImagePlane, LinearColor, NormalizationSettings,
+    ResolvedAlphaMode,
     prepare_registered_channel_set,
 };
 use hot_trimmer_material_analysis::{
@@ -42,7 +44,7 @@ use hot_trimmer_placement_solver::{
 };
 use hot_trimmer_project_store::{ProjectSummary, SourceOwnership, StoredSource};
 use hot_trimmer_render_core::{
-    ExemplarMaskIntent, PlanarArea, PreparedExemplarRequest, PreparedExemplarScope,
+    ExemplarMaskIntent, PlanarArea, PreparedExemplarChannel, PreparedExemplarRequest, PreparedExemplarScope,
     RectificationQuality, RectificationWorkLimits, RenderCancellationToken,
     prepare_registered_exemplar, registered_level_zero_channels,
 };
@@ -654,6 +656,7 @@ fn compile_persisted(
                 plan,
                 result,
                 grid_rect: region.grid_rect,
+                behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
             }
         })
         .collect::<Vec<_>>();
@@ -879,9 +882,17 @@ fn compile_source_frame(
             .region_bindings
             .get(&region.id)
             .ok_or_else(|| format!("region {} has no persisted content binding", region.id))?;
-        let (source_set_id, patch) =
-            resolve_region_content(request.project, document, primary, &binding.content)?;
-        let domain = if let Some(patch) = patch.as_ref() {
+        let (source_set_id, patch, solid_domain) = match &binding.content {
+            ContentReference::Solid(values) => (None, None, Some(Arc::new(build_solid_domain(values)?))),
+            _ => {
+                let (source_set_id, patch) = resolve_region_content(request.project, document, primary, &binding.content)?;
+                (Some(source_set_id), patch, None)
+            }
+        };
+        let domain = if let Some(domain) = solid_domain {
+            domain
+        } else if let Some(patch) = patch.as_ref() {
+            let source_set_id = source_set_id.expect("patch content has an owning source set");
             let preserve_source_resolution = matches!(request.profile, SourceFramePreviewProfile::Authoritative);
             let patch_key = patch_domain_cache_key(request.project, source_set_id, patch, preserve_source_resolution)?;
             if let Some(found) = source_frame_cache.and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&patch_key))) {
@@ -901,9 +912,10 @@ fn compile_source_frame(
                 }
                 domain
             }
-        } else if let Some(domain) = direct_domains.get(&source_set_id) {
+        } else if let Some(domain) = source_set_id.and_then(|id| direct_domains.get(&id)) {
             Arc::clone(domain)
         } else {
+            let source_set_id = source_set_id.expect("non-solid content has a source set");
             let (domain, _) = direct_source_frame_domain(
                 request.project,
                 source_set_id,
@@ -947,7 +959,7 @@ fn compile_source_frame(
         let (source_set_id, patch_id, domain) = &region_domains[region_index];
         let uses_frame_partition =
             matches!(&binding.content, ContentReference::InheritPrimaryMaterial)
-                && *source_set_id == frame.source_set_id;
+                && *source_set_id == Some(frame.source_set_id);
         let rect = region
             .grid_rect
             .ok_or_else(|| format!("region {} has no persisted GridRect", region.id))?;
@@ -1016,14 +1028,22 @@ fn compile_source_frame(
             } else {
                 "partition"
             }
+        } else if matches!(&binding.content, ContentReference::Solid(_)) {
+            "solid_binding"
         } else if patch_id.is_some() {
             "patch_binding"
         } else {
             "whole_source_binding"
         };
+        validate_manual_mapping(region.id, &binding.mapping)?;
+        let behavior = &binding.mapping.behavior;
+        if behavior.period_pixels.is_some_and(|period| period[0] > crop.width || period[1] > crop.height) {
+            return Err(format!("region {} authored repeat period exceeds its exact source crop", region.id));
+        }
+        let mapping_mode = manual_sampling_mode(behavior.role, behavior.sampling);
         let candidate_id = hot_trimmer_domain::ContentDigest::sha256(
             format!(
-                "source-frame|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|address={:?}",
+                "source-frame|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|mapping={:?}",
                 frame
                     .identity
                     .0
@@ -1038,11 +1058,23 @@ fn compile_source_frame(
                 mapping_origin,
                 source_set_id,
                 patch_id,
-                binding.mapping.address_mode
+                binding.mapping
             )
             .as_bytes(),
         );
-        let authored_repeat = binding.mapping.address_mode == AddressMode::Repeat;
+        let authored_repeat = behavior.sampling != RegionSampling::OneShot;
+        let mirror = match (binding.mapping.transform.mirror_x, binding.mapping.transform.mirror_y) {
+            (true, false) => MirrorTransform::X,
+            (false, true) => MirrorTransform::Y,
+            _ => MirrorTransform::None,
+        };
+        let (family, route) = match mapping_mode {
+            SamplingMode::RepeatX => (CandidateFamily::RepeatXSegment, CandidateRoute::Repeat),
+            SamplingMode::RepeatY => (CandidateFamily::RepeatYSegment, CandidateRoute::Repeat),
+            SamplingMode::PeriodicTile => (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat),
+            SamplingMode::PlanarRadial => (CandidateFamily::PlanarRadialSquare, CandidateRoute::PlanarRadial),
+            _ => (CandidateFamily::PanelDirect, CandidateRoute::Direct),
+        };
         let candidate = CropCandidate {
             candidate_id: candidate_id.clone(),
             source_id: domain.prepared_source_digest.clone(),
@@ -1050,15 +1082,15 @@ fn compile_source_frame(
             slot_id: region.id,
             crop: Some(crop),
             transform: CandidateTransform {
-                rotation: QuarterTurn::Zero,
-                mirror: MirrorTransform::None,
+                rotation: behavior.orientation,
+                mirror,
             },
             isotropic_scale: 1.0,
-            mapping_mode: if authored_repeat { hot_trimmer_domain::SamplingMode::PeriodicTile } else { hot_trimmer_domain::SamplingMode::DirectCrop },
-            family: CandidateFamily::PanelDirect,
-            route: CandidateRoute::Direct,
+            mapping_mode,
+            family,
+            route,
             position_strategy: PositionStrategy::DenseLowResolution,
-            period_pixels: authored_repeat.then_some([crop.width, crop.height]),
+            period_pixels: authored_repeat.then_some(behavior.period_pixels.unwrap_or([crop.width, crop.height])),
             seam_indices: Vec::new(),
             correspondence_reference: domain.cache_key.clone(),
             descriptors: CandidateDescriptors {
@@ -1081,20 +1113,25 @@ fn compile_source_frame(
                 reasons: vec!["accepted SourceFrame + GridRect direct mapping".into()],
             },
         };
+        let (slot_physical_size, source_pixels_per_physical_unit) = manual_physical_mapping(
+            behavior.sampling,
+            crop,
+            allocation,
+        );
         let plan = SamplingPlan {
             slot_id: region.id,
-            role: region.role,
+            role: manual_template_role(behavior.role),
             variation_group: region.material_group.clone(),
             prepared_domain_dimensions: [domain.width, domain.height],
             candidate,
-            slot_physical_size: [f64::from(crop.width), f64::from(crop.height)],
-            source_pixels_per_physical_unit: 1.0,
+            slot_physical_size,
+            source_pixels_per_physical_unit,
             sampling_policy: SamplingPolicy {
-                filter: hot_trimmer_domain::SourceSamplingMode::Linear,
-                scale: 1.0,
-                correct_tangent_normals: true,
+                filter: binding.mapping.sampling.filter,
+                scale: binding.mapping.sampling.scale * binding.mapping.transform.scale[0].abs(),
+                correct_tangent_normals: binding.mapping.sampling.correct_tangent_normals,
             },
-            radial_mapping: None,
+            radial_mapping: behavior.radial,
             stretch_override: StretchOverrideProvenance::NotAuthorized,
             slice_geometry: SliceGeometry::None,
             maximum_seam_cost_milli: 0,
@@ -1212,6 +1249,7 @@ fn compile_source_frame(
                 plan,
                 result,
                 grid_rect: region.grid_rect,
+                behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
             },
         )
         .collect();
@@ -1349,8 +1387,26 @@ fn aspect_matches(width: f64, height: f64, expected_width: f64, expected_height:
 #[cfg(test)]
 mod source_frame_partition_tests {
     use hot_trimmer_domain::{
-        LogicalGridSpec, PartitionRecipe, SamplingMode, generate_partition, resolve_boundaries,
+        LogicalGridSpec, PartitionRecipe, SamplingMode, SolidChannelValues, generate_partition, resolve_boundaries,
     };
+    use std::collections::BTreeMap;
+
+    use super::build_solid_domain;
+
+    #[test]
+    fn multi_source_patch_assignment_solid_content_builds_an_exact_domain() {
+        let domain = build_solid_domain(&SolidChannelValues {
+            base_color: Some([128, 64, 32, 128]),
+            scalar_channels: BTreeMap::new(),
+        }).expect("solid domain");
+        assert_eq!((domain.width, domain.height), (1, 1));
+        let pixel = match &domain.registered_channels()[0] {
+            hot_trimmer_render_core::PreparedExemplarChannel::BaseColor { plane, .. } => plane.pixel(0, 0),
+            _ => panic!("solid domain must contain Base Color"),
+        };
+        assert!((pixel.alpha - 128.0 / 255.0).abs() < 1.0e-6);
+        assert!(pixel.rgb[0] > pixel.rgb[1] && pixel.rgb[1] > pixel.rgb[2]);
+    }
 
     #[test]
     fn source_frame_partition_preserves_shared_boundaries_and_direct_sampling() {
@@ -1389,6 +1445,102 @@ mod source_frame_partition_tests {
             assert_eq!(SamplingMode::DirectCrop, SamplingMode::DirectCrop);
         }
     }
+}
+
+fn validate_manual_mapping(
+    region_id: hot_trimmer_domain::RegionId,
+    mapping: &RegionMapping,
+) -> Result<(), String> {
+    let epsilon = 1.0e-9;
+    if !mapping.behavior.supports_sampling() {
+        return Err(format!(
+            "region {region_id} role {:?} does not support {:?}; the mode was rejected before Stage 14",
+            mapping.behavior.role, mapping.behavior.sampling
+        ));
+    }
+    if mapping.behavior.period_pixels.is_some_and(|period| period.contains(&0)) {
+        return Err(format!("region {region_id} has an invalid zero source period"));
+    }
+    if !mapping.warps.is_empty() {
+        return Err(format!(
+            "region {region_id} has authored warp operations, but the manual Stage 14 route has no exact executor"
+        ));
+    }
+    if mapping.transform.offset.iter().any(|value| value.abs() > epsilon)
+        || mapping.transform.rotation_degrees.abs() > epsilon
+        || (mapping.transform.scale[0] - mapping.transform.scale[1]).abs() > epsilon
+        || (mapping.transform.mirror_x && mapping.transform.mirror_y)
+    {
+        return Err(format!(
+            "region {region_id} uses a transform not exactly representable by the manual Stage 14 sampling plan"
+        ));
+    }
+    if mapping.behavior.role == ManualRegionRole::Radial
+        && mapping.behavior.radial.is_some_and(|radial| (radial.falloff - 1.0).abs() > epsilon)
+    {
+        return Err(format!(
+            "region {region_id} radial falloff is disabled until Stage 14 executes that warp exactly"
+        ));
+    }
+    Ok(())
+}
+
+fn manual_sampling_mode(role: ManualRegionRole, sampling: RegionSampling) -> SamplingMode {
+    if role == ManualRegionRole::Radial {
+        return SamplingMode::PlanarRadial;
+    }
+    match sampling {
+        RegionSampling::OneShot => SamplingMode::DirectCrop,
+        RegionSampling::LoopX => SamplingMode::RepeatX,
+        RegionSampling::LoopY => SamplingMode::RepeatY,
+        RegionSampling::LoopXy => SamplingMode::PeriodicTile,
+    }
+}
+
+fn manual_template_role(role: ManualRegionRole) -> TemplateSlotRole {
+    match role {
+        ManualRegionRole::Panel => TemplateSlotRole::Planar,
+        ManualRegionRole::HorizontalStrip | ManualRegionRole::VerticalStrip => TemplateSlotRole::RepeatingStrip,
+        ManualRegionRole::Unique => TemplateSlotRole::UniqueDetail,
+        ManualRegionRole::Radial => TemplateSlotRole::Radial,
+    }
+}
+
+fn manual_physical_mapping(
+    sampling: RegionSampling,
+    crop: SourceCrop,
+    allocation: hot_trimmer_domain::CanonicalRect,
+) -> ([f64; 2], f64) {
+    let crop_size = [f64::from(crop.width), f64::from(crop.height)];
+    let destination = [f64::from(allocation.width), f64::from(allocation.height)];
+    match sampling {
+        RegionSampling::OneShot => (crop_size, 1.0),
+        RegionSampling::LoopX => (destination, crop_size[1] / destination[1]),
+        RegionSampling::LoopY => (destination, crop_size[0] / destination[0]),
+        RegionSampling::LoopXy => (
+            destination,
+            (crop_size[0] / destination[0]).max(crop_size[1] / destination[1]),
+        ),
+    }
+}
+
+fn build_solid_domain(values: &SolidChannelValues) -> Result<hot_trimmer_material_synthesis::PreparedMaterialDomain, String> {
+    let rgba = values.base_color.ok_or_else(|| "solid region content requires an explicit Base Color for Stage 14".to_string())?;
+    let linear = |component: u8| {
+        let value = f32::from(component) / 255.0;
+        if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+    };
+    let plane = ImagePlane::from_row_major(1, 1, 1, &[LinearColor {
+        rgb: [linear(rgba[0]), linear(rgba[1]), linear(rgba[2])],
+        alpha: f32::from(rgba[3]) / 255.0,
+    }]).map_err(|error| error.to_string())?;
+    let identity = ContentDigest::sha256(&serde_json::to_vec(values).map_err(|error| error.to_string())?);
+    hot_trimmer_material_synthesis::PreparedMaterialDomain::from_registered_channels(
+        identity.clone(), identity, vec![PreparedExemplarChannel::BaseColor {
+            plane,
+            alpha_mode: if rgba[3] == 255 { ResolvedAlphaMode::Opaque } else { ResolvedAlphaMode::Straight },
+        }],
+    ).map_err(|error| error.to_string())
 }
 
 fn resolve_region_content(

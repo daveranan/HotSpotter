@@ -1,4 +1,4 @@
-import type { AuthoredLayoutPreset, AuthoredLayoutPresetRegion, TrimSheetDocument } from "@hot-trimmer/ipc-contracts";
+import type { AuthoredLayoutPreset, AuthoredLayoutPresetRegion, RegionBehavior, TrimSheetDocument } from "@hot-trimmer/ipc-contracts";
 
 export const authoredGridResolutions = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256] as const;
 export const DIAGONAL_CASCADE_PRESET_ID = "builtin.diagonal-cascade";
@@ -11,12 +11,17 @@ const diagonalRects = [
   [20,48,4,8],[8,52,8,4],[0,56,32,1],[0,57,32,1],[0,58,32,2],[0,60,32,4],
 ] as const;
 
-function record(key: string, displayName: string, x: number, y: number, width: number, height: number): AuthoredLayoutPresetRegion {
+export function defaultRegionBehavior(): RegionBehavior {
+  return { version: 1, role: "panel", continuity: "none", sampling: "one_shot", orientation: "zero", edgeEligibility: { left: true, right: true, top: true, bottom: true } };
+}
+
+function record(key: string, displayName: string, x: number, y: number, width: number, height: number, defaultBehavior = defaultRegionBehavior()): AuthoredLayoutPresetRegion {
   return {
     presetRegionKey: key, displayName, gridRect: { x, y, width, height }, role: "planar",
     orientation: width > height ? "horizontal" : height > width ? "vertical" : "unspecified",
     uvFit: { kind: "rectangular", fitAxis: "automatic", keepProportion: true, allowedRotations: ["zero"], mirrorAllowed: false, worldSizeMeters: [width, height], classificationTags: ["AUTHORED_LAYOUT"] },
     structuralProfile: "flat",
+    defaultBehavior,
   };
 }
 
@@ -39,7 +44,7 @@ export function snapshotDocumentPreset(document: TrimSheetDocument, presetId: st
   const priorKeys = new Map(document.authoredLayoutPreset?.regions.map((region) => [rectKey(region.gridRect), region.presetRegionKey]));
   return {
     presetId, schemaVersion: 1, name, logicalGrid: grid, canonicalAspect: [document.renderSettings.outputSize.width, document.renderSettings.outputSize.height],
-    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height)] : []),
+    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height, document.regionBindings[region.id]?.mapping.behavior ?? defaultRegionBehavior())] : []),
     provenance: "user_authored_snapshot",
   };
 }
@@ -70,7 +75,7 @@ export function presetExactlyCoversGrid(preset: AuthoredLayoutPreset): boolean {
     if (rect.width <= 0 || rect.height <= 0 || rect.x < 0 || rect.y < 0 || rect.x + rect.width > width || rect.y + rect.height > height) return false;
     for (let y = rect.y; y < rect.y + rect.height; y += 1) for (let x = rect.x; x < rect.x + rect.width; x += 1) {
       const index = y * width + x;
-      owners[index] += 1;
+      owners[index] = (owners[index] ?? 0) + 1;
       if (owners[index] !== 1) return false;
     }
   }

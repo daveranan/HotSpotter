@@ -4,6 +4,7 @@ use hot_trimmer_domain::{
     generate_partition, resolve_boundaries, ContentDigest, LogicalGridSpec, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, OrientedPixelSize, PartitionRecipe, PixelSize,
     SamplingMode, SourceFrame, SourceId, TrimSheetDocument, TrimSheetDocumentCommand, NormalizedBounds, NormalizedScalar,
+    ManualRegionRole, RegionBehavior, RegionContinuity, RegionSampling,
 };
 use hot_trimmer_placement_solver::MirrorTransform;
 use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
@@ -50,6 +51,142 @@ fn numbered_source() -> (Vec<u8>, Vec<u8>) {
     let mut encoded = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(image).write_to(&mut encoded, ImageFormat::Png).expect("encode fixture");
     (encoded.into_inner(), raw)
+}
+
+fn compile_behavior_document(
+    store: &ProjectStore,
+    document: &TrimSheetDocument,
+) -> hot_trimmer_sheet_compiler::IntermediateAtlasArtifact {
+    let mut summary = store.summary().expect("behavior summary");
+    summary.document = Some(document.clone());
+    hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
+        .compile_persisted_stage_14_preview(
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                project: &summary,
+                revision: document.document_revision,
+                draft_id: None,
+                input_hash: None,
+                profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+            },
+            &CancellationToken::new(),
+            || true,
+        )
+        .expect("manual behavior compile")
+}
+
+fn selected_region_pixels(
+    artifact: &hot_trimmer_sheet_compiler::IntermediateAtlasArtifact,
+    region_id: hot_trimmer_domain::RegionId,
+) -> Vec<u8> {
+    let slot = artifact.slots.iter().find(|slot| slot.region_id == region_id).expect("selected slot");
+    let base = artifact.channels.iter().find(|channel| channel.role == hot_trimmer_domain::MaterialChannelRole::BaseColor).expect("Base Color");
+    let width = artifact.topology.output_size.width;
+    let mut pixels = Vec::new();
+    for y in slot.allocation.y..slot.allocation.y + slot.allocation.height {
+        for x in slot.allocation.x..slot.allocation.x + slot.allocation.width {
+            let index = ((y * width + x) * 4) as usize;
+            pixels.extend_from_slice(&base.rgba8[index..index + 4]);
+        }
+    }
+    pixels
+}
+
+#[test]
+fn manual_region_behavior_compile_persisted_executes_modes_edges_radial_and_persistence() {
+    let root = std::env::temp_dir().join(format!("hot-trimmer-manual-region-behavior-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create behavior fixture directory");
+    let project_path = root.join("manual-region-behavior.hottrimmer");
+    let mut store = ProjectStore::create(&project_path, "Manual Region Behavior").expect("create behavior project");
+    let (encoded, _) = numbered_source();
+    let initial = store.summary().expect("initial summary");
+    let source_set_id = Uuid::from_bytes(initial.source_sets[0].id.to_bytes());
+    let input = SourceInput {
+        id: SourceId::new(), ownership: SourceOwnership::OwnedCopy, external_path: None,
+        origin_path: PathBuf::from("manual-numbered.png"), sha256: ContentDigest::sha256(&encoded).0,
+        width: 128, height: 64, format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+        exif_orientation: 1, has_embedded_icc_profile: false, encoded_bytes: encoded.len() as u64,
+        owned_bytes: Some(encoded),
+    };
+    store.replace_source_in_set(source_set_id, SourceChannel::BaseColor, &input).expect("register behavior source");
+    store.create_source_frame_document().expect("create authored behavior document");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution { output_size: PixelSize { width: 64, height: 64 } }).expect("small behavior output");
+    let baseline_document = store.document().expect("baseline document").clone();
+    let baseline = compile_behavior_document(&store, &baseline_document);
+    assert!(baseline.slots.iter().all(|slot| slot.requested_sampling == RegionSampling::OneShot
+        && slot.executed_mode == SamplingMode::DirectCrop && slot.period_pixels.is_none()), "defaults never repeat");
+
+    let region_id = baseline_document.topology.regions[0].id;
+    let whole_source = baseline_document.apply_command(&TrimSheetDocumentCommand::SetRegionContent {
+        region_id,
+        content: hot_trimmer_domain::ContentReference::MaterialSource(baseline_document.primary_material.expect("primary")),
+    }).expect("assign whole numbered source");
+    let mut artifacts = Vec::new();
+    for sampling in [RegionSampling::OneShot, RegionSampling::LoopX, RegionSampling::LoopY, RegionSampling::LoopXy] {
+        let mut behavior = RegionBehavior::default();
+        behavior.sampling = sampling;
+        behavior.period_pixels = (sampling != RegionSampling::OneShot).then_some([17, 11]);
+        behavior.synchronize_derived_fields();
+        let document = whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior: behavior.clone() }).expect("author supported behavior");
+        let artifact = compile_behavior_document(&store, &document);
+        let slot = artifact.slots.iter().find(|slot| slot.region_id == region_id).expect("behavior slot");
+        let expected = match sampling { RegionSampling::OneShot => SamplingMode::DirectCrop, RegionSampling::LoopX => SamplingMode::RepeatX, RegionSampling::LoopY => SamplingMode::RepeatY, RegionSampling::LoopXy => SamplingMode::PeriodicTile };
+        assert_eq!(slot.requested_sampling, sampling);
+        assert_eq!(slot.executed_mode, expected);
+        assert_eq!(slot.mapping_mode, expected);
+        artifacts.push((sampling, selected_region_pixels(&artifact, region_id), artifact));
+    }
+    for left in 0..artifacts.len() {
+        for right in left + 1..artifacts.len() {
+            assert_ne!(artifacts[left].1, artifacts[right].1, "each explicit sampling mode produces known different numbered pixels");
+        }
+    }
+
+    for (continuity, expected) in [
+        (RegionContinuity::X, [false, false, true, true]),
+        (RegionContinuity::Y, [true, true, false, false]),
+        (RegionContinuity::Xy, [false, false, false, false]),
+    ] {
+        let mut behavior = RegionBehavior::default();
+        behavior.continuity = continuity;
+        behavior.synchronize_derived_fields();
+        let document = whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior }).expect("author continuity");
+        let artifact = compile_behavior_document(&store, &document);
+        let edges = artifact.slots.iter().find(|slot| slot.region_id == region_id).expect("edge slot").edge_eligibility;
+        assert_eq!([edges.left, edges.right, edges.top, edges.bottom], expected);
+    }
+
+    let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
+    radial.radial = Some(hot_trimmer_domain::RadialMappingSettings { center_x: 0.35, center_y: 0.6, inner_radius: 0.08, outer_radius: 0.42, falloff: 1.0 });
+    radial.synchronize_derived_fields();
+    let radial_document = whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior: radial.clone() }).expect("classify radial");
+    let radial_artifact = compile_behavior_document(&store, &radial_document);
+    assert_eq!(radial_artifact.slots.iter().find(|slot| slot.region_id == region_id).unwrap().executed_mode, SamplingMode::PlanarRadial);
+    for (before, after) in baseline.slots.iter().zip(&radial_artifact.slots) {
+        if before.region_id == region_id { assert_ne!(before.stage_14_result_id, after.stage_14_result_id); }
+        else { assert_eq!(before.stage_14_result_id, after.stage_14_result_id, "radial edit changed another RegionId"); }
+    }
+
+    let mut unsupported = RegionBehavior::new(ManualRegionRole::Unique);
+    unsupported.sampling = RegionSampling::LoopX;
+    unsupported.synchronize_derived_fields();
+    assert!(whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior: unsupported }).is_err(), "unsupported role/sampling cannot reach Stage 14");
+
+    store.execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
+        region_id,
+        content: hot_trimmer_domain::ContentReference::MaterialSource(store.document().unwrap().primary_material.unwrap()),
+    }).expect("persist whole source");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior: radial.clone() }).expect("persist radial behavior");
+    store.undo_document_command().expect("undo behavior");
+    store.redo_document_command().expect("redo behavior");
+    drop(store);
+    let reopened = ProjectStore::open(&project_path).expect("reopen behavior project");
+    let reopened_document = reopened.document().expect("reopened document");
+    assert_eq!(reopened_document.region_bindings[&region_id].mapping.behavior, radial);
+    let mut save_as = reopened_document.authored_layout_preset.clone().expect("embedded preset");
+    save_as.preset_id = "user.manual-region-behavior".into();
+    save_as.regions[0].default_behavior = radial.clone();
+    let reopened_save_as: hot_trimmer_domain::AuthoredLayoutPreset = serde_json::from_slice(&serde_json::to_vec(&save_as).unwrap()).unwrap();
+    assert_eq!(reopened_save_as.regions[0].default_behavior, radial, "preset Save As preserves every behavior field");
 }
 
 fn fixture_project(target: u32) -> (ProjectStore, Vec<u8>, TrimSheetDocument) {

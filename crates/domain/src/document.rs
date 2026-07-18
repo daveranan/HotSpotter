@@ -199,6 +199,134 @@ pub struct RadialMappingSettings {
     pub falloff: f64,
 }
 
+pub const REGION_BEHAVIOR_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualRegionRole {
+    #[default]
+    Panel,
+    HorizontalStrip,
+    VerticalStrip,
+    Unique,
+    Radial,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionContinuity {
+    #[default]
+    None,
+    X,
+    Y,
+    Xy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionSampling {
+    #[default]
+    OneShot,
+    LoopX,
+    LoopY,
+    LoopXy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeEligibility {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl EdgeEligibility {
+    #[must_use]
+    pub const fn for_continuity(continuity: RegionContinuity) -> Self {
+        Self {
+            left: !matches!(continuity, RegionContinuity::X | RegionContinuity::Xy),
+            right: !matches!(continuity, RegionContinuity::X | RegionContinuity::Xy),
+            top: !matches!(continuity, RegionContinuity::Y | RegionContinuity::Xy),
+            bottom: !matches!(continuity, RegionContinuity::Y | RegionContinuity::Xy),
+        }
+    }
+}
+
+impl Default for EdgeEligibility {
+    fn default() -> Self {
+        Self::for_continuity(RegionContinuity::None)
+    }
+}
+
+/// The sole persisted manual behavior contract for one region. `continuity` describes
+/// destination structural seams; `sampling` independently describes source addressing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionBehavior {
+    pub version: u16,
+    pub role: ManualRegionRole,
+    pub continuity: RegionContinuity,
+    pub sampling: RegionSampling,
+    /// Authored source-space repeat period. `None` means the exact assigned crop extent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_pixels: Option<[u32; 2]>,
+    pub orientation: QuarterTurn,
+    pub edge_eligibility: EdgeEligibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radial: Option<RadialMappingSettings>,
+}
+
+impl RegionBehavior {
+    #[must_use]
+    pub fn new(role: ManualRegionRole) -> Self {
+        let radial = (role == ManualRegionRole::Radial).then_some(RadialMappingSettings {
+            center_x: 0.5,
+            center_y: 0.5,
+            inner_radius: 0.0,
+            outer_radius: 0.5,
+            falloff: 1.0,
+        });
+        Self { role, radial, ..Self::default() }
+    }
+
+    #[must_use]
+    pub const fn supports_sampling(&self) -> bool {
+        matches!(
+            (self.role, self.sampling),
+            (ManualRegionRole::Panel, _)
+                | (ManualRegionRole::HorizontalStrip, RegionSampling::OneShot | RegionSampling::LoopX)
+                | (ManualRegionRole::VerticalStrip, RegionSampling::OneShot | RegionSampling::LoopY)
+                | (ManualRegionRole::Unique | ManualRegionRole::Radial, RegionSampling::OneShot)
+        )
+    }
+
+    pub fn synchronize_derived_fields(&mut self) {
+        self.version = REGION_BEHAVIOR_VERSION;
+        self.edge_eligibility = EdgeEligibility::for_continuity(self.continuity);
+        if self.role == ManualRegionRole::Radial {
+            self.radial.get_or_insert_with(|| RegionBehavior::new(ManualRegionRole::Radial).radial.unwrap());
+        } else {
+            self.radial = None;
+        }
+    }
+}
+
+impl Default for RegionBehavior {
+    fn default() -> Self {
+        Self {
+            version: REGION_BEHAVIOR_VERSION,
+            role: ManualRegionRole::Panel,
+            continuity: RegionContinuity::None,
+            sampling: RegionSampling::OneShot,
+            period_pixels: None,
+            orientation: QuarterTurn::Zero,
+            edge_eligibility: EdgeEligibility::default(),
+            radial: None,
+        }
+    }
+}
+
 impl From<RadialParameters> for RadialMappingSettings {
     fn from(value: RadialParameters) -> Self {
         Self {
@@ -226,6 +354,8 @@ pub struct RegionMapping {
     pub transform: MappingTransform,
     pub address_mode: AddressMode,
     pub sampling: SamplingPolicy,
+    #[serde(default)]
+    pub behavior: RegionBehavior,
 }
 
 /// Global source framing applied before a region's own content mapping.
@@ -255,6 +385,7 @@ impl Default for RegionMapping {
             transform: MappingTransform::default(),
             address_mode: AddressMode::Clamp,
             sampling: SamplingPolicy::default(),
+            behavior: RegionBehavior::default(),
         }
     }
 }
@@ -387,6 +518,8 @@ pub struct AuthoredLayoutPresetRegion {
     pub orientation: RegionOrientation,
     pub uv_fit: UvFitPolicy,
     pub structural_profile: StructuralProfile,
+    #[serde(default)]
+    pub default_behavior: RegionBehavior,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1255,7 +1388,16 @@ impl TrimSheetDocument {
                 RegionBinding {
                     region_id,
                     content: ContentReference::InheritPrimaryMaterial,
-                    mapping: RegionMapping::default(),
+                    mapping: RegionMapping {
+                        radial: authored.default_behavior.radial,
+                        address_mode: if authored.default_behavior.sampling == RegionSampling::OneShot {
+                            AddressMode::Clamp
+                        } else {
+                            AddressMode::Repeat
+                        },
+                        behavior: authored.default_behavior.clone(),
+                        ..RegionMapping::default()
+                    },
                     variation: VariationSettings::default(),
                     blend: BlendPolicy::default(),
                 },
@@ -1371,13 +1513,24 @@ impl TrimSheetDocument {
                 &template.identity.compatibility_key,
                 &slot.compatibility_key,
             );
+            let behavior_role = match (slot.role, slot.allocation.height > slot.allocation.width) {
+                (TemplateSlotRole::RepeatingStrip, true) => ManualRegionRole::VerticalStrip,
+                (TemplateSlotRole::RepeatingStrip, _) => ManualRegionRole::HorizontalStrip,
+                (TemplateSlotRole::UniqueDetail | TemplateSlotRole::TrimCap, _) => ManualRegionRole::Unique,
+                (TemplateSlotRole::Radial, _) => ManualRegionRole::Radial,
+                _ => ManualRegionRole::Panel,
+            };
+            let mut behavior = RegionBehavior::new(behavior_role);
+            behavior.radial = slot.radial_parameters.map(Into::into).or(behavior.radial);
+            behavior.synchronize_derived_fields();
             bindings.insert(
                 region_id,
                 RegionBinding {
                     region_id,
                     content: ContentReference::InheritPrimaryMaterial,
                     mapping: RegionMapping {
-                        radial: slot.radial_parameters.map(Into::into),
+                        radial: behavior.radial,
+                        behavior,
                         ..template_region_mapping(slot.source_mapping)
                     },
                     variation: VariationSettings::default(),
@@ -1531,11 +1684,35 @@ impl TrimSheetDocument {
                     .content = content.clone();
             }
             TrimSheetDocumentCommand::SetRegionAddressMode { region_id, address_mode } => {
-                next.region_bindings
+                let mapping = &mut next.region_bindings
                     .get_mut(region_id)
                     .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
-                    .mapping
-                    .address_mode = *address_mode;
+                    .mapping;
+                mapping.address_mode = *address_mode;
+                mapping.behavior.sampling = match address_mode {
+                    AddressMode::Clamp => RegionSampling::OneShot,
+                    AddressMode::Repeat => RegionSampling::LoopXy,
+                    AddressMode::MirroredRepeat => {
+                        return Err(TrimSheetDocumentError::UnsupportedRegionBehavior(*region_id));
+                    }
+                };
+                mapping.behavior.synchronize_derived_fields();
+            }
+            TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior } => {
+                let mut behavior = behavior.clone();
+                behavior.synchronize_derived_fields();
+                validate_region_behavior(*region_id, &behavior)?;
+                let mapping = &mut next.region_bindings
+                    .get_mut(region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
+                    .mapping;
+                mapping.address_mode = if behavior.sampling == RegionSampling::OneShot {
+                    AddressMode::Clamp
+                } else {
+                    AddressMode::Repeat
+                };
+                mapping.radial = behavior.radial;
+                mapping.behavior = behavior;
             }
             TrimSheetDocumentCommand::SetSheetFraming { framing } => {
                 next.sheet_framing = framing.clone();
@@ -1612,23 +1789,18 @@ impl TrimSheetDocument {
                     .region_bindings
                     .get_mut(region_id)
                     .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
-                binding.mapping = RegionMapping::default();
+                reset_source_mapping_preserving_behavior(&mut binding.mapping);
             }
             TrimSheetDocumentCommand::SetRegionRadial { region_id, radial } => {
-                let region = next
-                    .topology
-                    .regions
-                    .iter()
-                    .find(|region| region.id == *region_id)
-                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?;
-                if region.role != TemplateSlotRole::Radial {
-                    return Err(TrimSheetDocumentError::InvalidRadialMapping(*region_id));
-                }
-                next.region_bindings
+                let mapping = &mut next.region_bindings
                     .get_mut(region_id)
                     .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
-                    .mapping
-                    .radial = Some(*radial);
+                    .mapping;
+                if mapping.behavior.role != ManualRegionRole::Radial {
+                    return Err(TrimSheetDocumentError::InvalidRadialMapping(*region_id));
+                }
+                mapping.radial = Some(*radial);
+                mapping.behavior.radial = Some(*radial);
             }
             TrimSheetDocumentCommand::SetOutputResolution { output_size } => {
                 next.render_settings.output_size = *output_size;
@@ -1745,10 +1917,9 @@ impl TrimSheetDocument {
         sibling_binding.mapping = RegionMapping::default();
         next.region_bindings.insert(new_id, sibling_binding);
         next.source_overrides.remove(&region_id);
-        next.region_bindings
-            .get_mut(&region_id)
-            .expect("existing binding")
-            .mapping = RegionMapping::default();
+        reset_source_mapping_preserving_behavior(
+            &mut next.region_bindings.get_mut(&region_id).expect("existing binding").mapping,
+        );
         next.repin_source_frame_topology()?;
         Ok(next)
     }
@@ -1795,10 +1966,9 @@ impl TrimSheetDocument {
         next.region_bindings.remove(&sibling_id);
         next.source_overrides.remove(&region_id);
         next.source_overrides.remove(&sibling_id);
-        next.region_bindings
-            .get_mut(&region_id)
-            .expect("existing binding")
-            .mapping = RegionMapping::default();
+        reset_source_mapping_preserving_behavior(
+            &mut next.region_bindings.get_mut(&region_id).expect("existing binding").mapping,
+        );
         next.repin_source_frame_topology()?;
         Ok(next)
     }
@@ -1914,10 +2084,8 @@ impl TrimSheetDocument {
         next.topology.regions[sibling_index].grid_rect = Some(right_rect);
         for id in [region_id, next.topology.regions[sibling_index].id] {
             next.source_overrides.remove(&id);
-            next.region_bindings
-                .get_mut(&id)
-                .expect("existing binding")
-                .mapping = RegionMapping::default();
+            let binding = next.region_bindings.get_mut(&id).expect("existing binding");
+            reset_source_mapping_preserving_behavior(&mut binding.mapping);
         }
         next.repin_source_frame_topology()?;
         Ok(next)
@@ -1986,10 +2154,8 @@ impl TrimSheetDocument {
                 let mut retained = region.clone();
                 retained.grid_rect = Some(first);
                 rebuilt.push(retained);
-                next.region_bindings
-                    .get_mut(&region.id)
-                    .expect("intersected binding")
-                    .mapping = RegionMapping::default();
+                let binding = next.region_bindings.get_mut(&region.id).expect("intersected binding");
+                reset_source_mapping_preserving_behavior(&mut binding.mapping);
                 for piece in pieces.into_iter().skip(1) {
                     let new_id =
                         unique_partition_region_id(&recipe, piece, occupied_ids.iter().copied());
@@ -2176,7 +2342,7 @@ impl TrimSheetDocument {
                 if piece_index == 0 {
                     definition.grid_rect = Some(piece);
                     if changed {
-                        binding.mapping = RegionMapping::default();
+                        reset_source_mapping_preserving_behavior(&mut binding.mapping);
                         next.source_overrides.remove(&owner);
                     }
                     next.region_bindings.insert(owner, binding);
@@ -2398,7 +2564,25 @@ fn template_region_mapping(_mapping: TemplateSourceMapping) -> RegionMapping {
         transform: MappingTransform::default(),
         address_mode: AddressMode::Clamp,
         sampling: SamplingPolicy::default(),
+        behavior: RegionBehavior::default(),
     }
+}
+
+fn reset_source_mapping(behavior: RegionBehavior) -> RegionMapping {
+    RegionMapping {
+        radial: behavior.radial,
+        address_mode: if behavior.sampling == RegionSampling::OneShot {
+            AddressMode::Clamp
+        } else {
+            AddressMode::Repeat
+        },
+        behavior,
+        ..RegionMapping::default()
+    }
+}
+
+fn reset_source_mapping_preserving_behavior(mapping: &mut RegionMapping) {
+    *mapping = reset_source_mapping(mapping.behavior.clone());
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2448,6 +2632,10 @@ pub enum TrimSheetDocumentCommand {
     SetRegionAddressMode {
         region_id: RegionId,
         address_mode: AddressMode,
+    },
+    SetRegionBehavior {
+        region_id: RegionId,
+        behavior: RegionBehavior,
     },
     SetSheetFraming {
         framing: SheetFraming,
@@ -2510,6 +2698,7 @@ fn authored_region(ordinal: u32, rect: GridRect) -> AuthoredLayoutPresetRegion {
             classification_tags: vec!["AUTHORED_LAYOUT".into()],
         },
         structural_profile: StructuralProfile::Flat,
+        default_behavior: RegionBehavior::default(),
     }
 }
 
@@ -2729,6 +2918,7 @@ pub fn validate_authored_layout_preset(
                 "authored layout preset region is invalid".into(),
             ));
         }
+        validate_region_behavior(RegionId::from_bytes([0; 16]), &region.default_behavior)?;
         for y in rect.y..rect.y + rect.height {
             for x in rect.x..rect.x + rect.width {
                 let index = (y * preset.logical_grid.width + x) as usize;
@@ -2848,6 +3038,15 @@ fn validate_mapping(
     region_id: RegionId,
     mapping: &RegionMapping,
 ) -> Result<(), TrimSheetDocumentError> {
+    validate_region_behavior(region_id, &mapping.behavior)?;
+    if mapping.radial != mapping.behavior.radial
+        || (mapping.behavior.sampling == RegionSampling::OneShot
+            && mapping.address_mode != AddressMode::Clamp)
+        || (mapping.behavior.sampling != RegionSampling::OneShot
+            && mapping.address_mode != AddressMode::Repeat)
+    {
+        return Err(TrimSheetDocumentError::UnsupportedRegionBehavior(region_id));
+    }
     match mapping.projection {
         Projection::Crop { bounds, .. } => {
             if bounds.width.get() <= 0.0
@@ -2913,6 +3112,36 @@ fn validate_mapping(
         if !source_warp_is_valid(&operation.operation) {
             return Err(TrimSheetDocumentError::InvalidWarp { region_id, index });
         }
+    }
+    Ok(())
+}
+
+fn validate_region_behavior(
+    region_id: RegionId,
+    behavior: &RegionBehavior,
+) -> Result<(), TrimSheetDocumentError> {
+    if behavior.version != REGION_BEHAVIOR_VERSION
+        || behavior.edge_eligibility != EdgeEligibility::for_continuity(behavior.continuity)
+        || !behavior.supports_sampling()
+        || (behavior.role == ManualRegionRole::Radial) != behavior.radial.is_some()
+        || behavior.period_pixels.is_some_and(|period| period.contains(&0))
+    {
+        return Err(TrimSheetDocumentError::UnsupportedRegionBehavior(region_id));
+    }
+    if let Some(radial) = behavior.radial
+        && (!radial.center_x.is_finite()
+            || !radial.center_y.is_finite()
+            || !radial.inner_radius.is_finite()
+            || !radial.outer_radius.is_finite()
+            || !radial.falloff.is_finite()
+            || !(0.0..=1.0).contains(&radial.center_x)
+            || !(0.0..=1.0).contains(&radial.center_y)
+            || radial.inner_radius < 0.0
+            || radial.outer_radius <= radial.inner_radius
+            || radial.outer_radius > 2.0
+            || !(0.1..=4.0).contains(&radial.falloff))
+    {
+        return Err(TrimSheetDocumentError::InvalidRadialMapping(region_id));
     }
     Ok(())
 }
@@ -3255,6 +3484,8 @@ pub enum TrimSheetDocumentError {
     SourceCellMustBeDetached(RegionId),
     #[error("region radial mapping is invalid or unsupported for this region: {0}")]
     InvalidRadialMapping(RegionId),
+    #[error("region behavior is internally inconsistent or unsupported by Stage 14: {0}")]
+    UnsupportedRegionBehavior(RegionId),
     #[error("region mapping contains a non-finite or out-of-range numeric value: {0}")]
     InvalidNumericValue(RegionId),
     #[error("region has too many warp operations: {0}")]

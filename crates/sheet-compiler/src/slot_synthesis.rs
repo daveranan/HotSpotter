@@ -376,6 +376,11 @@ fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
         }
         _ => {}
     }
+    p.valid = p.valid
+        && p.x >= f64::from(c.x)
+        && p.x < f64::from(c.x + c.width)
+        && p.y >= f64::from(c.y)
+        && p.y < f64::from(c.y + c.height);
     p
 }
 

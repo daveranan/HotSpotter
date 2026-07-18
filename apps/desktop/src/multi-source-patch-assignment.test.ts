@@ -83,9 +83,8 @@ test("workbench and hotspot visibility are independent and the source-sheet divi
 test("selected region authority is exposed at the top of the right inspector", () => {
   assert.match(app, />REGION CONTROLS</);
   assert.match(app, />Content source<select/);
-  assert.match(app, />One-shot \/ no loop</);
-  assert.match(app, />Loop XY</);
-  assert.match(app, /set_region_address_mode/);
+  assert.match(app, /samplingOptions/);
+  assert.match(app, /set_region_behavior/);
   assert.match(compiler, /authored_repeat/);
 });
 
@@ -94,7 +93,7 @@ test("patch assignment paints immediately and publishes the persisted binding wi
   assert.match(app, /pendingPatchRegions\.map\(\(\{ region, patchPreview \}\) => <div/);
   const layoutAssignment = app.slice(app.indexOf("async function editSourceFrameLayout"), app.indexOf("function discardPartitionCandidate"));
   const directPatchAssignment = app.slice(app.indexOf("async function assignPatchToRegion"), app.indexOf("async function assignContentToRegion"));
-  const directContentAssignment = app.slice(app.indexOf("async function assignContentToRegion"), app.indexOf("async function setRegionAddressMode"));
+  const directContentAssignment = app.slice(app.indexOf("async function assignContentToRegion"), app.indexOf("async function setRegionBehavior"));
   assert.match(layoutAssignment, /if \(!assignedRegionId\) setArtifact/);
   assert.doesNotMatch(directPatchAssignment, /retopologizeArtifact|setArtifact/);
   assert.doesNotMatch(directContentAssignment, /retopologizeArtifact|setArtifact/);
@@ -103,6 +102,17 @@ test("patch assignment paints immediately and publishes the persisted binding wi
   assert.match(app, /className="content-source-group"/);
   assert.match(app, /base\?\.displayName \?\? source\.name/);
   assert.match(app, /void requestPreview\(undefined\);/);
+});
+
+test("solid content, replacement preflight, library metadata, and diagnostics are product connected", () => {
+  assert.match(app, /type: "solid", id: \{ baseColor: \[128, 128, 128, 255\] \}/);
+  assert.match(compiler, /fn build_solid_domain/);
+  assert.match(compiler, /"solid_binding"/);
+  assert.match(app, /function replaceBaseWithPreflight/);
+  assert.match(app, /affectedRegions/);
+  assert.match(app, /const readiness = base \? "Ready" : "Missing Base Color"/);
+  assert.match(app, /const shape = .*\? "Rectangle" : "Four point"/);
+  assert.match(app, /<summary>Advanced compile diagnostics<\/summary>/);
 });
 
 test("scrolling the region assignment menu does not zoom the hotspot sheet", () => {

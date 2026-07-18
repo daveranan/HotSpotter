@@ -1,8 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SourceFramePreviewController, type PreviewControllerClock } from "./source-frame-preview-controller.ts";
+import { preserveViewAcrossContentResize } from "./source-workbench-geometry.ts";
 
 type Profile = "draft512" | "refinement1024" | "authoritative";
+
+test("source-frame-preview-performance preserves manual viewport intent across draft refinement", () => {
+  const before = { x: -310, y: -180, scale: 1.5 };
+  const after = preserveViewAcrossContentResize(
+    before,
+    { width: 512, height: 512 },
+    { width: 1024, height: 1024 },
+    { width: 800, height: 600 },
+  );
+  assert.deepEqual(after, { x: -310, y: -180, scale: 0.75 });
+  const centerBefore = [(400 - before.x) / (before.scale * 512), (300 - before.y) / (before.scale * 512)];
+  const centerAfter = [(400 - after.x) / (after.scale * 1024), (300 - after.y) / (after.scale * 1024)];
+  assert.deepEqual(centerAfter, centerBefore);
+});
 
 test("source-frame-preview-performance coalesces drags and preserves a final profile request", async () => {
   class FakeClock implements PreviewControllerClock {
