@@ -99,11 +99,20 @@ test("patch assignment paints immediately and publishes the persisted binding wi
   assert.match(layoutAssignment, /if \(!pixelRegionId\) setArtifact/);
   assert.doesNotMatch(directPatchAssignment, /retopologizeArtifact|setArtifact/);
   assert.doesNotMatch(directContentAssignment, /retopologizeArtifact|setArtifact/);
-  assert.match(app, /requestPreview\(undefined, undefined, "draft512", current\.document!\.documentRevision, false\)/);
+  assert.match(app, /requestPreview\(undefined, undefined, interactivePreviewProfile, current\.document!\.documentRevision, false\)/);
   assert.doesNotMatch(app, /requestPreview\(assignedRegionId, undefined/);
   assert.match(app, /className="content-source-group"/);
   assert.match(app, /base\?\.displayName \?\? source\.name/);
-  assert.match(app, /void requestPreview\(undefined\);/);
+  assert.match(app, /void requestPreview\(undefined, undefined, interactivePreviewProfile/);
+});
+
+test("resizing an assigned patch publishes a draft before the selected interactive quality", () => {
+  const resize = app.slice(app.indexOf("async function replacePatchGeometry"), app.indexOf("async function setResolution"));
+  assert.match(resize, /assignedToRegion/);
+  assert.match(resize, /binding\.content\.type === "patch" && binding\.content\.id === patchId/);
+  assert.ok(resize.indexOf('requestPreview(undefined, undefined, "draft512", revision, false)')
+    < resize.indexOf("requestPreview(undefined, undefined, interactivePreviewProfile, revision, false)"));
+  assert.match(resize, /lastAutomaticPreviewRevision\.current = revision/);
 });
 
 test("solid content, replacement preflight, library metadata, and diagnostics are product connected", () => {
@@ -125,7 +134,7 @@ test("patch domains are bounded for draft publication and reused across assignme
   assert.match(compiler, /patch_domain_cache_key\(request\.project, source_set_id, patch, preserve_source_resolution\)/);
   assert.match(compiler, /matches!\(request\.profile, SourceFramePreviewProfile::Authoritative\)/);
   assert.match(compiler, /guard\.insert\(patch_key, Arc::clone\(&domain\)\)/);
-  assert.match(compiler, /const MAX_DIRECT_DOMAINS: usize = 32/);
+  assert.match(compiler, /const MAX_DIRECT_DOMAINS: usize = 4/);
   assert.match(compiler, /build_direct_patch_domain/);
   assert.match(compiler, /PreparedMaterialDomain::from_registered_channels/);
   assert.doesNotMatch(compiler.slice(compiler.indexOf("fn build_direct_patch_domain"), compiler.indexOf("fn build_domain")), /prepare_stage_08_material_domain|RepeatX|PeriodicTile/);
@@ -180,7 +189,7 @@ test("texture maps own replacement while source groups keep only group actions",
   const mapSlotRule = styles.slice(styles.indexOf(".map-slot {"), styles.indexOf(".map-slot.active"));
   assert.match(mapSlotRule, /padding: 1px 2px 2px 3px;/);
   assert.doesNotMatch(mapSlotRule, /height:/);
-  assert.match(styles, /\.map-slot\.add-maps \{[\s\S]*place-items: center;[\s\S]*align-self: stretch;[\s\S]*flex: 0 0 auto;[\s\S]*min-width: max-content;[\s\S]*white-space: nowrap;/);
+  assert.match(styles, /\.map-slot\.add-maps \{[\s\S]*place-items: center;[\s\S]*align-self: stretch;[\s\S]*flex: 0 0 auto;[\s\S]*min-width: 88px;[\s\S]*white-space: nowrap;/);
 });
 
 test("source, patch, and texture context menus dismiss on outside pointer input", () => {

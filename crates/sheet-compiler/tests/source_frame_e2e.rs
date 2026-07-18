@@ -263,6 +263,88 @@ fn manual_region_behavior_compile_persisted_executes_modes_edges_radial_and_pers
     assert_eq!(reopened_save_as.regions[0].default_behavior, radial, "preset Save As preserves every behavior field");
 }
 
+#[test]
+fn manual_region_behavior_resized_patch_invalidates_only_its_rendered_domain() {
+    use hot_trimmer_domain::{
+        ContentReference, NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId,
+        PatchProperties, RectificationSettings,
+    };
+
+    let root = std::env::temp_dir().join(format!("hot-trimmer-patch-domain-cache-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create patch cache fixture directory");
+    let project_path = root.join("patch-domain-cache.hottrimmer");
+    let mut store = ProjectStore::create(&project_path, "Patch Domain Cache").expect("create patch cache project");
+    let (encoded, _) = numbered_source();
+    let source_set_id = Uuid::from_bytes(store.summary().unwrap().source_sets[0].id.to_bytes());
+    let source_id = SourceId::new();
+    store.replace_source_in_set(source_set_id, SourceChannel::BaseColor, &SourceInput {
+        id: source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
+        origin_path: PathBuf::from("numbered-patch-cache.png"), sha256: ContentDigest::sha256(&encoded).0,
+        width: 128, height: 64, format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+        exif_orientation: 1, has_embedded_icc_profile: false, encoded_bytes: encoded.len() as u64,
+        owned_bytes: Some(encoded),
+    }).expect("register patch cache source");
+    store.create_source_frame_document().expect("create patch cache document");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
+        output_size: PixelSize { width: 64, height: 64 },
+    }).expect("set patch cache output");
+
+    let square = |left: f64, top: f64| PatchGeometry {
+        corners: [
+            NormalizedPoint::new(left, top).unwrap(),
+            NormalizedPoint::new(left + 0.25, top).unwrap(),
+            NormalizedPoint::new(left + 0.25, top + 0.25).unwrap(),
+            NormalizedPoint::new(left, top + 0.25).unwrap(),
+        ],
+        assistance_mask: None,
+    };
+    let patch_id = PatchId::new();
+    store.execute_patch_command(&PatchCommand::Create {
+        patch: Patch {
+            id: patch_id, source_id, name: "Radial Cache Patch".into(), enabled: true,
+            geometry: square(0.0, 0.0), properties: PatchProperties::default(),
+            rectification: RectificationSettings::default(),
+        },
+        index: None,
+    }, None).expect("create radial cache patch");
+    store.refresh_document_assets().expect("refresh radial cache patch");
+    let region_id = store.document().unwrap().topology.regions[0].id;
+    store.execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
+        region_id, content: ContentReference::Patch(patch_id),
+    }).expect("assign radial cache patch");
+    let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
+    radial.synchronize_derived_fields();
+    store.execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior: radial })
+        .expect("classify radial cache patch");
+
+    let compiler = hot_trimmer_sheet_compiler::AlgorithmCompiler::new();
+    let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
+    let compile = |store: &ProjectStore, input_hash: &str| {
+        let summary = store.summary().expect("patch cache summary");
+        let revision = summary.document.as_ref().unwrap().document_revision;
+        compiler.compile_persisted_stage_14_preview_with_cache(
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                project: &summary, revision, draft_id: None, input_hash: Some(input_hash.into()),
+                profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+            },
+            &CancellationToken::new(), || true, Some(&cache),
+        ).expect("compile radial patch cache fixture")
+    };
+    let before = compile(&store, "before-resize");
+    store.execute_patch_command(&PatchCommand::ReplaceGeometry {
+        patch_id, geometry: square(0.7, 0.7),
+    }, Some(1)).expect("move radial cache patch");
+    store.refresh_document_assets().expect("refresh moved radial cache patch");
+    let after = compile(&store, "after-resize");
+
+    assert_ne!(selected_region_pixels(&before, region_id), selected_region_pixels(&after, region_id),
+        "the same PatchId with different authored geometry must not reuse old radial pixels");
+    assert!(after.telemetry.iter().any(|line| line.contains("render_cache_hits=23")),
+        "only the resized patch region should miss the rendered-region cache");
+    drop(store);
+    std::fs::remove_dir_all(root).expect("remove patch cache fixture directory");
+}
+
 fn fixture_project(target: u32) -> (ProjectStore, Vec<u8>, TrimSheetDocument) {
     fixture_project_with_output(target, PixelSize { width: 64, height: 64 })
 }

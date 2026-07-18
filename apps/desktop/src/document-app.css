@@ -530,7 +530,7 @@ button:disabled {
   align-self: stretch;
   flex: 0 0 auto;
   width: auto;
-  min-width: max-content;
+  min-width: 88px;
   padding: 2px 8px;
   white-space: nowrap;
   text-align: center;

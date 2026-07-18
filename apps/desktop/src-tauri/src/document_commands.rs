@@ -103,6 +103,7 @@ impl ProjectSession {
             .join(format!("baseline-{}.hottrimmer", Uuid::new_v4()));
         store.backup_atomic(&baseline).map_err(store_error)?;
         self.store = Some(store);
+        self.source_projection_cache.lock().map_err(|_| poisoned())?.clear();
         self.preview_prepared_sources.clear();
         self.prepared_exemplars = PreparedExemplarCache::default();
         self.source_analysis_cache = SourceAnalysisCache::default();
@@ -166,6 +167,18 @@ pub struct PreviewService {
     cancellation_count: AtomicU64,
     source_frame_cache: Mutex<hot_trimmer_sheet_compiler::SourceFramePreviewCache>,
     previewed_candidate_recipes: Mutex<BTreeSet<(u64, hot_trimmer_domain::DocumentHash)>>,
+}
+
+impl PreviewService {
+    fn reset(&self) {
+        self.latest_draft_id.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut cache) = self.source_frame_cache.lock() {
+            *cache = hot_trimmer_sheet_compiler::SourceFramePreviewCache::default();
+        }
+        if let Ok(mut candidates) = self.previewed_candidate_recipes.lock() {
+            candidates.clear();
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -652,12 +665,14 @@ pub fn startup_status(state: State<'_, StartupState>) -> StartupStatus {
 pub fn create_project(
     request: CreateProjectRequest,
     session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
     let store =
         ProjectStore::create(Path::new(&request.path), request.name.trim()).map_err(store_error)?;
     session.adopt(store, false)?;
+    preview_service.reset();
     remember_open_project_best_effort(&session);
     project_projection(&session)
 }
@@ -666,6 +681,7 @@ pub fn create_project(
 pub fn create_draft_project(
     request: FoundationStatusRequest,
     session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
 ) -> Result<ProjectProjection, UserFacingError> {
     request.validate().map_err(UserFacingError::from)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
@@ -675,6 +691,7 @@ pub fn create_draft_project(
         .join(format!("Untitled-{}.hottrimmer", Uuid::new_v4()));
     let store = ProjectStore::create(&path, "Untitled").map_err(store_error)?;
     session.adopt(store, true)?;
+    preview_service.reset();
     project_projection(&session)
 }
 
@@ -682,11 +699,13 @@ pub fn create_draft_project(
 pub fn open_project(
     request: ProjectPathRequest,
     session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
     let store = ProjectStore::open(Path::new(&request.path)).map_err(store_error)?;
     session.adopt(store, false)?;
+    preview_service.reset();
     remember_open_project_best_effort(&session);
     project_projection(&session)
 }
@@ -2584,6 +2603,7 @@ pub fn list_recent_projects(
 pub fn close_project(
     request: CloseProjectRequest,
     session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
 ) -> Result<(), UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let mut session = session.lock().map_err(|_| poisoned())?;
@@ -2599,6 +2619,12 @@ pub fn close_project(
         }
     }
     session.store = None;
+    session.source_projection_cache.lock().map_err(|_| poisoned())?.clear();
+    session.preview_prepared_sources.clear();
+    session.prepared_exemplars = PreparedExemplarCache::default();
+    session.source_analysis_cache = SourceAnalysisCache::default();
+    session.scale_orientation_cache = ScaleOrientationCache::default();
+    preview_service.reset();
     if let Some(path) = session.baseline.take() {
         let _ = fs::remove_file(path);
     }

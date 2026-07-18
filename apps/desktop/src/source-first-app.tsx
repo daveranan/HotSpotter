@@ -1007,6 +1007,10 @@ function App() {
       if (failure(reason).code !== "operation_cancelled") {
         setProblem(failure(reason));
         if (draftId === previewDraftId.current) setPreviewProgress({ requestId: draftId, phase: "failed", profile, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs: performance.now() - (previewPublishStartedAt.current ?? performance.now()) });
+      } else if (draftId === previewDraftId.current) {
+        // A superseded native job is terminal for this request. Do not leave the footer
+        // counting forever as though CPU/GPU work were still running.
+        setPreviewProgress(null);
       }
     }
   }
@@ -1126,6 +1130,15 @@ function App() {
   }
 
   async function closeToDraft() {
+    // Drop browser-held data URLs and decoded preview surfaces before the native project/cache
+    // boundary. WebView allocators may retain committed pages, but no old project image remains reachable.
+    previewDraftId.current += 1;
+    setArtifact(null);
+    setPreview(null);
+    setPreparedPatchPreview(null);
+    setPreparedPatchPreviews({});
+    setPreviewProgress(null);
+    setPreviewClientTelemetry([]);
     try {
       await invoke("close_project", { request: { ...protocol, save: false } });
     } catch {
@@ -1356,7 +1369,31 @@ function App() {
 
   async function replacePatchGeometry(patchId: string, geometry: PatchGeometry) {
     try {
-      await patchCommand({ type: "replace_geometry", patchId, geometry }, Date.now());
+      undoneRegionPatchConversion.current = null;
+      const next = await invoke<ProjectProjection>("apply_patch_command", {
+        request: { ...protocol, command: { type: "replace_geometry", patchId, geometry }, coalescingGroup: Date.now() },
+      });
+      const assignedToRegion = Object.values(next.document?.regionBindings ?? {}).some((binding) =>
+        binding.content.type === "patch" && binding.content.id === patchId);
+      if (assignedToRegion && next.document) {
+        const revision = next.document.documentRevision;
+        // An assigned patch is part of the persisted Stage 14 appearance. Publish a small
+        // artifact first so a radial patch resize cannot leave the sheet stale while the
+        // selected 2K/4K/8K interactive profile is still rendering or encoding.
+        lastAutomaticPreviewRevision.current = revision;
+        dirtyPreviewRegion.current = null;
+        // Set the suppression token before publishing the new projection. This closes the
+        // race where React's revision effect could start a second native job first.
+        setProject(next);
+        setProblem(null);
+        await requestPreview(undefined, undefined, "draft512", revision, false);
+        if (interactivePreviewProfile !== "draft512" && lastAutomaticPreviewRevision.current === revision) {
+          void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
+        }
+      } else {
+        setProject(next);
+        setProblem(null);
+      }
       if (patchFallbackContent.current.has(patchId)) {
         patchGeometryEditDepth.current.set(patchId, (patchGeometryEditDepth.current.get(patchId) ?? 0) + 1);
         patchGeometryRedoDepth.current.set(patchId, 0);

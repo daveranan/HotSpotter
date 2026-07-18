@@ -20,7 +20,7 @@ use hot_trimmer_effect_compiler::{
 };
 use hot_trimmer_image_io::{
     CancellationToken as ImageCancellationToken, ImagePlane, LinearColor, NormalizationSettings,
-    ResolvedAlphaMode,
+    PreparedChannelCacheKey, PreparedChannelSet, ResolvedAlphaMode,
     prepare_registered_channel_set,
 };
 use hot_trimmer_material_analysis::{
@@ -135,6 +135,7 @@ impl Default for SourceFramePreviewProfile {
 
 #[derive(Clone, Debug, Default)]
 pub struct SourceFramePreviewCache {
+    prepared_sources: BTreeMap<PreparedChannelCacheKey, Arc<PreparedChannelSet>>,
     direct_domains:
         BTreeMap<ContentDigest, Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>>,
     rendered_regions: BTreeMap<ContentDigest, Arc<SynthesizedSlotMaterial>>,
@@ -158,6 +159,20 @@ impl SourceFramePreviewCache {
     ) -> Option<Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>> {
         self.direct_domains.get(key).cloned()
     }
+    fn get_prepared(&self, key: &PreparedChannelCacheKey) -> Option<Arc<PreparedChannelSet>> {
+        self.prepared_sources.get(key).cloned()
+    }
+    fn insert_prepared(&mut self, prepared: Arc<PreparedChannelSet>) {
+        const MAX_PREPARED_SOURCES: usize = 2;
+        if self.prepared_sources.len() >= MAX_PREPARED_SOURCES
+            && !self.prepared_sources.contains_key(&prepared.cache_key)
+        {
+            if let Some(oldest) = self.prepared_sources.keys().next().cloned() {
+                self.prepared_sources.remove(&oldest);
+            }
+        }
+        self.prepared_sources.insert(prepared.cache_key.clone(), prepared);
+    }
     fn insert(
         &mut self,
         key: ContentDigest,
@@ -165,7 +180,7 @@ impl SourceFramePreviewCache {
     ) {
         // Keep the pinned SourceFrame plus a small working set of authored patch domains.
         // Patch assignment must not redo Stages 2-8 every time the same patch is rebound.
-        const MAX_DIRECT_DOMAINS: usize = 32;
+        const MAX_DIRECT_DOMAINS: usize = 4;
         if self.direct_domains.len() >= MAX_DIRECT_DOMAINS
             && !self.direct_domains.contains_key(&key)
         {
@@ -179,7 +194,7 @@ impl SourceFramePreviewCache {
         self.rendered_regions.get(key).cloned()
     }
     fn insert_rendered(&mut self, key: ContentDigest, result: Arc<SynthesizedSlotMaterial>) {
-        const MAX_RENDERED_REGIONS: usize = 128;
+        const MAX_RENDERED_REGIONS: usize = 32;
         if self.rendered_regions.len() >= MAX_RENDERED_REGIONS
             && !self.rendered_regions.contains_key(&key)
         {
@@ -193,7 +208,7 @@ impl SourceFramePreviewCache {
         self.composed_atlases.get(key).cloned()
     }
     fn insert_composed(&mut self, key: ContentDigest, artifact: Arc<IntermediateAtlasArtifact>) {
-        const MAX_COMPOSED_ATLASES: usize = 2;
+        const MAX_COMPOSED_ATLASES: usize = 1;
         if self.composed_atlases.len() >= MAX_COMPOSED_ATLASES
             && !self.composed_atlases.contains_key(&key)
         {
@@ -846,7 +861,8 @@ fn compile_source_frame(
         request.profile, output_size.width, output_size.height, request.revision,
         document.appearance_hash().map_err(|error| error.to_string())?, request.input_hash,
     ).as_bytes());
-    if let Some(cached) = source_frame_cache.and_then(|cache| {
+    if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
+        && let Some(cached) = source_frame_cache.and_then(|cache| {
         cache
             .lock()
             .ok()
@@ -865,17 +881,21 @@ fn compile_source_frame(
     let decode_started = Instant::now();
     // SourceFrame geometry is owned by its persisted sourceSetId. Selection and primary
     // material are independent UI/document state and must never choose the frame validator.
+    let reusable_source_cache = if matches!(request.profile, SourceFramePreviewProfile::Authoritative) {
+        None
+    } else {
+        source_frame_cache
+    };
     let (frame_domain, decode_cache_hit) = direct_source_frame_domain(
         request.project,
         frame.source_set_id,
+        request.profile,
         image_cancellation,
-        source_frame_cache,
+        reusable_source_cache,
     )?;
     let decode_ms = decode_started.elapsed().as_millis();
-    if frame_domain.width != frame.oriented_dimensions.width
-        || frame_domain.height != frame.oriented_dimensions.height
-    {
-        return Err("SourceFrame oriented dimensions do not match the prepared source".into());
+    if frame_domain.width == 0 || frame_domain.height == 0 {
+        return Err("SourceFrame prepared source dimensions are empty".into());
     }
     // Resolve the existing RegionBinding authority once per region. Inherited content uses
     // the pinned primary, an explicit material source uses that whole registered source, and
@@ -901,7 +921,8 @@ fn compile_source_frame(
             let source_set_id = source_set_id.expect("patch content has an owning source set");
             let preserve_source_resolution = matches!(request.profile, SourceFramePreviewProfile::Authoritative);
             let patch_key = patch_domain_cache_key(request.project, source_set_id, patch, preserve_source_resolution)?;
-            if let Some(found) = source_frame_cache.and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&patch_key))) {
+            if let Some(found) = (!preserve_source_resolution).then_some(source_frame_cache).flatten()
+                .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&patch_key))) {
                 found
             } else {
                 let domain = Arc::new(build_direct_patch_domain(
@@ -912,8 +933,9 @@ fn compile_source_frame(
                     preserve_source_resolution,
                     image_cancellation,
                     _render_cancellation,
+                    (!preserve_source_resolution).then_some(source_frame_cache).flatten(),
                 )?);
-                if let Some(cache) = source_frame_cache {
+                if !preserve_source_resolution && let Some(cache) = source_frame_cache {
                     if let Ok(mut guard) = cache.lock() { guard.insert(patch_key, Arc::clone(&domain)); }
                 }
                 domain
@@ -925,8 +947,9 @@ fn compile_source_frame(
             let (domain, _) = direct_source_frame_domain(
                 request.project,
                 source_set_id,
+                request.profile,
                 image_cancellation,
-                source_frame_cache,
+                reusable_source_cache,
             )?;
             direct_domains.insert(source_set_id, Arc::clone(&domain));
             domain
@@ -938,13 +961,13 @@ fn compile_source_frame(
         ));
     }
     let source_left =
-        (frame.bounds.x.get() * f64::from(frame.oriented_dimensions.width)).round() as u32;
+        (frame.bounds.x.get() * f64::from(frame_domain.width)).round() as u32;
     let source_top =
-        (frame.bounds.y.get() * f64::from(frame.oriented_dimensions.height)).round() as u32;
+        (frame.bounds.y.get() * f64::from(frame_domain.height)).round() as u32;
     let source_width =
-        (frame.bounds.width.get() * f64::from(frame.oriented_dimensions.width)).round() as u32;
+        (frame.bounds.width.get() * f64::from(frame_domain.width)).round() as u32;
     let source_height =
-        (frame.bounds.height.get() * f64::from(frame.oriented_dimensions.height)).round() as u32;
+        (frame.bounds.height.get() * f64::from(frame_domain.height)).round() as u32;
     let source_x = hot_trimmer_domain::resolve_boundaries(source_left, source_width, grid.width);
     let source_y = hot_trimmer_domain::resolve_boundaries(source_top, source_height, grid.height);
     let destination_x = hot_trimmer_domain::resolve_boundaries(0, output_size.width, grid.width);
@@ -987,16 +1010,16 @@ fn compile_source_frame(
                 .get(&region.id)
                 .map(|value| {
                     let bounds = value.source_bounds;
-                    let x = (bounds.x.get() * f64::from(frame.oriented_dimensions.width)).round()
+                    let x = (bounds.x.get() * f64::from(frame_domain.width)).round()
                         as u32;
-                    let y = (bounds.y.get() * f64::from(frame.oriented_dimensions.height)).round()
+                    let y = (bounds.y.get() * f64::from(frame_domain.height)).round()
                         as u32;
                     SourceCrop {
                         x,
                         y,
-                        width: (bounds.width.get() * f64::from(frame.oriented_dimensions.width))
+                        width: (bounds.width.get() * f64::from(frame_domain.width))
                             .round() as u32,
-                        height: (bounds.height.get() * f64::from(frame.oriented_dimensions.height))
+                        height: (bounds.height.get() * f64::from(frame_domain.height))
                             .round() as u32,
                     }
                 })
@@ -1156,20 +1179,22 @@ fn compile_source_frame(
             hotspot: semantic,
         };
         let rendered_key = ContentDigest::sha256(format!(
-            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|semantic={}x{}|padding={preview_padding_px}",
+            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|domain={:?}|semantic={}x{}|padding={preview_padding_px}",
             request.profile, output_size.width, output_size.height, plan.candidate.candidate_id,
+            domain.cache_key,
             semantic.width, semantic.height,
         ).as_bytes());
-        let result = if let Some(cached) = source_frame_cache.and_then(|cache| {
+        let result = if let Some(cached) = (!matches!(request.profile, SourceFramePreviewProfile::Authoritative))
+            .then_some(source_frame_cache).flatten().and_then(|cache| {
             cache
                 .lock()
                 .ok()
                 .and_then(|guard| guard.get_rendered(&rendered_key))
         }) {
             rendered_cache_hits += 1;
-            (*cached).clone()
+            cached
         } else {
-            let result = synthesize_slot_material_with_guard(
+            let result = Arc::new(synthesize_slot_material_with_guard(
                 SlotSynthesisRequest {
                     plan: &plan,
                     domain: domain.as_ref(),
@@ -1183,10 +1208,11 @@ fn compile_source_frame(
                     "Stage 14 direct SourceFrame sampling failed for {}: {error}",
                     region.id
                 )
-            })?;
-            if let Some(cache) = source_frame_cache {
+            })?);
+            if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
+                && let Some(cache) = source_frame_cache {
                 if let Ok(mut guard) = cache.lock() {
-                    guard.insert_rendered(rendered_key, Arc::new(result.clone()));
+                    guard.insert_rendered(rendered_key, Arc::clone(&result));
                 }
             }
             result
@@ -1259,7 +1285,7 @@ fn compile_source_frame(
                 patch_id: region_domains[index].1.clone(),
                 domain: region_domains[index].2.as_ref(),
                 plan,
-                result,
+                result: result.as_ref(),
                 grid_rect: region.grid_rect,
                 behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
             },
@@ -1313,7 +1339,8 @@ fn compile_source_frame(
         frame_domain.width, frame_domain.height, output_size.width, output_size.height,
         document.render_settings.atlas_padding_px, preview_padding_px, document.topology.regions.len(), document.patches.len(),
         u8::from(!decode_cache_hit), u8::from(!decode_cache_hit), started.elapsed().as_millis()));
-    if let Some(cache) = source_frame_cache {
+    if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
+        && let Some(cache) = source_frame_cache {
         if let Ok(mut guard) = cache.lock() {
             guard.insert_composed(composition_key, Arc::new(artifact.clone()));
         }
@@ -1324,6 +1351,7 @@ fn compile_source_frame(
 fn direct_source_frame_domain(
     project: &ProjectSummary,
     source_set_id: hot_trimmer_domain::SourceSetId,
+    profile: SourceFramePreviewProfile,
     cancellation: &ImageCancellationToken,
     cache: Option<&Mutex<SourceFramePreviewCache>>,
 ) -> Result<
@@ -1342,17 +1370,25 @@ fn direct_source_frame_domain(
         })
         .collect::<Vec<_>>();
     let (registered, encoded) = registered_inputs(&sources)?;
+    let max_level_zero_edge = match profile {
+        SourceFramePreviewProfile::Draft512 => Some(1024),
+        SourceFramePreviewProfile::Refinement1024 => Some(2048),
+        SourceFramePreviewProfile::Authoritative => None,
+    };
     let settings = NormalizationSettings {
         max_levels: 1,
+        // This is a conservative peak-work declaration and includes scratch required to
+        // decode the original compressed image before the bounded level-zero resize. It is
+        // not retained-domain memory; max_level_zero_edge below controls that allocation.
         max_memory_bytes: 4_294_967_296,
-        max_level_zero_edge: None,
+        max_level_zero_edge,
         ..NormalizationSettings::default()
     };
-    let prepared_key = hot_trimmer_image_io::prepared_cache_key(&registered, &settings).0;
+    let prepared_key = hot_trimmer_image_io::prepared_cache_key(&registered, &settings);
     let cache_key = ContentDigest::sha256(
         format!(
             "{DIRECT_SOURCE_FRAME_DECODER_VERSION}|{}|orientation={}",
-            prepared_key.0, registered.orientation
+            prepared_key.0.0, registered.orientation
         )
         .as_bytes(),
     );
@@ -1361,10 +1397,20 @@ fn direct_source_frame_domain(
     {
         return Ok((found, true));
     }
-    let prepared = prepare_registered_channel_set(&registered, &encoded, &settings, cancellation)
-        .map_err(|error| {
-        format!("Stage 2 direct SourceFrame decode/preparation failed: {error}")
-    })?;
+    let prepared = if let Some(found) = cache
+        .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get_prepared(&prepared_key)))
+    {
+        found
+    } else {
+        let prepared = Arc::new(prepare_registered_channel_set(&registered, &encoded, &settings, cancellation)
+            .map_err(|error| format!("Stage 2 direct SourceFrame decode/preparation failed: {error}"))?);
+        if let Some(cache) = cache
+            && let Ok(mut guard) = cache.lock()
+        {
+            guard.insert_prepared(Arc::clone(&prepared));
+        }
+        prepared
+    };
     let channels = registered_level_zero_channels(&prepared)
         .map_err(|error| format!("direct registered preparation failed: {error}"))?;
     let domain = Arc::new(
@@ -1668,27 +1714,40 @@ fn build_direct_patch_domain(
     preserve_source_resolution: bool,
     image_cancellation: &ImageCancellationToken,
     render_cancellation: &RenderCancellationToken,
+    cache: Option<&Mutex<SourceFramePreviewCache>>,
 ) -> Result<hot_trimmer_material_synthesis::PreparedMaterialDomain, String> {
     let source_set = project.source_sets.iter().find(|set| set.id == source_set_id)
         .ok_or_else(|| format!("material source set {source_set_id} is missing"))?;
     let sources = project.sources.iter()
-        .filter(|source| source.source_set_id.to_string() == source_set_id.to_string())
+        .filter(|source| source.source_set_id.to_string() == source_set_id.to_string()
+            && source.registration.role == MaterialChannelRole::BaseColor)
         .collect::<Vec<_>>();
     if !sources.iter().any(|source| source.input.id == patch.source_id) {
         return Err(format!("patch {} does not belong to material source set {source_set_id}", patch.id));
     }
     let (registered, encoded) = registered_inputs(&sources)?;
-    let prepared = prepare_registered_channel_set(
-        &registered,
-        &encoded,
-        &NormalizationSettings {
-            max_levels: 1,
-            max_memory_bytes: 1_073_741_824,
-            max_level_zero_edge: (!preserve_source_resolution).then_some(1024),
-            ..NormalizationSettings::default()
-        },
-        image_cancellation,
-    ).map_err(|error| format!("Stage 2 direct patch preparation failed: {error}"))?;
+    let settings = NormalizationSettings {
+        max_levels: 1,
+        max_memory_bytes: 4_294_967_296,
+        max_level_zero_edge: (!preserve_source_resolution).then_some(1024),
+        ..NormalizationSettings::default()
+    };
+    let prepared_key = hot_trimmer_image_io::prepared_cache_key(&registered, &settings);
+    let prepared = if let Some(found) = cache
+        .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get_prepared(&prepared_key)))
+    {
+        found
+    } else {
+        let prepared = Arc::new(prepare_registered_channel_set(
+            &registered, &encoded, &settings, image_cancellation,
+        ).map_err(|error| format!("Stage 2 direct patch preparation failed: {error}"))?);
+        if let Some(cache) = cache
+            && let Ok(mut guard) = cache.lock()
+        {
+            guard.insert_prepared(Arc::clone(&prepared));
+        }
+        prepared
+    };
     let patch_revision = u64::from_str_radix(&cache_key.0[..16], 16)
         .map_err(|error| format!("direct patch revision failed: {error}"))?;
     let exemplar = prepare_registered_exemplar(
