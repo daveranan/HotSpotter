@@ -1,6 +1,6 @@
 //! Non-exportable composition of authoritative Stage 14 slot results into Stage 9 topology.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, CompiledTemplateTopology, ContentDigest,
@@ -56,6 +56,10 @@ pub struct IntermediateSlotInspection {
     pub display_name: String,
     pub allocation: hot_trimmer_domain::CanonicalRect,
     pub hotspot: hot_trimmer_domain::CanonicalRect,
+    pub semantic_rect: hot_trimmer_domain::CanonicalRect,
+    pub padded_rect: hot_trimmer_domain::CanonicalRect,
+    pub atlas_destination: hot_trimmer_domain::CanonicalRect,
+    pub preview_padding_px: u32,
     pub mapping_mode: SamplingMode,
     pub source_transform: CandidateTransform,
     pub isotropic_scale: f64,
@@ -92,6 +96,9 @@ pub struct IntermediateAtlasArtifact {
     pub unavailable_channels: Vec<MaterialChannelRole>,
     pub correspondence: Vec<[f32; 2]>,
     pub validity: Vec<u8>,
+    /// Per-pixel RegionId ownership, including padding. This categorical authority is
+    /// retained without encoding unrelated material channels for a Base Color preview.
+    pub region_ownership: Vec<RegionId>,
     pub slots: Vec<IntermediateSlotInspection>,
     pub algorithm_versions: BTreeMap<u8, AlgorithmProvenance>,
     pub diagnostics: Vec<CompilationDiagnostic>,
@@ -163,6 +170,7 @@ pub(crate) fn compose_intermediate_atlas(
         .collect::<BTreeMap<_, _>>();
     let mut correspondence = vec![[f32::NAN; 2]; pixels];
     let mut validity = vec![0_u8; pixels];
+    let mut region_ownership = vec![None; pixels];
     let mut inspections = Vec::with_capacity(request.slots.len());
 
     for input in &request.slots {
@@ -171,11 +179,16 @@ pub(crate) fn compose_intermediate_atlas(
         let topology_slot = request.topology.slots.iter().find(|slot| slot.slot_key == input.slot_key)
             .ok_or_else(|| IntermediateAtlasError::SlotArtifactMismatch(input.slot_key.into()))?;
         let allocation = topology_slot.allocation;
+        let semantic = topology_slot.hotspot;
         if request.placement_plan.placements.iter().find(|plan| plan.slot_id == input.plan.slot_id) != Some(input.plan)
             || input.plan.slot_id != input.region_id
-            || input.result.width != allocation.width || input.result.height != allocation.height
+            || input.result.width != semantic.width || input.result.height != semantic.height
             || allocation.x.checked_add(allocation.width).is_none_or(|end| end > width)
             || allocation.y.checked_add(allocation.height).is_none_or(|end| end > height)
+            || semantic.x < allocation.x || semantic.y < allocation.y
+            || semantic.x.checked_add(semantic.width).is_none_or(|end| end > allocation.x + allocation.width)
+            || semantic.y.checked_add(semantic.height).is_none_or(|end| end > allocation.y + allocation.height)
+            || semantic.width == 0 || semantic.height == 0
             || input.result.diagnostics.executed_mode != input.plan.candidate.mapping_mode
             || input.plan.candidate.domain_id != input.domain.cache_key
         {
@@ -184,15 +197,13 @@ pub(crate) fn compose_intermediate_atlas(
         let plan_id = ContentDigest::sha256(&serde_json::to_vec(input.plan)
             .map_err(|error| IntermediateAtlasError::Identity(error.to_string()))?);
         let result_id = slot_result_id(input.result, &plan_id);
-        let mut valid_count = 0_u64;
-        for y in 0..allocation.height {
-            for x in 0..allocation.width {
-                let atlas = usize::try_from(u64::from(allocation.y + y) * u64::from(width) + u64::from(allocation.x + x))
+        for y in 0..semantic.height {
+            for x in 0..semantic.width {
+                let atlas = usize::try_from(u64::from(semantic.y + y) * u64::from(width) + u64::from(semantic.x + x))
                     .map_err(|_| IntermediateAtlasError::InvalidTopology)?;
                 correspondence[atlas] = *input.result.correspondence.pixel(x, y);
                 let is_valid = input.result.validity.pixel(x, y).0 >= 0.5;
                 validity[atlas] = u8::from(is_valid) * 255;
-                valid_count += u64::from(is_valid);
                 if is_valid {
                     for role in &roles {
                         let channel = input.result.channels.iter().find(|channel| channel.role() == *role)
@@ -202,9 +213,47 @@ pub(crate) fn compose_intermediate_atlas(
                 }
             }
         }
+        dilate_invalid_semantic(
+            semantic,
+            width,
+            &mut correspondence,
+            &mut validity,
+            &mut channel_pixels,
+        )?;
+        for y in allocation.y..allocation.y + allocation.height {
+            for x in allocation.x..allocation.x + allocation.width {
+                let atlas = usize::try_from(u64::from(y) * u64::from(width) + u64::from(x))
+                    .map_err(|_| IntermediateAtlasError::InvalidTopology)?;
+                if region_ownership[atlas].replace(input.region_id).is_some() {
+                    return Err(IntermediateAtlasError::SlotArtifactMismatch(input.slot_key.into()));
+                }
+                if x < semantic.x || x >= semantic.x + semantic.width || y < semantic.y || y >= semantic.y + semantic.height {
+                    let owner_x = x.clamp(semantic.x, semantic.x + semantic.width - 1);
+                    let owner_y = y.clamp(semantic.y, semantic.y + semantic.height - 1);
+                    let owner = usize::try_from(u64::from(owner_y) * u64::from(width) + u64::from(owner_x))
+                        .map_err(|_| IntermediateAtlasError::InvalidTopology)?;
+                    correspondence[atlas] = correspondence[owner];
+                    validity[atlas] = validity[owner];
+                    for pixels in channel_pixels.values_mut() {
+                        let source = pixels[owner * 4..owner * 4 + 4].to_vec();
+                        pixels[atlas * 4..atlas * 4 + 4].copy_from_slice(&source);
+                    }
+                }
+            }
+        }
+        let valid_count = (allocation.y..allocation.y + allocation.height)
+            .flat_map(|y| (allocation.x..allocation.x + allocation.width).map(move |x| (x, y)))
+            .filter(|(x, y)| validity[(*y * width + *x) as usize] > 0)
+            .count() as u64;
+        let preview_padding_px = semantic.x.saturating_sub(allocation.x)
+            .max(semantic.y.saturating_sub(allocation.y))
+            .max((allocation.x + allocation.width).saturating_sub(semantic.x + semantic.width))
+            .max((allocation.y + allocation.height).saturating_sub(semantic.y + semantic.height));
         inspections.push(IntermediateSlotInspection {
             region_id: input.region_id, slot_key: input.slot_key.into(), display_name: input.display_name.into(), allocation,
-            hotspot: topology_slot.hotspot, mapping_mode: input.plan.candidate.mapping_mode,
+            hotspot: semantic, semantic_rect: semantic, padded_rect: allocation,
+            atlas_destination: allocation, preview_padding_px,
+            mapping_mode: input.plan.candidate.mapping_mode,
             source_transform: input.plan.candidate.transform, isotropic_scale: input.plan.candidate.isotropic_scale,
             sampling_scale: input.plan.sampling_policy.scale,
             valid_pixel_count: valid_count, source_id: input.plan.candidate.source_id.clone(),
@@ -239,11 +288,75 @@ pub(crate) fn compose_intermediate_atlas(
         topology: request.topology.clone(), placement_plan_id,
         channels: channel_pixels.into_iter().map(|(role, rgba8)| IntermediateAtlasChannel { role, rgba8 }).collect(),
         unavailable_channels: all_importable.into_iter().filter(|role| !roles.contains(role)).collect(),
-        correspondence, validity, slots: inspections, algorithm_versions: request.algorithm_versions.clone(),
+        correspondence, validity,
+        region_ownership: region_ownership.into_iter().collect::<Option<Vec<_>>>()
+            .ok_or(IntermediateAtlasError::IncompletePlacementPlan)?,
+        slots: inspections, algorithm_versions: request.algorithm_versions.clone(),
         diagnostics: request.diagnostics.clone(), regions: request.regions.clone(), telemetry: Vec::new(),
         pending: vec!["profiles", "semantic details", "effects", "final PBR composition", "finishing",
             "mips", "metadata", "export", "Blender application"],
     })
+}
+
+fn dilate_invalid_semantic(
+    semantic: hot_trimmer_domain::CanonicalRect,
+    atlas_width: u32,
+    correspondence: &mut [[f32; 2]],
+    validity: &mut [u8],
+    channels: &mut BTreeMap<MaterialChannelRole, Vec<u8>>,
+) -> Result<(), IntermediateAtlasError> {
+    let local_pixels = usize::try_from(u64::from(semantic.width) * u64::from(semantic.height))
+        .map_err(|_| IntermediateAtlasError::InvalidTopology)?;
+    let mut nearest = vec![usize::MAX; local_pixels];
+    let mut queue = VecDeque::new();
+    for y in 0..semantic.height {
+        for x in 0..semantic.width {
+            let local = (y * semantic.width + x) as usize;
+            let atlas = ((semantic.y + y) * atlas_width + semantic.x + x) as usize;
+            if validity[atlas] > 0 {
+                nearest[local] = local;
+                queue.push_back(local);
+            }
+        }
+    }
+    if queue.is_empty() {
+        return Err(IntermediateAtlasError::MissingRequiredSlot("base_color_validity".into()));
+    }
+    while let Some(local) = queue.pop_front() {
+        let x = local as u32 % semantic.width;
+        let y = local as u32 / semantic.width;
+        let neighbors = [
+            x.checked_sub(1).map(|nx| (nx, y)),
+            (x + 1 < semantic.width).then_some((x + 1, y)),
+            y.checked_sub(1).map(|ny| (x, ny)),
+            (y + 1 < semantic.height).then_some((x, y + 1)),
+        ];
+        for (nx, ny) in neighbors.into_iter().flatten() {
+            let next = (ny * semantic.width + nx) as usize;
+            if nearest[next] == usize::MAX {
+                nearest[next] = nearest[local];
+                queue.push_back(next);
+            }
+        }
+    }
+    for (local, owner_local) in nearest.into_iter().enumerate() {
+        let x = local as u32 % semantic.width;
+        let y = local as u32 / semantic.width;
+        let atlas = ((semantic.y + y) * atlas_width + semantic.x + x) as usize;
+        if validity[atlas] > 0 {
+            continue;
+        }
+        let owner_x = owner_local as u32 % semantic.width;
+        let owner_y = owner_local as u32 / semantic.width;
+        let owner = ((semantic.y + owner_y) * atlas_width + semantic.x + owner_x) as usize;
+        correspondence[atlas] = correspondence[owner];
+        validity[atlas] = validity[owner];
+        for pixels in channels.values_mut() {
+            let source = pixels[owner * 4..owner * 4 + 4].to_vec();
+            pixels[atlas * 4..atlas * 4 + 4].copy_from_slice(&source);
+        }
+    }
+    Ok(())
 }
 
 fn slot_result_id(result: &SynthesizedSlotMaterial, plan_id: &ContentDigest) -> ContentDigest {

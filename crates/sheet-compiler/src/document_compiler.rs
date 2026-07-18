@@ -34,6 +34,12 @@ pub struct RegisteredMaterialMap {
 pub struct ResolvedRegion {
     pub region_id: RegionId,
     pub display_name: String,
+    /// The destination that receives authored source samples.
+    pub semantic_bounds: PixelBounds,
+    /// The complete RegionId-owned rectangle, including owning-edge dilation.
+    pub padded_bounds: PixelBounds,
+    /// Stable atlas destination/ownership rectangle.
+    pub atlas_destination: PixelBounds,
     pub allocation_bounds: PixelBounds,
     pub hotspot_bounds: PixelBounds,
     pub id_color: IdColor,
@@ -173,19 +179,24 @@ pub fn resolve_compile_plan(
         {
             return Err(SheetCompileError::UnsupportedRegionMapping(region.id));
         }
+        let allocation_bounds = scale_rect(
+            region.allocation_rect,
+            document.topology.snapshot.canonical_size,
+            dimensions,
+        )?;
+        let hotspot_bounds = scale_rect(
+            region.hotspot_rect,
+            document.topology.snapshot.canonical_size,
+            dimensions,
+        )?;
         regions.push(ResolvedRegion {
             region_id: region.id,
             display_name: region.display_name.clone(),
-            allocation_bounds: scale_rect(
-                region.allocation_rect,
-                document.topology.snapshot.canonical_size,
-                dimensions,
-            )?,
-            hotspot_bounds: scale_rect(
-                region.hotspot_rect,
-                document.topology.snapshot.canonical_size,
-                dimensions,
-            )?,
+            semantic_bounds: hotspot_bounds,
+            padded_bounds: allocation_bounds,
+            atlas_destination: allocation_bounds,
+            allocation_bounds,
+            hotspot_bounds,
             id_color: region.id_color,
             material_id,
             material_id_color: material_id_color(material_id),
@@ -248,11 +259,16 @@ pub fn resolve_profile_regions(
             ).map_err(|_| SheetCompileError::UnsupportedRegionMapping(region.id))?;
             mapping.projection = Projection::Crop { bounds, focus };
         }
+        let allocation_bounds = PixelBounds { x: slot.allocation.x, y: slot.allocation.y, width: slot.allocation.width, height: slot.allocation.height };
+        let hotspot_bounds = PixelBounds { x: slot.hotspot.x, y: slot.hotspot.y, width: slot.hotspot.width, height: slot.hotspot.height };
         regions.push(ResolvedRegion {
             region_id: region.id,
             display_name: region.display_name.clone(),
-            allocation_bounds: PixelBounds { x: slot.allocation.x, y: slot.allocation.y, width: slot.allocation.width, height: slot.allocation.height },
-            hotspot_bounds: PixelBounds { x: slot.hotspot.x, y: slot.hotspot.y, width: slot.hotspot.width, height: slot.hotspot.height },
+            semantic_bounds: hotspot_bounds,
+            padded_bounds: allocation_bounds,
+            atlas_destination: allocation_bounds,
+            allocation_bounds,
+            hotspot_bounds,
             id_color: region.id_color,
             material_id,
             material_id_color: material_id_color(material_id),

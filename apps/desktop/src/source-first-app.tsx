@@ -40,7 +40,7 @@ import {
   type TrimSheetDocumentCommand,
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
-import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, gridRectToPreviewBounds, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, preserveViewAcrossContentResize, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
+import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, gridRectToPreviewBounds, mapQuadToUnitSquare, mapUnitSquareToQuad, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, preserveViewAcrossContentResize, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
 import { SourceFramePreviewController } from "./source-frame-preview-controller";
 import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
 import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
@@ -65,7 +65,7 @@ const templates = [
 ] as const;
 
 const channelOptions: ReadonlyArray<{ value: SourceChannel; label: string; short: string; tone: string }> = [
-  { value: "base_color", label: "Base Color", short: "BC", tone: "color" },
+  { value: "base_color", label: "Diffuse", short: "D", tone: "color" },
   { value: "normal", label: "Normal", short: "N", tone: "normal" },
   { value: "height", label: "Height", short: "H", tone: "height" },
   { value: "roughness", label: "Roughness", short: "R", tone: "roughness" },
@@ -78,7 +78,7 @@ const channelOptions: ReadonlyArray<{ value: SourceChannel; label: string; short
 ];
 
 const mapViews: readonly [CompiledMapView, string][] = [
-  ["baseColor", "Base Color"],
+  ["baseColor", "Diffuse"],
   ["normal", "Normal"],
   ["height", "Height"],
   ["roughness", "Roughness"],
@@ -124,7 +124,7 @@ function samplingPrerequisite(role: ManualRegionRole, sampling: RegionSampling):
 function changedBehavior(current: RegionBehavior, patch: Partial<RegionBehavior>): RegionBehavior {
   const next = { ...current, ...patch };
   next.edgeEligibility = eligibleEdges(next.continuity);
-  if (next.role === "radial") next.radial = next.radial ?? { centerX: .5, centerY: .5, innerRadius: 0, outerRadius: .5, falloff: 1 };
+  if (next.role === "radial") next.radial = next.radial ?? { centerX: .5, centerY: .5, innerRadius: 0, outerRadius: .5, falloff: 1, blendWidth: .05, seamBlendWidth: .03 };
   else delete next.radial;
   if (samplingPrerequisite(next.role, next.sampling)) next.sampling = "one_shot";
   return next;
@@ -139,12 +139,11 @@ function behaviorCueLabel(behavior: RegionBehavior) {
 }
 
 function RegionBehaviorCue({ behavior }: { behavior: RegionBehavior }) {
-  const roleGlyph = { panel: "▣", horizontal_strip: "▬", vertical_strip: "▮", unique: "◆", radial: "◎" }[behavior.role];
   const loopGlyph = { one_shot: "1×", loop_x: "↔", loop_y: "↕", loop_xy: "⤢" }[behavior.sampling];
   const orientationGlyph = { zero: "→", ninety: "↓", one_eighty: "←", two_seventy: "↑" }[behavior.orientation];
   const continuous = behavior.continuity === "none" ? [] : behavior.continuity === "x" ? ["left", "right"] : behavior.continuity === "y" ? ["top", "bottom"] : ["left", "right", "top", "bottom"];
   return <span className="region-behavior-cue" aria-label={behaviorCueLabel(behavior)} title={behaviorCueLabel(behavior)}>
-    <i className="behavior-role">{roleGlyph}</i><i className={`behavior-loop ${behavior.sampling}`}>{loopGlyph}</i><i className="behavior-orientation">{orientationGlyph}</i>
+    {behavior.sampling !== "one_shot" ? <i className={`behavior-loop ${behavior.sampling}`}>{loopGlyph}</i> : null}<i className="behavior-orientation">{orientationGlyph}</i>
     {continuous.map((edge) => <i key={edge} className={`continuity-cue ${edge}`} />)}
   </span>;
 }
@@ -229,12 +228,28 @@ function failure(reason: unknown): CommandFailure {
   return { code: "operation_failed", message: String(reason), recovery: "Correct the issue and retry." };
 }
 
+type PreviewProfile = "draft512" | "refinement1024" | "authoritative";
+type PreviewProgress = {
+  requestId: number;
+  phase: "compiling" | "received" | "painted" | "failed";
+  profile: PreviewProfile;
+  startedAt: number;
+  elapsedMs?: number;
+  dimensions?: { width: number; height: number };
+};
+
 function App() {
   const native = isNativeRuntime();
   const [project, setProject] = useState<ProjectProjection | null>(null);
   const [artifact, setArtifact] = useState<IntermediateAtlasProjection | null>(null);
   const [preview, setPreview] = useState<PreviewSheetProjection | null>(null);
   const [previewClientTelemetry, setPreviewClientTelemetry] = useState<string[]>([]);
+  const [interactivePreviewProfile, setInteractivePreviewProfile] = useState<PreviewProfile>(() => {
+    const saved = localStorage.getItem("hot-trimmer.interactive-preview-profile.v1");
+    return saved === "refinement1024" || saved === "authoritative" ? saved : "draft512";
+  });
+  const [previewProgress, setPreviewProgress] = useState<PreviewProgress | null>(null);
+  const [previewElapsedMs, setPreviewElapsedMs] = useState(0);
   const [templateId, setTemplateId] = useState<string>(templates[0][0]);
   const [targetRegionCount, setTargetRegionCount] = useState(63);
   const [candidateRecipe, setCandidateRecipe] = useState<PartitionRecipe>(defaultPartitionRecipe);
@@ -251,6 +266,7 @@ function App() {
   const [mapView, setMapView] = useState<CompiledMapView>("baseColor");
   const [activity, setActivity] = useState<Activity>("starting");
   const [problem, setProblem] = useState<CommandFailure | null>(null);
+  const [importProgress, setImportProgress] = useState<{ stage: string; fraction: number } | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [showRecents, setShowRecents] = useState(false);
   const [panes, setPanes] = useState<PaneState>(() => {
@@ -262,6 +278,11 @@ function App() {
   const [draftName, setDraftName] = useState("");
   const [activePatchId, setActivePatchId] = useState<string | null>(null);
   const [regionPatchEditId, setRegionPatchEditId] = useState<string | null>(null);
+  const patchFallbackContent = useRef(new Map<string, ContentReference>());
+  const patchGeometryEditDepth = useRef(new Map<string, number>());
+  const patchGeometryRedoDepth = useRef(new Map<string, number>());
+  const lastRegionPatchId = useRef<string | null>(null);
+  const undoneRegionPatchConversion = useRef<string | null>(null);
   const [preparedPatchPreview, setPreparedPatchPreview] = useState<PreparedPatchPreviewProjection | null>(null);
   const [preparedPatchPreviews, setPreparedPatchPreviews] = useState<Record<string, PreparedPatchPreviewProjection>>({});
   const [draftPatchPreview, setDraftPatchPreview] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
@@ -294,7 +315,24 @@ function App() {
     revision: number;
   }>());
   const paneDrag = useRef<{ kind: PaneDragKind; start: PaneState } | null>(null);
+  useEffect(() => { localStorage.setItem("hot-trimmer.interactive-preview-profile.v1", interactivePreviewProfile); }, [interactivePreviewProfile]);
+  useEffect(() => {
+    if (previewProgress?.phase !== "compiling") return;
+    const update = () => setPreviewElapsedMs(performance.now() - previewProgress.startedAt);
+    update();
+    const timer = window.setInterval(update, 100);
+    return () => window.clearInterval(timer);
+  }, [previewProgress?.requestId, previewProgress?.phase]);
   const workbenchRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    void listen<{ stage: string; fraction: number }>("import-progress", (event) => {
+      if (!disposed) setImportProgress(event.payload.fraction >= 1 ? null : event.payload);
+    }).then((unlisten) => { if (disposed) unlisten(); });
+    return () => { disposed = true; };
+  }, [native]);
 
   const sourceSets = project?.materialSources ?? [];
   const activeSourceSetId = selectedSourceSetId || sourceSets[0]?.id || "";
@@ -313,13 +351,22 @@ function App() {
   const selectedSlot = artifact?.slots.find((slot) => slot.regionId === selectedRegionId) ?? null;
   const selectedBinding = selectedRegionId ? project?.document?.regionBindings[selectedRegionId] ?? null : null;
   const selectedBindingContent = selectedBinding?.content;
-  const selectedRadialSourceBounds = selectedBindingContent?.type === "patch" ? (() => {
+  const selectedRadialSourceGeometry = selectedBindingContent?.type === "patch" ? (() => {
     const patch = project?.patches.find((value) => value.id === selectedBindingContent.id);
-    if (!patch) return undefined;
-    const bounds = patchBounds(patch.geometry.corners);
-    return { x: bounds.left, y: bounds.top, width: bounds.right - bounds.left, height: bounds.bottom - bounds.top };
-  })() : selectedSlot?.sourceBounds ?? { x: 0, y: 0, width: 1, height: 1 };
+    return patch?.geometry;
+  })() : (() => {
+    const bounds = selectedSlot?.sourceBounds ?? { x: 0, y: 0, width: 1, height: 1 };
+    return { corners: [
+      { x: bounds.x, y: bounds.y }, { x: bounds.x + bounds.width, y: bounds.y },
+      { x: bounds.x + bounds.width, y: bounds.y + bounds.height }, { x: bounds.x, y: bounds.y + bounds.height },
+    ] } as PatchGeometry;
+  })();
   const selectedCrop = selectedBinding?.mapping.projection.type === "crop" ? selectedBinding.mapping.projection : null;
+  const selectedCanvasCrop = selectedBindingContent?.type !== "patch" && selectedSlot?.sourceBounds ? {
+    type: "crop" as const,
+    bounds: selectedSlot.sourceBounds,
+    focus: { x: selectedSlot.sourceBounds.x + selectedSlot.sourceBounds.width * 0.5, y: selectedSlot.sourceBounds.y + selectedSlot.sourceBounds.height * 0.5 },
+  } : null;
   const currentTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
   const stale = !!project?.document && !!artifact && artifact.documentRevision !== project.document.documentRevision;
   const buildState = buildStatus(project, artifact, activity, problem, stale);
@@ -353,8 +400,8 @@ function App() {
     dirtyPreviewRegion.current = null;
     // Persisted appearance edits are not transient crop requests. The compiler's content
     // hashes reuse every unchanged region while the request remains contract-valid.
-    void requestPreview(undefined);
-  }, [native, project?.document?.documentRevision]);
+    void requestPreview(undefined, undefined, interactivePreviewProfile, undefined, interactivePreviewProfile === "draft512");
+  }, [native, project?.document?.documentRevision, interactivePreviewProfile]);
 
   useEffect(() => {
     const controller = transientPreviewController.current;
@@ -407,10 +454,10 @@ function App() {
       return;
     }
     controller.setExecutor(async (request) => {
-      await requestPreview(request.regionId, request.projection, "draft512", request.revision, false);
+      await requestPreview(request.regionId, request.projection, interactivePreviewProfile, request.revision, false);
     });
     return () => controller.cancel();
-  }, [native, project?.document?.documentRevision, draftPreviewFps]);
+  }, [native, project?.document?.documentRevision, draftPreviewFps, interactivePreviewProfile]);
 
   useEffect(() => {
     const element = workbenchRef.current;
@@ -447,6 +494,7 @@ function App() {
 
   useEffect(() => {
     setRegionPatchEditId((current) => current && current !== selectedRegionId ? null : current);
+    if (selectedRegionId) setSourceFrameEditing(false);
   }, [selectedRegionId]);
 
   useEffect(() => {
@@ -561,11 +609,27 @@ function App() {
   }
 
   function acceptProject(next: ProjectProjection) {
+    // Project replacement is a hard UI boundary. In-flight patch work belongs to the
+    // previous project and must never be allowed to publish into the fresh draft.
+    patchPreviewRequestId.current += 1;
+    transientPreviewController.current.cancel();
+    sourceFramePreviewController.current.cancel();
+    patchFallbackContent.current.clear();
     setProject(next);
     setArtifact(null);
     setPreview(null);
     setProblem(null);
     setSelectedRegionId(null);
+    setActivePatchId(null);
+    setRegionPatchEditId(null);
+    setPreparedPatchPreview(null);
+    setPreparedPatchPreviews({});
+    setDraftPatchPreview(null);
+    setPatchTool(null);
+    setSourceFrameEditing(false);
+    dirtyPreviewRegion.current = null;
+    suppressAutomaticPreviewRevision.current = null;
+    lastAutomaticPreviewRevision.current = null;
     setSelectedSourceSetId(next.document?.primaryMaterial ?? next.materialSources[0]?.id ?? "");
     setSelectedChannel("base_color");
     setTemplateId(templates[0][0]);
@@ -598,7 +662,7 @@ function App() {
       setProblem({
         code: "source_map_not_identified",
         message: "No selected file matched an empty registered map slot.",
-        recovery: "Open an empty map slot directly, or include a Base Color image for a new material source.",
+        recovery: "Open an empty map slot directly, or include a Diffuse texture for a new material source.",
       });
       return;
     }
@@ -746,7 +810,7 @@ function App() {
       setProblem({
         code: "trim_sheet_missing",
         message: "No trim sheet document exists yet.",
-        recovery: "Import a Base Color to create the source-to-sheet document, or open a legacy project and rebuild after confirming the preserved sources.",
+        recovery: "Import a Diffuse texture to create the source-to-sheet document, or open a legacy project and rebuild after confirming the preserved sources.",
       });
       return;
     }
@@ -824,23 +888,31 @@ function App() {
 
   async function editSourceFrameLayout(commandValue: TrimSheetDocumentCommand): Promise<ProjectProjection | null> {
     if (!project?.document || activity !== "idle" || candidatePreviewing) return null;
-    setActivity("editing"); setProblem(null);
+    setActivity("editing"); setProblem(null); undoneRegionPatchConversion.current = null;
     try {
-      const assignedRegionId = commandValue.type === "set_region_content" ? commandValue.regionId : null;
-      if (assignedRegionId) dirtyPreviewRegion.current = assignedRegionId;
+      const pixelRegionId = commandValue.type === "set_region_content"
+        || commandValue.type === "set_region_behavior"
+        || commandValue.type === "set_region_radial"
+        || commandValue.type === "set_region_projection"
+        ? commandValue.regionId : null;
+      const topologyChanged = commandValue.type === "resize_source_frame_region"
+        || commandValue.type === "draw_source_frame_region"
+        || commandValue.type === "split_source_frame_region"
+        || commandValue.type === "merge_source_frame_regions"
+        || commandValue.type === "apply_authored_layout_preset";
+      if (pixelRegionId) dirtyPreviewRegion.current = pixelRegionId;
       const current = await applyCommand(commandValue);
       setProject(current);
-      // Content assignment changes pixels, not topology. Keep the last published artifact at
-      // its truthful revision so the prepared patch overlay remains visible until Stage 14
-      // publishes the new pixels. Advancing its revision here suppressed that fast path.
-      if (!assignedRegionId) setArtifact((prior) => retopologizeArtifact(prior, current));
+      // Region content and mapping behavior change pixels, not topology. Keep the last published
+      // artifact at its truthful revision until Stage 14 publishes the requested mapping.
+      if (!pixelRegionId) setArtifact((prior) => retopologizeArtifact(prior, current));
       setSelectedRegionId((selected) => current.document!.topology.regions.some((region) => region.id === selected) ? selected : null);
-      if (assignedRegionId) {
+      if (pixelRegionId || topologyChanged) {
         dirtyPreviewRegion.current = null;
         lastAutomaticPreviewRevision.current = current.document!.documentRevision;
         // Region identity without a projection is not a transient crop request. Compile the
         // persisted binding revision; the immediate overlay above covers publication latency.
-        void requestPreview(undefined, undefined, "draft512", current.document!.documentRevision, false);
+        void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision, false);
       }
       return current;
     } catch (reason) { setProblem(failure(reason)); return null; }
@@ -897,12 +969,14 @@ function App() {
     }
   }
 
-  async function requestPreview(regionId?: string, projection?: CropProjection, profile: "draft512" | "refinement1024" = "draft512", revision?: number, scheduleRefinement = true) {
+  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true) {
     const requestedRevision = revision ?? project?.document?.documentRevision;
     if (!native || requestedRevision === undefined) return;
     const draftId = ++previewDraftId.current;
     setProblem(null);
     previewPublishStartedAt.current = performance.now();
+    setPreviewElapsedMs(0);
+    setPreviewProgress({ requestId: draftId, phase: "compiling", profile, startedAt: previewPublishStartedAt.current });
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: {
@@ -917,6 +991,7 @@ function App() {
       });
       setPreviewClientTelemetry([`profile=${profile}`, `artifact_dimensions=${next.width}x${next.height}`, `ipc_round_trip_ms=${Math.round(performance.now() - (previewPublishStartedAt.current ?? performance.now()))}`]);
       if (draftId === previewDraftId.current) {
+        setPreviewProgress({ requestId: draftId, phase: "received", profile, startedAt: previewPublishStartedAt.current, elapsedMs: performance.now() - previewPublishStartedAt.current, dimensions: { width: next.width, height: next.height } });
         setArtifact(next);
         setPreview(null);
         setProblem(null);
@@ -929,8 +1004,19 @@ function App() {
         }
       }
     } catch (reason) {
-      if (failure(reason).code !== "operation_cancelled") setProblem(failure(reason));
+      if (failure(reason).code !== "operation_cancelled") {
+        setProblem(failure(reason));
+        if (draftId === previewDraftId.current) setPreviewProgress({ requestId: draftId, phase: "failed", profile, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs: performance.now() - (previewPublishStartedAt.current ?? performance.now()) });
+      }
     }
+  }
+
+  async function renderFullResolutionPreview() {
+    const revision = project?.document?.documentRevision;
+    if (!native || revision === undefined || activity !== "idle") return;
+    setActivity("compiling");
+    try { await requestPreview(undefined, undefined, "authoritative", revision, false); }
+    finally { setActivity("idle"); }
   }
 
   function previewSelectedCrop(bounds: NormalizedBounds) {
@@ -949,8 +1035,42 @@ function App() {
     documentHistoryBusy.current = true;
     setActivity("editing");
     try {
+      const regionPatchId = lastRegionPatchId.current;
+      const regionPatchExists = !!regionPatchId && !!project?.patches.some((patch) => patch.id === regionPatchId);
+      if (regionPatchId && !regionPatchExists) {
+        patchGeometryEditDepth.current.delete(regionPatchId);
+        patchGeometryRedoDepth.current.delete(regionPatchId);
+        lastRegionPatchId.current = null;
+      }
+      if (!redo && regionPatchId && regionPatchExists && (patchGeometryEditDepth.current.get(regionPatchId) ?? 0) > 0) {
+        const patchNext = await invoke<ProjectProjection>("undo_patch_command", { request: protocol });
+        patchGeometryEditDepth.current.set(regionPatchId, Math.max(0, (patchGeometryEditDepth.current.get(regionPatchId) ?? 1) - 1));
+        patchGeometryRedoDepth.current.set(regionPatchId, (patchGeometryRedoDepth.current.get(regionPatchId) ?? 0) + 1);
+        setProject(patchNext); setPreview(null); setArtifact(null); setProblem(null);
+        return;
+      }
+      if (redo && regionPatchId && regionPatchExists && (patchGeometryRedoDepth.current.get(regionPatchId) ?? 0) > 0) {
+        const patchNext = await invoke<ProjectProjection>("redo_patch_command", { request: protocol });
+        patchGeometryRedoDepth.current.set(regionPatchId, Math.max(0, (patchGeometryRedoDepth.current.get(regionPatchId) ?? 1) - 1));
+        patchGeometryEditDepth.current.set(regionPatchId, (patchGeometryEditDepth.current.get(regionPatchId) ?? 0) + 1);
+        setProject(patchNext); setPreview(null); setArtifact(null); setProblem(null);
+        return;
+      }
+      const restoringPatchId = redo && project?.canRedoPatch && project.canRedoDocument ? undoneRegionPatchConversion.current : null;
+      if (redo && undoneRegionPatchConversion.current && !restoringPatchId) undoneRegionPatchConversion.current = null;
+      if (restoringPatchId) await invoke<ProjectProjection>("redo_patch_command", { request: protocol });
       const priorTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
-      const next = await invoke<ProjectProjection>(redo ? "redo_document_command" : "undo_document_command", { request: protocol });
+      let next = await invoke<ProjectProjection>(redo ? "redo_document_command" : "undo_document_command", { request: protocol });
+      if (!redo && regionPatchId && regionPatchExists && patchFallbackContent.current.has(regionPatchId)
+        && !Object.values(next.document?.regionBindings ?? {}).some((binding) => binding.content.type === "patch" && binding.content.id === regionPatchId)) {
+        next = await invoke<ProjectProjection>("undo_patch_command", { request: protocol });
+        undoneRegionPatchConversion.current = regionPatchId;
+        lastRegionPatchId.current = null;
+        setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null);
+      } else if (redo && restoringPatchId) {
+        lastRegionPatchId.current = restoringPatchId;
+        undoneRegionPatchConversion.current = null;
+      }
       const nextTopologyHash = next.document ? hashBytes(next.document.topology.topologyHash) : null;
       if (next.document && priorTopologyHash !== nextTopologyHash) suppressAutomaticPreviewRevision.current = next.document.documentRevision;
       setProject(next);
@@ -1026,6 +1146,7 @@ function App() {
   }
 
   async function patchCommand(command: PatchCommand, coalescingGroup?: number) {
+    undoneRegionPatchConversion.current = null;
     const next = await invoke<ProjectProjection>("apply_patch_command", {
       request: { ...protocol, command, coalescingGroup },
     });
@@ -1061,7 +1182,7 @@ function App() {
     } catch (reason) { setProblem(failure(reason)); }
   }
 
-  async function editSelectedRegionAsPatch() {
+  async function editSelectedRegionAsPatch(authoredBounds?: NormalizedBounds) {
     const document = project?.document;
     const regionId = selectedRegionId;
     if (!document || !regionId || activity !== "idle") return;
@@ -1082,15 +1203,19 @@ function App() {
     const owner = project?.materialSources.find((set) => set.id === sourceSetId);
     const base = owner?.registeredChannels?.channels.find((source) => source.channel === "base_color");
     if (!owner || !base) {
-      setProblem({ code: "source_missing", message: `The source for ${definition.displayName} is unavailable.`, recovery: "Assign a valid Base Color source before converting this region to a patch." });
+      setProblem({ code: "source_missing", message: `The source for ${definition.displayName} is unavailable.`, recovery: "Assign a valid Diffuse source before converting this region to a patch." });
       return;
     }
-    const bounds = binding.mapping.projection.type === "crop"
+    const bounds = authoredBounds ?? (binding.mapping.projection.type === "crop"
       ? binding.mapping.projection.bounds
       : document.sourceFrame?.sourceSetId === sourceSetId && document.logicalGrid && definition.gridRect
         ? sourceFrameGridBounds(document.sourceFrame.bounds, document.logicalGrid, definition.gridRect)
-        : { x: 0, y: 0, width: 1, height: 1 };
+        : { x: 0, y: 0, width: 1, height: 1 });
     const patchId = crypto.randomUUID();
+    patchFallbackContent.current.set(patchId, content);
+    lastRegionPatchId.current = patchId;
+    patchGeometryEditDepth.current.set(patchId, 0);
+    patchGeometryRedoDepth.current.set(patchId, 0);
     try {
       await patchCommand({
         type: "create",
@@ -1107,7 +1232,7 @@ function App() {
       await assignPatchToRegion(patchId, regionId);
       setSelectedSourceSetId(owner.id); setSelectedChannel("base_color"); setActivePatchId(patchId);
       setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
-    } catch (reason) { setProblem(failure(reason)); }
+    } catch (reason) { patchFallbackContent.current.delete(patchId); setProblem(failure(reason)); }
   }
 
   async function assignPatchToRegion(patchId: string, regionId: string) {
@@ -1161,7 +1286,7 @@ function App() {
       (binding.content.type === "material_source" && binding.content.id === sourceSetId)
       || (binding.content.type === "patch" && ownedPatchIds.has(binding.content.id))).length;
     const ownsFrame = project.document.sourceFrame?.sourceSetId === sourceSetId;
-    if (!window.confirm(`Replace Base Color for ${set.name}?\n\n${ownedPatchIds.size} owned patch(es) and ${affectedRegions} explicit region binding(s) will keep their stable IDs.${ownsFrame ? " The SourceFrame will be revalidated against the replacement dimensions." : ""} Incompatible companion-map dimensions will be rejected before the project is changed.`)) return;
+    if (!window.confirm(`Replace Diffuse texture for ${set.name}?\n\n${ownedPatchIds.size} owned patch(es) and ${affectedRegions} explicit region binding(s) will keep their stable IDs.${ownsFrame ? " The SourceFrame will be revalidated against the replacement dimensions." : ""} Incompatible companion-map dimensions will be rejected before the project is changed.`)) return;
     void chooseImages("base_color", sourceSetId);
   }
 
@@ -1195,15 +1320,16 @@ function App() {
     const dependent = (project?.document && Object.values(project.document.regionBindings)
       .filter((binding) => binding.content.type === "patch" && binding.content.id === patchId)
       .map((binding) => binding.regionId)) ?? [];
-    if (dependent.length) {
-      setProblem({ code: "patch_in_use", message: `Patch is assigned to ${dependent.length} region(s).`, recovery: "Choose an explicit fallback for those regions before removing the patch." });
-      return;
+    for (const regionId of dependent) {
+      const fallback = patchFallbackContent.current.get(patchId) ?? { type: "inherit_primary_material" };
+      await command({ type: "set_region_content", regionId, content: fallback });
     }
     setDraftPatchPreview((draft) => draft?.patchId === patchId ? null : draft);
     setActivePatchId((active) => active === patchId ? null : active);
     setPatchTool(null);
     try {
       await patchCommand({ type: "delete", patchId });
+      patchFallbackContent.current.delete(patchId);
     } catch (reason) {
       setActivePatchId(patchId);
       setProblem(failure(reason));
@@ -1229,7 +1355,13 @@ function App() {
   }
 
   async function replacePatchGeometry(patchId: string, geometry: PatchGeometry) {
-    try { await patchCommand({ type: "replace_geometry", patchId, geometry }, Date.now()); }
+    try {
+      await patchCommand({ type: "replace_geometry", patchId, geometry }, Date.now());
+      if (patchFallbackContent.current.has(patchId)) {
+        patchGeometryEditDepth.current.set(patchId, (patchGeometryEditDepth.current.get(patchId) ?? 0) + 1);
+        patchGeometryRedoDepth.current.set(patchId, 0);
+      }
+    }
     catch (reason) { setProblem(failure(reason)); }
     finally { setDraftPatchPreview((draft) => draft?.patchId === patchId ? null : draft); }
   }
@@ -1238,6 +1370,15 @@ function App() {
     if (!project?.document) return;
     try {
       await command({ type: "set_output_resolution", outputSize: { width: size, height: size } });
+    } catch (reason) {
+      setProblem(failure(reason));
+    }
+  }
+
+  async function setAtlasPadding(paddingPx: number) {
+    if (!project?.document) return;
+    try {
+      await command({ type: "set_atlas_padding", paddingPx: Math.max(0, Math.min(4096, Math.round(paddingPx))) });
     } catch (reason) {
       setProblem(failure(reason));
     }
@@ -1274,13 +1415,43 @@ function App() {
 
   async function setRegionRadial(regionId: string, radial: NonNullable<RegionMapping["radial"]>) {
     dirtyPreviewRegion.current = regionId;
-    try { await command({ type: "set_region_radial", regionId, radial }); }
+    try {
+      const next = await applyCommand({ type: "set_region_radial", regionId, radial });
+      const revision = next.document!.documentRevision;
+      // Source-side radial gestures bypass the Layout command helper, so publish their
+      // persisted revision explicitly. A fast draft prevents the sheet from sitting stale
+      // while a selected 4K/8K interactive profile is still compiling.
+      lastAutomaticPreviewRevision.current = revision;
+      dirtyPreviewRegion.current = null;
+      setProject(next);
+      await requestPreview(undefined, undefined, "draft512", revision, false);
+      if (interactivePreviewProfile !== "draft512" && lastAutomaticPreviewRevision.current === revision) {
+        void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
+      }
+    }
     catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
   }
 
   function chooseSource(sourceSetId: string, channel: SourceChannel) {
     setSelectedSourceSetId(sourceSetId);
     setSelectedChannel(channel);
+  }
+
+  function selectPatchAndLinkedRegion(patchId: string, sourceSetId?: string) {
+    const patch = project?.patches.find((candidate) => candidate.id === patchId);
+    const owner = sourceSetId
+      ? project?.materialSources.find((source) => source.id === sourceSetId)
+      : patch && project?.materialSources.find((source) => source.registeredChannels?.channels.some((channel) => channel.id === patch.sourceId));
+    if (owner) chooseSource(owner.id, "base_color");
+    setActivePatchId(patchId);
+    setSourceFrameEditing(false);
+    const linkedRegionIds = project?.document?.topology.regions
+      .filter((region) => {
+        const content = project.document!.regionBindings[region.id]?.content;
+        return content?.type === "patch" && content.id === patchId;
+      })
+      .map((region) => region.id) ?? [];
+    setSelectedRegionId((current) => current && linkedRegionIds.includes(current) ? current : linkedRegionIds[0] ?? null);
   }
 
   return (
@@ -1334,9 +1505,8 @@ function App() {
           selectedSource={selectedSource}
           activePatchId={activePatchId}
           onSelect={chooseSource}
-          onSelectPatch={(patchId, sourceSetId) => { chooseSource(sourceSetId, "base_color"); setActivePatchId(patchId); }}
+          onSelectPatch={(patchId, sourceSetId) => selectPatchAndLinkedRegion(patchId, sourceSetId)}
           onAddSourceSet={() => void addSourceSet()}
-          onReplaceBase={replaceBaseWithPreflight}
           onAddMaps={(id) => void chooseImages(undefined, id)}
           onSetPrimary={(id) => void setPrimaryMaterialExplicit(id)}
           onRemove={(id) => void removeSourceSet(id)}
@@ -1351,7 +1521,11 @@ function App() {
             sources={activeSources}
             selectedChannel={selectedChannel}
             onSelect={(channel) => setSelectedChannel(channel)}
-            onOpen={(channel) => void chooseImages(channel)}
+            onOpen={(channel) => {
+              const replacingDiffuse = channel === "base_color" && activeSources.some((source) => source.channel === "base_color");
+              if (replacingDiffuse) replaceBaseWithPreflight(activeSourceSetId);
+              else void chooseImages(channel);
+            }}
             onOpenAll={() => void chooseImages()}
           />
           <div className="patch-toolbar">
@@ -1359,7 +1533,6 @@ function App() {
             <button className={patchTool === "four-point" ? "active" : ""} onClick={() => setPatchTool((tool) => tool === "four-point" ? null : "four-point")} disabled={!selectedSource}>Four Point</button>
             <button onClick={() => activePatchId && void deletePatch(activePatchId)} disabled={!activePatchId}>Delete Patch</button>
             <button onClick={() => activePatchId && selectedRegionId && void assignPatchToRegion(activePatchId, selectedRegionId)} disabled={!activePatchId || !selectedRegionId || activity !== "idle"}>Assign patch to region</button>
-            <button className={regionPatchEditId ? "active" : ""} onClick={() => regionPatchEditId ? setRegionPatchEditId(null) : void editSelectedRegionAsPatch()} disabled={!selectedRegionId || activity !== "idle"}>{regionPatchEditId ? "Finish region edit" : "Edit region as patch"}</button>
             <label className="normal-setting" title="Applied explicitly when importing or replacing a tangent-space Normal map.">
               Normal convention
               <select value={normalConvention} onChange={(event) => setNormalConvention(event.currentTarget.value as "open_gl" | "direct_x")}>
@@ -1383,25 +1556,26 @@ function App() {
             logicalGrid={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.logicalGrid : undefined}
             partitionRegions={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? artifact?.regions ?? [] : []}
             selectedSlot={regionPatchEditId ? null : selectedSlot}
-            crop={regionPatchEditId ? null : selectedCrop}
+            crop={regionPatchEditId ? null : selectedCanvasCrop ?? selectedCrop}
             selectedRegion={selectedRegion}
             radialBehavior={selectedBinding?.mapping.behavior}
-            radialSourceBounds={selectedRadialSourceBounds}
+            radialSourceGeometry={selectedRadialSourceGeometry}
             onCommitRadial={(radial) => selectedRegionId && void setRegionRadial(selectedRegionId, radial)}
             onCommitBehavior={(behavior) => selectedRegionId && void setRegionBehavior(selectedRegionId, behavior)}
             sourceFrameEditing={sourceFrameEditing}
             importing={activity === "importing"}
+            importProgress={importProgress}
             onOpenBase={() => void chooseImages("base_color")}
-            onCommitCrop={(bounds) => void setSelectedCrop(bounds)}
-            onDraftCrop={previewSelectedCrop}
+            onCommitCrop={(bounds) => void editSelectedRegionAsPatch(bounds)}
+            onDraftCrop={(bounds) => { if (selectedBindingContent?.type === "patch") previewSelectedCrop(bounds); }}
             onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
             patches={project?.patches.filter((patch) => patch.sourceId === selectedSource?.id && (!regionPatchEditId || patch.id === activePatchId)) ?? []}
             activePatchId={activePatchId}
-            onEditPatch={setActivePatchId}
+            onEditPatch={selectPatchAndLinkedRegion}
             onCommitPatch={(patchId, geometry) => void replacePatchGeometry(patchId, geometry)}
             onDraftPatch={setDraftPatchPreview}
             onDeletePatch={(patchId) => void deletePatch(patchId)}
-            onExitPatch={() => { setDraftPatchPreview(null); setActivePatchId(null); setRegionPatchEditId(null); }}
+            onExitPatch={() => { setDraftPatchPreview(null); setActivePatchId(null); setRegionPatchEditId(null); setSelectedRegionId(null); }}
             tool={patchTool}
             onCreatePatch={(geometry, fourPoint) => void createPatch(geometry, fourPoint)}
             onCancelTool={() => setPatchTool(null)}
@@ -1417,15 +1591,23 @@ function App() {
           activePatchId={activePatchId}
           mapView={mapView}
           selectedRegionId={selectedRegionId}
-          setSelectedRegionId={setSelectedRegionId}
+          setSelectedRegionId={(id) => { setSelectedRegionId(id); if (!id) { setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSourceFrameEditing(false); } }}
+          sourceFrameEditing={sourceFrameEditing}
+          onEditSourceFrame={() => { const frame = project?.document?.sourceFrame; if (!frame) return; setSelectedRegionId(null); setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSelectedSourceSetId(frame.sourceSetId); setSelectedChannel("base_color"); setSourceWorkbenchOpen(true); setSourceFrameEditing(true); }}
           buildState={buildState}
           problem={problem}
           templateId={templateId}
           setTemplateId={setTemplateId}
           primaryMaterial={primaryMaterial}
           build={build}
+          renderFullResolutionPreview={renderFullResolutionPreview}
+          interactivePreviewProfile={interactivePreviewProfile}
+          setInteractivePreviewProfile={setInteractivePreviewProfile}
+          previewProgress={previewProgress}
+          previewElapsedMs={previewElapsedMs}
           activity={activity}
           setResolution={setResolution}
+          setAtlasPadding={setAtlasPadding}
            targetRegionCount={targetRegionCount}
            setTargetRegionCount={setTargetRegionCount}
            regenerateSourceFrame={regenerateSourceFrame}
@@ -1443,6 +1625,7 @@ function App() {
            previewClientTelemetry={previewClientTelemetry}
            onPreviewPaint={(dimensions) => {
              if (previewPublishStartedAt.current !== null) {
+               setPreviewProgress((current) => current ? { ...current, phase: "painted", elapsedMs: performance.now() - current.startedAt, dimensions } : current);
                setPreviewClientTelemetry((current) => [
                  ...current.filter((entry) => !entry.startsWith("paint_ms=") && !entry.startsWith("png_decoded_dimensions=")),
                  `png_decoded_dimensions=${dimensions.width}x${dimensions.height}`,
@@ -1463,13 +1646,11 @@ function App() {
           onRedo={() => void history(true)}
           onClassify={(materialSourceId, classificationCommand) => void applyMaterialClassificationCommand(materialSourceId, classificationCommand)}
           onCalibrate={(materialSourceId, calibrationCommand) => void applyMaterialCalibrationCommand(materialSourceId, calibrationCommand)}
-          onSetCrop={(regionId, bounds) => void setRegionCrop(regionId, bounds)}
           onSetRadial={(regionId, radial) => void setRegionRadial(regionId, radial)}
+          onResizeRegion={(regionId, gridRect) => void editSourceFrameLayout({ type: "resize_source_frame_region", regionId, gridRect })}
           onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
           sourceFrameEditing={sourceFrameEditing}
           onSetSourceFrameEditing={setSourceFrameEditing}
-          onDetachSourceCell={(regionId) => void detachSourceCell(regionId)}
-          onResetSourceCell={(regionId) => void resetSourceCell(regionId)}
           selectedSourceSetId={activeSourceSetId}
           onSetExemplarGroup={(id, group) => void setExemplarGroup(id, group)}
           onSetDelightingIntent={(id, intent) => void setDelightingIntent(id, intent)}
@@ -1505,7 +1686,6 @@ function SourceLibrary(props: {
   onSelect: (sourceSetId: string, channel: SourceChannel) => void;
   onSelectPatch: (patchId: string, sourceSetId: string) => void;
   onAddSourceSet: () => void;
-  onReplaceBase: (sourceSetId: string) => void;
   onAddMaps: (sourceSetId: string) => void;
   onSetPrimary: (sourceSetId: string) => void;
   onRemove: (sourceSetId: string) => void;
@@ -1516,25 +1696,41 @@ function SourceLibrary(props: {
   const sourceSets = props.project?.materialSources ?? [];
   const [sourceMenu, setSourceMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [patchMenu, setPatchMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  useEffect(() => {
+    if (!sourceMenu && !patchMenu) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!(event.target as Element | null)?.closest(".source-context-menu, .library-patch-context-menu")) {
+        setSourceMenu(null);
+        setPatchMenu(null);
+      }
+    };
+    const dismissBlur = () => { setSourceMenu(null); setPatchMenu(null); };
+    window.addEventListener("pointerdown", dismiss, true);
+    window.addEventListener("blur", dismissBlur);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss, true);
+      window.removeEventListener("blur", dismissBlur);
+    };
+  }, [sourceMenu, patchMenu]);
   const sourceSetForPatch = (patch: Patch) => sourceSets.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
   const patches = (props.project?.patches ?? []).filter((patch) => sourceSetForPatch(patch)?.id === props.activeSourceSetId);
   return <aside className="source-library">
-    <header className="panel-title"><span>WORKPLACE</span></header>
+    <header className="panel-title"><span>WORKBENCH</span></header>
     <section className="library-section source-list"><div className="section-head"><span>SOURCES</span><b>{sourceSets.length}</b></div>
       {sourceSets.map((set) => {
         const channels = set.registeredChannels?.channels ?? [];
         const base = channels.find((source) => source.channel === "base_color");
         const count = channels.length;
-        const readiness = base ? "Ready" : "Missing Base Color";
+        const readiness = base ? "Ready" : "Missing Diffuse";
         return <div key={set.id} className="source-set-entry">
           <button className={`source-set ${set.id === props.activeSourceSetId ? "active" : ""}`} onClick={() => props.onSelect(set.id, base?.channel ?? "base_color")} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSourceMenu({ id: set.id, x: event.clientX, y: event.clientY }); }}>
             <span className="thumb">{base ? <img src={base.thumbnailDataUrl} alt="" /> : "+"}</span>
-            <span><strong>{set.name}</strong><small>{count} map{count === 1 ? "" : "s"} · {base ? `${base.orientedSize.width}×${base.orientedSize.height}` : "missing Base Color"}</small><small>{readiness} · rev {set.sourceRevision}{props.project?.document?.primaryMaterial === set.id ? " · PRIMARY" : ""}</small></span>
+            <span><strong>{set.name}</strong><small>{count} map{count === 1 ? "" : "s"} · {base ? `${base.orientedSize.width}×${base.orientedSize.height}` : "missing Diffuse"}</small><small>{readiness} · rev {set.sourceRevision}{props.project?.document?.primaryMaterial === set.id ? " · PRIMARY" : ""}</small></span>
           </button>
         </div>;
       })}
       <button className="new-source" onClick={props.onAddSourceSet}>+ Add independent source…</button>
-      <button className="new-source" title="Add or replace Normal, Height, Roughness, AO, and other channel files for this material source." onClick={() => props.activeSourceSetId && props.onAddMaps(props.activeSourceSetId)} disabled={!props.activeSourceSetId}>+ Add/replace channel maps…</button>
+      <button className="new-source" title="Add Normal, Height, Roughness, AO, and other texture maps to this source group." onClick={() => props.activeSourceSetId && props.onAddMaps(props.activeSourceSetId)} disabled={!props.activeSourceSetId}>+ Add maps…</button>
     </section>
     <section className="library-section patches"><div className="section-head"><span>PATCHES · SELECTED SOURCE</span><b>{patches.length}</b></div>
       <div className="patch-list">{patches.map((patch) => {
@@ -1548,8 +1744,8 @@ function SourceLibrary(props: {
       })}</div>
       {!patches.length ? <p>Choose Rectangle or Four Point, then author patches on the selected source. Selecting another source switches this list.</p> : null}
     </section>
-    {sourceMenu ? createPortal(<div className="patch-context-menu source-context-menu" role="menu" style={{ left: sourceMenu.x, top: sourceMenu.y }} onContextMenu={(event) => event.preventDefault()}><button role="menuitem" onClick={() => { props.onRenameSource(sourceMenu.id); setSourceMenu(null); }}>Rename…</button><button role="menuitem" onClick={() => { props.onReplaceBase(sourceMenu.id); setSourceMenu(null); }}>Replace Base Color / File…</button><button role="menuitem" onClick={() => { props.onAddMaps(sourceMenu.id); setSourceMenu(null); }}>Add or replace channel maps…</button><button role="menuitem" onClick={() => { props.onSetPrimary(sourceMenu.id); setSourceMenu(null); }}>Set as primary / Rebase layout…</button><button role="menuitem" onClick={() => { const base = sourceSets.find((set) => set.id === sourceMenu.id)?.registeredChannels?.channels.find((source) => source.channel === "base_color"); if (base) void revealItemInDir(base.original.path); setSourceMenu(null); }}>Reveal source</button><button role="menuitem" className="danger" onClick={() => { props.onRemove(sourceMenu.id); setSourceMenu(null); }}>Remove…</button></div>, document.body) : null}
-    {patchMenu ? createPortal(<div className="patch-context-menu" role="menu" style={{ left: patchMenu.x, top: patchMenu.y }} onContextMenu={(event) => event.preventDefault()}><button onClick={() => { props.onRenamePatch(patchMenu.id); setPatchMenu(null); }}>Rename…</button><button className="danger" onClick={() => { props.onDeletePatch(patchMenu.id); setPatchMenu(null); }}>Remove…</button></div>, document.body) : null}
+    {sourceMenu ? createPortal(<div className="patch-context-menu source-context-menu" role="menu" style={{ left: sourceMenu.x, top: sourceMenu.y }} onContextMenu={(event) => event.preventDefault()}><button role="menuitem" onClick={() => { props.onRenameSource(sourceMenu.id); setSourceMenu(null); }}>Rename…</button><button role="menuitem" onClick={() => { props.onSetPrimary(sourceMenu.id); setSourceMenu(null); }}>Set as primary / Rebase layout…</button><button role="menuitem" onClick={() => { const base = sourceSets.find((set) => set.id === sourceMenu.id)?.registeredChannels?.channels.find((source) => source.channel === "base_color"); if (base) void revealItemInDir(base.original.path); setSourceMenu(null); }}>Reveal source</button><button role="menuitem" className="danger" onClick={() => { props.onRemove(sourceMenu.id); setSourceMenu(null); }}>Remove…</button></div>, document.body) : null}
+    {patchMenu ? createPortal(<div className="patch-context-menu library-patch-context-menu" role="menu" style={{ left: patchMenu.x, top: patchMenu.y }} onContextMenu={(event) => event.preventDefault()}><button onClick={() => { props.onRenamePatch(patchMenu.id); setPatchMenu(null); }}>Rename…</button><button className="danger" onClick={() => { props.onDeletePatch(patchMenu.id); setPatchMenu(null); }}>Remove…</button></div>, document.body) : null}
   </aside>;
 }
 
@@ -1561,9 +1757,24 @@ function MapSlots(props: {
   onOpenAll: () => void;
 }) {
   const hasBase = props.sources.some((source) => source.channel === "base_color");
-  return <div className="map-slots" onWheel={(event) => {
+  const [channelMenu, setChannelMenu] = useState<{ channel: SourceChannel; x: number; y: number; filled: boolean } | null>(null);
+  useEffect(() => {
+    if (!channelMenu) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!(event.target as Element | null)?.closest(".channel-context-menu")) setChannelMenu(null);
+    };
+    const dismissBlur = () => setChannelMenu(null);
+    window.addEventListener("pointerdown", dismiss, true);
+    window.addEventListener("blur", dismissBlur);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss, true);
+      window.removeEventListener("blur", dismissBlur);
+    };
+  }, [channelMenu]);
+  return <><div className="map-slots" onContextMenu={(event) => event.preventDefault()} onWheel={(event) => {
     if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) event.currentTarget.scrollLeft += event.deltaY;
   }}>
+    <button className="map-slot add-maps" onClick={props.onOpenAll}>Add maps…</button>
     {channelOptions.map((option) => {
       const source = props.sources.find((candidate) => candidate.channel === option.value);
       const blocked = option.value !== "base_color" && !hasBase;
@@ -1571,18 +1782,22 @@ function MapSlots(props: {
         key={option.value}
         className={`map-slot ${props.selectedChannel === option.value ? "active" : ""} ${source ? "filled" : ""}`}
         disabled={blocked}
-        title={blocked ? "Add Base Color to anchor this source set first." : source?.original.path ?? `Add ${option.label}`}
+        title={blocked ? "Add a Diffuse texture to anchor this source group first." : source?.original.path ?? `Add ${option.label}`}
         onClick={() => {
           props.onSelect(option.value);
           if (!source) props.onOpen(option.value);
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setChannelMenu({ channel: option.value, x: event.clientX, y: event.clientY, filled: !!source });
         }}
       >
         <span className={`channel-swatch ${option.tone}`}>{option.short}</span>
         <span><strong>{option.label}</strong><small>{source?.displayName ?? "+ Add map"}</small></span>
       </button>;
     })}
-    <button className="map-slot add-maps" onClick={props.onOpenAll}>Add maps...</button>
-  </div>;
+  </div>{channelMenu ? createPortal(<div className="patch-context-menu channel-context-menu" role="menu" style={{ left: channelMenu.x, top: channelMenu.y }} onContextMenu={(event) => event.preventDefault()}><button role="menuitem" onClick={() => { props.onOpen(channelMenu.channel); setChannelMenu(null); }}>{channelMenu.filled ? "Replace texture…" : "Add texture…"}</button></div>, document.body) : null}</>;
 }
 
 function useViewportController(content: { width: number; height: number } | null, contentKey = "default") {
@@ -1654,11 +1869,12 @@ function SourceCanvas(props: {
   crop: CropProjection | null;
   selectedRegion: ResolvedRegion | null;
   radialBehavior?: RegionBehavior;
-  radialSourceBounds?: NormalizedBounds;
+  radialSourceGeometry?: PatchGeometry;
   onCommitRadial: (radial: NonNullable<RegionBehavior["radial"]>) => void;
   onCommitBehavior: (behavior: RegionBehavior) => void;
   sourceFrameEditing: boolean;
   importing: boolean;
+  importProgress: { stage: string; fraction: number } | null;
   onOpenBase: () => void;
   onCommitCrop: (bounds: NormalizedBounds) => void;
   onDraftCrop: (bounds: NormalizedBounds) => void;
@@ -1689,7 +1905,7 @@ function SourceCanvas(props: {
     | null
   >(null);
   const patchCreate = useRef<{ pointerId: number; start: { x: number; y: number } } | null>(null);
-  const radialDrag = useRef<{ pointerId: number; kind: "center" | "inner" | "outer" | "seam"; lastRadial: NonNullable<RegionBehavior["radial"]>; lastOrientation: RegionBehavior["orientation"] } | null>(null);
+  const radialDrag = useRef<{ pointerId: number; kind: "center" | "inner" | "transition" | "outer" | "seam" | "seam_blend"; lastRadial: NonNullable<RegionBehavior["radial"]>; lastOrientation: RegionBehavior["orientation"] } | null>(null);
   const [draftRadial, setDraftRadial] = useState<NonNullable<RegionBehavior["radial"]> | null>(null);
   const [draftRadialOrientation, setDraftRadialOrientation] = useState<RegionBehavior["orientation"] | null>(null);
   const [draftPatch, setDraftPatch] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
@@ -1699,11 +1915,23 @@ function SourceCanvas(props: {
   const [pointEditPatchId, setPointEditPatchId] = useState<string | null>(null);
   const [loupePoint, setLoupePoint] = useState<{ x: number; y: number; corner: number; clientX: number; clientY: number } | null>(null);
   const [patchMenu, setPatchMenu] = useState<{ patchId: string; clientX: number; clientY: number } | null>(null);
-  const committedCrop = props.selectedSlot?.mappingOrigin === "explicit_override"
-    ? props.selectedSlot.sourceBounds ?? props.crop?.bounds ?? null
-    : null;
+  const committedCrop = props.crop?.bounds ?? null;
   const effectiveCrop = draftCrop ?? committedCrop;
   const effectiveFrame = draftFrame ?? props.sourceFrame?.bounds ?? null;
+  const patchEditing = !!props.activePatchId;
+  const effectiveRadialSourceGeometry = draftPatch?.patchId === props.activePatchId
+    ? draftPatch.geometry
+    : patchEditing
+      ? props.radialSourceGeometry
+      : effectiveCrop
+        ? { corners: [
+            { x: effectiveCrop.x, y: effectiveCrop.y },
+            { x: effectiveCrop.x + effectiveCrop.width, y: effectiveCrop.y },
+            { x: effectiveCrop.x + effectiveCrop.width, y: effectiveCrop.y + effectiveCrop.height },
+            { x: effectiveCrop.x, y: effectiveCrop.y + effectiveCrop.height },
+          ] as PatchGeometry["corners"] }
+        : props.radialSourceGeometry;
+  const radialEditing = props.radialBehavior?.role === "radial" && !!props.radialBehavior.radial && !!effectiveRadialSourceGeometry;
 
   useEffect(() => {
     setDraftCrop(null);
@@ -1769,22 +1997,28 @@ function SourceCanvas(props: {
 
   function movePointer(event: React.PointerEvent<HTMLElement>) {
     const activeRadial = radialDrag.current;
-    if (activeRadial?.pointerId === event.pointerId && props.radialSourceBounds) {
+    if (activeRadial?.pointerId === event.pointerId && effectiveRadialSourceGeometry) {
       const target = point(event);
-      const bounds = props.radialSourceBounds;
-      const local = { x: clamp01((target.x - bounds.x) / Math.max(1e-9, bounds.width)), y: clamp01((target.y - bounds.y) / Math.max(1e-9, bounds.height)) };
+      const local = mapQuadToUnitSquare(effectiveRadialSourceGeometry.corners, target);
       if (activeRadial.kind === "seam") {
         const dx = local.x - activeRadial.lastRadial.centerX, dy = local.y - activeRadial.lastRadial.centerY;
         const quarter = ((Math.round(Math.atan2(dy, dx) / (Math.PI / 2)) % 4) + 4) % 4;
         activeRadial.lastOrientation = (["zero", "ninety", "one_eighty", "two_seventy"] as const)[quarter]!;
         setDraftRadialOrientation(activeRadial.lastOrientation);
+      } else if (activeRadial.kind === "seam_blend") {
+        const dx = local.x - activeRadial.lastRadial.centerX, dy = local.y - activeRadial.lastRadial.centerY;
+        const seamAngle = ({ zero: 0, ninety: Math.PI / 2, one_eighty: Math.PI, two_seventy: Math.PI * 1.5 } as const)[activeRadial.lastOrientation];
+        const delta = Math.abs(Math.atan2(Math.sin(Math.atan2(dy, dx) - seamAngle), Math.cos(Math.atan2(dy, dx) - seamAngle)));
+        activeRadial.lastRadial = { ...activeRadial.lastRadial, seamBlendWidth: Math.min(0.25, delta / (Math.PI * 2)) };
+        setDraftRadial(activeRadial.lastRadial);
       } else {
         const next = { ...activeRadial.lastRadial };
         if (activeRadial.kind === "center") { next.centerX = local.x; next.centerY = local.y; }
         else {
           const radius = Math.hypot(local.x - next.centerX, local.y - next.centerY);
-          if (activeRadial.kind === "inner" && radius < next.outerRadius) next.innerRadius = Math.max(0, radius);
-          if (activeRadial.kind === "outer" && radius > next.innerRadius && radius <= 2) next.outerRadius = radius;
+          if (activeRadial.kind === "inner") next.innerRadius = Math.max(0, Math.min(next.outerRadius - 0.001, radius));
+          if (activeRadial.kind === "transition") next.blendWidth = Math.max(0, Math.min(next.outerRadius - next.innerRadius, radius - next.innerRadius));
+          if (activeRadial.kind === "outer") next.outerRadius = Math.max(next.innerRadius + 0.001, Math.min(2, radius));
         }
         if (next.outerRadius > next.innerRadius) activeRadial.lastRadial = next;
         setDraftRadial(activeRadial.lastRadial);
@@ -1899,13 +2133,13 @@ function SourceCanvas(props: {
     cropDrag.current = { pointerId: event.pointerId, action, origin: effectiveCrop, x: start.x, y: start.y };
   }
 
-  function beginRadial(event: React.PointerEvent<Element>, kind: "center" | "inner" | "outer" | "seam") {
+  function beginRadial(event: React.PointerEvent<Element>, kind: "center" | "inner" | "transition" | "outer" | "seam" | "seam_blend") {
     const radial = props.radialBehavior?.radial;
     if (!radial || event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
-    radialDrag.current = { pointerId: event.pointerId, kind, lastRadial: { ...radial, falloff: 1 }, lastOrientation: props.radialBehavior!.orientation };
+    radialDrag.current = { pointerId: event.pointerId, kind, lastRadial: { ...radial }, lastOrientation: props.radialBehavior!.orientation };
   }
 
   function beginFrame(event: React.PointerEvent<SVGElement>, action: CropDragAction) {
@@ -2039,13 +2273,13 @@ function SourceCanvas(props: {
           className={`source-region-boundary ${region.regionId === props.selectedRegion?.regionId ? "selected" : ""}`}
         /> : null)}
       </svg> : null}
-      {props.selectedRegion && props.selectedSlot?.mappingOrigin === "partition" ? <div className="partition-selection-status" data-selection-status="partition-owned">
-        Partition-owned — Detach to adjust
+      {props.selectedRegion && props.selectedSlot?.mappingOrigin === "partition" && !radialEditing && !patchEditing ? <div className="partition-selection-status" data-selection-status="partition-owned">
+        Drag the crop to create a region patch
       </div> : null}
     </div> : <div className="empty-source-canvas">
-      <strong>Open or drop a Base Color</strong>
+      <strong>Open or drop a Diffuse texture</strong>
       <span>The source canvas is ready before the project has a save location.</span>
-      <button className="primary" onClick={props.onOpenBase}>Open Base Color</button>
+      <button className="primary" onClick={props.onOpenBase}>Open Diffuse</button>
     </div>}
     {props.source ? <svg
       className="patch-overlay"
@@ -2053,7 +2287,7 @@ function SourceCanvas(props: {
       viewBox={`0 0 ${props.source.orientedSize.width} ${props.source.orientedSize.height}`}
       aria-label="Editable patch outlines"
     >
-      {effectiveFrame ? <g
+      {props.sourceFrameEditing && effectiveFrame ? <g
         className={`patch-outline source-frame-transform ${props.sourceFrameEditing ? "active" : "source-frame-preview"}`}
         style={{ pointerEvents: props.sourceFrameEditing ? "auto" : "none" }}
       >
@@ -2081,7 +2315,7 @@ function SourceCanvas(props: {
           />)}
         </g> : null}
       </g> : null}
-      {effectiveCrop ? <g className="patch-outline active source-crop-transform">
+      {effectiveCrop && !patchEditing ? <g className="patch-outline active source-crop-transform">
         <polygon
           points={`${effectiveCrop.x * props.source.orientedSize.width},${effectiveCrop.y * props.source.orientedSize.height} ${(effectiveCrop.x + effectiveCrop.width) * props.source.orientedSize.width},${effectiveCrop.y * props.source.orientedSize.height} ${(effectiveCrop.x + effectiveCrop.width) * props.source.orientedSize.width},${(effectiveCrop.y + effectiveCrop.height) * props.source.orientedSize.height} ${effectiveCrop.x * props.source.orientedSize.width},${(effectiveCrop.y + effectiveCrop.height) * props.source.orientedSize.height}`}
           aria-label={`Move source crop for ${props.selectedRegion?.displayName ?? "selected region"}`}
@@ -2106,27 +2340,41 @@ function SourceCanvas(props: {
           />)}
         </g>
       </g> : null}
-      {props.radialBehavior?.role === "radial" && props.radialBehavior.radial && props.radialSourceBounds ? (() => {
+      {props.radialBehavior?.role === "radial" && props.radialBehavior.radial && effectiveRadialSourceGeometry ? (() => {
         const radial = draftRadial ?? props.radialBehavior!.radial!;
         const orientation = draftRadialOrientation ?? props.radialBehavior!.orientation;
-        const bounds = props.radialSourceBounds!;
-        const width = bounds.width * props.source!.orientedSize.width, height = bounds.height * props.source!.orientedSize.height;
-        const cx = (bounds.x + radial.centerX * bounds.width) * props.source!.orientedSize.width;
-        const cy = (bounds.y + radial.centerY * bounds.height) * props.source!.orientedSize.height;
-        const unit = Math.min(width, height), inner = radial.innerRadius * unit, outer = radial.outerRadius * unit;
+        const geometry = effectiveRadialSourceGeometry;
+        const sourcePoint = (point: { x: number; y: number }) => { const mapped = mapUnitSquareToQuad(geometry.corners, point); return { x: mapped.x * props.source!.orientedSize.width, y: mapped.y * props.source!.orientedSize.height }; };
+        const center = sourcePoint({ x: radial.centerX, y: radial.centerY });
         const angle = ({ zero: 0, ninety: Math.PI / 2, one_eighty: Math.PI, two_seventy: Math.PI * 1.5 } as const)[orientation];
+        const ring = (radius: number) => Array.from({ length: 65 }, (_, index) => { const theta = index / 64 * Math.PI * 2; return sourcePoint({ x: radial.centerX + Math.cos(theta) * radius, y: radial.centerY + Math.sin(theta) * radius }); }).map((point) => `${point.x},${point.y}`).join(" ");
+        const innerHandle = sourcePoint({ x: radial.centerX + radial.innerRadius, y: radial.centerY });
+        const transitionRadius = Math.min(radial.outerRadius, radial.innerRadius + radial.blendWidth);
+        const transitionHandle = sourcePoint({ x: radial.centerX + transitionRadius, y: radial.centerY });
+        const outerHandle = sourcePoint({ x: radial.centerX + radial.outerRadius, y: radial.centerY });
+        const seamBlendAngle = radial.seamBlendWidth * Math.PI * 2;
+        const seamBlendHandle = sourcePoint({ x: radial.centerX + Math.cos(angle + seamBlendAngle) * radial.outerRadius, y: radial.centerY + Math.sin(angle + seamBlendAngle) * radial.outerRadius });
+        const seamBlendMirror = sourcePoint({ x: radial.centerX + Math.cos(angle - seamBlendAngle) * radial.outerRadius, y: radial.centerY + Math.sin(angle - seamBlendAngle) * radial.outerRadius });
+        const seamRadius = radial.outerRadius + Math.max(0.035, 14 / Math.max(props.source!.orientedSize.width, props.source!.orientedSize.height) / viewport.view.scale);
+        const seamHandle = sourcePoint({ x: radial.centerX + Math.cos(angle) * seamRadius, y: radial.centerY + Math.sin(angle) * seamRadius });
         const handle = 7 / viewport.view.scale;
         return <g className="radial-gizmo" aria-label="Selected region radial source gizmo">
-          <circle className="radial-ring inner" cx={cx} cy={cy} r={inner} />
-          <circle className="radial-ring outer" cx={cx} cy={cy} r={outer} />
-          <line className="radial-seam" x1={cx} y1={cy} x2={cx + Math.cos(angle) * outer} y2={cy + Math.sin(angle) * outer} />
-          <circle className="radial-hit center" cx={cx} cy={cy} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "center")}><title>Move radial center</title></circle>
-          <circle className="radial-handle center" cx={cx} cy={cy} r={handle} />
-          <circle className="radial-hit" cx={cx + inner} cy={cy} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "inner")}><title>Adjust inner radius</title></circle>
-          <circle className="radial-handle" cx={cx + inner} cy={cy} r={handle} />
-          <circle className="radial-hit" cx={cx + outer} cy={cy} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "outer")}><title>Adjust outer radius</title></circle>
-          <circle className="radial-handle" cx={cx + outer} cy={cy} r={handle} />
-          <circle className="radial-hit seam" cx={cx + Math.cos(angle) * outer} cy={cy + Math.sin(angle) * outer} r={handle * 1.9} onPointerDown={(event) => beginRadial(event, "seam")}><title>Rotate seam in exact quarter turns</title></circle>
+          <polyline className="radial-ring inner" points={ring(radial.innerRadius)} />
+          {radial.blendWidth > 0 ? <polyline className="radial-ring transition" points={ring(transitionRadius)} /> : null}
+          <polyline className="radial-ring outer" points={ring(radial.outerRadius)} />
+          <line className="radial-seam" x1={center.x} y1={center.y} x2={seamHandle.x} y2={seamHandle.y} />
+          {radial.seamBlendWidth > 0 ? <><line className="radial-seam feather" x1={center.x} y1={center.y} x2={seamBlendHandle.x} y2={seamBlendHandle.y} /><line className="radial-seam feather" x1={center.x} y1={center.y} x2={seamBlendMirror.x} y2={seamBlendMirror.y} /></> : null}
+          <circle className="radial-hit center" cx={center.x} cy={center.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "center")}><title>Move radial center</title></circle>
+          <circle className="radial-handle center" cx={center.x} cy={center.y} r={handle} />
+          <circle className="radial-hit" cx={innerHandle.x} cy={innerHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "inner")}><title>Adjust inner radius</title></circle>
+          <circle className="radial-handle" cx={innerHandle.x} cy={innerHandle.y} r={handle} />
+          <circle className="radial-hit transition" cx={transitionHandle.x} cy={transitionHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "transition")}><title>Adjust transition width</title></circle>
+          <circle className="radial-handle transition" cx={transitionHandle.x} cy={transitionHandle.y} r={handle} />
+          <circle className="radial-hit" cx={outerHandle.x} cy={outerHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "outer")}><title>Adjust outer radius</title></circle>
+          <circle className="radial-handle" cx={outerHandle.x} cy={outerHandle.y} r={handle} />
+          <circle className="radial-hit seam-blend" cx={seamBlendHandle.x} cy={seamBlendHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "seam_blend")}><title>Adjust seam blend width</title></circle>
+          <circle className="radial-handle seam-blend" cx={seamBlendHandle.x} cy={seamBlendHandle.y} r={handle} />
+          <circle className="radial-hit seam" cx={seamHandle.x} cy={seamHandle.y} r={handle * 1.9} onPointerDown={(event) => beginRadial(event, "seam")}><title>Rotate seam in exact quarter turns</title></circle>
         </g>;
       })() : null}
       {props.patches.map((patch) => {
@@ -2159,7 +2407,8 @@ function SourceCanvas(props: {
         return <g key={patch.id} className={`patch-outline ${active ? "active" : ""} ${pointEditing ? "point-editing" : ""}`} onContextMenu={(event) => openPatchMenu(event, patch)}>
           <polygon
             points={points}
-            onPointerDown={(event) => beginPatchMove(event, patch)}
+            style={radialEditing && active ? { pointerEvents: "none" } : undefined}
+            onPointerDown={radialEditing && active ? undefined : (event) => beginPatchMove(event, patch)}
             onClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); }}
             onDoubleClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); setPointEditPatchId(patch.id); }}
           />
@@ -2213,7 +2462,7 @@ function SourceCanvas(props: {
         <span>Delete patch</span><small>Delete</small>
       </button>
     </div> : null}
-    {props.importing ? <div className="canvas-state">Importing source...</div> : null}
+    {props.importing ? <div className="canvas-state"><strong>{props.importProgress?.stage ?? "Preparing source"}</strong><progress max={1} value={props.importProgress?.fraction ?? 0} /><button onClick={() => void invoke("cancel_import", { request: protocol })}>Cancel import</button></div> : null}
     {props.source ? <div className="viewport-tools">
       <button onClick={() => viewport.zoom(0.8)}>-</button>
       <output>{Math.round(viewport.view.scale * 100)}%</output>
@@ -2333,14 +2582,22 @@ function SheetWorkbench(props: {
   mapView: CompiledMapView;
   selectedRegionId: string | null;
   setSelectedRegionId: (id: string | null) => void;
+  sourceFrameEditing: boolean;
+  onEditSourceFrame: () => void;
   buildState: string;
   problem: CommandFailure | null;
   templateId: string;
   setTemplateId: (id: string) => void;
   primaryMaterial: string;
   build: () => void;
+  renderFullResolutionPreview: () => void;
+  interactivePreviewProfile: PreviewProfile;
+  setInteractivePreviewProfile: (profile: PreviewProfile) => void;
+  previewProgress: PreviewProgress | null;
+  previewElapsedMs: number;
   activity: Activity;
   setResolution: (size: number) => void;
+  setAtlasPadding: (paddingPx: number) => void;
   targetRegionCount: number;
   setTargetRegionCount: (count: number) => void;
   regenerateSourceFrame: (count: number) => void;
@@ -2394,6 +2651,9 @@ function SheetWorkbench(props: {
   const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startCellX: number; startCellY: number; endCellX: number; endCellY: number } | null>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
   const displayRegions = sheet?.regions ?? [];
+  const selectedLayoutRegion = props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId);
+  const selectedLayoutBinding = props.selectedRegionId ? props.project?.document?.regionBindings[props.selectedRegionId] : undefined;
+  const selectedLayoutSlot = props.selectedRegionId ? props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegionId) : undefined;
   const selectedGridRect = resizeDraft?.rect ?? displayRegions.find((region) => region.regionId === props.selectedRegionId)?.gridRect;
   const pendingPatchRegions = props.artifact?.documentRevision !== props.project?.document?.documentRevision
     ? displayRegions.flatMap((region) => {
@@ -2411,11 +2671,11 @@ function SheetWorkbench(props: {
     : null;
   const localTopologyPending = props.artifact?.telemetry.at(-1)?.startsWith("local topology edit:") ?? false;
   // The source texture is a bounded transient fast path only. Once Stage 14 publishes the
-  // current revision, its encoded Base Color is the settled visible product artifact.
+  // current revision, its encoded Diffuse texture is the settled visible product artifact.
   const continuousTexture = props.mapView === "baseColor" && (drawDraft || resizeDraft || localTopologyPending || !imageUrl) ? sourceTexture : null;
   const editorHasImage = !!continuousTexture || !!imageUrl;
   const sourceTextureProblem = props.mapView === "baseColor" && sourceFrame && !continuousTexture && !imageUrl
-    ? "The complete oriented Source Frame Base Color is unavailable. Layout editing will not display a partial Stage 14 map. Re-register Base Color for this Source Frame."
+    ? "The complete oriented Source Frame Diffuse texture is unavailable. Layout editing will not display a partial Stage 14 map. Re-register Diffuse for this Source Frame."
     : null;
   const workpieceSize = sheet
     ? { width: sheet.width, height: sheet.height }
@@ -2536,13 +2796,13 @@ function SheetWorkbench(props: {
       const undo = key === "z" && !event.shiftKey;
       const redo = key === "y" || (key === "z" && event.shiftKey);
       if (!undo && !redo) return;
-      if (props.activity !== "idle" || (undo && !props.project?.canUndoDocument) || (redo && !props.project?.canRedoDocument)) return;
+      if (props.activity !== "idle" || (undo && !props.project?.canUndoDocument && !props.project?.canUndoPatch) || (redo && !props.project?.canRedoDocument && !props.project?.canRedoPatch)) return;
       event.preventDefault();
       if (undo) props.onUndo(); else props.onRedo();
     };
     window.addEventListener("keydown", historyShortcut);
     return () => window.removeEventListener("keydown", historyShortcut);
-  }, [props.activity, props.onUndo, props.onRedo, props.project?.canRedoDocument, props.project?.canUndoDocument]);
+  }, [props.activity, props.onUndo, props.onRedo, props.project?.canRedoDocument, props.project?.canRedoPatch, props.project?.canUndoDocument, props.project?.canUndoPatch]);
   useEffect(() => {
     if (!layoutMenu) return;
     const dismiss = (event: PointerEvent) => {
@@ -2565,11 +2825,30 @@ function SheetWorkbench(props: {
     <section className="layout-stage">
     <aside className="layout-sidebar" aria-label="Layout controls">
       <header><span>LAYOUT</span><strong className={`layout-state ${candidateState.toLowerCase().replaceAll(" ", "-")}`}>{candidateState}</strong></header>
+      {props.project?.document?.sourceFrame ? <fieldset className="trim-sheet-source-settings"><legend>Trim-sheet source</legend><p>Controls the source frame used by the entire authored layout.</p><button className={`source-frame-layout-action ${props.sourceFrameEditing ? "active" : ""}`} onClick={props.onEditSourceFrame}>{props.sourceFrameEditing ? "Editing entire trim-sheet source" : "Edit entire trim-sheet source position"}</button></fieldset> : null}
       <div className="layout-tool-row" role="toolbar" aria-label="Atlas editing tools"><button className={layoutTool === "select" ? "active" : ""} onClick={() => { setLayoutTool("select"); setDrawDraft(null); }}>Select / resize</button><button className={layoutTool === "draw" ? "active" : ""} onClick={() => { setLayoutTool("draw"); setLayoutMenu(null); }}>Draw region</button></div>
       <p className="layout-help">Draw snapped rectangles or resize the selected box with its handles. Middle-drag pans in either tool; pointer movement stays local and release publishes one refreshed artifact.</p>
       <div className="display-controls"><label><input type="checkbox" checked={textureVisible} onChange={(event) => setTextureVisible(event.target.checked)} /> Texture</label><label><input type="checkbox" checked={regionFillVisible} onChange={(event) => setRegionFillVisible(event.target.checked)} /> Region colors</label><label><input type="checkbox" checked={edgeEligibilityVisible} onChange={(event) => setEdgeEligibilityVisible(event.target.checked)} /> Edge eligibility</label></div>
       <div className="grid-controls"><label><input type="checkbox" checked={gridVisible} onChange={(event) => setGridVisible(event.target.checked)} /> Grid</label><label>Opacity <input aria-label="Grid opacity" type="range" min={0} max={100} value={gridOpacity} onChange={(event) => setGridOpacity(Number(event.target.value))} /></label></div>
+      <fieldset className="preview-resolution-settings"><legend>Preview resolution</legend>
+        <label>Size<select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document || props.activity !== "idle"}>
+          <option value={1024}>1K · 1024</option><option value={2048}>2K · 2048</option><option value={4096}>4K · 4096</option><option value={8192}>8K · 8192</option>
+        </select></label>
+        <label>Interactive edits<select value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as PreviewProfile)} disabled={!props.project?.document || props.activity !== "idle"}>
+          <option value="draft512">Fast · 512</option><option value="refinement1024">Detailed · 1024</option><option value="authoritative">Full selected size</option>
+        </select></label>
+        <button onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle"}>Render full-resolution preview</button>
+        <small>Displayed now: {sheet ? `${sheet.width} × ${sheet.height}` : "not rendered"}. Full selected size lets you measure 4K/8K interaction cost directly.</small>
+      </fieldset>
       {selectedGridRect ? <output className="selection-readout">Selected: x {selectedGridRect.x}, y {selectedGridRect.y} · {selectedGridRect.width} × {selectedGridRect.height}</output> : drawRect ? <output className="selection-readout draw">Drawing: x {drawRect.x}, y {drawRect.y} · {drawRect.width} × {drawRect.height}</output> : <output className="selection-readout">No region selected</output>}
+      {selectedLayoutRegion && selectedLayoutBinding ? <fieldset className="layout-region-settings"><legend>Selected region</legend>
+        <strong>{selectedLayoutRegion.displayName}</strong>
+        <label>Replace source<select value={selectedLayoutBinding.content.type === "material_source" ? `source:${selectedLayoutBinding.content.id}` : selectedLayoutBinding.content.type === "patch" ? `patch:${selectedLayoutBinding.content.id}` : selectedLayoutBinding.content.type === "solid" ? "solid" : "inherit"} onChange={(event) => { const value = event.currentTarget.value; const content: ContentReference = value === "inherit" ? { type: "inherit_primary_material" } : value === "solid" ? { type: "solid", id: { baseColor: [128, 128, 128, 255] } } : value.startsWith("source:") ? { type: "material_source", id: value.slice(7) } : { type: "patch", id: value.slice(6) }; void props.onLayoutCommand({ type: "set_region_content", regionId: selectedLayoutRegion.id, content }); }}><option value="inherit">Primary source</option><option value="solid">Solid gray</option>{props.project?.materialSources.map((source) => <optgroup key={source.id} label={source.name}><option value={`source:${source.id}`}>Whole source</option>{props.project?.patches.filter((patch) => patch.enabled && source.registeredChannels?.channels.some((channel) => channel.id === patch.sourceId)).map((patch) => <option key={patch.id} value={`patch:${patch.id}`}>{patch.name}</option>)}</optgroup>)}</select></label>
+        <div className="layout-pair"><label>Role<select value={selectedLayoutBinding.mapping.behavior.role} onChange={(event) => void props.onLayoutCommand({ type: "set_region_behavior", regionId: selectedLayoutRegion.id, behavior: changedBehavior(selectedLayoutBinding.mapping.behavior, { role: event.currentTarget.value as ManualRegionRole }) })}>{manualRoleOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label>Continuity<select value={selectedLayoutBinding.mapping.behavior.continuity} onChange={(event) => void props.onLayoutCommand({ type: "set_region_behavior", regionId: selectedLayoutRegion.id, behavior: changedBehavior(selectedLayoutBinding.mapping.behavior, { continuity: event.currentTarget.value as RegionContinuity }) })}>{continuityOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label></div>
+        <div className="layout-pair"><label>Sampling<select value={selectedLayoutBinding.mapping.behavior.sampling} onChange={(event) => void props.onLayoutCommand({ type: "set_region_behavior", regionId: selectedLayoutRegion.id, behavior: changedBehavior(selectedLayoutBinding.mapping.behavior, { sampling: event.currentTarget.value as RegionSampling }) })}>{samplingOptions.map(([value, label]) => <option key={value} value={value} disabled={!!samplingPrerequisite(selectedLayoutBinding.mapping.behavior.role, value)}>{label}</option>)}</select></label><label>Orientation<select value={selectedLayoutBinding.mapping.behavior.orientation} onChange={(event) => void props.onLayoutCommand({ type: "set_region_behavior", regionId: selectedLayoutRegion.id, behavior: changedBehavior(selectedLayoutBinding.mapping.behavior, { orientation: event.currentTarget.value as RegionBehavior["orientation"] }) })}><option value="zero">0°</option><option value="ninety">90°</option><option value="one_eighty">180°</option><option value="two_seventy">270°</option></select></label></div>
+        <small className="region-settings-summary">Crop {boundsLabel(selectedLayoutSlot?.sourceCrop)} · eligible edges {Object.entries(selectedLayoutBinding.mapping.behavior.edgeEligibility).filter(([, eligible]) => eligible).map(([edge]) => edge).join(", ") || "none"}</small>
+        {selectedLayoutBinding.mapping.behavior.role === "radial" && selectedLayoutBinding.mapping.radial ? <RadialEditor regionId={selectedLayoutRegion.id} radial={selectedLayoutBinding.mapping.radial} onApply={(regionId, radial) => { void props.onLayoutCommand({ type: "set_region_radial", regionId, radial }); }} /> : null}
+      </fieldset> : null}
       <section className="layout-presets" aria-label="Authored layout presets">
         <strong>Authored preset</strong>
         {presetLibraryProblem ? <p className="layout-diagnostic" role="alert">{presetLibraryProblem}</p> : null}
@@ -2630,9 +2909,7 @@ function SheetWorkbench(props: {
       </footer>
       </fieldset>
       <details className="layout-advanced material-preview-settings"><summary>Optional material preview</summary>
-        <label>Output resolution<select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document}>
-          <option value={1024}>1024</option><option value={2048}>2048</option><option value={4096}>4096</option>
-        </select></label>
+        <label>Atlas padding (output px)<input aria-label="Atlas padding in output pixels" type="number" min={0} max={4096} value={props.project?.document?.renderSettings.atlasPaddingPx ?? 0} onChange={(event) => void props.setAtlasPadding(Number(event.currentTarget.value))} disabled={!props.project?.document} /><small>{(() => { const output = props.project?.document?.renderSettings.outputSize.width ?? 2048; const padding = props.project?.document?.renderSettings.atlasPaddingPx ?? 0; return `Draft 512: ${padding ? Math.max(1, Math.ceil(padding * 512 / output)) : 0}px · Refinement 1024: ${padding ? Math.max(1, Math.ceil(padding * 1024 / output)) : 0}px`; })()}</small></label>
         <button onClick={props.build} disabled={!props.project?.document || props.activity !== "idle"}>Rebuild material maps</button>
         <small>Layout drawing and resizing never require this rebuild.</small>
       </details>
@@ -2658,7 +2935,7 @@ function SheetWorkbench(props: {
       onPointerUp={(event) => { finishDirectEdit(event.pointerId); viewport.endPan(event); }}
       onPointerCancel={(event) => { finishDirectEdit(event.pointerId, true); viewport.endPan(event); }}
     >
-      {!sheet || !editorHasImage ? sourceTextureProblem ? <div className="empty-sheet source-texture-error"><strong>Complete Base Color unavailable</strong><span>{sourceTextureProblem}</span></div> : props.preparedPatchPreview ? <div
+      {!sheet || !editorHasImage ? sourceTextureProblem ? <div className="empty-sheet source-texture-error"><strong>Complete Diffuse unavailable</strong><span>{sourceTextureProblem}</span></div> : props.preparedPatchPreview ? <div
         className="rectified-workpiece"
         style={{ width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
       >
@@ -2676,7 +2953,7 @@ function SheetWorkbench(props: {
         <span>Rectified patch</span>
       </div> : <div className="empty-sheet">
         <strong>{props.project?.legacyLayoutDiscarded ? "No trim sheet yet" : "No compiled sheet"}</strong>
-        <span>{props.project?.legacyLayoutDiscarded ? "Sources, maps, and patches were preserved. Old layout state is not shown or converted." : "Build from the current Base Color when ready."}</span>
+        <span>{props.project?.legacyLayoutDiscarded ? "Sources, maps, and patches were preserved. Old layout state is not shown or converted." : "Build from the current Diffuse texture when ready."}</span>
       </div> : <div
         ref={sheetRef}
         className="sheet"
@@ -2727,8 +3004,9 @@ function SheetWorkbench(props: {
       </div> : null}
     </section>
     </section>
-    {props.artifact ? <footer className="artifact-footer">
-      <span>{props.artifact.width} x {props.artifact.height}</span>
+    <footer className="artifact-footer">
+      <PreviewProgressStatus progress={props.previewProgress} elapsedMs={props.previewElapsedMs} />
+      {props.artifact ? <><span>{props.artifact.width} x {props.artifact.height}</span>
       <span>{props.artifact.regions.length} regions</span>
       <span>{props.artifact.label}</span>
       <span>incomplete after Stage {props.artifact.incompleteAfterStage} · non-exportable</span>
@@ -2736,9 +3014,24 @@ function SheetWorkbench(props: {
       {props.artifact.telemetry.length > 0 || props.previewClientTelemetry.length > 0 ? <details className="preview-telemetry">
         <summary>Preview telemetry</summary>
         <pre>{[...props.artifact.telemetry, ...props.previewClientTelemetry].join("\n")}</pre>
-      </details> : null}
-    </footer> : null}
+      </details> : null}</> : <span>No preview rendered</span>}
+    </footer>
   </section>;
+}
+
+function PreviewProgressStatus(props: { progress: PreviewProgress | null; elapsedMs: number }) {
+  const progress = props.progress;
+  if (!progress) return <div className="preview-progress idle"><span>Preview idle</span><progress value={0} max={1} /></div>;
+  const elapsed = Math.round((progress.phase === "compiling" ? props.elapsedMs : progress.elapsedMs ?? 0) / 100) / 10;
+  const dimensions = progress.dimensions ? ` · ${progress.dimensions.width}×${progress.dimensions.height}` : "";
+  const label = progress.phase === "compiling" ? `Rendering / encoding preview · ${elapsed.toFixed(1)}s`
+    : progress.phase === "received" ? `Preview received, decoding${dimensions} · ${elapsed.toFixed(1)}s`
+      : progress.phase === "painted" ? `Preview ready${dimensions} · ${elapsed.toFixed(1)}s`
+        : `Preview failed · ${elapsed.toFixed(1)}s`;
+  return <div className={`preview-progress ${progress.phase}`}><span>{label}</span>{progress.phase === "painted"
+    ? <progress value={1} max={1} aria-label="Preview complete" />
+    : progress.phase === "failed" ? <progress value={0} max={1} aria-label="Preview failed" />
+      : <progress aria-label="Preview compiling" />}</div>;
 }
 
 function HierarchicalRecipeControls(props: { recipe: PartitionRecipe; setRecipe: React.Dispatch<React.SetStateAction<PartitionRecipe>> }) {
@@ -2815,13 +3108,11 @@ function Inspector(props: {
   onRedo: () => void;
   onClassify: (materialSourceId: string, command: MaterialClassificationCommand) => void;
   onCalibrate: (materialSourceId: string, command: MaterialCalibrationCommand) => void;
-  onSetCrop: (regionId: string, bounds: NormalizedBounds) => void;
   onSetRadial: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void;
+  onResizeRegion: (regionId: string, gridRect: LogicalRect) => void;
   onSetSourceFrame: (bounds: NormalizedBounds) => void;
   sourceFrameEditing: boolean;
   onSetSourceFrameEditing: (editing: boolean) => void;
-  onDetachSourceCell: (regionId: string) => void;
-  onResetSourceCell: (regionId: string) => void;
   selectedSourceSetId: string;
   onSetExemplarGroup: (materialSourceId: string, exemplarGroup: string | null) => void;
   onSetDelightingIntent: (materialSourceId: string, delighting: DelightingIntent) => void;
@@ -2846,11 +3137,18 @@ function Inspector(props: {
       ? props.project?.materialSources.find((source) => source.registeredChannels?.channels.some((channel) => channel.id === boundPatch?.sourceId))
       : props.project?.materialSources.find((source) => source.id === props.project?.document?.primaryMaterial);
   return <aside className={`context-inspector ${layoutMode ? "layout-mode" : ""}`}>
-    <header className="inspector-actions"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument}>Redo</button></header>
+    <header className="inspector-actions"><button onClick={props.onUndo} disabled={!props.project?.canUndoDocument && !props.project?.canUndoPatch}>Undo</button><button onClick={props.onRedo} disabled={!props.project?.canRedoDocument && !props.project?.canRedoPatch}>Redo</button></header>
     {layoutMode && !props.selectedRegion ? <section className="inspector-section layout-summary"><span>REGION INSPECTOR</span><p>Select a region to replace its source and edit its mapping settings here.</p></section> : null}
     {props.selectedRegion ? <section className="inspector-section region-controls-primary">
       <span>REGION SETTINGS</span><h2>{props.selectedRegion.displayName}</h2>
       <label>Content source<select value={binding?.content.type === "material_source" ? `source:${binding.content.id}` : binding?.content.type === "patch" ? `patch:${binding.content.id}` : binding?.content.type === "solid" ? "solid" : "inherit"} onChange={(event) => { const value = event.currentTarget.value; if (value === "inherit") props.onSetRegionContent(props.selectedRegion!.regionId, { type: "inherit_primary_material" }); else if (value === "solid") props.onSetRegionContent(props.selectedRegion!.regionId, { type: "solid", id: { baseColor: [128, 128, 128, 255] } }); else if (value.startsWith("source:")) props.onSetRegionContent(props.selectedRegion!.regionId, { type: "material_source", id: value.slice(7) }); else if (value.startsWith("patch:")) props.onSetRegionContent(props.selectedRegion!.regionId, { type: "patch", id: value.slice(6) }); }}><option value="inherit">Primary source</option><option value="solid">Solid gray</option>{props.project?.materialSources.map((source) => <optgroup key={source.id} label={source.registeredChannels?.channels.find((channel) => channel.channel === "base_color")?.displayName ?? source.name}><option value={`source:${source.id}`}>Whole source</option>{props.project?.patches.filter((patch) => patch.enabled && source.registeredChannels?.channels.some((channel) => channel.id === patch.sourceId)).map((patch) => <option key={patch.id} value={`patch:${patch.id}`}>{patch.name}</option>)}</optgroup>)}</select></label>
+      {props.selectedRegion.gridRect && props.project?.document?.logicalGrid ? <RegionGridRectEditor
+        key={`${props.selectedRegion.regionId}:${props.selectedRegion.gridRect.x}:${props.selectedRegion.gridRect.y}:${props.selectedRegion.gridRect.width}:${props.selectedRegion.gridRect.height}`}
+        regionId={props.selectedRegion.regionId}
+        gridRect={props.selectedRegion.gridRect}
+        grid={props.project.document.logicalGrid}
+        onApply={props.onResizeRegion}
+      /> : null}
       {binding ? <>
         <label>Role<select value={binding.mapping.behavior.role} onChange={(event) => props.onSetRegionBehavior(props.selectedRegion!.regionId, changedBehavior(binding.mapping.behavior, { role: event.currentTarget.value as ManualRegionRole }))}>{manualRoleOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
         <label>Continuity<select value={binding.mapping.behavior.continuity} onChange={(event) => props.onSetRegionBehavior(props.selectedRegion!.regionId, changedBehavior(binding.mapping.behavior, { continuity: event.currentTarget.value as RegionContinuity }))}>{continuityOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
@@ -2864,7 +3162,7 @@ function Inspector(props: {
       <span>MAP VIEW</span>
       <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact?.maps[id]} title={props.artifact && !props.artifact.maps[id] ? "Unavailable through Stage 14" : undefined}>{label}</button>)}</div>
     </section>
-    {selectedMaterial ? <section className="inspector-section source-inspector"><span>SOURCE INSPECTOR / ADVANCED MATERIAL PREPARATION</span>
+    {!layoutMode && selectedMaterial ? <section className="inspector-section source-inspector"><span>SOURCE INSPECTOR / ADVANCED MATERIAL PREPARATION</span>
       <h2>{selectedMaterial.name}</h2><dl><dt>Dimensions</dt><dd>{selectedMaterial.registeredChannels ? `${selectedMaterial.registeredChannels.orientedSize.width}×${selectedMaterial.registeredChannels.orientedSize.height}` : "-"}</dd><dt>Maps</dt><dd>{selectedMaterial.registeredChannels?.channels.length ?? 0}</dd><dt>Revision</dt><dd>{selectedMaterial.sourceRevision}</dd></dl>
       <label>Exemplar group<input key={`${selectedMaterial.id}:${selectedMaterial.sourceRevision}`} defaultValue={selectedMaterial.exemplarGroup ?? ""} placeholder="Optional group" onBlur={(event) => { const value = event.currentTarget.value.trim() || null; if (value !== selectedMaterial.exemplarGroup) props.onSetExemplarGroup(selectedMaterial.id, value); }} /></label>
       <label>De-lighting<select value={selectedMaterial.delighting.route.route} onChange={(event) => { const route = event.currentTarget.value; const nextRoute: DelightingIntent["route"] = route === "classical_low_frequency" ? { route: "classical_low_frequency" } : { route: "pass_through", reason: "user_disabled" }; props.onSetDelightingIntent(selectedMaterial.id, { ...selectedMaterial.delighting, route: nextRoute }); }}><option value="pass_through">Off / Pass through</option><option value="classical_low_frequency">Classical low frequency</option></select></label>
@@ -2927,13 +3225,13 @@ function Inspector(props: {
       </> : <p>Select a prepared patch to inspect Stage 5 evidence.</p>}
     </section>
     </details>
-    {props.project?.document?.sourceFrame ? <SourceFrameEditor
+    {!layoutMode && props.project?.document?.sourceFrame ? <SourceFrameEditor
       frame={props.project.document.sourceFrame}
       onApply={props.onSetSourceFrame}
       editing={props.sourceFrameEditing}
       onEditingChange={props.onSetSourceFrameEditing}
     /> : null}
-    <section className="inspector-section">
+    {!layoutMode ? <section className="inspector-section">
       <span>SELECTED REGION</span>
       {props.selectedRegion ? <>
         <h2>{props.selectedRegion.displayName}</h2>
@@ -2950,20 +3248,7 @@ function Inspector(props: {
           <dt>Artifact revision</dt><dd>{props.artifact?.documentRevision ?? "-"}</dd>
           <dt>Material</dt><dd>{props.selectedRegion.materialId.slice(0, 8)}</dd>
         </dl>
-        {stage14Slot?.mappingOrigin === "partition" ? <button onClick={() => props.onDetachSourceCell(props.selectedRegion!.regionId)}>Detach Source Cell</button> : null}
-        {stage14Slot?.mappingOrigin === "explicit_override" ? <button onClick={() => props.onResetSourceCell(props.selectedRegion!.regionId)}>Reset to Partition</button> : null}
         {overlapIds.length > 0 ? <p className="source-overlap-warning">Explicit override overlaps: {overlapIds.join(", ")}</p> : null}
-        {stage14Slot?.mappingOrigin === "explicit_override" && binding?.mapping.projection.type === "crop" ? <CropEditor
-          key={`${props.selectedRegion.regionId}-crop`}
-          regionId={props.selectedRegion.regionId}
-          bounds={binding.mapping.projection.bounds}
-          aspect={props.project?.document?.sourceFrame ? sourceCropAspect(
-            stage14Slot,
-            props.project.document.sourceFrame.orientedDimensions.width,
-            props.project.document.sourceFrame.orientedDimensions.height,
-          ) : 1}
-          onApply={props.onSetCrop}
-        /> : null}
         {binding?.mapping.behavior.role === "radial" && binding.mapping.radial ? <RadialEditor
           key={`${props.selectedRegion.regionId}-radial`}
           regionId={props.selectedRegion.regionId}
@@ -2971,9 +3256,8 @@ function Inspector(props: {
           onApply={props.onSetRadial}
         /> : null}
       </> : <p>Select a patch or create one on the source workbench.</p>}
-    </section>
-    <LockedSection title="Profiles & Weathering" reason="Generated-map recipes are not command-backed in this slice." />
-    <LockedSection title="Decorations" reason="Decoration bindings require authored patch commands." />
+    </section> : null}
+    {!layoutMode ? <><LockedSection title="Profiles & Weathering" reason="Generated-map recipes are not command-backed in this slice." /><LockedSection title="Decorations" reason="Decoration bindings require authored patch commands." /></> : null}
   </aside>;
 }
 
@@ -3118,32 +3402,49 @@ function CalibrationEditor(props: {
   </div>;
 }
 
-function CropEditor(props: { regionId: string; bounds: NormalizedBounds; aspect: number; onApply: (regionId: string, bounds: NormalizedBounds) => void }) {
-  const [bounds, setBounds] = useState(props.bounds);
-  useEffect(() => setBounds(props.bounds), [props.bounds.x, props.bounds.y, props.bounds.width, props.bounds.height]);
-  const set = (field: keyof NormalizedBounds, value: number) => setBounds((current) => constrainAspectBounds(
-    { ...current, [field]: value }, props.aspect, field === "height" ? "height" : "width",
-  ));
-  return <div className="mapping-editor">
-    <strong>SOURCE CROP</strong>
-    <small>Aspect locked to the destination region.</small>
-    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={0} max={1} step={0.01} value={Number(bounds[field].toFixed(4))} onChange={(event) => set(field, Number(event.target.value))} /></label>)}
-    <button onClick={() => props.onApply(props.regionId, constrainAspectBounds(bounds, props.aspect))}>Apply crop</button>
+function RegionGridRectEditor(props: { regionId: string; gridRect: LogicalRect; grid: { width: number; height: number }; onApply: (regionId: string, gridRect: LogicalRect) => void }) {
+  const [rect, setRect] = useState(props.gridRect);
+  const set = (field: keyof LogicalRect, value: number) => setRect((current) => {
+    const rounded = Math.round(Number.isFinite(value) ? value : current[field]);
+    if (field === "x") return { ...current, x: Math.max(0, Math.min(props.grid.width - current.width, rounded)) };
+    if (field === "y") return { ...current, y: Math.max(0, Math.min(props.grid.height - current.height, rounded)) };
+    if (field === "width") return { ...current, width: Math.max(1, Math.min(props.grid.width - current.x, rounded)) };
+    return { ...current, height: Math.max(1, Math.min(props.grid.height - current.y, rounded)) };
+  });
+  return <div className="mapping-editor region-grid-editor">
+    <strong>REGION GEOMETRY</strong>
+    <small>Exact logical-grid bounds. Applying uses the same ownership-preserving command as the sheet handles.</small>
+    {(["x", "y", "width", "height"] as const).map((field) => <label key={field}>{field}<input type="number" min={field === "width" || field === "height" ? 1 : 0} max={field === "x" || field === "width" ? props.grid.width : props.grid.height} step={1} value={rect[field]} onChange={(event) => set(field, Number(event.currentTarget.value))} /></label>)}
+    <button onClick={() => props.onApply(props.regionId, rect)} disabled={sameGridRect(rect, props.gridRect)}>Apply geometry</button>
   </div>;
 }
 
 function RadialEditor(props: { regionId: string; radial: NonNullable<RegionMapping["radial"]>; onApply: (regionId: string, radial: NonNullable<RegionMapping["radial"]>) => void }) {
   const [radial, setRadial] = useState(props.radial);
+  useEffect(() => setRadial(props.radial), [props.radial.centerX, props.radial.centerY, props.radial.innerRadius, props.radial.outerRadius, props.radial.falloff, props.radial.blendWidth, props.radial.seamBlendWidth]);
   const fields: ReadonlyArray<[keyof typeof radial, string, number, number, number]> = [
     ["centerX", "Center X", 0, 1, 0.01], ["centerY", "Center Y", 0, 1, 0.01],
-    ["innerRadius", "Inner", 0, 1.99, 0.01], ["outerRadius", "Outer", 0.01, 2, 0.01],
+    ["innerRadius", "Protected center", 0, 1.999, 0.001], ["outerRadius", "Warp outer edge", 0.001, 2, 0.001],
+    ["falloff", "Falloff", 0.1, 4, 0.05],
+    ["blendWidth", "Transition width", 0, 1, 0.005],
+    ["seamBlendWidth", "Seam blend", 0, 0.25, 0.005],
   ];
+  const update = (field: keyof typeof radial, value: number) => {
+    if (!Number.isFinite(value)) return;
+    let next = { ...radial, [field]: value };
+    if (field === "innerRadius") next = { ...next, innerRadius: Math.max(0, Math.min(radial.outerRadius - 0.001, value)) };
+    else if (field === "outerRadius") next = { ...next, outerRadius: Math.max(radial.innerRadius + 0.001, Math.min(2, value)) };
+    else {
+      const limits: readonly [number, number] = field === "falloff" ? [0.1, 4] : field === "seamBlendWidth" ? [0, 0.25] : [0, 1];
+      next = { ...next, [field]: Math.max(limits[0], Math.min(limits[1], value)) };
+    }
+    setRadial(next);
+    props.onApply(props.regionId, next);
+  };
   return <div className="mapping-editor radial-editor">
     <strong>RADIAL PROJECTION</strong>
-    {fields.map(([field, label, min, max, step]) => <label key={field}>{label}<input type="number" min={min} max={max} step={step} value={Number(radial[field].toFixed(3))} onChange={(event) => setRadial((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}
-    <label title="Stage 14 PlanarRadial does not execute a falloff warp yet.">Falloff<input type="number" value={1} disabled /></label>
-    <small>Arbitrary seam angle and falloff stay disabled until Stage 14 has an exact executor. Orientation above provides truthful quarter turns.</small>
-    <button onClick={() => props.onApply(props.regionId, radial)}>Apply radial</button>
+    {fields.map(([field, label, min, max, step]) => <label key={field}>{label}<input type="number" min={min} max={max} step={step} value={Number(radial[field].toFixed(3))} onChange={(event) => update(field, Number(event.target.value))} /></label>)}
+    <small>The protected center stays planar. Transition width blends into the concentric wrap; Falloff redistributes detail across the remaining band. Changes apply immediately.</small>
   </div>;
 }
 
@@ -3192,6 +3493,9 @@ function retopologizeArtifact(prior: IntermediateAtlasProjection | null, project
     return {
       regionId: definition.id,
       displayName: definition.displayName,
+      semanticBounds: previewBounds,
+      paddedBounds: previewBounds,
+      atlasDestination: previewBounds,
       allocationBounds: previewBounds,
       hotspotBounds: previewBounds,
       idColor: existing?.idColor ?? stableRegionColor(definition.id),

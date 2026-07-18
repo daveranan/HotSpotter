@@ -401,6 +401,20 @@ authored preset topology
 -> Region ID
 ```
 
-The first material prompt should prove one visible structural profile on one manually classified region, through
-`compile_persisted`, without altering layout or Base Color sampling. Only then extend the same route across all regions
-and effects.
+The later material sequence consumes one authoritative `compile_persisted` artifact. No material prompt may recreate
+topology, resolve a second binding, choose a new crop, infer continuity, or bypass the published semantic/padded owner
+rectangles:
+
+1. **Structural profile height** — prove one visible profile on one manually classified RegionId, using its published
+   edge eligibility and padded ownership. Base Color sampling and layout remain byte-identical.
+2. **Material + structural height** — combine registered height from the same source/patch transform with the structural
+   profile inside the same owner rectangle, preserving continuity and radial semantics.
+3. **Normal** — derive or combine normals from that accepted height and registered mapping; padding consumes the same
+   owning-edge dilation and never crosses RegionId.
+4. **Roughness and AO** — sample only the already-resolved binding/transform, apply typed fallbacks per region, and keep
+   Base Color plus prior maps unchanged.
+5. **Region ID** — encode the `compile_persisted` per-pixel ownership already published for semantic and padding texels;
+   categorical IDs use nearest ownership through mip generation.
+
+Each step extends the same artifact and cache identities. The first step remains the gate: one structural profile must
+be visibly and measurably correct before expanding across all regions or adding later effects.

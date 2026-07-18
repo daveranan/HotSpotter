@@ -197,9 +197,13 @@ pub struct RadialMappingSettings {
     pub inner_radius: f64,
     pub outer_radius: f64,
     pub falloff: f64,
+    #[serde(default)]
+    pub blend_width: f64,
+    #[serde(default)]
+    pub seam_blend_width: f64,
 }
 
-pub const REGION_BEHAVIOR_VERSION: u16 = 1;
+pub const REGION_BEHAVIOR_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -286,6 +290,8 @@ impl RegionBehavior {
             inner_radius: 0.0,
             outer_radius: 0.5,
             falloff: 1.0,
+            blend_width: 0.05,
+            seam_blend_width: 0.03,
         });
         Self { role, radial, ..Self::default() }
     }
@@ -335,6 +341,8 @@ impl From<RadialParameters> for RadialMappingSettings {
             inner_radius: value.inner_radius,
             outer_radius: value.outer_radius,
             falloff: 0.5,
+            blend_width: 0.0,
+            seam_blend_width: 0.0,
         }
     }
 }
@@ -673,6 +681,10 @@ pub struct ChannelRenderPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct RenderSettings {
     pub output_size: PixelSize,
+    /// Owning-edge dilation reserved inside each region allocation, expressed at the
+    /// authoritative output resolution. Preview profiles derive their own scaled value.
+    #[serde(default)]
+    pub atlas_padding_px: u32,
     pub renderer_version: String,
     pub channels: BTreeMap<Channel, ChannelRenderPolicy>,
 }
@@ -712,6 +724,7 @@ impl Default for RenderSettings {
                 width: 2_048,
                 height: 2_048,
             },
+            atlas_padding_px: 0,
             renderer_version: "1".into(),
             channels,
         }
@@ -1153,6 +1166,7 @@ impl TrimSheetDocument {
             }
         }
         if !self.render_settings.output_size.is_nonzero()
+            || self.render_settings.atlas_padding_px > 4_096
             || self.render_settings.renderer_version.trim().is_empty()
             || self.render_settings.channels.is_empty()
         {
@@ -1804,6 +1818,9 @@ impl TrimSheetDocument {
             }
             TrimSheetDocumentCommand::SetOutputResolution { output_size } => {
                 next.render_settings.output_size = *output_size;
+            }
+            TrimSheetDocumentCommand::SetAtlasPadding { padding_px } => {
+                next.render_settings.atlas_padding_px = *padding_px;
             }
         }
         next.document_revision = next.document_revision.saturating_add(1);
@@ -2651,6 +2668,9 @@ pub enum TrimSheetDocumentCommand {
     SetOutputResolution {
         output_size: PixelSize,
     },
+    SetAtlasPadding {
+        padding_px: u32,
+    },
     SetSourceFrame {
         bounds: NormalizedBounds,
     },
@@ -3069,11 +3089,15 @@ fn validate_mapping(
             || !radial.inner_radius.is_finite()
             || !radial.outer_radius.is_finite()
             || !radial.falloff.is_finite()
+            || !radial.blend_width.is_finite()
+            || !radial.seam_blend_width.is_finite()
             || !(0.0..=1.0).contains(&radial.center_x)
             || !(0.0..=1.0).contains(&radial.center_y)
             || radial.inner_radius < 0.0
             || radial.outer_radius <= radial.inner_radius
             || radial.outer_radius > 2.0
+            || !(0.0..=1.0).contains(&radial.blend_width)
+            || !(0.0..=0.25).contains(&radial.seam_blend_width)
             || !(0.1..=4.0).contains(&radial.falloff))
     {
         return Err(TrimSheetDocumentError::InvalidRadialMapping(region_id));
@@ -3134,11 +3158,15 @@ fn validate_region_behavior(
             || !radial.inner_radius.is_finite()
             || !radial.outer_radius.is_finite()
             || !radial.falloff.is_finite()
+            || !radial.blend_width.is_finite()
+            || !radial.seam_blend_width.is_finite()
             || !(0.0..=1.0).contains(&radial.center_x)
             || !(0.0..=1.0).contains(&radial.center_y)
             || radial.inner_radius < 0.0
             || radial.outer_radius <= radial.inner_radius
             || radial.outer_radius > 2.0
+            || !(0.0..=1.0).contains(&radial.blend_width)
+            || !(0.0..=0.25).contains(&radial.seam_blend_width)
             || !(0.1..=4.0).contains(&radial.falloff))
     {
         return Err(TrimSheetDocumentError::InvalidRadialMapping(region_id));

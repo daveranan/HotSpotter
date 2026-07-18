@@ -165,7 +165,7 @@ impl SourceFramePreviewCache {
     ) {
         // Keep the pinned SourceFrame plus a small working set of authored patch domains.
         // Patch assignment must not redo Stages 2-8 every time the same patch is rebound.
-        const MAX_DIRECT_DOMAINS: usize = 8;
+        const MAX_DIRECT_DOMAINS: usize = 32;
         if self.direct_domains.len() >= MAX_DIRECT_DOMAINS
             && !self.direct_domains.contains_key(&key)
         {
@@ -386,8 +386,9 @@ fn compile_persisted(
     let mut stage10 = resolve_slot_demands_with_guard(&stage10_inputs, &|| !active())
         .map_err(|error| format!("Stage 10 failed: {error:?}"))?;
     // Gate 1 is deliberately limited to modes with a truthful registered Stage 14
-    // implementation. TextureSynthesis and PolarRadial currently have candidate
-    // families but no exact Stage 14 artifact, so they must not reach optimization.
+    // implementation. TextureSynthesis still has candidate families but no exact
+    // Stage 14 artifact, so it must not reach optimization. PolarRadial is executed
+    // by the typed manual radial branch below.
     for demand in &mut stage10.slots {
         let region = document
             .topology
@@ -755,6 +756,11 @@ fn compile_source_frame(
         },
         SourceFramePreviewProfile::Authoritative => document.render_settings.output_size,
     };
+    let preview_padding_px = scaled_atlas_padding(
+        document.render_settings.atlas_padding_px,
+        document.render_settings.output_size,
+        output_size,
+    );
     let frame = document
         .source_frame
         .as_ref()
@@ -969,6 +975,12 @@ fn compile_source_frame(
             width: destination_x[(rect.x + rect.width) as usize] - destination_x[rect.x as usize],
             height: destination_y[(rect.y + rect.height) as usize] - destination_y[rect.y as usize],
         };
+        let behavior = &binding.mapping.behavior;
+        let semantic = semantic_rect_for_padding(
+            allocation,
+            preview_padding_px,
+            behavior.edge_eligibility,
+        );
         let crop = if uses_frame_partition {
             document
                 .source_overrides
@@ -1036,7 +1048,6 @@ fn compile_source_frame(
             "whole_source_binding"
         };
         validate_manual_mapping(region.id, &binding.mapping)?;
-        let behavior = &binding.mapping.behavior;
         if behavior.period_pixels.is_some_and(|period| period[0] > crop.width || period[1] > crop.height) {
             return Err(format!("region {} authored repeat period exceeds its exact source crop", region.id));
         }
@@ -1073,6 +1084,7 @@ fn compile_source_frame(
             SamplingMode::RepeatY => (CandidateFamily::RepeatYSegment, CandidateRoute::Repeat),
             SamplingMode::PeriodicTile => (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat),
             SamplingMode::PlanarRadial => (CandidateFamily::PlanarRadialSquare, CandidateRoute::PlanarRadial),
+            SamplingMode::PolarRadial => (CandidateFamily::PolarRadialSynthesis, CandidateRoute::PolarRadial),
             _ => (CandidateFamily::PanelDirect, CandidateRoute::Direct),
         };
         let candidate = CropCandidate {
@@ -1116,7 +1128,7 @@ fn compile_source_frame(
         let (slot_physical_size, source_pixels_per_physical_unit) = manual_physical_mapping(
             behavior.sampling,
             crop,
-            allocation,
+            semantic,
         );
         let plan = SamplingPlan {
             slot_id: region.id,
@@ -1141,12 +1153,12 @@ fn compile_source_frame(
         let topology_slot = hot_trimmer_domain::CompiledTemplateSlot {
             slot_key,
             allocation,
-            hotspot: allocation,
+            hotspot: semantic,
         };
         let rendered_key = ContentDigest::sha256(format!(
-            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|allocation={}x{}",
+            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|semantic={}x{}|padding={preview_padding_px}",
             request.profile, output_size.width, output_size.height, plan.candidate.candidate_id,
-            allocation.width, allocation.height,
+            semantic.width, semantic.height,
         ).as_bytes());
         let result = if let Some(cached) = source_frame_cache.and_then(|cache| {
             cache
@@ -1161,7 +1173,7 @@ fn compile_source_frame(
                 SlotSynthesisRequest {
                     plan: &plan,
                     domain: domain.as_ref(),
-                    output_dimensions: [allocation.width, allocation.height],
+                    output_dimensions: [semantic.width, semantic.height],
                     limits: SlotSynthesisLimits::default(),
                 },
                 &|| !active(),
@@ -1291,10 +1303,16 @@ fn compile_source_frame(
         },
     );
     let cache = if decode_cache_hit { "hit" } else { "miss" };
-    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; regions={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_ms={decode_ms}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; compose_ms={compose_ms}; decode_full_frame_allocations={}; elapsed_ms={}",
+    let rendered_cache_misses = document.topology.regions.len().saturating_sub(rendered_cache_hits as usize);
+    let allocated_bytes = artifact.channels.iter().map(|channel| channel.rgba8.len()).sum::<usize>()
+        + artifact.validity.len()
+        + artifact.correspondence.len() * std::mem::size_of::<[f32; 2]>()
+        + artifact.region_ownership.len() * std::mem::size_of::<hot_trimmer_domain::RegionId>();
+    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_ms={compose_ms}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
         request.profile, frame.oriented_dimensions.width, frame.oriented_dimensions.height,
-        frame_domain.width, frame_domain.height, output_size.width, output_size.height, document.topology.regions.len(),
-        u8::from(!decode_cache_hit), started.elapsed().as_millis()));
+        frame_domain.width, frame_domain.height, output_size.width, output_size.height,
+        document.render_settings.atlas_padding_px, preview_padding_px, document.topology.regions.len(), document.patches.len(),
+        u8::from(!decode_cache_hit), u8::from(!decode_cache_hit), started.elapsed().as_millis()));
     if let Some(cache) = source_frame_cache {
         if let Ok(mut guard) = cache.lock() {
             guard.insert_composed(composition_key, Arc::new(artifact.clone()));
@@ -1475,19 +1493,12 @@ fn validate_manual_mapping(
             "region {region_id} uses a transform not exactly representable by the manual Stage 14 sampling plan"
         ));
     }
-    if mapping.behavior.role == ManualRegionRole::Radial
-        && mapping.behavior.radial.is_some_and(|radial| (radial.falloff - 1.0).abs() > epsilon)
-    {
-        return Err(format!(
-            "region {region_id} radial falloff is disabled until Stage 14 executes that warp exactly"
-        ));
-    }
     Ok(())
 }
 
 fn manual_sampling_mode(role: ManualRegionRole, sampling: RegionSampling) -> SamplingMode {
     if role == ManualRegionRole::Radial {
-        return SamplingMode::PlanarRadial;
+        return SamplingMode::PolarRadial;
     }
     match sampling {
         RegionSampling::OneShot => SamplingMode::DirectCrop,
@@ -1504,6 +1515,60 @@ fn manual_template_role(role: ManualRegionRole) -> TemplateSlotRole {
         ManualRegionRole::Unique => TemplateSlotRole::UniqueDetail,
         ManualRegionRole::Radial => TemplateSlotRole::Radial,
     }
+}
+
+/// Converts authoritative output padding to the requested preview profile. A nonzero
+/// authored value remains visible at bounded profiles; authoritative output is exact.
+fn scaled_atlas_padding(
+    padding_px: u32,
+    authoritative: hot_trimmer_domain::PixelSize,
+    profile: hot_trimmer_domain::PixelSize,
+) -> u32 {
+    if padding_px == 0 || authoritative.width == 0 || authoritative.height == 0 {
+        return 0;
+    }
+    let numerator = u64::from(padding_px)
+        * u64::from(profile.width)
+        * u64::from(authoritative.height);
+    let denominator = u64::from(authoritative.width) * u64::from(authoritative.height);
+    let scaled_width = numerator.div_ceil(denominator);
+    let numerator = u64::from(padding_px)
+        * u64::from(profile.height)
+        * u64::from(authoritative.width);
+    let scaled_height = numerator.div_ceil(denominator);
+    u32::try_from(scaled_width.min(scaled_height).max(1)).unwrap_or(u32::MAX)
+}
+
+fn semantic_rect_for_padding(
+    allocation: hot_trimmer_domain::CanonicalRect,
+    padding_px: u32,
+    edges: hot_trimmer_domain::EdgeEligibility,
+) -> hot_trimmer_domain::CanonicalRect {
+    let (left, right) = fitted_edge_insets(
+        allocation.width,
+        edges.left.then_some(padding_px).unwrap_or(0),
+        edges.right.then_some(padding_px).unwrap_or(0),
+    );
+    let (top, bottom) = fitted_edge_insets(
+        allocation.height,
+        edges.top.then_some(padding_px).unwrap_or(0),
+        edges.bottom.then_some(padding_px).unwrap_or(0),
+    );
+    hot_trimmer_domain::CanonicalRect {
+        x: allocation.x + left,
+        y: allocation.y + top,
+        width: allocation.width - left - right,
+        height: allocation.height - top - bottom,
+    }
+}
+
+fn fitted_edge_insets(extent: u32, leading: u32, trailing: u32) -> (u32, u32) {
+    let available = extent.saturating_sub(1);
+    if leading > 0 && trailing > 0 {
+        let each = leading.min(trailing).min(available / 2);
+        return (each, each);
+    }
+    (leading.min(available), trailing.min(available))
 }
 
 fn manual_physical_mapping(
@@ -1981,7 +2046,7 @@ fn legal_gate1_mode(
             SamplingMode::UniqueContain | SamplingMode::UniqueCover
         ),
         TemplateSlotRole::TrimCap => mode == SamplingMode::ThreeSliceCap,
-        TemplateSlotRole::Radial => matches!(mode, SamplingMode::PlanarRadial),
+        TemplateSlotRole::Radial => matches!(mode, SamplingMode::PolarRadial),
     }
 }
 

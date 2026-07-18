@@ -176,6 +176,42 @@ export function preserveViewAcrossContentResize(
   };
 }
 
+type QuadPoint = { x: number; y: number };
+type QuadCorners = readonly [QuadPoint, QuadPoint, QuadPoint, QuadPoint];
+
+/** Maps rectified patch UVs into the authored four-point source geometry. */
+export function mapUnitSquareToQuad(corners: QuadCorners, point: QuadPoint): QuadPoint {
+  const [topLeft, topRight, bottomRight, bottomLeft] = corners;
+  const top = { x: topLeft.x + (topRight.x - topLeft.x) * point.x, y: topLeft.y + (topRight.y - topLeft.y) * point.x };
+  const bottom = { x: bottomLeft.x + (bottomRight.x - bottomLeft.x) * point.x, y: bottomLeft.y + (bottomRight.y - bottomLeft.y) * point.x };
+  return { x: top.x + (bottom.x - top.x) * point.y, y: top.y + (bottom.y - top.y) * point.y };
+}
+
+/** Inverts the bilinear patch map so source-pointer gestures edit rectified patch UVs. */
+export function mapQuadToUnitSquare(corners: QuadCorners, point: QuadPoint): QuadPoint {
+  const xs = corners.map((corner) => corner.x), ys = corners.map((corner) => corner.y);
+  let uv = {
+    x: clamp((point.x - Math.min(...xs)) / Math.max(1e-9, Math.max(...xs) - Math.min(...xs)), 0, 1),
+    y: clamp((point.y - Math.min(...ys)) / Math.max(1e-9, Math.max(...ys) - Math.min(...ys)), 0, 1),
+  };
+  for (let iteration = 0; iteration < 10; iteration += 1) {
+    const mapped = mapUnitSquareToQuad(corners, uv);
+    const epsilon = 1e-5;
+    const du = mapUnitSquareToQuad(corners, { x: uv.x + epsilon, y: uv.y });
+    const dv = mapUnitSquareToQuad(corners, { x: uv.x, y: uv.y + epsilon });
+    const ux = (du.x - mapped.x) / epsilon, uy = (du.y - mapped.y) / epsilon;
+    const vx = (dv.x - mapped.x) / epsilon, vy = (dv.y - mapped.y) / epsilon;
+    const determinant = ux * vy - uy * vx;
+    if (Math.abs(determinant) < 1e-12) break;
+    const errorX = mapped.x - point.x, errorY = mapped.y - point.y;
+    uv = {
+      x: clamp(uv.x - (errorX * vy - errorY * vx) / determinant, 0, 1),
+      y: clamp(uv.y - (ux * errorY - uy * errorX) / determinant, 0, 1),
+    };
+  }
+  return uv;
+}
+
 export function clamp01(value: number): number {
   return clamp(value, 0, 1);
 }

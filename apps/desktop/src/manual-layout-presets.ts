@@ -12,7 +12,7 @@ const diagonalRects = [
 ] as const;
 
 export function defaultRegionBehavior(): RegionBehavior {
-  return { version: 1, role: "panel", continuity: "none", sampling: "one_shot", orientation: "zero", edgeEligibility: { left: true, right: true, top: true, bottom: true } };
+  return { version: 2, role: "panel", continuity: "none", sampling: "one_shot", orientation: "zero", edgeEligibility: { left: true, right: true, top: true, bottom: true } };
 }
 
 function record(key: string, displayName: string, x: number, y: number, width: number, height: number, defaultBehavior = defaultRegionBehavior()): AuthoredLayoutPresetRegion {
@@ -44,7 +44,7 @@ export function snapshotDocumentPreset(document: TrimSheetDocument, presetId: st
   const priorKeys = new Map(document.authoredLayoutPreset?.regions.map((region) => [rectKey(region.gridRect), region.presetRegionKey]));
   return {
     presetId, schemaVersion: 1, name, logicalGrid: grid, canonicalAspect: [document.renderSettings.outputSize.width, document.renderSettings.outputSize.height],
-    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height, document.regionBindings[region.id]?.mapping.behavior ?? defaultRegionBehavior())] : []),
+    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height, document.regionBindings?.[region.id]?.mapping.behavior ?? defaultRegionBehavior())] : []),
     provenance: "user_authored_snapshot",
   };
 }

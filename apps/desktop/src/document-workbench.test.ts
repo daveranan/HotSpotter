@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CompiledSheetProjection, TrimSheetDocumentCommand } from "@hot-trimmer/ipc-contracts";
-import { adjustCrop, anchoredZoom, fitSourceFrame, gridRectToPreviewBounds, movePatch, normalizePatchToRectangle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
+import { adjustCrop, anchoredZoom, fitSourceFrame, gridRectToPreviewBounds, mapQuadToUnitSquare, mapUnitSquareToQuad, movePatch, normalizePatchToRectangle, resizeAspectLocked, resizePatch, resizePanes, rotatePatch } from "./source-workbench-geometry.ts";
 
 test("document command wire shapes are typed and carry exact stable IDs", () => {
   const regionId = "764f7fc0-5091-47f8-878f-1e926b0c9f66";
@@ -78,6 +78,19 @@ test("source crop geometry moves and resizes inside normalized source space", ()
     width: 0.75,
     height: 0.8,
   });
+});
+
+test("radial gizmo coordinates round-trip through an authored four-point patch", () => {
+  const corners = [
+    { x: 0.12, y: 0.18 }, { x: 0.91, y: 0.08 },
+    { x: 0.82, y: 0.9 }, { x: 0.2, y: 0.78 },
+  ] as const;
+  for (const local of [{ x: 0.35, y: 0.62 }, { x: 0.5, y: 0.5 }, { x: 0.82, y: 0.24 }]) {
+    const source = mapUnitSquareToQuad(corners, local);
+    const roundTrip = mapQuadToUnitSquare(corners, source);
+    assert.ok(Math.abs(roundTrip.x - local.x) < 0.000001);
+    assert.ok(Math.abs(roundTrip.y - local.y) < 0.000001);
+  }
 });
 
 function assertBoundsClose(

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const app = readFileSync(new URL("./source-first-app.tsx", import.meta.url), "utf8");
+const styles = readFileSync(new URL("./document-app.css", import.meta.url), "utf8");
 const compiler = readFileSync(new URL("../../../crates/sheet-compiler/src/persisted_pipeline.rs", import.meta.url), "utf8");
 const store = readFileSync(new URL("../../../crates/project-store/src/lib.rs", import.meta.url), "utf8");
 const native = readFileSync(new URL("../src-tauri/src/document_commands.rs", import.meta.url), "utf8");
@@ -62,7 +63,8 @@ test("libraries, assignment, splitters, and application context menus are runtim
   assert.doesNotMatch(app, /Filter patches by source|All sources/);
   assert.match(app, /sourceSetForPatch\(patch\)\?\.id === props\.activeSourceSetId/);
   assert.match(app, /Add independent source/);
-  assert.match(app, /Add\/replace channel maps/);
+  assert.match(app, />\+ Add maps…</);
+  assert.match(app, /channelMenu\.filled \? "Replace texture…" : "Add texture…"/);
   assert.match(app, /Set as primary \/ Rebase layout/);
   assert.match(app, /onContextMenu=\{\(event\) => \{ event\.preventDefault\(\)/);
   assert.match(app, /hot-trimmer\.workbench-panes\.v1/);
@@ -81,7 +83,7 @@ test("workbench and hotspot visibility are independent and the source-sheet divi
 });
 
 test("selected region authority is exposed at the top of the right inspector", () => {
-  assert.match(app, />REGION CONTROLS</);
+  assert.match(app, />REGION SETTINGS</);
   assert.match(app, />Content source<select/);
   assert.match(app, /samplingOptions/);
   assert.match(app, /set_region_behavior/);
@@ -94,7 +96,7 @@ test("patch assignment paints immediately and publishes the persisted binding wi
   const layoutAssignment = app.slice(app.indexOf("async function editSourceFrameLayout"), app.indexOf("function discardPartitionCandidate"));
   const directPatchAssignment = app.slice(app.indexOf("async function assignPatchToRegion"), app.indexOf("async function assignContentToRegion"));
   const directContentAssignment = app.slice(app.indexOf("async function assignContentToRegion"), app.indexOf("async function setRegionBehavior"));
-  assert.match(layoutAssignment, /if \(!assignedRegionId\) setArtifact/);
+  assert.match(layoutAssignment, /if \(!pixelRegionId\) setArtifact/);
   assert.doesNotMatch(directPatchAssignment, /retopologizeArtifact|setArtifact/);
   assert.doesNotMatch(directContentAssignment, /retopologizeArtifact|setArtifact/);
   assert.match(app, /requestPreview\(undefined, undefined, "draft512", current\.document!\.documentRevision, false\)/);
@@ -110,32 +112,83 @@ test("solid content, replacement preflight, library metadata, and diagnostics ar
   assert.match(compiler, /"solid_binding"/);
   assert.match(app, /function replaceBaseWithPreflight/);
   assert.match(app, /affectedRegions/);
-  assert.match(app, /const readiness = base \? "Ready" : "Missing Base Color"/);
+  assert.match(app, /const readiness = base \? "Ready" : "Missing Diffuse"/);
   assert.match(app, /const shape = .*\? "Rectangle" : "Four point"/);
   assert.match(app, /<summary>Advanced compile diagnostics<\/summary>/);
 });
 
 test("scrolling the region assignment menu does not zoom the hotspot sheet", () => {
-  const menu = app.slice(app.indexOf('className="layout-menu region-content-menu"'), app.indexOf("<strong>Content</strong>"));
-  assert.match(menu, /onWheel=\{\(event\) => event\.stopPropagation\(\)\}/);
+  assert.match(app, /className="layout-menu"[\s\S]*?onWheel=\{\(event\) => event\.stopPropagation\(\)\}[\s\S]*?className="layout-submenu region-content-menu"/);
 });
 
 test("patch domains are bounded for draft publication and reused across assignments", () => {
   assert.match(compiler, /patch_domain_cache_key\(request\.project, source_set_id, patch, preserve_source_resolution\)/);
   assert.match(compiler, /matches!\(request\.profile, SourceFramePreviewProfile::Authoritative\)/);
   assert.match(compiler, /guard\.insert\(patch_key, Arc::clone\(&domain\)\)/);
-  assert.match(compiler, /const MAX_DIRECT_DOMAINS: usize = 8/);
+  assert.match(compiler, /const MAX_DIRECT_DOMAINS: usize = 32/);
   assert.match(compiler, /build_direct_patch_domain/);
   assert.match(compiler, /PreparedMaterialDomain::from_registered_channels/);
   assert.doesNotMatch(compiler.slice(compiler.indexOf("fn build_direct_patch_domain"), compiler.indexOf("fn build_domain")), /prepare_stage_08_material_domain|RepeatX|PeriodicTile/);
 });
 
 test("a selected region can become an isolated editable patch", () => {
-  assert.match(app, /async function editSelectedRegionAsPatch\(\)/);
+  assert.match(app, /async function editSelectedRegionAsPatch\(authoredBounds\?: NormalizedBounds\)/);
   assert.match(app, /name: nextPatchName\(base\.id\)/);
   assert.match(app, /await assignPatchToRegion\(patchId, regionId\)/);
   assert.match(app, /Editing selected region as an isolated patch/);
   assert.match(app, /!regionPatchEditId \|\| patch\.id === activePatchId/);
+  assert.match(app, /onCommitCrop=\{\(bounds\) => void editSelectedRegionAsPatch\(bounds\)\}/);
+  assert.doesNotMatch(app, />Detach Source Cell</);
+  assert.doesNotMatch(app, />Reset to Partition</);
+});
+
+test("Workbench terminology and region geometry have one visible authority", () => {
+  assert.match(app, />WORKBENCH</);
+  assert.doesNotMatch(app, /WORKPLACE/);
+  assert.match(app, /function RegionGridRectEditor/);
+  assert.match(app, /type: "resize_source_frame_region"/);
+  assert.match(app, />Apply geometry</);
+  assert.match(app, /\{props\.selectedRegion \? <section className="inspector-section region-controls-primary">/);
+});
+
+test("a fresh project cancels and clears every patch-derived state", () => {
+  const reset = app.slice(app.indexOf("function acceptProject"), app.indexOf("async function chooseImages"));
+  assert.match(reset, /patchPreviewRequestId\.current \+= 1/);
+  assert.match(reset, /transientPreviewController\.current\.cancel\(\)/);
+  assert.match(reset, /sourceFramePreviewController\.current\.cancel\(\)/);
+  for (const state of ["ActivePatchId", "RegionPatchEditId", "PreparedPatchPreview", "DraftPatchPreview", "PatchTool"]) {
+    assert.match(reset, new RegExp(`set${state}\\(null\\)`));
+  }
+  assert.match(reset, /setPreparedPatchPreviews\(\{\}\)/);
+  assert.match(reset, /patchFallbackContent\.current\.clear\(\)/);
+});
+
+test("texture maps own replacement while source groups keep only group actions", () => {
+  const sourceMenu = app.slice(app.indexOf("{sourceMenu ?"), app.indexOf("{patchMenu ?"));
+  assert.doesNotMatch(sourceMenu, /Replace .*texture|Add maps|channel maps/);
+  assert.match(sourceMenu, /Rename…/);
+  assert.match(sourceMenu, /Reveal source/);
+  assert.match(sourceMenu, /Remove…/);
+  const slots = app.slice(app.indexOf("function MapSlots"), app.indexOf("function useViewportController"));
+  assert.ok(slots.indexOf('className="map-slot add-maps"') < slots.indexOf("channelOptions.map"));
+  assert.match(slots, /onContextMenu=\{\(event\) => \{/);
+  assert.match(slots, /Replace texture…/);
+  assert.doesNotMatch(app, /Base Color/);
+  assert.match(styles, /\.map-slots \{[\s\S]*padding: 2px;/);
+  assert.doesNotMatch(styles, /scrollbar-width: thin|scrollbar-color:/);
+  assert.match(styles, /\.map-slots::-webkit-scrollbar \{ height: 2px; \}/);
+  const mapSlotRule = styles.slice(styles.indexOf(".map-slot {"), styles.indexOf(".map-slot.active"));
+  assert.match(mapSlotRule, /padding: 1px 2px 2px 3px;/);
+  assert.doesNotMatch(mapSlotRule, /height:/);
+  assert.match(styles, /\.map-slot\.add-maps \{[\s\S]*place-items: center;[\s\S]*align-self: stretch;[\s\S]*flex: 0 0 auto;[\s\S]*min-width: max-content;[\s\S]*white-space: nowrap;/);
+});
+
+test("source, patch, and texture context menus dismiss on outside pointer input", () => {
+  assert.match(app, /closest\("\.source-context-menu, \.library-patch-context-menu"\)/);
+  assert.match(app, /className="patch-context-menu library-patch-context-menu"/);
+  assert.match(app, /closest\("\.channel-context-menu"\)/);
+  assert.match(app, /window\.addEventListener\("pointerdown", dismiss, true\)/);
+  assert.match(app, /window\.removeEventListener\("pointerdown", dismiss, true\)/);
 });
 
 test("new patches are enumerated per source and menus show the stored name once", () => {

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
-    io::{Cursor, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -24,7 +24,7 @@ use hot_trimmer_domain::{
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, NormalizationSettings,
-    PreparedChannelSet, inspect_bytes_with_policy, inspect_path_with_policy,
+    PreparedChannelSet, inspect_bytes_with_policy, inspect_path_cancellable,
     prepare_registered_channel_set,
 };
 use hot_trimmer_material_analysis::{
@@ -43,9 +43,9 @@ use hot_trimmer_render_core::{
 use hot_trimmer_sheet_compiler::{
     AlgorithmCompiler, CompiledMapSet, PreviewMapKind, ResolvedRegion,
 };
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use image::{ColorType, ImageEncoder, codecs::png::{CompressionType, FilterType, PngEncoder}};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::paths::AppPaths;
@@ -151,6 +151,13 @@ impl ProjectSession {
 pub type SharedProjectSession = Arc<Mutex<ProjectSession>>;
 pub type PendingProjectPath = Arc<Mutex<Option<String>>>;
 pub type SharedImportJob = Arc<Mutex<Option<CancellationToken>>>;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProgress {
+    stage: &'static str,
+    fraction: f32,
+}
 pub type SharedPreviewService = Arc<PreviewService>;
 
 #[derive(Default)]
@@ -565,6 +572,10 @@ pub struct Stage14SlotProjection {
     display_name: String,
     allocation_bounds: hot_trimmer_domain::CanonicalRect,
     hotspot_bounds: hot_trimmer_domain::CanonicalRect,
+    semantic_rect: hot_trimmer_domain::CanonicalRect,
+    padded_rect: hot_trimmer_domain::CanonicalRect,
+    atlas_destination: hot_trimmer_domain::CanonicalRect,
+    preview_padding_px: u32,
     mapping_mode: String,
     source_transform: hot_trimmer_placement_solver::CandidateTransform,
     isotropic_scale: f64,
@@ -685,17 +696,24 @@ pub fn import_source(
     request: ImportSourceRequest,
     session: State<'_, SharedProjectSession>,
     import_job: State<'_, SharedImportJob>,
+    app: AppHandle,
 ) -> Result<ProjectProjection, UserFacingError> {
     validate_protocol(request.protocol_version)?;
     let cancellation = CancellationToken::new();
     *import_job.lock().map_err(|_| poisoned())? = Some(cancellation.clone());
+    let _ = app.emit("import-progress", ImportProgress { stage: "Reading and decoding", fraction: 0.05 });
     let path = PathBuf::from(&request.path);
-    let inspected = inspect_path_with_policy(
+    let inspected = inspect_path_cancellable(
         &path,
         DecodeLimits::default(),
         color_policy(request.channel),
+        &cancellation,
     )
     .map_err(image_error)?;
+    let _ = app.emit("import-progress", ImportProgress { stage: "Validating registration", fraction: 0.82 });
+    if cancellation.is_cancelled() {
+        return Err(image_error(hot_trimmer_image_io::ImageIoError::Cancelled));
+    }
     let input = source_input(&path, request.ownership, &inspected);
     let mut session = session.lock().map_err(|_| poisoned())?;
     let store = session.store.as_mut().ok_or_else(no_project)?;
@@ -718,6 +736,7 @@ pub fn import_source(
         .invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
     session.mark_mutated();
     *import_job.lock().map_err(|_| poisoned())? = None;
+    let _ = app.emit("import-progress", ImportProgress { stage: "Complete", fraction: 1.0 });
     project_projection(&session)
 }
 
@@ -2241,6 +2260,10 @@ fn build_stage_14_preview(
                 ),
                 allocation_bounds: slot.allocation,
                 hotspot_bounds: slot.hotspot,
+                semantic_rect: slot.semantic_rect,
+                padded_rect: slot.padded_rect,
+                atlas_destination: slot.atlas_destination,
+                preview_padding_px: slot.preview_padding_px,
                 mapping_mode: format!("{:?}", slot.mapping_mode),
                 source_transform: slot.source_transform,
                 isotropic_scale: slot.isotropic_scale,
@@ -2870,15 +2893,10 @@ fn encode_maps(
 }
 
 fn png_data_url(width: u32, height: u32, pixels: Vec<u8>) -> Result<String, UserFacingError> {
-    let image = RgbaImage::from_raw(width, height, pixels)
-        .ok_or_else(|| error(ErrorCode::Internal, "Compiled pixels are invalid."))?;
-    let mut encoded = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image)
-        .write_to(&mut encoded, ImageFormat::Png)
-        .map_err(|e| error(ErrorCode::Internal, &e.to_string()))?;
+    let encoded = encode_preview_png(width, height, &pixels)?;
     Ok(format!(
         "data:image/png;base64,{}",
-        STANDARD.encode(encoded.into_inner())
+        STANDARD.encode(encoded)
     ))
 }
 
@@ -2895,12 +2913,7 @@ fn png_data_url_cancellable(
             "Preview publication was superseded.",
         ));
     }
-    let image = RgbaImage::from_raw(width, height, pixels)
-        .ok_or_else(|| error(ErrorCode::Internal, "Compiled pixels are invalid."))?;
-    let mut encoded = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image)
-        .write_to(&mut encoded, ImageFormat::Png)
-        .map_err(|e| error(ErrorCode::Internal, &e.to_string()))?;
+    let encoded = encode_preview_png(width, height, &pixels)?;
     if cancellation.is_cancelled() || !active() {
         return Err(error(
             ErrorCode::OperationCancelled,
@@ -2909,8 +2922,24 @@ fn png_data_url_cancellable(
     }
     Ok(format!(
         "data:image/png;base64,{}",
-        STANDARD.encode(encoded.into_inner())
+        STANDARD.encode(encoded)
     ))
+}
+
+fn encode_preview_png(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>, UserFacingError> {
+    let expected = usize::try_from(u64::from(width) * u64::from(height) * 4)
+        .map_err(|_| error(ErrorCode::Internal, "Compiled preview dimensions are invalid."))?;
+    if pixels.len() != expected {
+        return Err(error(ErrorCode::Internal, "Compiled pixels are invalid."));
+    }
+    // Preview publication optimizes latency, not file size. Export encoding remains separate.
+    // The default adaptive PNG path is disproportionately expensive for high-entropy 2K–8K
+    // material imagery, especially in development builds.
+    let mut encoded = Vec::new();
+    PngEncoder::new_with_quality(&mut encoded, CompressionType::Fast, FilterType::Sub)
+        .write_image(pixels, width, height, ColorType::Rgba8.into())
+        .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+    Ok(encoded)
 }
 
 fn rgba_nontransparent_bounds(pixels: &[u8], width: u32, height: u32) -> String {

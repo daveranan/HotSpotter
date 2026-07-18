@@ -103,7 +103,13 @@ impl SlotSynthesisError {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Position { x: f64, y: f64, valid: bool }
+struct Position { x: f64, y: f64, valid: bool, seam_sample: Option<[f64; 2]>, seam_blend: f64 }
+
+impl Position {
+    fn single(x: f64, y: f64, valid: bool) -> Self {
+        Self { x, y, valid, seam_sample: None, seam_blend: 0.0 }
+    }
+}
 
 pub fn synthesize_slot_material(
     request: SlotSynthesisRequest<'_>,
@@ -127,6 +133,8 @@ pub fn synthesize_slot_material_with_guard(
     }
 
     let mut positions = Vec::with_capacity(usize::try_from(pixels).map_err(|_| SlotSynthesisError::ResourceLimitExceeded)?);
+    let mut seam_positions = Vec::with_capacity(positions.capacity());
+    let mut seam_blends = Vec::with_capacity(positions.capacity());
     let mut validity = Vec::with_capacity(positions.capacity());
     for y in 0..height {
         if cancelled() { return Err(SlotSynthesisError::Cancelled); }
@@ -136,6 +144,8 @@ pub fn synthesize_slot_material_with_guard(
             let source_valid = position.valid && sample_validity(request.domain, position.x, position.y);
             if !position.x.is_finite() || !position.y.is_finite() { return Err(SlotSynthesisError::InvalidPlan); }
             positions.push([position.x as f32, position.y as f32]);
+            seam_positions.push(position.seam_sample.map_or([position.x as f32, position.y as f32], |sample| [sample[0] as f32, sample[1] as f32]));
+            seam_blends.push(position.seam_blend as f32);
             validity.push(MaskValue(if source_valid { 1.0 } else { 0.0 }));
         }
     }
@@ -143,7 +153,7 @@ pub fn synthesize_slot_material_with_guard(
     let validity = plane(width, height, request.limits.tile_edge, &validity)?;
     let mut channels = Vec::with_capacity(request.domain.registered_channels().len());
     for channel in request.domain.registered_channels() {
-        channels.push(sample_channel(channel, &positions, width, height, &request, cancelled)?);
+        channels.push(sample_channel(channel, &positions, &seam_positions, &seam_blends, width, height, &request, cancelled)?);
     }
     if cancelled() { return Err(SlotSynthesisError::Cancelled); }
     let algorithm = AlgorithmProvenance { algorithm_id: STAGE_14_ALGORITHM_ID.into(), version: STAGE_14_ALGORITHM_VERSION.into() };
@@ -204,9 +214,11 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
     }
     if p.radial_mapping.is_some_and(|radial| !radial.center_x.is_finite() || !radial.center_y.is_finite()
         || !radial.inner_radius.is_finite() || !radial.outer_radius.is_finite()
-        || !radial.falloff.is_finite() || !(0.0..=1.0).contains(&radial.center_x)
+        || !radial.falloff.is_finite() || !radial.blend_width.is_finite() || !radial.seam_blend_width.is_finite()
+        || !(0.0..=1.0).contains(&radial.center_x)
         || !(0.0..=1.0).contains(&radial.center_y) || radial.inner_radius < 0.0
         || radial.outer_radius <= radial.inner_radius || radial.outer_radius > 2.0
+        || !(0.0..=1.0).contains(&radial.blend_width) || !(0.0..=0.25).contains(&radial.seam_blend_width)
         || !(0.1..=4.0).contains(&radial.falloff)) {
         return Err(SlotSynthesisError::InvalidPlan);
     }
@@ -321,38 +333,71 @@ fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
             let origin = [(source_size[0] - extent[0]) * 0.5, (source_size[1] - extent[1]) * 0.5];
             let valid = mode != SamplingMode::UniqueContain
                 || (m[0] >= origin[0] && m[0] < origin[0] + extent[0] && m[1] >= origin[1] && m[1] < origin[1] + extent[1]);
-            Position { x: f64::from(c.x) + (m[0] - origin[0]) * pixels_per_unit,
-                y: f64::from(c.y) + (m[1] - origin[1]) * pixels_per_unit, valid }
+            Position::single(f64::from(c.x) + (m[0] - origin[0]) * pixels_per_unit,
+                f64::from(c.y) + (m[1] - origin[1]) * pixels_per_unit, valid)
         }
-        SamplingMode::ExplicitStretch => Position { x: f64::from(c.x) + m[0] / source_size[0] * cw,
-            y: f64::from(c.y) + m[1] / source_size[1] * ch, valid: true },
+        SamplingMode::ExplicitStretch => Position::single(f64::from(c.x) + m[0] / source_size[0] * cw,
+            f64::from(c.y) + m[1] / source_size[1] * ch, true),
         SamplingMode::PolarRadial => {
-            let (center_x, center_y, inner_radius, outer_radius, falloff) = r.plan.radial_mapping.map_or(
-                (0.5, 0.5, 0.0, 0.5, 1.0), |radial| (radial.center_x, radial.center_y,
-                    radial.inner_radius, radial.outer_radius, radial.falloff));
+            let (center_x, center_y, inner_radius, outer_radius, falloff, blend_width, seam_blend_width) = r.plan.radial_mapping.map_or(
+                (0.5, 0.5, 0.0, 0.5, 1.0, 0.0, 0.0), |radial| (radial.center_x, radial.center_y,
+                    radial.inner_radius, radial.outer_radius, radial.falloff, radial.blend_width, radial.seam_blend_width));
             let radial_local = transform_local([q[0] - center_x, q[1] - center_y],
                 transform.rotation, transform.mirror);
             let dx = radial_local[0]; let dy = radial_local[1];
             let radius = dx.hypot(dy); let radial_span = (outer_radius - inner_radius).max(f64::EPSILON);
             let theta = dy.atan2(dx).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
-            Position { x: f64::from(c.x) + theta * cw,
-                y: f64::from(c.y) + ((radius - inner_radius) / radial_span).clamp(0.0, 1.0).powf(falloff) * ch,
-                valid: radius >= inner_radius && radius <= outer_radius }
+            if radius < inner_radius {
+                Position::single(f64::from(c.x) + (center_x + dx) * cw,
+                    f64::from(c.y) + (center_y + dy) * ch, true)
+            } else {
+                let planar = [(center_x + dx) * cw, (center_y + dy) * ch];
+                let polar = [theta * cw,
+                    ((radius - inner_radius) / radial_span).clamp(0.0, 1.0).powf(falloff) * ch];
+                let transition = blend_width.min(radial_span);
+                let t = if transition <= f64::EPSILON { 1.0 }
+                    else { ((radius - inner_radius) / transition).clamp(0.0, 1.0) };
+                let blend = t * t * (3.0 - 2.0 * t);
+                let x = f64::from(c.x) + planar[0] * (1.0 - blend) + polar[0] * blend;
+                let y = f64::from(c.y) + planar[1] * (1.0 - blend) + polar[1] * blend;
+                let seam_distance = theta.min(1.0 - theta);
+                let (seam_sample, seam_blend) = if seam_blend_width > f64::EPSILON && seam_distance < seam_blend_width {
+                    let edge_t = (seam_distance / seam_blend_width).clamp(0.0, 1.0);
+                    let feather = 0.5 * (1.0 - edge_t * edge_t * (3.0 - 2.0 * edge_t)) * blend;
+                    let other_polar_x = ((1.0 - theta) * cw).min(cw - f64::EPSILON);
+                    (Some([f64::from(c.x) + planar[0] * (1.0 - blend) + other_polar_x * blend, y]), feather)
+                } else { (None, 0.0) };
+                Position { x, y, valid: radius <= outer_radius, seam_sample, seam_blend }
+            }
         }
         SamplingMode::PlanarRadial => {
-            let (center_x, center_y, inner_radius, outer_radius) = r.plan.radial_mapping.map_or(
-                (0.5, 0.5, 0.0, f64::INFINITY), |radial| (radial.center_x, radial.center_y, radial.inner_radius, radial.outer_radius));
-            let radius = (q[0] - center_x).hypot(q[1] - center_y);
-            let radial_local = transform_local([(q[0] - center_x) * destination_size[0],
-                (q[1] - center_y) * destination_size[1]], transform.rotation, transform.mirror);
-            Position { x: f64::from(c.x) + center_x * cw + radial_local[0] * scale,
-                y: f64::from(c.y) + center_y * ch + radial_local[1] * scale,
-                valid: radius >= inner_radius && radius <= outer_radius }
+            let (center_x, center_y, inner_radius, outer_radius, falloff) = r.plan.radial_mapping.map_or(
+                (0.5, 0.5, 0.0, f64::INFINITY, 1.0), |radial| (radial.center_x, radial.center_y,
+                    radial.inner_radius, radial.outer_radius, radial.falloff));
+            let delta = [q[0] - center_x, q[1] - center_y];
+            let radius = delta[0].hypot(delta[1]);
+            let warped_radius = if outer_radius.is_finite() {
+                let span = (outer_radius - inner_radius).max(f64::EPSILON);
+                inner_radius + ((radius - inner_radius) / span).clamp(0.0, 1.0).powf(falloff) * span
+            } else { radius };
+            let radial_scale = if radius > f64::EPSILON { warped_radius / radius } else { 0.0 };
+            let radial_local = transform_local([delta[0] * radial_scale * destination_size[0],
+                delta[1] * radial_scale * destination_size[1]], transform.rotation, transform.mirror);
+            // Planar radial is a deformation of a rectangular allocation, not an annular
+            // mask. Clamp its sampling footprint to the assigned crop so every destination
+            // pixel remains defined even when the authored rings do not cover the corners.
+            let min_x = f64::from(c.x) + 0.5;
+            let max_x = f64::from(c.x + c.width) - 0.5;
+            let min_y = f64::from(c.y) + 0.5;
+            let max_y = f64::from(c.y + c.height) - 0.5;
+            Position::single(
+                (f64::from(c.x) + center_x * cw + radial_local[0] * scale).clamp(min_x, max_x),
+                (f64::from(c.y) + center_y * ch + radial_local[1] * scale).clamp(min_y, max_y), true)
         }
         SamplingMode::ThreeSliceCap => three_slice(c, m, source_size, scale, r.plan.slice_geometry),
         SamplingMode::NineSlicePanel => nine_slice(c, m, source_size, scale, r.plan.slice_geometry),
-        _ => Position { x: f64::from(c.x) + cw * 0.5 + source_local[0] * scale,
-            y: f64::from(c.y) + ch * 0.5 + source_local[1] * scale, valid: true },
+        _ => Position::single(f64::from(c.x) + cw * 0.5 + source_local[0] * scale,
+            f64::from(c.y) + ch * 0.5 + source_local[1] * scale, true),
     };
     match mode {
         SamplingMode::PeriodicTile => {
@@ -405,14 +450,14 @@ fn transform_local(mut p: [f64; 2], rotation: QuarterTurn, mirror: MirrorTransfo
 fn three_slice(c: SourceCrop, m: [f64; 2], size: [f64; 2], scale: f64, geometry: SliceGeometry) -> Position {
     let SliceGeometry::Three { leading_cap_pixels, trailing_cap_pixels, center } = geometry else { unreachable!("validated") };
     let (x, valid) = slice_axis(m[0], size[0], c.x, c.width, leading_cap_pixels, trailing_cap_pixels, scale, center);
-    Position { x, y: f64::from(c.y) + (m[1] - size[1] * 0.5) * scale + f64::from(c.height) * 0.5, valid }
+    Position::single(x, f64::from(c.y) + (m[1] - size[1] * 0.5) * scale + f64::from(c.height) * 0.5, valid)
 }
 
 fn nine_slice(c: SourceCrop, m: [f64; 2], size: [f64; 2], scale: f64, geometry: SliceGeometry) -> Position {
     let SliceGeometry::Nine { left_pixels, right_pixels, top_pixels, bottom_pixels, center } = geometry else { unreachable!("validated") };
     let (x, valid_x) = slice_axis(m[0], size[0], c.x, c.width, left_pixels, right_pixels, scale, center);
     let (y, valid_y) = slice_axis(m[1], size[1], c.y, c.height, top_pixels, bottom_pixels, scale, center);
-    Position { x, y, valid: valid_x && valid_y }
+    Position::single(x, y, valid_x && valid_y)
 }
 
 fn slice_axis(value: f64, destination: f64, origin: u32, extent: u32, leading: u32, trailing: u32,
@@ -440,32 +485,64 @@ fn sample_validity(domain: &PreparedMaterialDomain, x: f64, y: f64) -> bool {
     domain.validity.pixel(pixel_x, pixel_y).0 >= 0.5
 }
 
-fn sample_channel(channel: &PreparedExemplarChannel, positions: &[[f32; 2]], width: u32, height: u32,
+fn sample_channel(channel: &PreparedExemplarChannel, positions: &[[f32; 2]], seam_positions: &[[f32; 2]], seam_blends: &[f32], width: u32, height: u32,
     r: &SlotSynthesisRequest<'_>, cancelled: &dyn Fn() -> bool) -> Result<PreparedExemplarChannel, SlotSynthesisError> {
     let edge = r.limits.tile_edge; let linear = r.plan.sampling_policy.filter != SourceSamplingMode::Nearest;
     Ok(match channel {
         PreparedExemplarChannel::BaseColor { plane: src, alpha_mode } => PreparedExemplarChannel::BaseColor {
-            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| sample_color(src, p, linear))?)?, alpha_mode: *alpha_mode },
+            plane: plane(width, height, edge, &rasterize_blended(positions, seam_positions, seam_blends, width, cancelled,
+                |p| sample_color(src, p, linear), |a, b, t| LinearColor {
+                    rgb: std::array::from_fn(|i| a.rgb[i] * (1.0 - t) + b.rgb[i] * t),
+                    alpha: a.alpha * (1.0 - t) + b.alpha * t,
+                })?)?, alpha_mode: *alpha_mode },
         PreparedExemplarChannel::Scalar { role, plane: src } => PreparedExemplarChannel::Scalar { role: *role,
-            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| LinearScalar(sample_f32(src, p, linear, |v| v.0)))?)? },
+            plane: plane(width, height, edge, &rasterize_blended(positions, seam_positions, seam_blends, width, cancelled,
+                |p| LinearScalar(sample_f32(src, p, linear, |v| v.0)), |a, b, t| LinearScalar(a.0 * (1.0 - t) + b.0 * t))?)? },
         PreparedExemplarChannel::Normal { plane: src, source_convention, canonical_convention, alpha_policy } => PreparedExemplarChannel::Normal {
-            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| transform_normal(sample_normal(src, p, linear), r))?)?,
+            plane: plane(width, height, edge, &rasterize_blended(positions, seam_positions, seam_blends, width, cancelled,
+                |p| sample_normal(src, p, linear), blend_normal)?.into_iter().map(|normal| transform_normal(normal, r)).collect::<Vec<_>>())?,
             source_convention: *source_convention, canonical_convention: *canonical_convention, alpha_policy: *alpha_policy },
         PreparedExemplarChannel::MaterialId { plane: src } => PreparedExemplarChannel::MaterialId {
-            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| sample_nearest(src, p))?)? },
+            plane: plane(width, height, edge, &rasterize_blended(positions, seam_positions, seam_blends, width, cancelled,
+                |p| sample_nearest(src, p), |a, b, t| if t < 0.5 { a } else { b })?)? },
         PreparedExemplarChannel::Mask { role, plane: src } => PreparedExemplarChannel::Mask { role: *role,
-            plane: plane(width, height, edge, &rasterize(positions, width, cancelled, |p| MaskValue(sample_f32(src, p, linear, |v| v.0)))?)? },
+            plane: plane(width, height, edge, &rasterize_blended(positions, seam_positions, seam_blends, width, cancelled,
+                |p| MaskValue(sample_f32(src, p, linear, |v| v.0)), |a, b, t| MaskValue(a.0 * (1.0 - t) + b.0 * t))?)? },
     })
 }
 
-fn rasterize<T>(positions: &[[f32; 2]], width: u32, cancelled: &dyn Fn() -> bool,
-    mut sample: impl FnMut([f32; 2]) -> T) -> Result<Vec<T>, SlotSynthesisError> {
+fn rasterize_blended<T>(positions: &[[f32; 2]], seam_positions: &[[f32; 2]], seam_blends: &[f32], width: u32,
+    cancelled: &dyn Fn() -> bool, mut sample: impl FnMut([f32; 2]) -> T,
+    mut blend: impl FnMut(T, T, f32) -> T) -> Result<Vec<T>, SlotSynthesisError> {
     let mut values = Vec::with_capacity(positions.len());
-    for row in positions.chunks_exact(usize::try_from(width).map_err(|_| SlotSynthesisError::ResourceLimitExceeded)?) {
+    let row_width = usize::try_from(width).map_err(|_| SlotSynthesisError::ResourceLimitExceeded)?;
+    for row_start in (0..positions.len()).step_by(row_width) {
         if cancelled() { return Err(SlotSynthesisError::Cancelled); }
-        values.extend(row.iter().copied().map(&mut sample));
+        let row_end = (row_start + row_width).min(positions.len());
+        for index in row_start..row_end {
+            let primary = sample(positions[index]);
+            let amount = seam_blends[index];
+            values.push(if amount > 0.0 { blend(primary, sample(seam_positions[index]), amount) } else { primary });
+        }
     }
     Ok(values)
+}
+
+#[cfg(test)]
+fn rasterize<T>(positions: &[[f32; 2]], width: u32, cancelled: &dyn Fn() -> bool,
+    sample: impl FnMut([f32; 2]) -> T) -> Result<Vec<T>, SlotSynthesisError> {
+    let seam_blends = vec![0.0; positions.len()];
+    rasterize_blended(positions, positions, &seam_blends, width, cancelled, sample, |primary, _, _| primary)
+}
+
+fn blend_normal(a: TangentNormal, b: TangentNormal, t: f32) -> TangentNormal {
+    let mut normal = TangentNormal {
+        xyz: std::array::from_fn(|i| a.xyz[i] * (1.0 - t) + b.xyz[i] * t),
+        alpha: a.alpha * (1.0 - t) + b.alpha * t,
+    };
+    let length = normal.xyz.iter().map(|value| value * value).sum::<f32>().sqrt().max(f32::EPSILON);
+    normal.xyz = normal.xyz.map(|value| value / length);
+    normal
 }
 
 fn bounds<T>(p: &ImagePlane<T>, at: [f32; 2]) -> (u32, u32, u32, u32, f32, f32) {

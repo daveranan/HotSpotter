@@ -4,7 +4,7 @@ use hot_trimmer_domain::{
     generate_partition, resolve_boundaries, ContentDigest, LogicalGridSpec, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, OrientedPixelSize, PartitionRecipe, PixelSize,
     SamplingMode, SourceFrame, SourceId, TrimSheetDocument, TrimSheetDocumentCommand, NormalizedBounds, NormalizedScalar,
-    ManualRegionRole, RegionBehavior, RegionContinuity, RegionSampling,
+    ManualRegionRole, QuarterTurn, RegionBehavior, RegionContinuity, RegionSampling,
 };
 use hot_trimmer_placement_solver::MirrorTransform;
 use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
@@ -12,6 +12,24 @@ use hot_trimmer_domain::CancellationToken;
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use uuid::Uuid;
 use std::sync::Mutex;
+
+fn striped_source(width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
+    let mut image = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            image.put_pixel(x, y, Rgba([
+                48_u8.saturating_add(((x / 3 + y / 7) * 17) as u8),
+                32_u8.saturating_add(((x / 5) * 23) as u8),
+                64_u8.saturating_add(((y / 4) * 31) as u8),
+                255,
+            ]));
+        }
+    }
+    let raw = image.as_raw().clone();
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image).write_to(&mut encoded, ImageFormat::Png).expect("encode striped fixture");
+    (encoded.into_inner(), raw)
+}
 
 fn numbered_source() -> (Vec<u8>, Vec<u8>) {
     let width = 128_u32;
@@ -156,14 +174,70 @@ fn manual_region_behavior_compile_persisted_executes_modes_edges_radial_and_pers
     }
 
     let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
-    radial.radial = Some(hot_trimmer_domain::RadialMappingSettings { center_x: 0.35, center_y: 0.6, inner_radius: 0.08, outer_radius: 0.42, falloff: 1.0 });
+    radial.radial = Some(hot_trimmer_domain::RadialMappingSettings { center_x: 0.35, center_y: 0.6, inner_radius: 0.08, outer_radius: 0.42, falloff: 1.0, blend_width: 0.04, seam_blend_width: 0.03 });
     radial.synchronize_derived_fields();
-    let radial_document = whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior: radial.clone() }).expect("classify radial");
-    let radial_artifact = compile_behavior_document(&store, &radial_document);
-    assert_eq!(radial_artifact.slots.iter().find(|slot| slot.region_id == region_id).unwrap().executed_mode, SamplingMode::PlanarRadial);
-    for (before, after) in baseline.slots.iter().zip(&radial_artifact.slots) {
-        if before.region_id == region_id { assert_ne!(before.stage_14_result_id, after.stage_14_result_id); }
-        else { assert_eq!(before.stage_14_result_id, after.stage_14_result_id, "radial edit changed another RegionId"); }
+    let mut moved_center = radial.clone();
+    moved_center.radial.as_mut().unwrap().center_x = 0.62;
+    moved_center.radial.as_mut().unwrap().center_y = 0.28;
+    let mut changed_radii = radial.clone();
+    changed_radii.radial.as_mut().unwrap().inner_radius = 0.2;
+    changed_radii.radial.as_mut().unwrap().outer_radius = 0.7;
+    let mut changed_falloff = radial.clone();
+    changed_falloff.radial.as_mut().unwrap().falloff = 2.25;
+    let mut changed_seam = radial.clone();
+    changed_seam.orientation = QuarterTurn::Ninety;
+
+    let mut radial_artifacts = Vec::new();
+    for (label, behavior) in [
+        ("base", radial.clone()),
+        ("center", moved_center),
+        ("radii", changed_radii),
+        ("falloff", changed_falloff),
+        ("seam", changed_seam),
+    ] {
+        let document = whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id, behavior }).expect("classify radial");
+        let artifact = compile_behavior_document(&store, &document);
+        let slot = artifact.slots.iter().find(|slot| slot.region_id == region_id).expect("radial slot");
+        assert_eq!(slot.executed_mode, SamplingMode::PolarRadial);
+        assert_eq!(slot.valid_pixel_count, u64::from(slot.allocation.width) * u64::from(slot.allocation.height), "{label} radial left invalid pixels in its rectangular allocation");
+        for before in &baseline.slots {
+            let after = artifact.slots.iter().find(|candidate| candidate.region_id == before.region_id).expect("same RegionId after radial edit");
+            if before.region_id == region_id {
+                assert_ne!(before.stage_14_result_id, after.stage_14_result_id);
+            } else {
+                assert_eq!(before.stage_14_result_id, after.stage_14_result_id, "{label} radial edit changed another RegionId");
+                assert_eq!(selected_region_pixels(&baseline, before.region_id), selected_region_pixels(&artifact, before.region_id), "{label} radial edit changed another region's pixels");
+            }
+        }
+        radial_artifacts.push((label, selected_region_pixels(&artifact, region_id), artifact));
+    }
+    for left in 0..radial_artifacts.len() {
+        for right in left + 1..radial_artifacts.len() {
+            assert_ne!(radial_artifacts[left].1, radial_artifacts[right].1,
+                "radial {} and {} controls must produce different numbered pixels", radial_artifacts[left].0, radial_artifacts[right].0);
+        }
+    }
+
+    let ordered_radial_document = whole_source.apply_command(&TrimSheetDocumentCommand::SetRegionBehavior {
+        region_id, behavior: radial.clone(),
+    }).expect("ordered radial document");
+    let ordered_radial_artifact = compile_behavior_document(&store, &ordered_radial_document);
+    let mut shuffled_radial_document = ordered_radial_document.clone();
+    let mut reversed_regions = shuffled_radial_document.topology.regions.clone();
+    reversed_regions.reverse();
+    shuffled_radial_document.topology = hot_trimmer_domain::AcceptedTopology::new(
+        shuffled_radial_document.topology.kind,
+        shuffled_radial_document.topology.snapshot.clone(),
+        shuffled_radial_document.topology.compatibility_key.clone(),
+        reversed_regions,
+    ).expect("rebuild topology in reverse iteration order");
+    let shuffled_radial_artifact = compile_behavior_document(&store, &shuffled_radial_document);
+    for region in &ordered_radial_document.topology.regions {
+        assert_eq!(
+            selected_region_pixels(&ordered_radial_artifact, region.id),
+            selected_region_pixels(&shuffled_radial_artifact, region.id),
+            "reversing region iteration changed pixels assigned to RegionId {}", region.id,
+        );
     }
 
     let mut unsupported = RegionBehavior::new(ManualRegionRole::Unique);
@@ -435,4 +509,280 @@ fn source_frame_profiles_publish_atomic_full_square_artifacts() {
     let cache = cache.lock().expect("cache");
     assert!(cache.rendered_region_count() <= 128);
     assert!(cache.composed_atlas_count() <= 2);
+}
+
+#[test]
+fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_rejects_stale_publication() {
+    use hot_trimmer_domain::{
+        AuthoredLayoutPreset, AuthoredLayoutPresetRegion, ContentReference, GridRect,
+        NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId, PatchProperties,
+        RectificationSettings, RegionOrientation, StructuralProfile, TemplateSlotRole,
+        AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Dimension qualification is deliberately metadata/coordinate-only: source size is not
+    // atlas size and this proof must not allocate a synthetic 24K RGBA frame.
+    for (width, height) in [(7_952, 4_016), (8_000, 8_000), (16_384, 8_192), (24_576, 12_288)] {
+        let frame = SourceFrame::centered_largest(
+            hot_trimmer_domain::SourceSetId::new(),
+            OrientedPixelSize { width, height },
+            [1, 1],
+            7,
+        );
+        assert_eq!(frame.oriented_dimensions, OrientedPixelSize { width, height });
+        let x = resolve_boundaries(0, width, 64);
+        let y = resolve_boundaries(0, height, 64);
+        assert_eq!((*x.first().unwrap(), *x.last().unwrap()), (0, width));
+        assert_eq!((*y.first().unwrap(), *y.last().unwrap()), (0, height));
+        assert!(x.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(y.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    let root = std::env::temp_dir().join(format!("hot-trimmer-manual-base-color-product-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create product fixture directory");
+    let project_path = root.join("manual-base-color-product.hottrimmer");
+    let mut store = ProjectStore::create(&project_path, "Manual Base Color Product").expect("create product project");
+    let initial = store.summary().expect("initial product summary");
+    let source_a_set = Uuid::from_bytes(initial.source_sets[0].id.to_bytes());
+    let source_b_set = Uuid::new_v4();
+    let (encoded_a, _) = numbered_source();
+    let (encoded_b, _) = striped_source(96, 128);
+    let source_a = SourceId::new();
+    let source_b = SourceId::new();
+    for (source_set_id, source_id, encoded, width, height, name) in [
+        (source_a_set, source_a, encoded_a, 128, 64, "representative-7952x4016.png"),
+        (source_b_set, source_b, encoded_b, 96, 128, "secondary-8000x8000.png"),
+    ] {
+        let input = SourceInput {
+            id: source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,
+            origin_path: PathBuf::from(name), sha256: ContentDigest::sha256(&encoded).0,
+            width, height, format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+            exif_orientation: 1, has_embedded_icc_profile: false, encoded_bytes: encoded.len() as u64,
+            owned_bytes: Some(encoded),
+        };
+        store.replace_source_in_set(source_set_id, SourceChannel::BaseColor, &input).expect("register product source");
+    }
+    store.create_source_frame_document().expect("create authored product document");
+    let seed = store.document().expect("seed document").topology.regions[0].clone();
+    let grid = LogicalGridSpec::DEFAULT;
+    let mut authored_regions = Vec::new();
+    for y in 0..8_u32 {
+        for x in 0..8_u32 {
+            let index = y * 8 + x;
+            authored_regions.push(AuthoredLayoutPresetRegion {
+                preset_region_key: format!("cell-{index:02}"),
+                display_name: format!("Authored Cell {}", index + 1),
+                grid_rect: GridRect { x: x * 8, y: y * 8, width: 8, height: 8 },
+                role: TemplateSlotRole::Planar,
+                orientation: RegionOrientation::Unspecified,
+                uv_fit: seed.uv_fit.clone(),
+                structural_profile: StructuralProfile::Flat,
+                default_behavior: RegionBehavior::default(),
+            });
+        }
+    }
+    let preset = AuthoredLayoutPreset {
+        preset_id: "fixture.manual-base-color-product".into(),
+        schema_version: AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
+        name: "Manual Base Color Product Fixture".into(),
+        logical_grid: grid,
+        canonical_aspect: [1, 1],
+        regions: authored_regions,
+        provenance: "manual_base_color_product fixture".into(),
+    };
+    store.execute_document_command(&TrimSheetDocumentCommand::ApplyAuthoredLayoutPreset {
+        preset,
+        instance_id: "stable-product-instance".into(),
+    }).expect("apply 64-region authored preset");
+
+    let patch_points = |index: u32| {
+        let column = index % 5;
+        let row = (index / 5) % 4;
+        let left = f64::from(20 + column * 180) / 1_000.0;
+        let top = f64::from(30 + row * 220) / 1_000.0;
+        let right = f64::from(160 + column * 180) / 1_000.0;
+        let bottom = f64::from(190 + row * 220) / 1_000.0;
+        [
+            NormalizedPoint::new(left, top).unwrap(),
+            NormalizedPoint::new(right, top).unwrap(),
+            NormalizedPoint::new(right, bottom).unwrap(),
+            NormalizedPoint::new(left, bottom).unwrap(),
+        ]
+    };
+    let mut patch_ids = Vec::new();
+    for index in 0..20_u32 {
+        let patch_id = PatchId::new();
+        patch_ids.push(patch_id);
+        store.execute_patch_command(&PatchCommand::Create {
+            patch: Patch {
+                id: patch_id,
+                source_id: if index % 2 == 0 { source_a } else { source_b },
+                name: format!("Product Patch {}", index + 1),
+                enabled: true,
+                geometry: PatchGeometry { corners: patch_points(index), assistance_mask: None },
+                properties: PatchProperties::default(),
+                rectification: RectificationSettings::default(),
+            },
+            index: None,
+        }, None).expect("create product patch");
+    }
+    store.refresh_document_assets().expect("refresh product patches");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
+        output_size: PixelSize { width: 2_048, height: 2_048 },
+    }).expect("set authoritative output independently of source size");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetAtlasPadding { padding_px: 16 })
+        .expect("persist owning-edge padding");
+
+    let region_ids = store.document().unwrap().topology.regions.iter().map(|region| region.id).collect::<Vec<_>>();
+    for (region_id, patch_id) in region_ids.iter().copied().zip(patch_ids.iter().copied()) {
+        store.execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
+            region_id,
+            content: ContentReference::Patch(patch_id),
+        }).expect("bind authored patch");
+    }
+    let source_b_id = hot_trimmer_domain::SourceSetId::from_bytes(*source_b_set.as_bytes());
+    for region_id in region_ids.iter().copied().skip(20).take(4) {
+        store.execute_document_command(&TrimSheetDocumentCommand::SetRegionContent {
+            region_id,
+            content: ContentReference::MaterialSource(source_b_id),
+        }).expect("bind whole secondary source");
+    }
+    for (index, sampling) in [(20_usize, RegionSampling::LoopX), (21, RegionSampling::LoopY), (22, RegionSampling::LoopXy)] {
+        let mut behavior = RegionBehavior::default();
+        behavior.sampling = sampling;
+        behavior.period_pixels = Some([16, 16]);
+        behavior.synchronize_derived_fields();
+        store.execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id: region_ids[index], behavior })
+            .expect("author explicit loop");
+    }
+    let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
+    radial.synchronize_derived_fields();
+    store.execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id: region_ids[23], behavior: radial })
+        .expect("author radial region");
+
+    let document = store.document().expect("complete product document").clone();
+    let stable_ids = document.topology.regions.iter().map(|region| region.id).collect::<Vec<_>>();
+    let mut summary = store.summary().expect("complete product summary");
+    summary.document = Some(document.clone());
+    let compiler = hot_trimmer_sheet_compiler::AlgorithmCompiler::new();
+    let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
+    let draft = compiler.compile_persisted_stage_14_preview_with_cache(
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+            project: &summary, revision: document.document_revision, draft_id: Some(3), input_hash: Some("C".into()),
+            profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+        },
+        &CancellationToken::new(), || true, Some(&cache),
+    ).expect("publish complete 512 product draft");
+    assert_eq!(draft.slots.len(), 64);
+    assert_eq!(draft.channels.len(), 1, "Base Color preview does not encode unrelated channels");
+    assert!(draft.telemetry.iter().any(|line| line.contains("preview_padding_px=4")));
+    assert!(draft.validity.iter().all(|value| *value > 0), "no transparent/black disappearance");
+    assert_eq!(draft.region_ownership.len(), 512 * 512);
+
+    let mut logical_coverage = vec![0_u8; (grid.width * grid.height) as usize];
+    let mut crops = BTreeSet::new();
+    let patch_set = patch_ids.iter().copied().collect::<BTreeSet<_>>();
+    for slot in &draft.slots {
+        let rect = slot.grid_rect.expect("manual GridRect");
+        for y in rect.y..rect.y + rect.height { for x in rect.x..rect.x + rect.width {
+            logical_coverage[(y * grid.width + x) as usize] += 1;
+        }}
+        let binding = &document.region_bindings[&slot.region_id];
+        if matches!(binding.content, ContentReference::InheritPrimaryMaterial) {
+            let crop = slot.source_crop.expect("inherited direct crop");
+            assert!(crops.insert((crop.x, crop.y, crop.width, crop.height)), "default crops are unique");
+        }
+        if let ContentReference::Patch(id) = binding.content { assert!(patch_set.contains(&id)); }
+        assert_eq!(slot.padded_rect, slot.atlas_destination);
+        assert!(slot.semantic_rect.x >= slot.padded_rect.x && slot.semantic_rect.y >= slot.padded_rect.y);
+        for y in slot.padded_rect.y..slot.padded_rect.y + slot.padded_rect.height {
+            for x in slot.padded_rect.x..slot.padded_rect.x + slot.padded_rect.width {
+                let index = (y * 512 + x) as usize;
+                assert_eq!(draft.region_ownership[index], slot.region_id, "padding ownership crossed RegionId");
+            }
+        }
+    }
+    assert!(logical_coverage.iter().all(|count| *count == 1), "semantic topology is complete and non-overlapping");
+    let base = &draft.channels[0].rgba8;
+    for slot in &draft.slots {
+        let semantic = slot.semantic_rect;
+        for y in slot.padded_rect.y..slot.padded_rect.y + slot.padded_rect.height {
+            for x in slot.padded_rect.x..slot.padded_rect.x + slot.padded_rect.width {
+                let owner_x = x.clamp(semantic.x, semantic.x + semantic.width - 1);
+                let owner_y = y.clamp(semantic.y, semantic.y + semantic.height - 1);
+                let at = ((y * 512 + x) * 4) as usize;
+                let owner = ((owner_y * 512 + owner_x) * 4) as usize;
+                if x < semantic.x || x >= semantic.x + semantic.width || y < semantic.y || y >= semantic.y + semantic.height {
+                    assert_eq!(&base[at..at + 4], &base[owner..owner + 4], "padding is nearest owning-edge dilation");
+                }
+            }
+        }
+    }
+
+    // Warm composition is exact and bounded; direct topology edits never evict source domains.
+    let warm = compiler.compile_persisted_stage_14_preview_with_cache(
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+            project: &summary, revision: document.document_revision, draft_id: Some(4), input_hash: Some("C".into()),
+            profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+        }, &CancellationToken::new(), || true, Some(&cache),
+    ).expect("warm complete draft");
+    assert!(warm.telemetry.iter().any(|line| line.contains("composed_cache=hit")));
+    let refinement = compiler.compile_persisted_stage_14_preview_with_cache(
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+            project: &summary, revision: document.document_revision, draft_id: Some(5), input_hash: Some("C-refinement".into()),
+            profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Refinement1024,
+        }, &CancellationToken::new(), || true, Some(&cache),
+    ).expect("publish complete 1024 refinement");
+    assert_eq!(refinement.topology.output_size, PixelSize { width: 1_024, height: 1_024 });
+    assert!(refinement.telemetry.iter().any(|line| line.contains("preview_padding_px=8")));
+    assert!(refinement.validity.iter().all(|value| *value > 0));
+    assert_eq!(refinement.region_ownership.len(), 1_024 * 1_024);
+    let cache = cache.lock().expect("bounded product cache");
+    assert!(cache.entry_count() <= 32);
+    assert!(cache.rendered_region_count() <= 128);
+    assert!(cache.composed_atlas_count() <= 2);
+    drop(cache);
+
+    // Rapid A -> B -> C: stale guards reject A/B before publication; only C is returned.
+    let stale = compiler.compile_persisted_stage_14_preview(
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+            project: &summary, revision: document.document_revision, draft_id: Some(1), input_hash: Some("A".into()),
+            profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+        }, &CancellationToken::new(), || false,
+    );
+    assert!(stale.is_err());
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(compiler.compile_persisted_stage_14_preview(
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+            project: &summary, revision: document.document_revision, draft_id: Some(2), input_hash: Some("B".into()),
+            profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+        }, &cancelled, || true,
+    ).is_err());
+    assert_eq!(draft.revision, document.document_revision, "only current C artifact may publish");
+
+    drop(store);
+    let reopened = ProjectStore::open(&project_path).expect("reopen product fixture");
+    let reopened_document = reopened.document().expect("reopened product document");
+    assert_eq!(reopened_document.topology, document.topology, "topology reopens exactly");
+    assert_eq!(reopened_document.logical_grid, document.logical_grid, "logical grid reopens exactly");
+    assert_eq!(reopened_document.authored_layout_preset, document.authored_layout_preset, "embedded preset reopens exactly");
+    assert_eq!(reopened_document.authored_layout_instance_id, document.authored_layout_instance_id, "preset instance reopens exactly");
+    assert_eq!(reopened_document.materials, document.materials, "multi-source registrations reopen exactly");
+    assert_eq!(reopened_document.patches, document.patches, "patches reopen exactly");
+    assert_eq!(reopened_document.region_bindings, document.region_bindings, "bindings and behavior reopen exactly");
+    assert_eq!(reopened_document.source_frame, document.source_frame, "SourceFrame ownership reopens exactly");
+    assert_eq!(reopened_document.render_settings, document.render_settings, "output and padding reopen exactly");
+    assert_eq!(reopened_document.topology.regions.iter().map(|region| region.id).collect::<Vec<_>>(), stable_ids);
+    assert_eq!(reopened_document.render_settings.atlas_padding_px, 16);
+    assert_eq!(reopened_document.patches.len(), 20);
+    assert_eq!(reopened_document.source_frame.as_ref().unwrap().source_set_id,
+        hot_trimmer_domain::SourceSetId::from_bytes(*source_a_set.as_bytes()));
+    let binding_kinds = reopened_document.region_bindings.values().fold(BTreeMap::new(), |mut counts, binding| {
+        *counts.entry(match binding.content { ContentReference::InheritPrimaryMaterial => "inherit", ContentReference::MaterialSource(_) => "source", ContentReference::Patch(_) => "patch", _ => "other" }).or_insert(0_u32) += 1;
+        counts
+    });
+    assert_eq!(binding_kinds.get("patch"), Some(&20));
+    assert_eq!(binding_kinds.get("source"), Some(&4));
 }

@@ -49,7 +49,7 @@ export type RegionContinuity = "none" | "x" | "y" | "xy";
 export type RegionSampling = "one_shot" | "loop_x" | "loop_y" | "loop_xy";
 export type RegionQuarterTurn = "zero" | "ninety" | "one_eighty" | "two_seventy";
 export interface EdgeEligibility { left: boolean; right: boolean; top: boolean; bottom: boolean }
-export interface RadialMappingSettings { centerX: number; centerY: number; innerRadius: number; outerRadius: number; falloff: number }
+export interface RadialMappingSettings { centerX: number; centerY: number; innerRadius: number; outerRadius: number; falloff: number; blendWidth: number; seamBlendWidth: number }
 export interface RegionBehavior {
   version: number;
   role: ManualRegionRole;
@@ -227,7 +227,7 @@ export interface TrimSheetDocument {
   primaryMaterial: string | null;
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
   regionBindings: Record<string, RegionBinding>;
-  renderSettings: { outputSize: PixelSize; rendererVersion: string };
+  renderSettings: { outputSize: PixelSize; atlasPaddingPx?: number; rendererVersion: string };
   sourceFrame?: SourceFrame;
   logicalGrid?: { schemaVersion: number; width: number; height: number };
   partitionProvenance?: unknown;
@@ -401,6 +401,9 @@ export interface RecentProject {
 export interface ResolvedRegion {
   regionId: string;
   displayName: string;
+  semanticBounds: PixelBounds;
+  paddedBounds: PixelBounds;
+  atlasDestination: PixelBounds;
   allocationBounds: PixelBounds;
   hotspotBounds: PixelBounds;
   idColor: readonly [number, number, number];
@@ -436,6 +439,10 @@ export interface Stage14SlotProjection {
   displayName: string;
   allocationBounds: PixelBounds;
   hotspotBounds: PixelBounds;
+  semanticRect: PixelBounds;
+  paddedRect: PixelBounds;
+  atlasDestination: PixelBounds;
+  previewPaddingPx: number;
   mappingMode: string;
   sourceTransform: { rotation: string; mirror: string };
   isotropicScale: number;
@@ -529,6 +536,7 @@ export type TrimSheetDocumentCommand =
   | { type: "set_region_projection"; regionId: string; projection: RegionMapping["projection"] }
   | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }
   | { type: "set_output_resolution"; outputSize: PixelSize }
+  | { type: "set_atlas_padding"; paddingPx: number }
   | { type: "set_source_frame"; bounds: NormalizedBounds }
   | { type: "detach_source_cell"; regionId: string }
   | { type: "reset_source_cell"; regionId: string };

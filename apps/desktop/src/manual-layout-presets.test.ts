@@ -44,7 +44,7 @@ test("manual-layout-presets: region context menu escapes the transformed sheet c
   const app = readFileSync("src/source-first-app.tsx", "utf8");
   assert.match(app, /createPortal\(<div className="layout-menu"[\s\S]*document\.body\)/);
   assert.match(app, /Math\.min\(event\.clientX, window\.innerWidth - 196\)/);
-  assert.match(app, /closest\("\.layout-menu"\)\) setLayoutMenu\(null\)/);
+  assert.match(app, /closest\("\.layout-menu"\)\) \{ setLayoutMenu\(null\); setLayoutSubmenu\(null\); \}/);
   assert.match(app, /window\.addEventListener\("blur", dismissBlur\)/);
 });
 
