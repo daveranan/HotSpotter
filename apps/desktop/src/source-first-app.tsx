@@ -23,6 +23,7 @@ import {
   type Patch,
   type PatchCommand,
   type PatchGeometry,
+  type PixelBounds,
   type ProjectProjection,
   type PreviewSheetProjection,
   type RecentProject,
@@ -41,7 +42,7 @@ import {
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
 import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, gridRectToPreviewBounds, mapQuadToUnitSquare, mapUnitSquareToQuad, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, preserveViewAcrossContentResize, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
-import { SourceFramePreviewController } from "./source-frame-preview-controller";
+import { GpuTiledPreviewPainter, gpuTiledPreviewMapMatches, shouldDisplayGpuTiledPreview, SourceFramePreviewController, type GpuTiledPreviewPaintSummary } from "./source-frame-preview-controller";
 import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
 import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
 import "./document-app.css";
@@ -124,7 +125,7 @@ function samplingPrerequisite(role: ManualRegionRole, sampling: RegionSampling):
 function changedBehavior(current: RegionBehavior, patch: Partial<RegionBehavior>): RegionBehavior {
   const next = { ...current, ...patch };
   next.edgeEligibility = eligibleEdges(next.continuity);
-  if (next.role === "radial") next.radial = next.radial ?? { centerX: .5, centerY: .5, innerRadius: 0, outerRadius: .5, falloff: 1, blendWidth: .05, seamBlendWidth: .03 };
+  if (next.role === "radial") next.radial = next.radial ?? { centerX: .5, centerY: .5, innerRadius: 0, outerRadius: .5, falloff: 1, blendWidth: 0, seamBlendWidth: .03 };
   else delete next.radial;
   if (samplingPrerequisite(next.role, next.sampling)) next.sampling = "one_shot";
   return next;
@@ -228,7 +229,19 @@ function failure(reason: unknown): CommandFailure {
   return { code: "operation_failed", message: String(reason), recovery: "Correct the issue and retry." };
 }
 
-type PreviewProfile = "draft512" | "refinement1024" | "authoritative";
+type PreviewProfile = "draft512" | "refinement1024" | "preview2048" | "preview4096" | "preview8192" | "authoritative";
+type InteractivePreviewProfile = Exclude<PreviewProfile, "draft512" | "authoritative">;
+function isInteractivePreviewProfile(value: string | null): value is InteractivePreviewProfile {
+  return value === "refinement1024"
+    || value === "preview2048"
+    || value === "preview4096"
+    || value === "preview8192";
+}
+
+function automaticPreviewKey(revision: number, profile: PreviewProfile): string {
+  return `${revision}:${profile}`;
+}
+
 type PreviewProgress = {
   requestId: number;
   phase: "compiling" | "received" | "painted" | "failed";
@@ -244,9 +257,9 @@ function App() {
   const [artifact, setArtifact] = useState<IntermediateAtlasProjection | null>(null);
   const [preview, setPreview] = useState<PreviewSheetProjection | null>(null);
   const [previewClientTelemetry, setPreviewClientTelemetry] = useState<string[]>([]);
-  const [interactivePreviewProfile, setInteractivePreviewProfile] = useState<PreviewProfile>(() => {
+  const [interactivePreviewProfile, setInteractivePreviewProfile] = useState<InteractivePreviewProfile>(() => {
     const saved = localStorage.getItem("hot-trimmer.interactive-preview-profile.v1");
-    return saved === "refinement1024" || saved === "authoritative" ? saved : "draft512";
+    return isInteractivePreviewProfile(saved) ? saved : "refinement1024";
   });
   const [previewProgress, setPreviewProgress] = useState<PreviewProgress | null>(null);
   const [previewElapsedMs, setPreviewElapsedMs] = useState(0);
@@ -298,7 +311,7 @@ function App() {
   const previewDraftId = useRef(0);
   const dirtyPreviewRegion = useRef<string | null>(null);
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
-  const lastAutomaticPreviewRevision = useRef<number | null>(null);
+  const lastAutomaticPreviewKey = useRef<string | null>(null);
   const patchPreviewRequestId = useRef(0);
   const previewPublishStartedAt = useRef<number | null>(null);
   const lastTransientCompletionAt = useRef(0);
@@ -390,17 +403,18 @@ function App() {
 
   useEffect(() => {
     if (!native || !project?.document) return;
+    const key = automaticPreviewKey(project.document.documentRevision, interactivePreviewProfile);
     if (suppressAutomaticPreviewRevision.current === project.document.documentRevision) {
       suppressAutomaticPreviewRevision.current = null;
-      lastAutomaticPreviewRevision.current = project.document.documentRevision;
+      lastAutomaticPreviewKey.current = key;
       return;
     }
-    if (lastAutomaticPreviewRevision.current === project.document.documentRevision) return;
-    lastAutomaticPreviewRevision.current = project.document.documentRevision;
+    if (lastAutomaticPreviewKey.current === key) return;
+    lastAutomaticPreviewKey.current = key;
     dirtyPreviewRegion.current = null;
     // Persisted appearance edits are not transient crop requests. The compiler's content
     // hashes reuse every unchanged region while the request remains contract-valid.
-    void requestPreview(undefined, undefined, interactivePreviewProfile, undefined, interactivePreviewProfile === "draft512");
+    void requestPreview(undefined, undefined, interactivePreviewProfile, undefined, false);
   }, [native, project?.document?.documentRevision, interactivePreviewProfile]);
 
   useEffect(() => {
@@ -629,7 +643,7 @@ function App() {
     setSourceFrameEditing(false);
     dirtyPreviewRegion.current = null;
     suppressAutomaticPreviewRevision.current = null;
-    lastAutomaticPreviewRevision.current = null;
+    lastAutomaticPreviewKey.current = null;
     setSelectedSourceSetId(next.document?.primaryMaterial ?? next.materialSources[0]?.id ?? "");
     setSelectedChannel("base_color");
     setTemplateId(templates[0][0]);
@@ -909,7 +923,7 @@ function App() {
       setSelectedRegionId((selected) => current.document!.topology.regions.some((region) => region.id === selected) ? selected : null);
       if (pixelRegionId || topologyChanged) {
         dirtyPreviewRegion.current = null;
-        lastAutomaticPreviewRevision.current = current.document!.documentRevision;
+        lastAutomaticPreviewKey.current = automaticPreviewKey(current.document!.documentRevision, interactivePreviewProfile);
         // Region identity without a projection is not a transient crop request. Compile the
         // persisted binding revision; the immediate overlay above covers publication latency.
         void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision, false);
@@ -972,6 +986,15 @@ function App() {
   async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true) {
     const requestedRevision = revision ?? project?.document?.documentRevision;
     if (!native || requestedRevision === undefined) return;
+    const viewIntent: "completeDraft512" | "completeRefinement1024" | "exactViewport" | "exactSelectedRegion" | undefined = profile === "draft512"
+      ? "completeDraft512"
+      : profile === "refinement1024"
+        ? "completeRefinement1024"
+        : profile === "authoritative" && regionId
+          ? "exactSelectedRegion"
+          : undefined;
+    const viewportRect = undefined;
+    const previewRegionId = viewIntent === "exactSelectedRegion" ? regionId : undefined;
     const draftId = ++previewDraftId.current;
     setProblem(null);
     previewPublishStartedAt.current = performance.now();
@@ -982,11 +1005,13 @@ function App() {
         request: {
           ...protocol,
           revision: requestedRevision,
-          regionId,
+          regionId: previewRegionId,
           transientProjection: projection,
           draftId,
           inputHash: JSON.stringify({ revision: requestedRevision, regionId, projection }),
           profile,
+          viewIntent,
+          viewportRect,
         },
       });
       setPreviewClientTelemetry([`profile=${profile}`, `artifact_dimensions=${next.width}x${next.height}`, `ipc_round_trip_ms=${Math.round(performance.now() - (previewPublishStartedAt.current ?? performance.now()))}`]);
@@ -1377,19 +1402,16 @@ function App() {
         binding.content.type === "patch" && binding.content.id === patchId);
       if (assignedToRegion && next.document) {
         const revision = next.document.documentRevision;
-        // An assigned patch is part of the persisted Stage 14 appearance. Publish a small
-        // artifact first so a radial patch resize cannot leave the sheet stale while the
-        // selected 2K/4K/8K interactive profile is still rendering or encoding.
-        lastAutomaticPreviewRevision.current = revision;
+        // An assigned patch is part of the persisted Stage 14 appearance. Keep the
+        // previous artifact visible until the selected preview size publishes, so radial
+        // or patch edits do not flash a lower-quality square intermediate.
+        lastAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile);
         dirtyPreviewRegion.current = null;
         // Set the suppression token before publishing the new projection. This closes the
         // race where React's revision effect could start a second native job first.
         setProject(next);
         setProblem(null);
-        await requestPreview(undefined, undefined, "draft512", revision, false);
-        if (interactivePreviewProfile !== "draft512" && lastAutomaticPreviewRevision.current === revision) {
-          void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
-        }
+        void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
       } else {
         setProject(next);
         setProblem(null);
@@ -1456,15 +1478,12 @@ function App() {
       const next = await applyCommand({ type: "set_region_radial", regionId, radial });
       const revision = next.document!.documentRevision;
       // Source-side radial gestures bypass the Layout command helper, so publish their
-      // persisted revision explicitly. A fast draft prevents the sheet from sitting stale
-      // while a selected 4K/8K interactive profile is still compiling.
-      lastAutomaticPreviewRevision.current = revision;
+      // persisted revision explicitly. Keep the previous artifact visible until the
+      // selected preview size is ready rather than flashing a lower-quality square pass.
+      lastAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile);
       dirtyPreviewRegion.current = null;
       setProject(next);
-      await requestPreview(undefined, undefined, "draft512", revision, false);
-      if (interactivePreviewProfile !== "draft512" && lastAutomaticPreviewRevision.current === revision) {
-        void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
-      }
+      void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
     }
     catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
   }
@@ -1942,7 +1961,7 @@ function SourceCanvas(props: {
     | null
   >(null);
   const patchCreate = useRef<{ pointerId: number; start: { x: number; y: number } } | null>(null);
-  const radialDrag = useRef<{ pointerId: number; kind: "center" | "inner" | "transition" | "outer" | "seam" | "seam_blend"; lastRadial: NonNullable<RegionBehavior["radial"]>; lastOrientation: RegionBehavior["orientation"] } | null>(null);
+  const radialDrag = useRef<{ pointerId: number; kind: "center" | "inner" | "outer" | "seam" | "seam_blend"; lastRadial: NonNullable<RegionBehavior["radial"]>; lastOrientation: RegionBehavior["orientation"] } | null>(null);
   const [draftRadial, setDraftRadial] = useState<NonNullable<RegionBehavior["radial"]> | null>(null);
   const [draftRadialOrientation, setDraftRadialOrientation] = useState<RegionBehavior["orientation"] | null>(null);
   const [draftPatch, setDraftPatch] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
@@ -2054,7 +2073,6 @@ function SourceCanvas(props: {
         else {
           const radius = Math.hypot(local.x - next.centerX, local.y - next.centerY);
           if (activeRadial.kind === "inner") next.innerRadius = Math.max(0, Math.min(next.outerRadius - 0.001, radius));
-          if (activeRadial.kind === "transition") next.blendWidth = Math.max(0, Math.min(next.outerRadius - next.innerRadius, radius - next.innerRadius));
           if (activeRadial.kind === "outer") next.outerRadius = Math.max(next.innerRadius + 0.001, Math.min(2, radius));
         }
         if (next.outerRadius > next.innerRadius) activeRadial.lastRadial = next;
@@ -2170,7 +2188,7 @@ function SourceCanvas(props: {
     cropDrag.current = { pointerId: event.pointerId, action, origin: effectiveCrop, x: start.x, y: start.y };
   }
 
-  function beginRadial(event: React.PointerEvent<Element>, kind: "center" | "inner" | "transition" | "outer" | "seam" | "seam_blend") {
+  function beginRadial(event: React.PointerEvent<Element>, kind: "center" | "inner" | "outer" | "seam" | "seam_blend") {
     const radial = props.radialBehavior?.radial;
     if (!radial || event.button !== 0) return;
     event.preventDefault();
@@ -2386,8 +2404,6 @@ function SourceCanvas(props: {
         const angle = ({ zero: 0, ninety: Math.PI / 2, one_eighty: Math.PI, two_seventy: Math.PI * 1.5 } as const)[orientation];
         const ring = (radius: number) => Array.from({ length: 65 }, (_, index) => { const theta = index / 64 * Math.PI * 2; return sourcePoint({ x: radial.centerX + Math.cos(theta) * radius, y: radial.centerY + Math.sin(theta) * radius }); }).map((point) => `${point.x},${point.y}`).join(" ");
         const innerHandle = sourcePoint({ x: radial.centerX + radial.innerRadius, y: radial.centerY });
-        const transitionRadius = Math.min(radial.outerRadius, radial.innerRadius + radial.blendWidth);
-        const transitionHandle = sourcePoint({ x: radial.centerX + transitionRadius, y: radial.centerY });
         const outerHandle = sourcePoint({ x: radial.centerX + radial.outerRadius, y: radial.centerY });
         const seamBlendAngle = radial.seamBlendWidth * Math.PI * 2;
         const seamBlendHandle = sourcePoint({ x: radial.centerX + Math.cos(angle + seamBlendAngle) * radial.outerRadius, y: radial.centerY + Math.sin(angle + seamBlendAngle) * radial.outerRadius });
@@ -2397,7 +2413,6 @@ function SourceCanvas(props: {
         const handle = 7 / viewport.view.scale;
         return <g className="radial-gizmo" aria-label="Selected region radial source gizmo">
           <polyline className="radial-ring inner" points={ring(radial.innerRadius)} />
-          {radial.blendWidth > 0 ? <polyline className="radial-ring transition" points={ring(transitionRadius)} /> : null}
           <polyline className="radial-ring outer" points={ring(radial.outerRadius)} />
           <line className="radial-seam" x1={center.x} y1={center.y} x2={seamHandle.x} y2={seamHandle.y} />
           {radial.seamBlendWidth > 0 ? <><line className="radial-seam feather" x1={center.x} y1={center.y} x2={seamBlendHandle.x} y2={seamBlendHandle.y} /><line className="radial-seam feather" x1={center.x} y1={center.y} x2={seamBlendMirror.x} y2={seamBlendMirror.y} /></> : null}
@@ -2405,8 +2420,6 @@ function SourceCanvas(props: {
           <circle className="radial-handle center" cx={center.x} cy={center.y} r={handle} />
           <circle className="radial-hit" cx={innerHandle.x} cy={innerHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "inner")}><title>Adjust inner radius</title></circle>
           <circle className="radial-handle" cx={innerHandle.x} cy={innerHandle.y} r={handle} />
-          <circle className="radial-hit transition" cx={transitionHandle.x} cy={transitionHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "transition")}><title>Adjust transition width</title></circle>
-          <circle className="radial-handle transition" cx={transitionHandle.x} cy={transitionHandle.y} r={handle} />
           <circle className="radial-hit" cx={outerHandle.x} cy={outerHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "outer")}><title>Adjust outer radius</title></circle>
           <circle className="radial-handle" cx={outerHandle.x} cy={outerHandle.y} r={handle} />
           <circle className="radial-hit seam-blend" cx={seamBlendHandle.x} cy={seamBlendHandle.y} r={handle * 1.7} onPointerDown={(event) => beginRadial(event, "seam_blend")}><title>Adjust seam blend width</title></circle>
@@ -2516,6 +2529,75 @@ function PatchPreview(props: { preview: PreviewSheetProjection; region: Resolved
     <header>Patch Preview</header>
     <div><img src={props.preview.dataUrl} alt="Selected patch draft render" style={{ width: props.preview.width * scale, height: props.preview.height * scale, transform: `translate(${-bounds.x * scale}px, ${-bounds.y * scale}px)` }} /></div>
   </aside>;
+}
+
+function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; mapView: CompiledMapView; onPaint: (dimensions: { width: number; height: number }) => void; onDebugSummary: (summary: GpuTiledPreviewPaintSummary | null) => void }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const painter = useRef(new GpuTiledPreviewPainter());
+  const onPaint = useRef(props.onPaint);
+  const publication = props.artifact.tileManifest;
+  const manifest = publication.manifest;
+
+  onPaint.current = props.onPaint;
+
+  useEffect(() => () => painter.current.dispose(), []);
+  useEffect(() => {
+    const surface = canvasRef.current;
+    if (!surface || !gpuTiledPreviewMapMatches(manifest.map, props.mapView)) return;
+    painter.current.beginGeneration(manifest.generation);
+    void painter.current.paint(surface, publication, {
+      getPayload: (request) => invoke<Uint8Array>("get_gpu_tiled_preview_payload", { request }),
+      releasePayload: async (request) => { await invoke("release_gpu_tiled_preview_payload", { request }); },
+    }, IPC_PROTOCOL_VERSION).then((painted) => {
+      props.onDebugSummary(painter.current.lastSummary());
+      if (painted) onPaint.current({ width: props.artifact.width, height: props.artifact.height });
+    });
+  }, [manifest.generation, manifest.opaqueHandle, manifest.map, props.artifact.height, props.artifact.width, props.mapView, publication, props.onDebugSummary]);
+
+  return <canvas
+    ref={canvasRef}
+    data-gpu-preview-canvas="true"
+    width={props.artifact.width}
+    height={props.artifact.height}
+    aria-label={`${props.mapView} trim sheet preview`}
+  />;
+}
+
+async function writeClipboardText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textArea = document.createElement("textarea");
+  textArea.value = text;
+  textArea.style.position = "fixed";
+  textArea.style.left = "-9999px";
+  document.body.appendChild(textArea);
+  textArea.focus();
+  textArea.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("Clipboard copy failed");
+  } finally {
+    textArea.remove();
+  }
+}
+
+function canvasPixelSummary(canvas: HTMLCanvasElement | null) {
+  if (!canvas) return null;
+  try {
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return { width: canvas.width, height: canvas.height, readable: false, reason: "2d context unavailable" };
+    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let nonTransparent = 0;
+    let nonZeroRgb = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      if (data[index + 3] !== 0) nonTransparent += 1;
+      if (data[index] !== 0 || data[index + 1] !== 0 || data[index + 2] !== 0) nonZeroRgb += 1;
+    }
+    return { width: canvas.width, height: canvas.height, readable: true, nonTransparent, nonZeroRgb };
+  } catch (reason) {
+    return { width: canvas.width, height: canvas.height, readable: false, reason: reason instanceof Error ? reason.message : String(reason) };
+  }
 }
 
 function rectangleGeometry(start: { x: number; y: number }, end: { x: number; y: number }): PatchGeometry {
@@ -2628,8 +2710,8 @@ function SheetWorkbench(props: {
   primaryMaterial: string;
   build: () => void;
   renderFullResolutionPreview: () => void;
-  interactivePreviewProfile: PreviewProfile;
-  setInteractivePreviewProfile: (profile: PreviewProfile) => void;
+  interactivePreviewProfile: InteractivePreviewProfile;
+  setInteractivePreviewProfile: (profile: InteractivePreviewProfile) => void;
   previewProgress: PreviewProgress | null;
   previewElapsedMs: number;
   activity: Activity;
@@ -2663,7 +2745,11 @@ function SheetWorkbench(props: {
       : null;
   const sheet = validPreview ?? artifact;
   const imageUrl = validPreview?.dataUrl ?? artifact?.maps[props.mapView];
+  const tiledManifestMatchesMap = artifact?.tileManifest.manifest.map === props.mapView;
   const sheetMatchesDocument = !!sheet && sheet.topologyHash === topologyHash;
+  const artifactRevisionMatchesDocument = !!props.project?.document
+    && !!props.artifact
+    && props.artifact.documentRevision === props.project.document.documentRevision;
   const displayedGrid = props.project?.document?.logicalGrid ?? diagonalCascadePreset.logicalGrid;
   // Generator state is retained only for legacy-document migration code below; it has no
   // visible product authority and no automatic preview effect.
@@ -2679,6 +2765,8 @@ function SheetWorkbench(props: {
   const [textureVisible, setTextureVisible] = useState(true);
   const [regionFillVisible, setRegionFillVisible] = useState(true);
   const [edgeEligibilityVisible, setEdgeEligibilityVisible] = useState(false);
+  const [debugCopyStatus, setDebugCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const [gpuPaintSummary, setGpuPaintSummary] = useState<GpuTiledPreviewPaintSummary | null>(null);
   const [hoverSnap, setHoverSnap] = useState<ReturnType<typeof snappedGridPoint> | null>(null);
   const [pendingGridChange, setPendingGridChange] = useState<{ preset: AuthoredLayoutPreset; size: number } | null>(null);
   const [userPresets, setUserPresets] = useState<AuthoredLayoutPreset[]>([]);
@@ -2707,11 +2795,19 @@ function SheetWorkbench(props: {
     ? props.project?.materialSources.find((source) => source.id === sourceFrame.sourceSetId)?.registeredChannels?.channels.find((channel) => channel.channel === "base_color")?.thumbnailDataUrl
     : null;
   const localTopologyPending = props.artifact?.telemetry.at(-1)?.startsWith("local topology edit:") ?? false;
-  // The source texture is a bounded transient fast path only. Once Stage 14 publishes the
-  // current revision, its encoded Diffuse texture is the settled visible product artifact.
-  const continuousTexture = props.mapView === "baseColor" && (drawDraft || resizeDraft || localTopologyPending || !imageUrl) ? sourceTexture : null;
-  const editorHasImage = !!continuousTexture || !!imageUrl;
-  const sourceTextureProblem = props.mapView === "baseColor" && sourceFrame && !continuousTexture && !imageUrl
+  // Do not substitute Source Frame pixels for Stage 14. During local edits, keep the last
+  // painted Stage 14 sheet visible until native publishes replacement pixels.
+  const hasTransientSourceFallback = false;
+  const currentTileGeneration = artifact?.tileManifest.manifest.generation;
+  const gpuTilePaintedBlank = gpuPaintSummary?.generation === currentTileGeneration
+    && !!gpuPaintSummary?.painted
+    && gpuPaintSummary.validPayload
+    && gpuPaintSummary.payloadNonTransparent === 0
+    && gpuPaintSummary.payloadNonZeroRgb === 0;
+  const continuousTexture = null;
+  const displayGpuTiles = shouldDisplayGpuTiledPreview(artifact?.tileManifest.manifest.map, props.mapView, hasTransientSourceFallback);
+  const editorHasImage = !!continuousTexture || displayGpuTiles || !!imageUrl;
+  const sourceTextureProblem = props.mapView === "baseColor" && sourceFrame && !continuousTexture && !displayGpuTiles && !imageUrl
     ? "The complete oriented Source Frame Diffuse texture is unavailable. Layout editing will not display a partial Stage 14 map. Re-register Diffuse for this Source Frame."
     : null;
   const workpieceSize = sheet
@@ -2720,6 +2816,7 @@ function SheetWorkbench(props: {
       ? { width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height }
       : null;
   const viewport = useViewportController(workpieceSize, props.project?.document?.id ?? "no-document");
+  useEffect(() => setGpuPaintSummary(null), [currentTileGeneration, artifact?.tileManifest.manifest.opaqueHandle, props.mapView]);
   const gridSteps = adaptiveGridSteps(displayedGrid, sheet?.width ?? 1, sheet?.height ?? 1, viewport.view.scale);
   useEffect(() => {
     let disposed = false;
@@ -2854,6 +2951,114 @@ function SheetWorkbench(props: {
     };
   }, [layoutMenu]);
   useEffect(() => setLayoutSubmenu(null), [layoutMenu?.x, layoutMenu?.y, layoutMenu?.regionId]);
+  function currentVisibleAtlasRect(): PixelBounds | null {
+    if (!sheet) return null;
+    const bounds = viewport.containerRef.current?.getBoundingClientRect();
+    if (!bounds || bounds.width <= 0 || bounds.height <= 0 || viewport.view.scale <= 0) return null;
+    const left = Math.max(0, Math.floor((0 - viewport.view.x) / viewport.view.scale));
+    const top = Math.max(0, Math.floor((0 - viewport.view.y) / viewport.view.scale));
+    const right = Math.min(sheet.width, Math.ceil((bounds.width - viewport.view.x) / viewport.view.scale));
+    const bottom = Math.min(sheet.height, Math.ceil((bounds.height - viewport.view.y) / viewport.view.scale));
+    return right > left && bottom > top ? { x: left, y: top, width: right - left, height: bottom - top } : null;
+  }
+  async function copyPreviewDebugInfo() {
+    const canvas = sheetRef.current?.querySelector<HTMLCanvasElement>('canvas[data-gpu-preview-canvas="true"]') ?? null;
+    const manifest = props.artifact?.tileManifest.manifest;
+    const telemetry = [...(props.artifact?.telemetry ?? []), ...props.previewClientTelemetry];
+    const debug = {
+      capturedAt: new Date().toISOString(),
+      activity: props.activity,
+      mapView: props.mapView,
+      interactivePreviewProfile: props.interactivePreviewProfile,
+      progress: props.previewProgress,
+      project: props.project?.document ? {
+        documentRevision: props.project.document.documentRevision,
+        topologyHash,
+        renderSettings: props.project.document.renderSettings,
+        sourceFrame: props.project.document.sourceFrame ? {
+          sourceSetId: props.project.document.sourceFrame.sourceSetId,
+          orientedDimensions: props.project.document.sourceFrame.orientedDimensions,
+          sourceRevision: props.project.document.sourceFrame.sourceRevision,
+        } : null,
+      } : null,
+      artifact: props.artifact ? {
+        width: props.artifact.width,
+        height: props.artifact.height,
+        documentRevision: props.artifact.documentRevision,
+        topologyHash: props.artifact.topologyHash,
+        appearanceHash: props.artifact.appearanceHash,
+        regions: props.artifact.regions.length,
+        slots: props.artifact.slots.length,
+        pending: props.artifact.pending,
+        mapKeys: Object.keys(props.artifact.maps),
+        selectedRegionId: props.selectedRegionId,
+        selectedGridRect,
+        selectedSlot: selectedLayoutSlot ? {
+          allocationBounds: selectedLayoutSlot.allocationBounds,
+          mappingMode: selectedLayoutSlot.mappingMode,
+          sourceCrop: selectedLayoutSlot.sourceCrop,
+          sourceBounds: selectedLayoutSlot.sourceBounds,
+          addressMode: selectedLayoutSlot.addressMode,
+        } : null,
+      } : null,
+      displayGate: {
+        sheetPresent: !!sheet,
+        validPreviewPresent: !!validPreview,
+        sheetMatchesDocument,
+        artifactRevisionMatchesDocument,
+        textureVisible,
+        regionFillVisible,
+        gridVisible,
+        hasTransientSourceFallback,
+        localTopologyPending,
+        continuousTexturePresent: !!continuousTexture,
+        gpuTilePaintedBlank,
+        gpuPaintSummary,
+        sourceTextureThumbnailPresent: !!sourceTexture,
+        imageUrlPresent: !!imageUrl,
+        imageUrlLength: imageUrl?.length ?? 0,
+        displayGpuTiles,
+        editorHasImage,
+        sourceTextureProblem,
+        rawManifestMapMatchesMapView: tiledManifestMatchesMap,
+        normalizedManifestMapMatchesMapView: gpuTiledPreviewMapMatches(manifest?.map, props.mapView),
+      },
+      viewport: {
+        view: viewport.view,
+        visibleAtlasRect: currentVisibleAtlasRect(),
+        container: viewport.containerRef.current ? {
+          width: Math.round(viewport.containerRef.current.getBoundingClientRect().width),
+          height: Math.round(viewport.containerRef.current.getBoundingClientRect().height),
+        } : null,
+      },
+      gpuTile: props.artifact?.tileManifest ?? null,
+      canvas: canvasPixelSummary(canvas),
+      telemetry,
+    };
+    const text = [
+      "Hot Trimmer preview debug",
+      JSON.stringify(debug, null, 2),
+      "",
+      "Telemetry",
+      telemetry.join("\n"),
+    ].join("\n");
+    try {
+      await writeClipboardText(text);
+      setDebugCopyStatus("copied");
+      window.setTimeout(() => setDebugCopyStatus("idle"), 1600);
+    } catch {
+      setDebugCopyStatus("failed");
+    }
+  }
+  useEffect(() => {
+    const copyShortcut = (event: KeyboardEvent) => {
+      if (event.key !== "F2" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      event.preventDefault();
+      void copyPreviewDebugInfo();
+    };
+    window.addEventListener("keydown", copyShortcut);
+    return () => window.removeEventListener("keydown", copyShortcut);
+  });
   return <section className="sheet-workbench">
     <header className="sheet-header">
       <div><strong>HOTSPOT SHEET</strong></div>
@@ -2871,11 +3076,11 @@ function SheetWorkbench(props: {
         <label>Size<select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document || props.activity !== "idle"}>
           <option value={1024}>1K · 1024</option><option value={2048}>2K · 2048</option><option value={4096}>4K · 4096</option><option value={8192}>8K · 8192</option>
         </select></label>
-        <label>Interactive edits<select value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as PreviewProfile)} disabled={!props.project?.document || props.activity !== "idle"}>
-          <option value="draft512">Fast · 512</option><option value="refinement1024">Detailed · 1024</option><option value="authoritative">Full selected size</option>
+        <label>Preview<select value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as InteractivePreviewProfile)} disabled={!props.project?.document || props.activity !== "idle"}>
+          <option value="refinement1024">1K · 1024</option><option value="preview2048">2K · 2048</option><option value="preview4096">4K · 4096</option><option value="preview8192">8K · 8192</option>
         </select></label>
         <button onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle"}>Render full-resolution preview</button>
-        <small>Displayed now: {sheet ? `${sheet.width} × ${sheet.height}` : "not rendered"}. Full selected size lets you measure 4K/8K interaction cost directly.</small>
+        <small>Displayed now: {sheet ? `${sheet.width} × ${sheet.height}` : "not rendered"}. Edits keep the last painted sheet until the selected preview size is ready.</small>
       </fieldset>
       {selectedGridRect ? <output className="selection-readout">Selected: x {selectedGridRect.x}, y {selectedGridRect.y} · {selectedGridRect.width} × {selectedGridRect.height}</output> : drawRect ? <output className="selection-readout draw">Drawing: x {drawRect.x}, y {drawRect.y} · {drawRect.width} × {drawRect.height}</output> : <output className="selection-readout">No region selected</output>}
       {selectedLayoutRegion && selectedLayoutBinding ? <fieldset className="layout-region-settings"><legend>Selected region</legend>
@@ -3009,7 +3214,7 @@ function SheetWorkbench(props: {
           } else if (!(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
         }}
       >
-        {textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
+        {textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && displayGpuTiles && artifact ? <GpuTiledPreviewCanvas artifact={artifact} mapView={props.mapView} onPaint={props.onPreviewPaint} onDebugSummary={setGpuPaintSummary} /> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
         {pendingPatchRegions.map(({ region, patchPreview }) => <div key={`assigned-${region.regionId}`} className="assigned-patch-preview" style={gridRectOverlayStyle(region.gridRect!, displayedGrid)}><img src={patchPreview.dataUrl} alt={`Immediate assigned patch preview for ${region.displayName}`} /></div>)}
         {layoutTool === "draw" && hoverSnap && !drawDraft ? <div className="draw-hover-cell" style={gridRectOverlayStyle({ x: hoverSnap.cellX, y: hoverSnap.cellY, width: 1, height: 1 }, displayedGrid)}><div className="draw-snap-crosshair"><span>cell {hoverSnap.cellX}, {hoverSnap.cellY}</span></div></div> : null}
         {(sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}
@@ -3048,6 +3253,9 @@ function SheetWorkbench(props: {
       <span>{props.artifact.label}</span>
       <span>incomplete after Stage {props.artifact.incompleteAfterStage} · non-exportable</span>
       <span>pending: {props.artifact.pending.join(", ")}</span>
+      <button className="copy-debug-button" onClick={() => void copyPreviewDebugInfo()} title="Copy preview telemetry, tile manifest, display gates, and canvas pixel summary. Shortcut: F2.">
+        {debugCopyStatus === "copied" ? "Copied debug" : debugCopyStatus === "failed" ? "Copy failed" : "Copy telemetry + debug"}
+      </button>
       {props.artifact.telemetry.length > 0 || props.previewClientTelemetry.length > 0 ? <details className="preview-telemetry">
         <summary>Preview telemetry</summary>
         <pre>{[...props.artifact.telemetry, ...props.previewClientTelemetry].join("\n")}</pre>
@@ -3463,7 +3671,6 @@ function RadialEditor(props: { regionId: string; radial: NonNullable<RegionMappi
     ["centerX", "Center X", 0, 1, 0.01], ["centerY", "Center Y", 0, 1, 0.01],
     ["innerRadius", "Protected center", 0, 1.999, 0.001], ["outerRadius", "Warp outer edge", 0.001, 2, 0.001],
     ["falloff", "Falloff", 0.1, 4, 0.05],
-    ["blendWidth", "Transition width", 0, 1, 0.005],
     ["seamBlendWidth", "Seam blend", 0, 0.25, 0.005],
   ];
   const update = (field: keyof typeof radial, value: number) => {
@@ -3481,7 +3688,7 @@ function RadialEditor(props: { regionId: string; radial: NonNullable<RegionMappi
   return <div className="mapping-editor radial-editor">
     <strong>RADIAL PROJECTION</strong>
     {fields.map(([field, label, min, max, step]) => <label key={field}>{label}<input type="number" min={min} max={max} step={step} value={Number(radial[field].toFixed(3))} onChange={(event) => update(field, Number(event.target.value))} /></label>)}
-    <small>The protected center stays planar. Transition width blends into the concentric wrap; Falloff redistributes detail across the remaining band. Changes apply immediately.</small>
+    <small>The protected center stays planar. Falloff redistributes detail across the wrap band. Changes apply immediately.</small>
   </div>;
 }
 

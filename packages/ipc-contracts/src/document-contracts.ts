@@ -483,6 +483,7 @@ export interface IntermediateAtlasProjection {
   topology: unknown;
   placementPlanId: string;
   maps: Partial<Record<CompiledMapView, string>>;
+  tileManifest: GpuTiledPreviewPublication;
   regions: readonly ResolvedRegion[];
   unavailableChannels: readonly string[];
   slots: readonly Stage14SlotProjection[];
@@ -495,7 +496,20 @@ export interface IntermediateAtlasProjection {
 }
 
 /** Preview work profile; this changes requested output work only, never SourceFrame ownership. */
-export type SourceFramePreviewProfile = "draft512" | "refinement1024" | "authoritative";
+export type SourceFramePreviewProfile =
+  | "draft512"
+  | "refinement1024"
+  | "preview2048"
+  | "preview4096"
+  | "preview8192"
+  | "authoritative";
+
+/** The display area that the persisted Stage 14 route must compile. */
+export type SourceFramePreviewViewIntent =
+  | "completeDraft512"
+  | "completeRefinement1024"
+  | "exactViewport"
+  | "exactSelectedRegion";
 
 export interface Stage14PreviewRequest {
   protocolVersion: number;
@@ -505,6 +519,9 @@ export interface Stage14PreviewRequest {
   draftId?: number;
   inputHash?: string;
   profile?: SourceFramePreviewProfile;
+  viewIntent?: SourceFramePreviewViewIntent;
+  /** Exact output-atlas coordinates, used only by `exactViewport`. */
+  viewportRect?: PixelBounds;
 }
 
 export interface PreviewSheetProjection {
@@ -517,6 +534,47 @@ export interface PreviewSheetProjection {
   mapView: CompiledMapView;
   dataUrl: string;
   regions: readonly ResolvedRegion[];
+}
+
+/** Metadata-only publication for an interactive GPU tile. The opaque handle is
+ * resolved through `get_gpu_tiled_preview_payload`, which returns raw bytes. */
+export interface GpuTiledPreviewManifest {
+  map: CompiledMapView;
+  mipLevel: number;
+  outputRect: PixelBounds;
+  validRect: PixelBounds;
+  haloPx: number;
+  generation: number;
+  pixelFormat: "rgba8UnormSrgb" | "r32Uint";
+  width: number;
+  height: number;
+  rowStride: number;
+  opaqueHandle: string;
+}
+
+/** Native and frontend timing fields are joined by generation. */
+export interface GpuTiledPreviewTelemetry {
+  generation: number;
+  nativePublishMs: number;
+  rawIpcBytes: number;
+  rawIpcMs: number;
+}
+
+export interface GpuTiledPreviewPublication {
+  manifest: GpuTiledPreviewManifest;
+  telemetry: GpuTiledPreviewTelemetry;
+}
+
+export interface GpuTiledPreviewPayloadRequest {
+  protocolVersion: number;
+  generation: number;
+  opaqueHandle: string;
+}
+
+export interface ReleaseGpuTiledPreviewPayloadRequest {
+  protocolVersion: number;
+  generation: number;
+  opaqueHandle: string;
 }
 
 export type TrimSheetDocumentCommand =

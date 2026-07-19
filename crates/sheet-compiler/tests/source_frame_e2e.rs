@@ -86,6 +86,7 @@ fn compile_behavior_document(
                 draft_id: None,
                 input_hash: None,
                 profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+                view_intent: None,
             },
             &CancellationToken::new(),
             || true,
@@ -327,6 +328,7 @@ fn manual_region_behavior_resized_patch_invalidates_only_its_rendered_domain() {
             hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
                 project: &summary, revision, draft_id: None, input_hash: Some(input_hash.into()),
                 profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+                view_intent: None,
             },
             &CancellationToken::new(), || true, Some(&cache),
         ).expect("compile radial patch cache fixture")
@@ -440,6 +442,7 @@ fn gpu_migration_cpu_baseline_contract() {
                     draft_id: None,
                     input_hash: Some(input_hash.to_owned()),
                     profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+                    view_intent: None,
                 },
                 &CancellationToken::new(),
                 || true,
@@ -518,6 +521,7 @@ fn source_frame_persisted_pipeline_is_pixel_exact_for_accepted_partitions() {
                 hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
                     project: &summary, revision: document.document_revision, draft_id: None, input_hash: None,
                     profile: Default::default(),
+                    view_intent: None,
                 },
                 &CancellationToken::new(), || true,
             )
@@ -606,7 +610,7 @@ fn source_frame_authoring_uses_one_compiled_record_for_move_detach_and_reset() {
     let moved_summary = { let mut summary = summary.clone(); summary.document = Some(moved.clone()); summary };
     let moved_artifact = hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
         .compile_persisted_stage_14_preview(
-        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &moved_summary, revision: moved.document_revision, draft_id: None, input_hash: None, profile: Default::default() },
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &moved_summary, revision: moved.document_revision, draft_id: None, input_hash: None, profile: Default::default(), view_intent: None },
             &CancellationToken::new(), || true,
         ).expect("moved compile");
     assert_eq!(detached.source_overrides[&region_id].source_bounds, moved.source_frame.as_ref().unwrap().region_bounds(moved.logical_grid.unwrap(), moved.topology.regions[0].grid_rect.unwrap()));
@@ -615,7 +619,7 @@ fn source_frame_authoring_uses_one_compiled_record_for_move_detach_and_reset() {
     let reset_summary = { let mut summary = summary.clone(); summary.document = Some(reset.clone()); summary };
     let restored = hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
         .compile_persisted_stage_14_preview(
-        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &reset_summary, revision: reset.document_revision, draft_id: None, input_hash: None, profile: Default::default() },
+        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest { project: &reset_summary, revision: reset.document_revision, draft_id: None, input_hash: None, profile: Default::default(), view_intent: None },
             &CancellationToken::new(), || true,
         ).expect("reset compile");
     assert_eq!(moved_artifact.slots[0].grid_rect, restored.slots[0].grid_rect);
@@ -632,6 +636,7 @@ fn source_frame_preview_profile_keeps_direct_coordinates_and_reuses_warm_decode(
     let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
     let request = |profile| hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
         project: &summary, revision: document.document_revision, draft_id: None, input_hash: None, profile,
+        view_intent: None,
     };
     let draft = compiler.compile_persisted_stage_14_preview_with_cache(
         request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512), &CancellationToken::new(), || true, Some(&cache),
@@ -666,6 +671,7 @@ fn source_frame_profiles_publish_atomic_full_square_artifacts() {
     let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
     let request = |profile| hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
         project: &summary, revision: document.document_revision, draft_id: None, input_hash: None, profile,
+        view_intent: None,
     };
     let draft = compiler.compile_persisted_stage_14_preview_with_cache(
         request(hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512), &CancellationToken::new(), || true, Some(&cache),
@@ -874,6 +880,7 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
         hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
             project: &summary, revision: document.document_revision, draft_id: Some(3), input_hash: Some("C".into()),
             profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+            view_intent: None,
         },
         &CancellationToken::new(), || true, Some(&cache),
     ).expect("publish complete 512 product draft");
@@ -928,6 +935,7 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
         hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
             project: &summary, revision: document.document_revision, draft_id: Some(4), input_hash: Some("C".into()),
             profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+            view_intent: None,
         }, &CancellationToken::new(), || true, Some(&cache),
     ).expect("warm complete draft");
     assert!(warm.telemetry.iter().any(|line| line.contains("composed_cache=hit")));
@@ -935,6 +943,7 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
         hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
             project: &summary, revision: document.document_revision, draft_id: Some(5), input_hash: Some("C-refinement".into()),
             profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Refinement1024,
+            view_intent: None,
         }, &CancellationToken::new(), || true, Some(&cache),
     ).expect("publish complete 1024 refinement");
     assert_eq!(refinement.topology.output_size, PixelSize { width: 1_024, height: 1_024 });
@@ -952,6 +961,7 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
         hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
             project: &summary, revision: document.document_revision, draft_id: Some(1), input_hash: Some("A".into()),
             profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+            view_intent: None,
         }, &CancellationToken::new(), || false,
     );
     assert!(stale.is_err());
@@ -961,6 +971,7 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
         hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
             project: &summary, revision: document.document_revision, draft_id: Some(2), input_hash: Some("B".into()),
             profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Draft512,
+            view_intent: None,
         }, &cancelled, || true,
     ).is_err());
     assert_eq!(draft.revision, document.document_revision, "only current C artifact may publish");

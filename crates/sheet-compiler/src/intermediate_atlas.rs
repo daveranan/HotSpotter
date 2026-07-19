@@ -1,6 +1,9 @@
 //! Non-exportable composition of authoritative Stage 14 slot results into Stage 9 topology.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CompilationDiagnostic, CompiledTemplateTopology, ContentDigest,
@@ -107,6 +110,9 @@ pub struct IntermediateAtlasArtifact {
     /// Measured persisted-spine facts.  These describe the exact artifact, never a
     /// separately reconstructed preview.
     pub telemetry: Vec<String>,
+    /// Bounded raw GPU tile returned by the persisted Stage 14 compile, when the
+    /// GPU executor is selected for interactive preview publication.
+    pub rendered_tile: Option<Arc<crate::GpuAtlasRenderedTile>>,
     pub pending: Vec<&'static str>,
 }
 
@@ -293,6 +299,7 @@ pub(crate) fn compose_intermediate_atlas(
             .ok_or(IntermediateAtlasError::IncompletePlacementPlan)?,
         slots: inspections, algorithm_versions: request.algorithm_versions.clone(),
         diagnostics: request.diagnostics.clone(), regions: request.regions.clone(), telemetry: Vec::new(),
+        rendered_tile: None,
         pending: vec!["profiles", "semantic details", "effects", "final PBR composition", "finishing",
             "mips", "metadata", "export", "Blender application"],
     })

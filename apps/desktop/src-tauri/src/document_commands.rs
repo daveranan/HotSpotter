@@ -14,13 +14,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hot_trimmer_domain::{
     ALGORITHM_STACK_CONTRACT_VERSION, AlgorithmProvenance, AssignmentProvenance,
     AuthoredLayoutPreset, CancellationToken as EngineCancellationToken, ChannelRegistration,
-    CompilerRequestHeader, ContentDigest, ContentReference, DelightingIntent, ErrorCode, FoundationStatusRequest,
-    IPC_PROTOCOL_VERSION, MaterialBehaviorClass, MaterialCalibrationCommand,
-    MaterialCalibrationIntent, MaterialChannelRole, MaterialClassificationCommand,
-    MaterialClassificationIntent, NormalConvention, OrientedPixelSize, OriginalAssetProvenance,
-    OutputSpecHeader, PartitionRecipe, PatchCommand, PatchGeometry, PatchId, Projection, RegionId,
-    RegisteredChannel, RegisteredChannelSet, SourceId, SourceOwnershipIntent, SourceSetId,
-    TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
+    CompilerRequestHeader, ContentDigest, ContentReference, DelightingIntent, ErrorCode,
+    FoundationStatusRequest, IPC_PROTOCOL_VERSION, MaterialBehaviorClass,
+    MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole, MaterialMapKind,
+    MaterialClassificationCommand, MaterialClassificationIntent, NormalConvention,
+    OrientedPixelSize, OriginalAssetProvenance, OutputSpecHeader, PartitionRecipe, PatchCommand,
+    PatchGeometry, PatchId, Projection, RegionId, RegisteredChannel, RegisteredChannelSet,
+    PixelBounds, SourceId, SourceOwnershipIntent, SourceSetId, TrimSheetDocument, TrimSheetDocumentCommand,
+    UserFacingError,
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, NormalizationSettings,
@@ -41,9 +42,14 @@ use hot_trimmer_render_core::{
     RenderCancellationToken, prepare_registered_exemplar,
 };
 use hot_trimmer_sheet_compiler::{
-    AlgorithmCompiler, CompiledMapSet, PreviewMapKind, ResolvedRegion,
+    AlgorithmCompiler, CompiledAtlasPreviewProfile, CompiledAtlasTileIdentity,
+    CompiledAtlasTileManifest, CompiledMapSet, CompiledTilePixelFormat, GpuAtlasTileCache,
+    OutputPixelRect, PreviewMapKind, ResolvedRegion,
 };
-use image::{ColorType, ImageEncoder, codecs::png::{CompressionType, FilterType, PngEncoder}};
+use image::{
+    ColorType, ImageEncoder,
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -103,7 +109,10 @@ impl ProjectSession {
             .join(format!("baseline-{}.hottrimmer", Uuid::new_v4()));
         store.backup_atomic(&baseline).map_err(store_error)?;
         self.store = Some(store);
-        self.source_projection_cache.lock().map_err(|_| poisoned())?.clear();
+        self.source_projection_cache
+            .lock()
+            .map_err(|_| poisoned())?
+            .clear();
         self.preview_prepared_sources.clear();
         self.prepared_exemplars = PreparedExemplarCache::default();
         self.source_analysis_cache = SourceAnalysisCache::default();
@@ -166,6 +175,8 @@ pub struct PreviewService {
     latest_draft_id: AtomicU64,
     cancellation_count: AtomicU64,
     source_frame_cache: Mutex<hot_trimmer_sheet_compiler::SourceFramePreviewCache>,
+    gpu_source_cache: Mutex<hot_trimmer_sheet_compiler::GpuAtlasSourceTextureCache>,
+    gpu_tile_cache: Mutex<GpuAtlasTileCache>,
     previewed_candidate_recipes: Mutex<BTreeSet<(u64, hot_trimmer_domain::DocumentHash)>>,
     gpu_capabilities: hot_trimmer_preview::GpuCapabilityService,
 }
@@ -175,6 +186,12 @@ impl PreviewService {
         self.latest_draft_id.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut cache) = self.source_frame_cache.lock() {
             *cache = hot_trimmer_sheet_compiler::SourceFramePreviewCache::default();
+        }
+        if let Ok(mut cache) = self.gpu_source_cache.lock() {
+            *cache = hot_trimmer_sheet_compiler::GpuAtlasSourceTextureCache::default();
+        }
+        if let Ok(mut cache) = self.gpu_tile_cache.lock() {
+            *cache = GpuAtlasTileCache::default();
         }
         if let Ok(mut candidates) = self.previewed_candidate_recipes.lock() {
             candidates.clear();
@@ -540,6 +557,38 @@ pub struct PreviewSheetProjection {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GpuTiledPreviewPayloadRequest {
+    protocol_version: u16,
+    generation: u64,
+    opaque_handle: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseGpuTiledPreviewPayloadRequest {
+    protocol_version: u16,
+    generation: u64,
+    opaque_handle: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuTiledPreviewTelemetry {
+    generation: u64,
+    native_publish_ms: u128,
+    raw_ipc_bytes: u64,
+    raw_ipc_ms: u128,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuTiledPreviewPublication {
+    manifest: CompiledAtlasTileManifest,
+    telemetry: GpuTiledPreviewTelemetry,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Stage14PreviewRequest {
     protocol_version: u16,
     revision: u64,
@@ -553,10 +602,43 @@ pub struct Stage14PreviewRequest {
     input_hash: Option<String>,
     #[serde(default)]
     profile: PreviewProfile,
+    #[serde(default)]
+    view_intent: Option<PreviewViewIntent>,
+    #[serde(default)]
+    viewport_rect: Option<PixelBounds>,
     /// A transient candidate is compiled by the same persisted spine against a cloned summary.
     /// It is never stored until the matching AcceptSourceFramePartition command is issued.
     #[serde(default)]
     candidate_recipe: Option<PartitionRecipe>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewViewIntent {
+    CompleteDraft512,
+    CompleteRefinement1024,
+    ExactViewport,
+    ExactSelectedRegion,
+}
+
+fn compiled_view_intent(
+    request: &Stage14PreviewRequest,
+) -> Result<Option<hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent>, UserFacingError> {
+    let rect = |value: Option<PixelBounds>, label: &str| {
+        value.map(OutputPixelRect).ok_or_else(|| error(ErrorCode::InvalidInput, &format!("{label} requires an exact output rectangle.")))
+    };
+    match request.view_intent {
+        None => Ok(None),
+        Some(PreviewViewIntent::CompleteDraft512) => Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::CompleteDraft512)),
+        Some(PreviewViewIntent::CompleteRefinement1024) => Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::CompleteRefinement1024)),
+        Some(PreviewViewIntent::ExactViewport) => Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewport(rect(request.viewport_rect, "Exact viewport")?))),
+        Some(PreviewViewIntent::ExactSelectedRegion) => {
+            let Some(region_id) = request.region_id else {
+                return Err(error(ErrorCode::InvalidInput, "Exact selected-region preview requires a selected region."));
+            };
+            Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactSelectedRegion(region_id)))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -564,6 +646,9 @@ pub struct Stage14PreviewRequest {
 pub enum PreviewProfile {
     Draft512,
     Refinement1024,
+    Preview2048,
+    Preview4096,
+    Preview8192,
     #[default]
     Authoritative,
 }
@@ -573,6 +658,9 @@ impl From<PreviewProfile> for hot_trimmer_sheet_compiler::SourceFramePreviewProf
         match value {
             PreviewProfile::Draft512 => Self::Draft512,
             PreviewProfile::Refinement1024 => Self::Refinement1024,
+            PreviewProfile::Preview2048 => Self::Preview2048,
+            PreviewProfile::Preview4096 => Self::Preview4096,
+            PreviewProfile::Preview8192 => Self::Preview8192,
             PreviewProfile::Authoritative => Self::Authoritative,
         }
     }
@@ -632,6 +720,7 @@ pub struct IntermediateAtlasProjection {
     topology: hot_trimmer_domain::CompiledTemplateTopology,
     placement_plan_id: String,
     maps: BTreeMap<String, String>,
+    tile_manifest: GpuTiledPreviewPublication,
     regions: Vec<ResolvedRegion>,
     unavailable_channels: Vec<String>,
     slots: Vec<Stage14SlotProjection>,
@@ -721,7 +810,13 @@ pub fn import_source(
     validate_protocol(request.protocol_version)?;
     let cancellation = CancellationToken::new();
     *import_job.lock().map_err(|_| poisoned())? = Some(cancellation.clone());
-    let _ = app.emit("import-progress", ImportProgress { stage: "Reading and decoding", fraction: 0.05 });
+    let _ = app.emit(
+        "import-progress",
+        ImportProgress {
+            stage: "Reading and decoding",
+            fraction: 0.05,
+        },
+    );
     let path = PathBuf::from(&request.path);
     let inspected = inspect_path_cancellable(
         &path,
@@ -730,7 +825,13 @@ pub fn import_source(
         &cancellation,
     )
     .map_err(image_error)?;
-    let _ = app.emit("import-progress", ImportProgress { stage: "Validating registration", fraction: 0.82 });
+    let _ = app.emit(
+        "import-progress",
+        ImportProgress {
+            stage: "Validating registration",
+            fraction: 0.82,
+        },
+    );
     if cancellation.is_cancelled() {
         return Err(image_error(hot_trimmer_image_io::ImageIoError::Cancelled));
     }
@@ -756,7 +857,13 @@ pub fn import_source(
         .invalidate_source(SourceSetId::from_bytes(*request.source_set_id.as_bytes()));
     session.mark_mutated();
     *import_job.lock().map_err(|_| poisoned())? = None;
-    let _ = app.emit("import-progress", ImportProgress { stage: "Complete", fraction: 1.0 });
+    let _ = app.emit(
+        "import-progress",
+        ImportProgress {
+            stage: "Complete",
+            fraction: 1.0,
+        },
+    );
     project_projection(&session)
 }
 
@@ -1500,6 +1607,91 @@ pub async fn preview_through_stage_14(
     })?
 }
 
+/// Returns cache-owned interactive tile bytes as a Tauri binary IPC response.
+/// The JSON manifest is published separately and contains no pixel transport.
+#[tauri::command]
+pub fn get_gpu_tiled_preview_payload(
+    request: GpuTiledPreviewPayloadRequest,
+    preview_service: State<'_, SharedPreviewService>,
+) -> Result<tauri::ipc::Response, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let preview_service = preview_service.inner();
+    if preview_service.latest_draft_id.load(Ordering::Acquire) != request.generation {
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "The requested preview tile belongs to a superseded generation.",
+        ));
+    }
+    let bytes = preview_service
+        .gpu_tile_cache
+        .lock()
+        .map_err(|_| poisoned())?
+        .resolve(&request.opaque_handle)
+        .filter(|tile| tile.manifest.generation == request.generation)
+        .map(|tile| tile.pixels().to_vec())
+        .ok_or_else(|| error(ErrorCode::InvalidInput, "The preview tile handle is unavailable."))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub fn release_gpu_tiled_preview_payload(
+    request: ReleaseGpuTiledPreviewPayloadRequest,
+    preview_service: State<'_, SharedPreviewService>,
+) -> Result<(), UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let preview_service = preview_service.inner();
+    let released = preview_service
+        .gpu_tile_cache
+        .lock()
+        .map_err(|_| poisoned())?
+        .release(request.generation, &request.opaque_handle);
+    if !released {
+        return Err(error(ErrorCode::InvalidInput, "The preview tile handle is unavailable."));
+    }
+    Ok(())
+}
+
+fn publish_gpu_tiled_preview(
+    preview_service: &PreviewService,
+    manifest: CompiledAtlasTileManifest,
+    pixels: Arc<[u8]>,
+) -> Result<GpuTiledPreviewPublication, UserFacingError> {
+    if preview_service.latest_draft_id.load(Ordering::Acquire) != manifest.generation {
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "Preview publication was superseded before the tile entered the native cache.",
+        ));
+    }
+    let started = Instant::now();
+    let published = {
+        let mut cache = preview_service.gpu_tile_cache.lock().map_err(|_| poisoned())?;
+        cache.begin_generation(manifest.generation);
+        cache.publish(manifest, pixels).map_err(|failure| {
+            error(ErrorCode::Internal, &format!("Tiled preview publication failed: {failure}"))
+        })?
+    };
+    if preview_service.latest_draft_id.load(Ordering::Acquire) != published.generation {
+        let _ = preview_service
+            .gpu_tile_cache
+            .lock()
+            .map(|mut cache| cache.release(published.generation, &published.opaque_handle));
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "Preview publication was superseded before the manifest was published.",
+        ));
+    }
+    let native_publish_ms = started.elapsed().as_millis();
+    Ok(GpuTiledPreviewPublication {
+        telemetry: GpuTiledPreviewTelemetry {
+            generation: published.generation,
+            native_publish_ms,
+            raw_ipc_bytes: u64::from(published.row_stride) * u64::from(published.height),
+            raw_ipc_ms: native_publish_ms,
+        },
+        manifest: published,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(any())]
 fn removed_preview_specific_fabrication(
@@ -1898,7 +2090,10 @@ fn removed_preview_specific_fabrication(
             plan,
             result,
             grid_rect: region.grid_rect,
-            behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
+            behavior: document.region_bindings[&region.id]
+                .mapping
+                .behavior
+                .clone(),
         })
         .collect();
     let algorithms = (1..=14)
@@ -2069,12 +2264,13 @@ fn build_stage_14_preview(
             "A newer document revision superseded this preview.",
         ));
     }
-    if request.region_id.is_some() != request.transient_projection.is_some() {
+    if request.transient_projection.is_some() && request.region_id.is_none() {
         return Err(error(
             ErrorCode::InvalidInput,
             "Transient crop requests require both regionId and transientProjection.",
         ));
     }
+    let view_intent = compiled_view_intent(&request)?;
     if let Some(recipe) = request.candidate_recipe.clone() {
         if request.region_id.is_some() {
             return Err(error(
@@ -2144,21 +2340,30 @@ fn build_stage_14_preview(
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let result = AlgorithmCompiler::new().compile_persisted_stage_14_preview_with_cache(
-            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
-                project: &summary,
-                revision: request.revision,
-                draft_id: request.draft_id,
-                input_hash: request.input_hash.clone(),
-                profile: request.profile.into(),
-            },
-            &cancellation,
-            || {
-                preview_service.latest_draft_id.load(Ordering::Acquire) == job
-                    && revision_current.load(Ordering::Acquire)
-            },
-            Some(&preview_service.source_frame_cache),
-        );
+        let gpu_executor = hot_trimmer_sheet_compiler::GpuAtlasRenderExecutor {
+            service: &preview_service.gpu_capabilities,
+            source_texture_cache: &preview_service.gpu_source_cache,
+        };
+        let result = AlgorithmCompiler::new()
+            .compile_persisted_stage_14_preview_with_cache_and_executor(
+                hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                    project: &summary,
+                    revision: request.revision,
+                    // Native owns publication generation. The frontend draft ID is
+                    // scheduling metadata and is absent on several valid commands.
+                    draft_id: Some(job),
+                    input_hash: request.input_hash.clone(),
+                    profile: request.profile.into(),
+                    view_intent,
+                },
+                &cancellation,
+                || {
+                    preview_service.latest_draft_id.load(Ordering::Acquire) == job
+                        && revision_current.load(Ordering::Acquire)
+                },
+                Some(&preview_service.source_frame_cache),
+                Some(&gpu_executor),
+            );
         monitoring_complete.store(true, Ordering::Release);
         result
     })
@@ -2194,47 +2399,17 @@ fn build_stage_14_preview(
             "The compiled SourceFrame artifact did not publish profile-local region metadata.",
         ));
     }
+    let rendered_tile = artifact.rendered_tile.clone().ok_or_else(|| error(
+        ErrorCode::LayoutInvalid,
+        "The GPU executor completed without a bounded tile payload.",
+    ))?;
     let output_size = artifact.topology.output_size;
-    let expected_bytes = usize::try_from(
-        u64::from(output_size.width) * u64::from(output_size.height) * 4,
-    )
-    .map_err(|_| {
-        error(
-            ErrorCode::InvalidInput,
-            "Compiled preview dimensions exceed the bounded publication limit.",
-        )
-    })?;
-    let encode_started = Instant::now();
-    let mut maps = BTreeMap::new();
-    for channel in &artifact.channels {
-        if channel.rgba8.len() != expected_bytes {
-            return Err(error(
-                ErrorCode::LayoutInvalid,
-                "Compiled preview pixels do not match the published profile dimensions.",
-            ));
-        }
-        if !preview_is_current() {
-            cancellation.cancel();
-            preview_service
-                .cancellation_count
-                .fetch_add(1, Ordering::AcqRel);
-            return Err(error(
-                ErrorCode::OperationCancelled,
-                "A newer document revision superseded this preview during publication.",
-            ));
-        }
-        maps.insert(
-            channel_key(channel.role).into(),
-            png_data_url_cancellable(
-                output_size.width,
-                output_size.height,
-                channel.rgba8.clone(),
-                &cancellation,
-                || preview_is_current(),
-            )?,
-        );
-    }
-    let encode_ms = encode_started.elapsed().as_millis();
+    let tile_manifest = publish_gpu_tiled_preview(
+        preview_service,
+        rendered_tile.manifest.clone(),
+        rendered_tile.payload(),
+    )?;
+    let maps = BTreeMap::new();
     if !preview_is_current() {
         cancellation.cancel();
         preview_service
@@ -2245,7 +2420,6 @@ fn build_stage_14_preview(
             "A newer document revision superseded this preview after publication.",
         ));
     }
-    let ipc_payload_chars: usize = maps.values().map(String::len).sum();
     let mut artifact = artifact;
     match preview_service.gpu_capabilities.initialize() {
         Ok(state) => artifact
@@ -2256,21 +2430,10 @@ fn build_stage_14_preview(
             preview_service.gpu_capabilities.generation()
         )),
     }
-    let base_color_bounds = artifact
-        .channels
-        .iter()
-        .find(|channel| channel.role == MaterialChannelRole::BaseColor)
-        .map(|channel| {
-            rgba_nontransparent_bounds(&channel.rgba8, output_size.width, output_size.height)
-        })
-        .ok_or_else(|| {
-            error(
-                ErrorCode::LayoutInvalid,
-                "Compiled SourceFrame artifact did not publish Base Color pixels.",
-            )
-        })?;
-    artifact.telemetry.push(format!("publish_encode_ms={encode_ms}; ipc_payload_chars={ipc_payload_chars}; png_encoded_dimensions={}x{}; rgba_nontransparent_bounds={}; cancellation_count={}",
-        output_size.width, output_size.height, base_color_bounds,
+    artifact.telemetry.push(format!("native_tile_publish_ms={}; raw_ipc_bytes={}; raw_ipc_ms={}; tile_generation={}; tile_dimensions={}x{}; rgba_nontransparent_bounds={}; cancellation_count={}",
+        tile_manifest.telemetry.native_publish_ms, tile_manifest.telemetry.raw_ipc_bytes,
+        tile_manifest.telemetry.raw_ipc_ms, tile_manifest.telemetry.generation,
+        tile_manifest.manifest.width, tile_manifest.manifest.height, "executor_tile",
         preview_service.cancellation_count.load(Ordering::Acquire)));
     let slots = artifact
         .slots
@@ -2345,6 +2508,7 @@ fn build_stage_14_preview(
         topology: artifact.topology,
         placement_plan_id: artifact.placement_plan_id.0,
         maps,
+        tile_manifest,
         regions: artifact.regions,
         unavailable_channels: artifact
             .unavailable_channels
@@ -2629,7 +2793,11 @@ pub fn close_project(
         }
     }
     session.store = None;
-    session.source_projection_cache.lock().map_err(|_| poisoned())?.clear();
+    session
+        .source_projection_cache
+        .lock()
+        .map_err(|_| poisoned())?
+        .clear();
     session.preview_prepared_sources.clear();
     session.prepared_exemplars = PreparedExemplarCache::default();
     session.source_analysis_cache = SourceAnalysisCache::default();
@@ -2963,8 +3131,12 @@ fn png_data_url_cancellable(
 }
 
 fn encode_preview_png(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>, UserFacingError> {
-    let expected = usize::try_from(u64::from(width) * u64::from(height) * 4)
-        .map_err(|_| error(ErrorCode::Internal, "Compiled preview dimensions are invalid."))?;
+    let expected = usize::try_from(u64::from(width) * u64::from(height) * 4).map_err(|_| {
+        error(
+            ErrorCode::Internal,
+            "Compiled preview dimensions are invalid.",
+        )
+    })?;
     if pixels.len() != expected {
         return Err(error(ErrorCode::Internal, "Compiled pixels are invalid."));
     }

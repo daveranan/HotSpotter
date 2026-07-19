@@ -1,6 +1,9 @@
 #![doc = "Interactive `wgpu` compositing and PBR preview boundary."]
 
-use std::sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -35,6 +38,7 @@ pub struct GpuCapabilityRecord {
     pub maximum_sampled_textures_per_stage: u32,
     pub maximum_storage_textures_per_stage: u32,
     pub timestamp_queries: bool,
+    pub clear_texture: bool,
     pub copy_bytes_per_row_alignment: u32,
     pub uniform_buffer_offset_alignment: u32,
     pub storage_buffer_offset_alignment: u32,
@@ -46,7 +50,7 @@ impl GpuCapabilityRecord {
     #[must_use]
     pub fn diagnostic_line(&self) -> String {
         format!(
-            "gpu_capability_generation={}; adapter={}; backend={}; driver={}; driver_info={}; max_texture_2d={}; tile_recommendation={}; timestamp_queries={}; row_alignment={}; formats={}",
+            "gpu_capability_generation={}; adapter={}; backend={}; driver={}; driver_info={}; max_texture_2d={}; tile_recommendation={}; timestamp_queries={}; clear_texture={}; row_alignment={}; formats={}",
             self.service_generation,
             self.adapter_name,
             self.backend,
@@ -55,8 +59,16 @@ impl GpuCapabilityRecord {
             self.maximum_texture_dimension_2d,
             self.recommended_tile_size,
             self.timestamp_queries,
+            self.clear_texture,
             self.copy_bytes_per_row_alignment,
-            self.candidate_formats.iter().map(|format| format!("{}:sampled={},storage={}", format.format, format.sampled, format.storage)).collect::<Vec<_>>().join("|")
+            self.candidate_formats
+                .iter()
+                .map(|format| format!(
+                    "{}:sampled={},storage={}",
+                    format.format, format.sampled, format.storage
+                ))
+                .collect::<Vec<_>>()
+                .join("|")
         )
     }
 }
@@ -86,7 +98,19 @@ impl GpuDeviceState {
     pub const fn capabilities(&self) -> &GpuCapabilityRecord {
         &self.capabilities
     }
+
+    #[must_use]
+    pub const fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    #[must_use]
+    pub const fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
 }
+
+pub const BASE_COLOR_ATLAS_WGSL: &str = include_str!("gpu_base_color.wgsl");
 
 /// Application-owned, one-time GPU initialization boundary. Prompt 1 only
 /// reports capabilities; no pixel executor consumes this state yet.
@@ -131,7 +155,7 @@ fn initialize_device(generation: u64) -> Result<Arc<GpuDeviceState>, GpuCapabili
     })?;
     let features = adapter.features();
     let limits = adapter.limits();
-    let requested_features = features & wgpu::Features::TIMESTAMP_QUERY;
+    let requested_features = features & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::CLEAR_TEXTURE);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("hot-trimmer-application-gpu"),
         required_features: requested_features,
@@ -155,8 +179,12 @@ fn initialize_device(generation: u64) -> Result<Arc<GpuDeviceState>, GpuCapabili
         let capabilities = adapter.get_texture_format_features(format);
         TextureFormatCapability {
             format: format!("{format:?}"),
-            sampled: capabilities.allowed_usages.contains(wgpu::TextureUsages::TEXTURE_BINDING),
-            storage: capabilities.allowed_usages.contains(wgpu::TextureUsages::STORAGE_BINDING),
+            sampled: capabilities
+                .allowed_usages
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING),
+            storage: capabilities
+                .allowed_usages
+                .contains(wgpu::TextureUsages::STORAGE_BINDING),
         }
     })
     .collect();
@@ -180,6 +208,7 @@ fn initialize_device(generation: u64) -> Result<Arc<GpuDeviceState>, GpuCapabili
             maximum_sampled_textures_per_stage: limits.max_sampled_textures_per_shader_stage,
             maximum_storage_textures_per_stage: limits.max_storage_textures_per_shader_stage,
             timestamp_queries: requested_features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            clear_texture: requested_features.contains(wgpu::Features::CLEAR_TEXTURE),
             copy_bytes_per_row_alignment: wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
             uniform_buffer_offset_alignment: limits.min_uniform_buffer_offset_alignment,
             storage_buffer_offset_alignment: limits.min_storage_buffer_offset_alignment,
@@ -215,7 +244,10 @@ mod tests {
         match (first, second) {
             (Ok(first), Ok(second)) => {
                 assert!(std::sync::Arc::ptr_eq(&first, &second));
-                assert_eq!(first.capabilities().service_generation, service.generation());
+                assert_eq!(
+                    first.capabilities().service_generation,
+                    service.generation()
+                );
             }
             (Err(first), Err(second)) => assert_eq!(first, second),
             _ => unreachable!("OnceLock returns one stable initialization result"),

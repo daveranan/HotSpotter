@@ -106,13 +106,13 @@ test("patch assignment paints immediately and publishes the persisted binding wi
   assert.match(app, /void requestPreview\(undefined, undefined, interactivePreviewProfile/);
 });
 
-test("resizing an assigned patch publishes a draft before the selected interactive quality", () => {
+test("resizing an assigned patch keeps the old sheet until selected preview quality publishes", () => {
   const resize = app.slice(app.indexOf("async function replacePatchGeometry"), app.indexOf("async function setResolution"));
   assert.match(resize, /assignedToRegion/);
   assert.match(resize, /binding\.content\.type === "patch" && binding\.content\.id === patchId/);
-  assert.ok(resize.indexOf('requestPreview(undefined, undefined, "draft512", revision, false)')
-    < resize.indexOf("requestPreview(undefined, undefined, interactivePreviewProfile, revision, false)"));
-  assert.match(resize, /lastAutomaticPreviewRevision\.current = revision/);
+  assert.doesNotMatch(resize, /requestPreview\(undefined, undefined, "draft512", revision, false\)/);
+  assert.match(resize, /requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false\)/);
+  assert.match(resize, /lastAutomaticPreviewKey\.current = automaticPreviewKey\(revision, interactivePreviewProfile\)/);
 });
 
 test("solid content, replacement preflight, library metadata, and diagnostics are product connected", () => {
@@ -131,7 +131,7 @@ test("scrolling the region assignment menu does not zoom the hotspot sheet", () 
 });
 
 test("patch domains are bounded for draft publication and reused across assignments", () => {
-  assert.match(compiler, /patch_domain_cache_key\(request\.project, source_set_id, patch, preserve_source_resolution\)/);
+  assert.match(compiler, /patch_domain_cache_key\(\s*request\.project,\s*source_set_id,\s*patch,\s*preserve_source_resolution,\s*\)/);
   assert.match(compiler, /matches!\(request\.profile, SourceFramePreviewProfile::Authoritative\)/);
   assert.match(compiler, /guard\.insert\(patch_key, Arc::clone\(&domain\)\)/);
   assert.match(compiler, /const MAX_DIRECT_DOMAINS: usize = 4/);

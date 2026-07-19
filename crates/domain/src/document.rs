@@ -290,7 +290,7 @@ impl RegionBehavior {
             inner_radius: 0.0,
             outer_radius: 0.5,
             falloff: 1.0,
-            blend_width: 0.05,
+            blend_width: 0.0,
             seam_blend_width: 0.03,
         });
         Self { role, radial, ..Self::default() }

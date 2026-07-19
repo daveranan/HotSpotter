@@ -98,6 +98,19 @@ passes.
 12. Keep the old draft visible until replacement tiles have painted. Reject stale generations before native
     publication and again before frontend paint. Revoke superseded frontend resources.
 
+    Future fallback note: if a rendered GPU tile is detected as blank/invalid, a source-texture fallback may be useful
+    for continued editing, but it must be explicit and visibly marked as a diagnostic fallback. Do not silently replace
+    failed Stage 14 pixels with Source Frame texture in a way that can be mistaken for successful GPU tile rendering.
+
+    Partial authoritative tile note: until native publication can composite partial selected-region/viewport tiles into
+    the existing sheet truthfully, interactive edit previews must publish complete draft/refinement artifacts rather than
+    replacing the full sheet display with a partial tile.
+
+    Live preview size note: the desktop may expose complete 1024/2048/4096/8192 preview profiles for stress testing,
+    but changing the size must not re-enable source-texture substitution or partial-tile-as-full-sheet publication.
+    A larger single-tile cache is only a stress-test bridge for 8K; production still needs split tile manifests,
+    capability-sized scheduling, and incremental replacement instead of one 256 MiB tile payload.
+
 13. Telemetry must separate plan, dispatch, readback, raw IPC, frontend upload, paint, cache hits/misses/evictions, and
     bytes. Join native and frontend timing by request generation.
 
@@ -140,4 +153,3 @@ npm.cmd run test --workspace @hot-trimmer/desktop -- gpu-tiled-preview
 
 After the test passes, perform one native check: 512 navigation -> select radial region -> exact 1:1 tile -> edit ->
 pan. Record request-to-paint telemetry. Stop and report; do not begin Prompt 004.
-

@@ -10,9 +10,9 @@ use std::{
 use hot_trimmer_domain::{
     AddressMode, AlgorithmProvenance, CancellationToken, ContentDigest, ContentReference,
     ManualRegionRole, MaterialChannelRole, OrientedPixelSize, OriginalAssetProvenance, Patch,
-    PhysicalScaleEvidence, Projection, QuarterTurn, RegionMapping, RegionSampling, SolidChannelValues,
-    RegisteredChannel, RegisteredChannelSet, SamplingMode, SamplingPolicy, SourceOwnershipIntent,
-    StageResult, TemplateSlotRole,
+    PhysicalScaleEvidence, Projection, QuarterTurn, RegionMapping, RegionSampling,
+    RegisteredChannel, RegisteredChannelSet, SamplingMode, SamplingPolicy, SolidChannelValues,
+    SourceOwnershipIntent, StageResult, TemplateSlotRole,
 };
 use hot_trimmer_effect_compiler::{
     RequiredSourceFootprint, SlotDemandIntent, SourceFootprintUnit, VisualImportance,
@@ -20,8 +20,7 @@ use hot_trimmer_effect_compiler::{
 };
 use hot_trimmer_image_io::{
     CancellationToken as ImageCancellationToken, ImagePlane, LinearColor, NormalizationSettings,
-    PreparedChannelCacheKey, PreparedChannelSet, ResolvedAlphaMode,
-    prepare_registered_channel_set,
+    PreparedChannelCacheKey, PreparedChannelSet, ResolvedAlphaMode, prepare_registered_channel_set,
 };
 use hot_trimmer_material_analysis::{
     AnalysisSettings, FeatureFieldSettings, ScaleOrientationSettings, analyze_source,
@@ -44,8 +43,8 @@ use hot_trimmer_placement_solver::{
 };
 use hot_trimmer_project_store::{ProjectSummary, SourceOwnership, StoredSource};
 use hot_trimmer_render_core::{
-    ExemplarMaskIntent, PlanarArea, PreparedExemplarChannel, PreparedExemplarRequest, PreparedExemplarScope,
-    RectificationQuality, RectificationWorkLimits, RenderCancellationToken,
+    ExemplarMaskIntent, PlanarArea, PreparedExemplarChannel, PreparedExemplarRequest,
+    PreparedExemplarScope, RectificationQuality, RectificationWorkLimits, RenderCancellationToken,
     prepare_registered_exemplar, registered_level_zero_channels,
 };
 
@@ -97,14 +96,15 @@ impl MaterialDomainView for MappedDomainView<'_> {
 }
 
 use crate::{
-    AlgorithmCompiler, AtlasComposeExecutionInput, AtlasPreparedSource, AtlasRenderExecutionInput,
-    AtlasRenderExecutor, CompiledAtlasPreviewProfile, CompiledAtlasPlanValidationError,
-    CompiledAtlasPlanV1, CompiledRegionCommandV1, CompiledSourceCommandV1, CompilerFacadeError,
-    IntermediateAtlasArtifact, IntermediateAtlasRequest, IntermediateSlotInput, OutputPixelRect, SourcePixelRect,
-    CpuAtlasRenderExecutor, SlotSynthesisLimits, SlotSynthesisRequest, SynthesizedSlotMaterial,
-    synthesize_slot_material_with_guard, COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
-    COMPILED_ATLAS_ALGORITHM_VERSION, CompiledColorSpacePolicy, CompiledNormalConvention,
-    CompiledTileRequest,
+    AlgorithmCompiler, AtlasComposeExecutionInput, AtlasFinalAtlasOutput, AtlasPreparedSource,
+    AtlasRenderExecutionInput, AtlasRenderExecutor, AtlasRenderExecutorOutput,
+    COMPILED_ATLAS_ALGORITHM_VERSION, COMPILED_ATLAS_PLAN_SCHEMA_VERSION, CompiledAtlasPlanV1,
+    CompiledAtlasPlanValidationError, CompiledAtlasPreviewProfile, CompiledColorSpacePolicy,
+    CompiledNormalConvention, CompiledRegionCommandV1, CompiledSourceCommandV1,
+    CompiledTileRequest, CompiledTileRequestKind, CompilerFacadeError, CpuAtlasRenderExecutor, IntermediateAtlasArtifact,
+    IntermediateAtlasRequest, IntermediateSlotInput, OutputPixelRect, SlotSynthesisLimits,
+    SlotSynthesisRequest, SourcePixelRect, SynthesizedSlotMaterial,
+    synthesize_slot_material_with_guard,
 };
 
 /// Gate 1 must show source subdivisions, not a second copy of the whole source in
@@ -123,13 +123,28 @@ pub struct PersistedStage14PreviewRequest<'a> {
     /// A request profile changes only output work/resolution.  SourceFrame topology,
     /// source coordinates, stable identities, and DirectCrop ownership stay fixed.
     pub profile: SourceFramePreviewProfile,
+    /// Optional view intent supplied by the desktop IPC contract. Older callers keep
+    /// their profile-derived complete request while all new interactive work is
+    /// compiled through this same persisted route.
+    pub view_intent: Option<SourceFramePreviewViewIntent>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceFramePreviewProfile {
     Draft512,
     Refinement1024,
+    Preview2048,
+    Preview4096,
+    Preview8192,
     Authoritative,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceFramePreviewViewIntent {
+    CompleteDraft512,
+    CompleteRefinement1024,
+    ExactViewport(OutputPixelRect),
+    ExactSelectedRegion(hot_trimmer_domain::RegionId),
 }
 
 impl Default for SourceFramePreviewProfile {
@@ -176,7 +191,8 @@ impl SourceFramePreviewCache {
                 self.prepared_sources.remove(&oldest);
             }
         }
-        self.prepared_sources.insert(prepared.cache_key.clone(), prepared);
+        self.prepared_sources
+            .insert(prepared.cache_key.clone(), prepared);
     }
     fn insert(
         &mut self,
@@ -198,7 +214,11 @@ impl SourceFramePreviewCache {
     pub(crate) fn get_rendered(&self, key: &ContentDigest) -> Option<Arc<SynthesizedSlotMaterial>> {
         self.rendered_regions.get(key).cloned()
     }
-    pub(crate) fn insert_rendered(&mut self, key: ContentDigest, result: Arc<SynthesizedSlotMaterial>) {
+    pub(crate) fn insert_rendered(
+        &mut self,
+        key: ContentDigest,
+        result: Arc<SynthesizedSlotMaterial>,
+    ) {
         const MAX_RENDERED_REGIONS: usize = 64;
         if self.rendered_regions.len() >= MAX_RENDERED_REGIONS
             && !self.rendered_regions.contains_key(&key)
@@ -244,6 +264,23 @@ impl AlgorithmCompiler {
         is_current: impl Fn() -> bool + Sync,
         source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
     ) -> Result<IntermediateAtlasArtifact, CompilerFacadeError> {
+        self.compile_persisted_stage_14_preview_with_cache_and_executor(
+            request,
+            cancellation,
+            is_current,
+            source_frame_cache,
+            None,
+        )
+    }
+
+    pub fn compile_persisted_stage_14_preview_with_cache_and_executor(
+        &self,
+        request: PersistedStage14PreviewRequest<'_>,
+        cancellation: &CancellationToken,
+        is_current: impl Fn() -> bool + Sync,
+        source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
+        executor_override: Option<&dyn AtlasRenderExecutor>,
+    ) -> Result<IntermediateAtlasArtifact, CompilerFacadeError> {
         let image_cancellation = ImageCancellationToken::new();
         let render_cancellation = RenderCancellationToken::new();
         let monitoring_complete = std::sync::atomic::AtomicBool::new(false);
@@ -266,6 +303,7 @@ impl AlgorithmCompiler {
                 &render_cancellation,
                 &is_current,
                 source_frame_cache,
+                executor_override,
             )
             .map_err(CompilerFacadeError::Pipeline);
             monitoring_complete.store(true, std::sync::atomic::Ordering::Release);
@@ -282,6 +320,7 @@ fn compile_persisted(
     render_cancellation: &RenderCancellationToken,
     is_current: &dyn Fn() -> bool,
     source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
+    executor_override: Option<&dyn AtlasRenderExecutor>,
 ) -> Result<IntermediateAtlasArtifact, String> {
     let active = || !cancellation.is_cancelled() && is_current();
     if !active() {
@@ -308,12 +347,12 @@ fn compile_persisted(
             document,
             primary,
             source_frame_cache,
+            executor_override,
         );
     }
     let mut domains = Vec::<DomainArtifacts>::new();
     let mut domain_keys = BTreeMap::<String, usize>::new();
-    let mut region_domains: Vec<usize> =
-        Vec::with_capacity(document.topology.regions.len());
+    let mut region_domains: Vec<usize> = Vec::with_capacity(document.topology.regions.len());
     for region in &document.topology.regions {
         let binding = document
             .region_bindings
@@ -678,7 +717,10 @@ fn compile_persisted(
                 plan,
                 result,
                 grid_rect: region.grid_rect,
-                behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
+                behavior: document.region_bindings[&region.id]
+                    .mapping
+                    .behavior
+                    .clone(),
             }
         })
         .collect::<Vec<_>>();
@@ -763,6 +805,7 @@ fn compile_source_frame(
     document: &hot_trimmer_domain::TrimSheetDocument,
     primary: hot_trimmer_domain::SourceSetId,
     source_frame_cache: Option<&Mutex<SourceFramePreviewCache>>,
+    executor_override: Option<&dyn AtlasRenderExecutor>,
 ) -> Result<IntermediateAtlasArtifact, String> {
     let started = Instant::now();
     let active = || !cancellation.is_cancelled() && is_current();
@@ -774,6 +817,18 @@ fn compile_source_frame(
         SourceFramePreviewProfile::Refinement1024 => hot_trimmer_domain::PixelSize {
             width: 1024,
             height: 1024,
+        },
+        SourceFramePreviewProfile::Preview2048 => hot_trimmer_domain::PixelSize {
+            width: 2048,
+            height: 2048,
+        },
+        SourceFramePreviewProfile::Preview4096 => hot_trimmer_domain::PixelSize {
+            width: 4096,
+            height: 4096,
+        },
+        SourceFramePreviewProfile::Preview8192 => hot_trimmer_domain::PixelSize {
+            width: 8192,
+            height: 8192,
         },
         SourceFramePreviewProfile::Authoritative => document.render_settings.output_size,
     };
@@ -827,7 +882,9 @@ fn compile_source_frame(
             .get(&region.id)
             .is_none_or(|binding| binding.mapping.address_mode == AddressMode::MirroredRepeat)
     }) {
-        return Err("SourceFrame workflow does not yet support mirrored-repeat address mode".into());
+        return Err(
+            "SourceFrame workflow does not yet support mirrored-repeat address mode".into(),
+        );
     }
     let cell_count = usize::try_from(u64::from(grid.width) * u64::from(grid.height))
         .map_err(|_| "logical grid is too large")?;
@@ -869,11 +926,12 @@ fn compile_source_frame(
     ).as_bytes());
     if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
         && let Some(cached) = source_frame_cache.and_then(|cache| {
-        cache
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get_composed(&composition_key))
-    }) {
+            cache
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get_composed(&composition_key))
+        })
+    {
         if !active() {
             return Err("preview cancelled or superseded before composed cache publication".into());
         }
@@ -911,9 +969,12 @@ fn compile_source_frame(
             .get(&region.id)
             .ok_or_else(|| format!("region {} has no persisted content binding", region.id))?;
         let (source_set_id, patch, solid_domain) = match &binding.content {
-            ContentReference::Solid(values) => (None, None, Some(Arc::new(build_solid_domain(values)?))),
+            ContentReference::Solid(values) => {
+                (None, None, Some(Arc::new(build_solid_domain(values)?)))
+            }
             _ => {
-                let (source_set_id, patch) = resolve_region_content(request.project, document, primary, &binding.content)?;
+                let (source_set_id, patch) =
+                    resolve_region_content(request.project, document, primary, &binding.content)?;
                 (Some(source_set_id), patch, None)
             }
         };
@@ -921,10 +982,19 @@ fn compile_source_frame(
             domain
         } else if let Some(patch) = patch.as_ref() {
             let source_set_id = source_set_id.expect("patch content has an owning source set");
-            let preserve_source_resolution = matches!(request.profile, SourceFramePreviewProfile::Authoritative);
-            let patch_key = patch_domain_cache_key(request.project, source_set_id, patch, preserve_source_resolution)?;
-            if let Some(found) = (!preserve_source_resolution).then_some(source_frame_cache).flatten()
-                .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&patch_key))) {
+            let preserve_source_resolution =
+                matches!(request.profile, SourceFramePreviewProfile::Authoritative);
+            let patch_key = patch_domain_cache_key(
+                request.project,
+                source_set_id,
+                patch,
+                preserve_source_resolution,
+            )?;
+            if let Some(found) = (!preserve_source_resolution)
+                .then_some(source_frame_cache)
+                .flatten()
+                .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get(&patch_key)))
+            {
                 found
             } else {
                 let domain = Arc::new(build_direct_patch_domain(
@@ -935,10 +1005,14 @@ fn compile_source_frame(
                     preserve_source_resolution,
                     image_cancellation,
                     _render_cancellation,
-                    (!preserve_source_resolution).then_some(source_frame_cache).flatten(),
+                    (!preserve_source_resolution)
+                        .then_some(source_frame_cache)
+                        .flatten(),
                 )?);
                 if !preserve_source_resolution && let Some(cache) = source_frame_cache {
-                    if let Ok(mut guard) = cache.lock() { guard.insert(patch_key, Arc::clone(&domain)); }
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(patch_key, Arc::clone(&domain));
+                    }
                 }
                 domain
             }
@@ -964,14 +1038,10 @@ fn compile_source_frame(
             domain,
         ));
     }
-    let source_left =
-        (frame.bounds.x.get() * f64::from(frame_domain.width)).round() as u32;
-    let source_top =
-        (frame.bounds.y.get() * f64::from(frame_domain.height)).round() as u32;
-    let source_width =
-        (frame.bounds.width.get() * f64::from(frame_domain.width)).round() as u32;
-    let source_height =
-        (frame.bounds.height.get() * f64::from(frame_domain.height)).round() as u32;
+    let source_left = (frame.bounds.x.get() * f64::from(frame_domain.width)).round() as u32;
+    let source_top = (frame.bounds.y.get() * f64::from(frame_domain.height)).round() as u32;
+    let source_width = (frame.bounds.width.get() * f64::from(frame_domain.width)).round() as u32;
+    let source_height = (frame.bounds.height.get() * f64::from(frame_domain.height)).round() as u32;
     let source_x = hot_trimmer_domain::resolve_boundaries(source_left, source_width, grid.width);
     let source_y = hot_trimmer_domain::resolve_boundaries(source_top, source_height, grid.height);
     let destination_x = hot_trimmer_domain::resolve_boundaries(0, output_size.width, grid.width);
@@ -1007,23 +1077,20 @@ fn compile_source_frame(
             mirror_y: binding.mapping.transform.mirror_y,
             offset: binding.mapping.transform.offset,
         };
-        let crop = if uses_frame_partition {
+        let fallback_crop = if uses_frame_partition {
             document
                 .source_overrides
                 .get(&region.id)
                 .map(|value| {
                     let bounds = value.source_bounds;
-                    let x = (bounds.x.get() * f64::from(frame_domain.width)).round()
-                        as u32;
-                    let y = (bounds.y.get() * f64::from(frame_domain.height)).round()
-                        as u32;
+                    let x = (bounds.x.get() * f64::from(frame_domain.width)).round() as u32;
+                    let y = (bounds.y.get() * f64::from(frame_domain.height)).round() as u32;
                     SourceCrop {
                         x,
                         y,
-                        width: (bounds.width.get() * f64::from(frame_domain.width))
-                            .round() as u32,
-                        height: (bounds.height.get() * f64::from(frame_domain.height))
-                            .round() as u32,
+                        width: (bounds.width.get() * f64::from(frame_domain.width)).round() as u32,
+                        height: (bounds.height.get() * f64::from(frame_domain.height)).round()
+                            as u32,
                     }
                 })
                 .unwrap_or(SourceCrop {
@@ -1040,14 +1107,26 @@ fn compile_source_frame(
                 height: domain.height,
             }
         };
+        let crop = source_frame_preview_crop(
+            &binding.mapping,
+            fallback_crop,
+            domain.width,
+            domain.height,
+        );
         if crop.width == 0 || crop.height == 0 || allocation.width == 0 || allocation.height == 0 {
             return Err(format!(
                 "source-frame region {} collapsed at resolved pixel boundaries",
                 region.id
             ));
         }
-        if behavior.period_pixels.is_some_and(|period| period[0] > crop.width || period[1] > crop.height) {
-            return Err(format!("region {} authored repeat period exceeds its exact source crop", region.id));
+        if behavior
+            .period_pixels
+            .is_some_and(|period| period[0] > crop.width || period[1] > crop.height)
+        {
+            return Err(format!(
+                "region {} authored repeat period exceeds its exact source crop",
+                region.id
+            ));
         }
         if uses_frame_partition
             && document.source_overrides.contains_key(&region.id)
@@ -1074,11 +1153,8 @@ fn compile_source_frame(
             }
             _ => behavior.sampling,
         };
-        let semantic = semantic_rect_for_padding(
-            allocation,
-            preview_padding_px,
-            behavior.edge_eligibility,
-        );
+        let semantic =
+            semantic_rect_for_padding(allocation, preview_padding_px, behavior.edge_eligibility);
         let mapping_origin = if uses_frame_partition {
             if document.source_overrides.contains_key(&region.id) {
                 "explicit_override"
@@ -1095,14 +1171,29 @@ fn compile_source_frame(
         let candidate_id = ContentDigest::sha256(
             format!(
                 "source-frame|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|mapping={:?}",
-                frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                region.id, crop.x, crop.y, crop.width, crop.height, mapping_origin,
-                source_set_id, patch_id, binding.mapping
+                frame
+                    .identity
+                    .0
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                region.id,
+                crop.x,
+                crop.y,
+                crop.width,
+                crop.height,
+                mapping_origin,
+                source_set_id,
+                patch_id,
+                binding.mapping
             )
             .as_bytes(),
         );
         let authored_repeat = behavior.sampling != RegionSampling::OneShot;
-        let mirror = match (binding.mapping.transform.mirror_x, binding.mapping.transform.mirror_y) {
+        let mirror = match (
+            binding.mapping.transform.mirror_x,
+            binding.mapping.transform.mirror_y,
+        ) {
             (true, false) => MirrorTransform::X,
             (false, true) => MirrorTransform::Y,
             _ => MirrorTransform::None,
@@ -1110,9 +1201,17 @@ fn compile_source_frame(
         let (family, route) = match mapping_mode {
             SamplingMode::RepeatX => (CandidateFamily::RepeatXSegment, CandidateRoute::Repeat),
             SamplingMode::RepeatY => (CandidateFamily::RepeatYSegment, CandidateRoute::Repeat),
-            SamplingMode::PeriodicTile => (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat),
-            SamplingMode::PlanarRadial => (CandidateFamily::PlanarRadialSquare, CandidateRoute::PlanarRadial),
-            SamplingMode::PolarRadial => (CandidateFamily::PolarRadialSynthesis, CandidateRoute::PolarRadial),
+            SamplingMode::PeriodicTile => {
+                (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat)
+            }
+            SamplingMode::PlanarRadial => (
+                CandidateFamily::PlanarRadialSquare,
+                CandidateRoute::PlanarRadial,
+            ),
+            SamplingMode::PolarRadial => (
+                CandidateFamily::PolarRadialSynthesis,
+                CandidateRoute::PolarRadial,
+            ),
             _ => (CandidateFamily::PanelDirect, CandidateRoute::Direct),
         };
         let candidate = CropCandidate {
@@ -1121,15 +1220,17 @@ fn compile_source_frame(
             domain_id: domain.cache_key.clone(),
             slot_id: region.id,
             crop: Some(crop),
-            transform: CandidateTransform { rotation: behavior.orientation, mirror },
+            transform: CandidateTransform {
+                rotation: behavior.orientation,
+                mirror,
+            },
             isotropic_scale: 1.0,
             mapping_mode,
             family,
             route,
             position_strategy: PositionStrategy::DenseLowResolution,
-            period_pixels: authored_repeat.then_some(
-                behavior.period_pixels.unwrap_or([crop.width, crop.height]),
-            ),
+            period_pixels: authored_repeat
+                .then_some(behavior.period_pixels.unwrap_or([crop.width, crop.height])),
             seam_indices: Vec::new(),
             correspondence_reference: domain.cache_key.clone(),
             descriptors: CandidateDescriptors {
@@ -1164,8 +1265,7 @@ fn compile_source_frame(
             source_pixels_per_physical_unit,
             sampling_policy: SamplingPolicy {
                 filter: binding.mapping.sampling.filter,
-                scale: binding.mapping.sampling.scale
-                    * binding.mapping.transform.scale[0].abs(),
+                scale: binding.mapping.sampling.scale * binding.mapping.transform.scale[0].abs(),
                 correct_tangent_normals: binding.mapping.sampling.correct_tangent_normals,
             },
             radial_mapping: behavior.radial,
@@ -1199,7 +1299,10 @@ fn compile_source_frame(
         region_records.push(CompiledRegionCommandV1 {
             region_id: region.id,
             compact_index: region_index.try_into().map_err(|_| {
-                format!("source-frame compact index for region {} overflows u32", region.id)
+                format!(
+                    "source-frame compact index for region {} overflows u32",
+                    region.id
+                )
             })?,
             source_set_id: *source_set_id,
             source_id: source_id.clone(),
@@ -1226,7 +1329,7 @@ fn compile_source_frame(
             render_cache_key,
         });
     }
-    let source_frame_atlas_plan = compiled_atlas_plan_from_persisted(
+    let mut source_frame_atlas_plan = compiled_atlas_plan_from_persisted(
         request.revision,
         request.draft_id,
         document.topology.topology_hash,
@@ -1239,33 +1342,47 @@ fn compile_source_frame(
         region_records,
     )
     .map_err(|error| error.to_string())?;
+    source_frame_atlas_plan.tile_request = compiled_tile_request_for(
+        request.profile,
+        request.view_intent.as_ref(),
+        output_size,
+        request.draft_id.unwrap_or_default(),
+        &source_frame_atlas_plan.ordered_regions,
+    )?;
+    source_frame_atlas_plan = source_frame_atlas_plan
+        .finalize()
+        .map_err(|error| error.to_string())?;
     let plan_ms = plan_started.elapsed().as_millis();
     let mut prepared_sources = BTreeMap::new();
     for (source_set_id, _patch_id, source_id, domain) in &region_sources {
-        prepared_sources.entry((*source_set_id, source_id.clone())).or_insert_with(|| {
-            AtlasPreparedSource {
+        prepared_sources
+            .entry((*source_set_id, source_id.clone()))
+            .or_insert_with(|| AtlasPreparedSource {
                 source_set_id: *source_set_id,
                 source_id: source_id.clone(),
                 channel_role: MaterialChannelRole::BaseColor,
                 domain: Arc::clone(domain),
-            }
-        });
+            });
     }
     let execution_input = AtlasRenderExecutionInput {
         prepared_sources: prepared_sources.into_values().collect(),
         source_frame_cache,
     };
-    let executor = CpuAtlasRenderExecutor;
-    let execution = executor.execute(
-        &source_frame_atlas_plan,
-        &execution_input,
-        cancellation,
-        is_current,
-    ).map_err(|error| error.to_string())?;
+    let cpu_executor = CpuAtlasRenderExecutor;
+    let executor = executor_override.unwrap_or(&cpu_executor);
+    let execution = executor
+        .execute(
+            &source_frame_atlas_plan,
+            &execution_input,
+            cancellation,
+            is_current,
+        )
+        .map_err(|error| error.to_string())?;
+    let cpu_execution = execution.as_cpu_regions();
     let mut slots = Vec::with_capacity(document.topology.regions.len());
     let mut plans = Vec::with_capacity(document.topology.regions.len());
     let mut results = Vec::with_capacity(document.topology.regions.len());
-    let rendered_cache_hits = execution.rendered_cache_hits;
+    let rendered_cache_hits = cpu_execution.map_or(0, |execution| execution.rendered_cache_hits);
     for (region_index, region) in document.topology.regions.iter().enumerate() {
         if !active() {
             return Err("preview cancelled or superseded in source-frame stages".into());
@@ -1288,28 +1405,22 @@ fn compile_source_frame(
             height: destination_y[(rect.y + rect.height) as usize] - destination_y[rect.y as usize],
         };
         let behavior = &binding.mapping.behavior;
-        let semantic = semantic_rect_for_padding(
-            allocation,
-            preview_padding_px,
-            behavior.edge_eligibility,
-        );
-        let crop = if uses_frame_partition {
+        let semantic =
+            semantic_rect_for_padding(allocation, preview_padding_px, behavior.edge_eligibility);
+        let fallback_crop = if uses_frame_partition {
             document
                 .source_overrides
                 .get(&region.id)
                 .map(|value| {
                     let bounds = value.source_bounds;
-                    let x = (bounds.x.get() * f64::from(frame_domain.width)).round()
-                        as u32;
-                    let y = (bounds.y.get() * f64::from(frame_domain.height)).round()
-                        as u32;
+                    let x = (bounds.x.get() * f64::from(frame_domain.width)).round() as u32;
+                    let y = (bounds.y.get() * f64::from(frame_domain.height)).round() as u32;
                     SourceCrop {
                         x,
                         y,
-                        width: (bounds.width.get() * f64::from(frame_domain.width))
-                            .round() as u32,
-                        height: (bounds.height.get() * f64::from(frame_domain.height))
-                            .round() as u32,
+                        width: (bounds.width.get() * f64::from(frame_domain.width)).round() as u32,
+                        height: (bounds.height.get() * f64::from(frame_domain.height)).round()
+                            as u32,
                     }
                 })
                 .unwrap_or(SourceCrop {
@@ -1326,6 +1437,12 @@ fn compile_source_frame(
                 height: domain.height,
             }
         };
+        let crop = source_frame_preview_crop(
+            &binding.mapping,
+            fallback_crop,
+            domain.width,
+            domain.height,
+        );
         if crop.width == 0 || crop.height == 0 || allocation.width == 0 || allocation.height == 0 {
             return Err(format!(
                 "source-frame region {} collapsed at resolved pixel boundaries",
@@ -1360,8 +1477,14 @@ fn compile_source_frame(
             "whole_source_binding"
         };
         validate_manual_mapping(region.id, &binding.mapping)?;
-        if behavior.period_pixels.is_some_and(|period| period[0] > crop.width || period[1] > crop.height) {
-            return Err(format!("region {} authored repeat period exceeds its exact source crop", region.id));
+        if behavior
+            .period_pixels
+            .is_some_and(|period| period[0] > crop.width || period[1] > crop.height)
+        {
+            return Err(format!(
+                "region {} authored repeat period exceeds its exact source crop",
+                region.id
+            ));
         }
         let mapping_mode = manual_sampling_mode(behavior.role, behavior.sampling);
         let candidate_id = hot_trimmer_domain::ContentDigest::sha256(
@@ -1386,7 +1509,10 @@ fn compile_source_frame(
             .as_bytes(),
         );
         let authored_repeat = behavior.sampling != RegionSampling::OneShot;
-        let mirror = match (binding.mapping.transform.mirror_x, binding.mapping.transform.mirror_y) {
+        let mirror = match (
+            binding.mapping.transform.mirror_x,
+            binding.mapping.transform.mirror_y,
+        ) {
             (true, false) => MirrorTransform::X,
             (false, true) => MirrorTransform::Y,
             _ => MirrorTransform::None,
@@ -1394,9 +1520,17 @@ fn compile_source_frame(
         let (family, route) = match mapping_mode {
             SamplingMode::RepeatX => (CandidateFamily::RepeatXSegment, CandidateRoute::Repeat),
             SamplingMode::RepeatY => (CandidateFamily::RepeatYSegment, CandidateRoute::Repeat),
-            SamplingMode::PeriodicTile => (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat),
-            SamplingMode::PlanarRadial => (CandidateFamily::PlanarRadialSquare, CandidateRoute::PlanarRadial),
-            SamplingMode::PolarRadial => (CandidateFamily::PolarRadialSynthesis, CandidateRoute::PolarRadial),
+            SamplingMode::PeriodicTile => {
+                (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat)
+            }
+            SamplingMode::PlanarRadial => (
+                CandidateFamily::PlanarRadialSquare,
+                CandidateRoute::PlanarRadial,
+            ),
+            SamplingMode::PolarRadial => (
+                CandidateFamily::PolarRadialSynthesis,
+                CandidateRoute::PolarRadial,
+            ),
             _ => (CandidateFamily::PanelDirect, CandidateRoute::Direct),
         };
         let candidate = CropCandidate {
@@ -1414,7 +1548,8 @@ fn compile_source_frame(
             family,
             route,
             position_strategy: PositionStrategy::DenseLowResolution,
-            period_pixels: authored_repeat.then_some(behavior.period_pixels.unwrap_or([crop.width, crop.height])),
+            period_pixels: authored_repeat
+                .then_some(behavior.period_pixels.unwrap_or([crop.width, crop.height])),
             seam_indices: Vec::new(),
             correspondence_reference: domain.cache_key.clone(),
             descriptors: CandidateDescriptors {
@@ -1437,11 +1572,8 @@ fn compile_source_frame(
                 reasons: vec!["accepted SourceFrame + GridRect direct mapping".into()],
             },
         };
-        let (slot_physical_size, source_pixels_per_physical_unit) = manual_physical_mapping(
-            behavior.sampling,
-            crop,
-            semantic,
-        );
+        let (slot_physical_size, source_pixels_per_physical_unit) =
+            manual_physical_mapping(behavior.sampling, crop, semantic);
         let plan = SamplingPlan {
             slot_id: region.id,
             role: manual_template_role(behavior.role),
@@ -1467,21 +1599,31 @@ fn compile_source_frame(
             allocation,
             hotspot: semantic,
         };
-        let executed = execution.regions.get(region_index).ok_or_else(|| {
-            format!("CPU atlas executor omitted region {}", region.id)
-        })?;
-        if executed.region_id != region.id || executed.sampling_plan != plan {
-            return Err(format!(
-                "CPU atlas executor returned an instruction mismatch for region {}",
-                region.id
-            ));
-        }
-        let result = Arc::clone(&executed.result);
+        let result = if let Some(cpu_execution) = cpu_execution {
+            let executed = cpu_execution
+                .regions
+                .get(region_index)
+                .ok_or_else(|| format!("CPU atlas executor omitted region {}", region.id))?;
+            if executed.region_id != region.id || executed.sampling_plan != plan {
+                return Err(format!(
+                    "CPU atlas executor returned an instruction mismatch for region {}",
+                    region.id
+                ));
+            }
+            Some(Arc::clone(&executed.result))
+        } else {
+            None
+        };
         slots.push(topology_slot);
         plans.push(plan);
-        results.push(result);
+        if let Some(result) = result {
+            results.push(result);
+        }
     }
-    let render_ms = execution.render_ms;
+    let render_ms = match &execution {
+        AtlasRenderExecutorOutput::CpuRegions(output) => output.render_ms,
+        AtlasRenderExecutorOutput::FinalAtlas(output) => output.render_ms,
+    };
     let topology = hot_trimmer_domain::CompiledTemplateTopology {
         identity: hot_trimmer_domain::TemplateIdentity {
             template_id: "source-frame".into(),
@@ -1529,30 +1671,6 @@ fn compile_source_frame(
             PlacementPlanQaView::Validation,
         ],
     };
-    let inputs = topology
-        .slots
-        .iter()
-        .zip(document.topology.regions.iter())
-        .zip(placement.placements.iter().zip(results.iter()))
-        .enumerate()
-        .map(
-            |(index, ((slot, region), (plan, result)))| IntermediateSlotInput {
-                region_id: region.id,
-                slot_key: slot.slot_key.as_str(),
-                display_name: region.display_name.as_str(),
-                required: true,
-                patch_id: region_sources[index]
-                    .1
-                    .as_ref()
-                    .map(|value| value.to_string()),
-                domain: region_sources[index].3.as_ref(),
-                plan,
-                result: result.as_ref(),
-                grid_rect: region.grid_rect,
-                behavior: document.region_bindings[&region.id].mapping.behavior.clone(),
-            },
-        )
-        .collect();
     let algorithms = (1..=14)
         .map(|stage| {
             (
@@ -1566,25 +1684,70 @@ fn compile_source_frame(
         .collect();
     let profile_regions =
         crate::resolve_profile_regions(document, &topology).map_err(|error| error.to_string())?;
-    let atlas_request = IntermediateAtlasRequest {
-        topology: &topology,
-        placement_plan: &placement,
-        slots: inputs,
-        revision: request.revision,
-        algorithm_versions: algorithms,
-        diagnostics: Vec::new(),
-        regions: profile_regions,
+    let (mut artifact, compose_ms) = match &execution {
+        AtlasRenderExecutorOutput::CpuRegions(_) => {
+            let inputs = topology
+                .slots
+                .iter()
+                .zip(document.topology.regions.iter())
+                .zip(placement.placements.iter().zip(results.iter()))
+                .enumerate()
+                .map(
+                    |(index, ((slot, region), (plan, result)))| IntermediateSlotInput {
+                        region_id: region.id,
+                        slot_key: slot.slot_key.as_str(),
+                        display_name: region.display_name.as_str(),
+                        required: true,
+                        patch_id: region_sources[index]
+                            .1
+                            .as_ref()
+                            .map(|value| value.to_string()),
+                        domain: region_sources[index].3.as_ref(),
+                        plan,
+                        result: result.as_ref(),
+                        grid_rect: region.grid_rect,
+                        behavior: document.region_bindings[&region.id]
+                            .mapping
+                            .behavior
+                            .clone(),
+                    },
+                )
+                .collect();
+            let atlas_request = IntermediateAtlasRequest {
+                topology: &topology,
+                placement_plan: &placement,
+                slots: inputs,
+                revision: request.revision,
+                algorithm_versions: algorithms,
+                diagnostics: Vec::new(),
+                regions: profile_regions,
+            };
+            let composition = executor
+                .compose(
+                    &AtlasComposeExecutionInput {
+                        plan: &source_frame_atlas_plan,
+                        request: &atlas_request,
+                    },
+                    cancellation,
+                    &is_current,
+                )
+                .map_err(|error| error.to_string())?;
+            (composition.artifact, composition.compose_ms)
+        }
+        AtlasRenderExecutorOutput::FinalAtlas(output) => (
+            final_atlas_artifact_from_gpu(
+                request.revision,
+                topology.clone(),
+                &placement,
+                algorithms,
+                profile_regions,
+                document,
+                &region_sources,
+                output,
+            )?,
+            0,
+        ),
     };
-    let composition = executor.compose(
-        &AtlasComposeExecutionInput {
-            plan: &source_frame_atlas_plan,
-            request: &atlas_request,
-        },
-        cancellation,
-        &is_current,
-    ).map_err(|error| error.to_string())?;
-    let mut artifact = composition.artifact;
-    let compose_ms = composition.compose_ms;
     artifact.pending.retain(|pending| *pending != "profiles");
     artifact.pending.insert(
         0,
@@ -1593,28 +1756,142 @@ fn compile_source_frame(
                 "Draft 512 Base Color complete; refinement pending"
             }
             SourceFramePreviewProfile::Refinement1024 => "Refinement 1024 Base Color complete",
+            SourceFramePreviewProfile::Preview2048 => "Preview 2048 Base Color complete",
+            SourceFramePreviewProfile::Preview4096 => "Preview 4096 Base Color complete",
+            SourceFramePreviewProfile::Preview8192 => "Preview 8192 Base Color complete",
             SourceFramePreviewProfile::Authoritative => "Authoritative Base Color complete",
         },
     );
     let cache = if decode_cache_hit { "hit" } else { "miss" };
-    let rendered_cache_misses = document.topology.regions.len().saturating_sub(rendered_cache_hits as usize);
-    let allocated_bytes = artifact.channels.iter().map(|channel| channel.rgba8.len()).sum::<usize>()
+    let gpu_final_atlas = matches!(execution, AtlasRenderExecutorOutput::FinalAtlas(_));
+    let rendered_cache_misses = if gpu_final_atlas {
+        0
+    } else {
+        document
+            .topology
+            .regions
+            .len()
+            .saturating_sub(rendered_cache_hits as usize)
+    };
+    let allocated_bytes = artifact
+        .channels
+        .iter()
+        .map(|channel| channel.rgba8.len())
+        .sum::<usize>()
         + artifact.validity.len()
         + artifact.correspondence.len() * std::mem::size_of::<[f32; 2]>()
         + artifact.region_ownership.len() * std::mem::size_of::<hot_trimmer_domain::RegionId>();
-    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; plan_ms={plan_ms}; executor=cpu; plan_hash={}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_executor=cpu; compose_ms={compose_ms}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
+    let executor_label = if gpu_final_atlas { "gpu" } else { "cpu" };
+    let compose_executor = if gpu_final_atlas { "gpu-direct" } else { "cpu" };
+    let cpu_stage14_calls = if gpu_final_atlas {
+        0
+    } else {
+        document.topology.regions.len()
+    };
+    let cpu_atlas_composition_calls = if gpu_final_atlas { 0 } else { 1 };
+    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; plan_ms={plan_ms}; executor={executor_label}; plan_hash={}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_executor={compose_executor}; compose_ms={compose_ms}; cpu_stage14_calls={cpu_stage14_calls}; cpu_atlas_composition_calls={cpu_atlas_composition_calls}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
         request.profile, frame.oriented_dimensions.width, frame.oriented_dimensions.height,
         frame_domain.width, frame_domain.height, output_size.width, output_size.height,
         document.render_settings.atlas_padding_px, preview_padding_px, document.topology.regions.len(), document.patches.len(),
         u8::from(!decode_cache_hit), source_frame_atlas_plan.final_plan_hash.0.as_str(),
         u8::from(!decode_cache_hit), started.elapsed().as_millis()));
     if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
-        && let Some(cache) = source_frame_cache {
+        && let Some(cache) = source_frame_cache
+    {
         if let Ok(mut guard) = cache.lock() {
             guard.insert_composed(composition_key, Arc::new(artifact.clone()));
         }
     }
     Ok(artifact)
+}
+
+fn compiled_tile_request_for(
+    profile: SourceFramePreviewProfile,
+    intent: Option<&SourceFramePreviewViewIntent>,
+    output_size: hot_trimmer_domain::PixelSize,
+    generation: u64,
+    regions: &[CompiledRegionCommandV1],
+) -> Result<CompiledTileRequest, String> {
+    let full = OutputPixelRect(hot_trimmer_domain::PixelBounds {
+        x: 0,
+        y: 0,
+        width: output_size.width,
+        height: output_size.height,
+    });
+    let (kind, valid_rect, halo_px) = match intent {
+        Some(SourceFramePreviewViewIntent::CompleteDraft512) => {
+            if profile != SourceFramePreviewProfile::Draft512 {
+                return Err("complete Draft 512 intent requires the Draft512 profile".into());
+            }
+            (CompiledTileRequestKind::CompleteDraft512, full, 0)
+        }
+        Some(SourceFramePreviewViewIntent::CompleteRefinement1024) => {
+            if profile != SourceFramePreviewProfile::Refinement1024 {
+                return Err("complete Refinement 1024 intent requires the Refinement1024 profile".into());
+            }
+            (CompiledTileRequestKind::CompleteRefinement1024, full, 0)
+        }
+        Some(SourceFramePreviewViewIntent::ExactViewport(rect)) => {
+            validate_requested_tile_rect(*rect, output_size, "viewport")?;
+            (CompiledTileRequestKind::ExactViewport, *rect, 1)
+        }
+        Some(SourceFramePreviewViewIntent::ExactSelectedRegion(region_id)) => {
+            let rect = regions
+                .iter()
+                .find_map(|region| (region.region_id == *region_id).then_some(region.destination_rect))
+                .ok_or_else(|| format!("exact selected-region request references unknown region {region_id}"))?;
+            validate_requested_tile_rect(rect, output_size, "selected region")?;
+            (CompiledTileRequestKind::ExactSelectedRegion, rect, 1)
+        }
+        None => match profile {
+            SourceFramePreviewProfile::Draft512 => (CompiledTileRequestKind::CompleteDraft512, full, 0),
+            SourceFramePreviewProfile::Refinement1024 => (CompiledTileRequestKind::CompleteRefinement1024, full, 0),
+            SourceFramePreviewProfile::Preview2048 => (CompiledTileRequestKind::CompletePreview2048, full, 0),
+            SourceFramePreviewProfile::Preview4096 => (CompiledTileRequestKind::CompletePreview4096, full, 0),
+            SourceFramePreviewProfile::Preview8192 => (CompiledTileRequestKind::CompletePreview8192, full, 0),
+            SourceFramePreviewProfile::Authoritative => (CompiledTileRequestKind::ExactViewport, full, 0),
+        },
+    };
+    let output_rect = expand_tile_rect(valid_rect, halo_px, output_size);
+    Ok(CompiledTileRequest {
+        kind,
+        generation,
+        output_rect,
+        mip_level: 0,
+        halo_px,
+        valid_rect,
+    })
+}
+
+fn validate_requested_tile_rect(
+    rect: OutputPixelRect,
+    output_size: hot_trimmer_domain::PixelSize,
+    label: &str,
+) -> Result<(), String> {
+    let rect = rect.0;
+    if rect.width == 0
+        || rect.height == 0
+        || rect.x >= output_size.width
+        || rect.y >= output_size.height
+        || rect.x.saturating_add(rect.width) > output_size.width
+        || rect.y.saturating_add(rect.height) > output_size.height
+    {
+        return Err(format!("exact {label} rectangle is outside the compiled output"));
+    }
+    Ok(())
+}
+
+fn expand_tile_rect(
+    valid_rect: OutputPixelRect,
+    halo_px: u32,
+    output_size: hot_trimmer_domain::PixelSize,
+) -> OutputPixelRect {
+    let valid = valid_rect.0;
+    let x = valid.x.saturating_sub(halo_px);
+    let y = valid.y.saturating_sub(halo_px);
+    let right = valid.x.saturating_add(valid.width).saturating_add(halo_px).min(output_size.width);
+    let bottom = valid.y.saturating_add(valid.height).saturating_add(halo_px).min(output_size.height);
+    OutputPixelRect(hot_trimmer_domain::PixelBounds { x, y, width: right - x, height: bottom - y })
 }
 
 pub fn compiled_atlas_plan_from_persisted(
@@ -1637,19 +1914,41 @@ pub fn compiled_atlas_plan_from_persisted(
         output_size,
         preview_profile: match profile {
             SourceFramePreviewProfile::Draft512 => CompiledAtlasPreviewProfile::Draft512,
-            SourceFramePreviewProfile::Refinement1024 => CompiledAtlasPreviewProfile::Refinement1024,
+            SourceFramePreviewProfile::Refinement1024 => {
+                CompiledAtlasPreviewProfile::Refinement1024
+            }
+            SourceFramePreviewProfile::Preview2048 => CompiledAtlasPreviewProfile::Preview2048,
+            SourceFramePreviewProfile::Preview4096 => CompiledAtlasPreviewProfile::Preview4096,
+            SourceFramePreviewProfile::Preview8192 => CompiledAtlasPreviewProfile::Preview8192,
             SourceFramePreviewProfile::Authoritative => CompiledAtlasPreviewProfile::Authoritative,
         },
         normal_convention: CompiledNormalConvention::OpenGl,
         color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
         tile_request: CompiledTileRequest {
+            kind: match profile {
+                SourceFramePreviewProfile::Draft512 => CompiledTileRequestKind::CompleteDraft512,
+                SourceFramePreviewProfile::Refinement1024 => {
+                    CompiledTileRequestKind::CompleteRefinement1024
+                }
+                SourceFramePreviewProfile::Preview2048 => CompiledTileRequestKind::CompletePreview2048,
+                SourceFramePreviewProfile::Preview4096 => CompiledTileRequestKind::CompletePreview4096,
+                SourceFramePreviewProfile::Preview8192 => CompiledTileRequestKind::CompletePreview8192,
+                SourceFramePreviewProfile::Authoritative => CompiledTileRequestKind::ExactViewport,
+            },
+            generation: request_generation.unwrap_or_default(),
             output_rect: OutputPixelRect(hot_trimmer_domain::PixelBounds {
-                x: 0, y: 0, width: output_size.width, height: output_size.height,
+                x: 0,
+                y: 0,
+                width: output_size.width,
+                height: output_size.height,
             }),
             mip_level: 0,
             halo_px: 0,
             valid_rect: OutputPixelRect(hot_trimmer_domain::PixelBounds {
-                x: 0, y: 0, width: output_size.width, height: output_size.height,
+                x: 0,
+                y: 0,
+                width: output_size.width,
+                height: output_size.height,
             }),
         },
         requested_maps: vec![hot_trimmer_domain::MaterialMapKind::BaseColor],
@@ -1658,6 +1957,181 @@ pub fn compiled_atlas_plan_from_persisted(
         final_plan_hash: ContentDigest(String::new()),
     }
     .finalize()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_atlas_artifact_from_gpu(
+    revision: u64,
+    topology: hot_trimmer_domain::CompiledTemplateTopology,
+    placement: &PlacementPlan,
+    algorithm_versions: BTreeMap<u8, AlgorithmProvenance>,
+    regions: Vec<crate::ResolvedRegion>,
+    document: &hot_trimmer_domain::TrimSheetDocument,
+    region_sources: &[(
+        hot_trimmer_domain::SourceSetId,
+        Option<hot_trimmer_domain::PatchId>,
+        ContentDigest,
+        Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>,
+    )],
+    output: &AtlasFinalAtlasOutput,
+) -> Result<IntermediateAtlasArtifact, String> {
+    let expected_pixels = usize::try_from(
+        u64::from(output.interactive_tile.manifest.width)
+            * u64::from(output.interactive_tile.manifest.height),
+    )
+    .map_err(|_| "GPU atlas output size overflows host metadata limits".to_string())?;
+    if output.base_color_rgba8.len() != expected_pixels * 4 {
+        return Err("GPU atlas output did not match its bounded tile dimensions".into());
+    }
+    let placement_plan_id = ContentDigest::sha256(
+        &placement
+            .deterministic_bytes()
+            .map_err(|error| error.to_string())?,
+    );
+    let mut inspections = Vec::with_capacity(topology.slots.len());
+    for (index, ((slot, region), plan)) in topology
+        .slots
+        .iter()
+        .zip(document.topology.regions.iter())
+        .zip(placement.placements.iter())
+        .enumerate()
+    {
+        let allocation = slot.allocation;
+        let valid_pixel_count = output
+            .region_valid_pixel_counts
+            .iter()
+            .find_map(|(region_id, count)| (*region_id == region.id).then_some(*count))
+            .unwrap_or_else(|| u64::from(allocation.width) * u64::from(allocation.height));
+        let plan_id =
+            ContentDigest::sha256(&serde_json::to_vec(plan).map_err(|error| error.to_string())?);
+        let source = &region_sources[index];
+        inspections.push(crate::IntermediateSlotInspection {
+            region_id: region.id,
+            slot_key: slot.slot_key.clone(),
+            display_name: region.display_name.clone(),
+            allocation,
+            hotspot: slot.hotspot,
+            semantic_rect: slot.hotspot,
+            padded_rect: allocation,
+            atlas_destination: allocation,
+            preview_padding_px: slot
+                .hotspot
+                .x
+                .saturating_sub(allocation.x)
+                .max(slot.hotspot.y.saturating_sub(allocation.y))
+                .max(
+                    (allocation.x + allocation.width)
+                        .saturating_sub(slot.hotspot.x + slot.hotspot.width),
+                )
+                .max(
+                    (allocation.y + allocation.height)
+                        .saturating_sub(slot.hotspot.y + slot.hotspot.height),
+                ),
+            mapping_mode: plan.candidate.mapping_mode,
+            source_transform: plan.candidate.transform,
+            isotropic_scale: plan.candidate.isotropic_scale,
+            sampling_scale: plan.sampling_policy.scale,
+            valid_pixel_count,
+            source_id: plan.candidate.source_id.clone(),
+            patch_id: source.1.as_ref().map(ToString::to_string),
+            domain_id: source.3.cache_key.clone(),
+            candidate_id: plan.candidate.candidate_id.clone(),
+            sampling_plan_id: plan_id.clone(),
+            stage_14_result_id: ContentDigest::sha256(
+                format!(
+                    "gpu-base-color|{}|{}|{}",
+                    plan_id.0, region.id, valid_pixel_count
+                )
+                .as_bytes(),
+            ),
+            source_crop: plan.candidate.crop,
+            grid_rect: region.grid_rect,
+            behavior_version: document.region_bindings[&region.id]
+                .mapping
+                .behavior
+                .version,
+            role: document.region_bindings[&region.id].mapping.behavior.role,
+            continuity: document.region_bindings[&region.id]
+                .mapping
+                .behavior
+                .continuity,
+            requested_sampling: document.region_bindings[&region.id]
+                .mapping
+                .behavior
+                .sampling,
+            executed_mode: plan.candidate.mapping_mode,
+            edge_eligibility: document.region_bindings[&region.id]
+                .mapping
+                .behavior
+                .edge_eligibility,
+            period_pixels: plan.candidate.period_pixels,
+            address_mode: match document.region_bindings[&region.id]
+                .mapping
+                .behavior
+                .sampling
+            {
+                RegionSampling::OneShot => "clamp",
+                RegionSampling::LoopX => "repeat_x",
+                RegionSampling::LoopY => "repeat_y",
+                RegionSampling::LoopXy => "repeat_xy",
+            },
+        });
+    }
+    let all_importable = [
+        MaterialChannelRole::Normal,
+        MaterialChannelRole::Height,
+        MaterialChannelRole::Roughness,
+        MaterialChannelRole::Metallic,
+        MaterialChannelRole::AmbientOcclusion,
+        MaterialChannelRole::Specular,
+        MaterialChannelRole::Opacity,
+        MaterialChannelRole::EdgeMask,
+        MaterialChannelRole::MaterialId,
+    ];
+    let complete_output_rect = hot_trimmer_domain::PixelBounds {
+        x: 0,
+        y: 0,
+        width: topology.output_size.width,
+        height: topology.output_size.height,
+    };
+    let channels = if output.interactive_tile.manifest.valid_rect.0 == complete_output_rect {
+        vec![crate::IntermediateAtlasChannel {
+            role: MaterialChannelRole::BaseColor,
+            rgba8: output.base_color_rgba8.to_vec(),
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(IntermediateAtlasArtifact {
+        label: crate::INTERMEDIATE_ATLAS_LABEL,
+        non_exportable: true,
+        incomplete_after_stage: crate::INCOMPLETE_AFTER_STAGE,
+        revision,
+        topology,
+        placement_plan_id,
+        channels,
+        unavailable_channels: all_importable.into(),
+        correspondence: Vec::new(),
+        validity: Vec::new(),
+        region_ownership: Vec::new(),
+        slots: inspections,
+        algorithm_versions,
+        diagnostics: Vec::new(),
+        regions,
+        telemetry: output.telemetry.clone(),
+        rendered_tile: Some(Arc::clone(&output.interactive_tile)),
+        pending: vec![
+            "profiles",
+            "semantic details",
+            "effects",
+            "final PBR composition",
+            "finishing",
+            "mips",
+            "metadata",
+            "export",
+            "Blender application",
+        ],
+    })
 }
 
 fn quarter_turn_degrees(orientation: QuarterTurn) -> f64 {
@@ -1694,6 +2168,9 @@ fn direct_source_frame_domain(
     let max_level_zero_edge = match profile {
         SourceFramePreviewProfile::Draft512 => Some(1024),
         SourceFramePreviewProfile::Refinement1024 => Some(2048),
+        SourceFramePreviewProfile::Preview2048 => Some(4096),
+        SourceFramePreviewProfile::Preview4096 => Some(8192),
+        SourceFramePreviewProfile::Preview8192 => None,
         SourceFramePreviewProfile::Authoritative => None,
     };
     let settings = NormalizationSettings {
@@ -1718,13 +2195,20 @@ fn direct_source_frame_domain(
     {
         return Ok((found, true));
     }
-    let prepared = if let Some(found) = cache
-        .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get_prepared(&prepared_key)))
-    {
+    let prepared = if let Some(found) = cache.and_then(|cache| {
+        cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get_prepared(&prepared_key))
+    }) {
         found
     } else {
-        let prepared = Arc::new(prepare_registered_channel_set(&registered, &encoded, &settings, cancellation)
-            .map_err(|error| format!("Stage 2 direct SourceFrame decode/preparation failed: {error}"))?);
+        let prepared = Arc::new(
+            prepare_registered_channel_set(&registered, &encoded, &settings, cancellation)
+                .map_err(|error| {
+                    format!("Stage 2 direct SourceFrame decode/preparation failed: {error}")
+                })?,
+        );
         if let Some(cache) = cache
             && let Ok(mut guard) = cache.lock()
         {
@@ -1772,7 +2256,8 @@ fn aspect_matches(width: f64, height: f64, expected_width: f64, expected_height:
 #[cfg(test)]
 mod source_frame_partition_tests {
     use hot_trimmer_domain::{
-        LogicalGridSpec, PartitionRecipe, SamplingMode, SolidChannelValues, generate_partition, resolve_boundaries,
+        LogicalGridSpec, PartitionRecipe, SamplingMode, SolidChannelValues, generate_partition,
+        resolve_boundaries,
     };
     use std::collections::BTreeMap;
 
@@ -1783,10 +2268,13 @@ mod source_frame_partition_tests {
         let domain = build_solid_domain(&SolidChannelValues {
             base_color: Some([128, 64, 32, 128]),
             scalar_channels: BTreeMap::new(),
-        }).expect("solid domain");
+        })
+        .expect("solid domain");
         assert_eq!((domain.width, domain.height), (1, 1));
         let pixel = match &domain.registered_channels()[0] {
-            hot_trimmer_render_core::PreparedExemplarChannel::BaseColor { plane, .. } => plane.pixel(0, 0),
+            hot_trimmer_render_core::PreparedExemplarChannel::BaseColor { plane, .. } => {
+                plane.pixel(0, 0)
+            }
             _ => panic!("solid domain must contain Base Color"),
         };
         assert!((pixel.alpha - 128.0 / 255.0).abs() < 1.0e-6);
@@ -1843,16 +2331,21 @@ fn validate_manual_mapping(
             mapping.behavior.role, mapping.behavior.sampling
         ));
     }
-    if mapping.behavior.period_pixels.is_some_and(|period| period.contains(&0)) {
-        return Err(format!("region {region_id} has an invalid zero source period"));
+    if mapping
+        .behavior
+        .period_pixels
+        .is_some_and(|period| period.contains(&0))
+    {
+        return Err(format!(
+            "region {region_id} has an invalid zero source period"
+        ));
     }
     if !mapping.warps.is_empty() {
         return Err(format!(
             "region {region_id} has authored warp operations, but the manual Stage 14 route has no exact executor"
         ));
     }
-    if mapping.transform.offset.iter().any(|value| value.abs() > epsilon)
-        || mapping.transform.rotation_degrees.abs() > epsilon
+    if mapping.transform.rotation_degrees.abs() > epsilon
         || (mapping.transform.scale[0] - mapping.transform.scale[1]).abs() > epsilon
         || (mapping.transform.mirror_x && mapping.transform.mirror_y)
     {
@@ -1878,7 +2371,9 @@ fn manual_sampling_mode(role: ManualRegionRole, sampling: RegionSampling) -> Sam
 fn manual_template_role(role: ManualRegionRole) -> TemplateSlotRole {
     match role {
         ManualRegionRole::Panel => TemplateSlotRole::Planar,
-        ManualRegionRole::HorizontalStrip | ManualRegionRole::VerticalStrip => TemplateSlotRole::RepeatingStrip,
+        ManualRegionRole::HorizontalStrip | ManualRegionRole::VerticalStrip => {
+            TemplateSlotRole::RepeatingStrip
+        }
         ManualRegionRole::Unique => TemplateSlotRole::UniqueDetail,
         ManualRegionRole::Radial => TemplateSlotRole::Radial,
     }
@@ -1894,14 +2389,12 @@ fn scaled_atlas_padding(
     if padding_px == 0 || authoritative.width == 0 || authoritative.height == 0 {
         return 0;
     }
-    let numerator = u64::from(padding_px)
-        * u64::from(profile.width)
-        * u64::from(authoritative.height);
+    let numerator =
+        u64::from(padding_px) * u64::from(profile.width) * u64::from(authoritative.height);
     let denominator = u64::from(authoritative.width) * u64::from(authoritative.height);
     let scaled_width = numerator.div_ceil(denominator);
-    let numerator = u64::from(padding_px)
-        * u64::from(profile.height)
-        * u64::from(authoritative.width);
+    let numerator =
+        u64::from(padding_px) * u64::from(profile.height) * u64::from(authoritative.width);
     let scaled_height = numerator.div_ceil(denominator);
     u32::try_from(scaled_width.min(scaled_height).max(1)).unwrap_or(u32::MAX)
 }
@@ -1956,23 +2449,45 @@ fn manual_physical_mapping(
     }
 }
 
-fn build_solid_domain(values: &SolidChannelValues) -> Result<hot_trimmer_material_synthesis::PreparedMaterialDomain, String> {
-    let rgba = values.base_color.ok_or_else(|| "solid region content requires an explicit Base Color for Stage 14".to_string())?;
+fn build_solid_domain(
+    values: &SolidChannelValues,
+) -> Result<hot_trimmer_material_synthesis::PreparedMaterialDomain, String> {
+    let rgba = values.base_color.ok_or_else(|| {
+        "solid region content requires an explicit Base Color for Stage 14".to_string()
+    })?;
     let linear = |component: u8| {
         let value = f32::from(component) / 255.0;
-        if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
     };
-    let plane = ImagePlane::from_row_major(1, 1, 1, &[LinearColor {
-        rgb: [linear(rgba[0]), linear(rgba[1]), linear(rgba[2])],
-        alpha: f32::from(rgba[3]) / 255.0,
-    }]).map_err(|error| error.to_string())?;
-    let identity = ContentDigest::sha256(&serde_json::to_vec(values).map_err(|error| error.to_string())?);
-    hot_trimmer_material_synthesis::PreparedMaterialDomain::from_registered_channels(
-        identity.clone(), identity, vec![PreparedExemplarChannel::BaseColor {
-            plane,
-            alpha_mode: if rgba[3] == 255 { ResolvedAlphaMode::Opaque } else { ResolvedAlphaMode::Straight },
+    let plane = ImagePlane::from_row_major(
+        1,
+        1,
+        1,
+        &[LinearColor {
+            rgb: [linear(rgba[0]), linear(rgba[1]), linear(rgba[2])],
+            alpha: f32::from(rgba[3]) / 255.0,
         }],
-    ).map_err(|error| error.to_string())
+    )
+    .map_err(|error| error.to_string())?;
+    let identity =
+        ContentDigest::sha256(&serde_json::to_vec(values).map_err(|error| error.to_string())?);
+    hot_trimmer_material_synthesis::PreparedMaterialDomain::from_registered_channels(
+        identity.clone(),
+        identity,
+        vec![PreparedExemplarChannel::BaseColor {
+            plane,
+            alpha_mode: if rgba[3] == 255 {
+                ResolvedAlphaMode::Opaque
+            } else {
+                ResolvedAlphaMode::Straight
+            },
+        }],
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn resolve_region_content(
@@ -2019,7 +2534,10 @@ fn patch_domain_cache_key(
     patch: &Patch,
     preserve_source_resolution: bool,
 ) -> Result<ContentDigest, String> {
-    let source_set = project.source_sets.iter().find(|set| set.id == source_set_id)
+    let source_set = project
+        .source_sets
+        .iter()
+        .find(|set| set.id == source_set_id)
         .ok_or_else(|| format!("material source set {source_set_id} is missing"))?;
     let identity = format!(
         "stage-02-08-patch-domain-v1|source={source_set:?}|patch={patch:?}|preserve={preserve_source_resolution}"
@@ -2037,14 +2555,27 @@ fn build_direct_patch_domain(
     render_cancellation: &RenderCancellationToken,
     cache: Option<&Mutex<SourceFramePreviewCache>>,
 ) -> Result<hot_trimmer_material_synthesis::PreparedMaterialDomain, String> {
-    let source_set = project.source_sets.iter().find(|set| set.id == source_set_id)
+    let source_set = project
+        .source_sets
+        .iter()
+        .find(|set| set.id == source_set_id)
         .ok_or_else(|| format!("material source set {source_set_id} is missing"))?;
-    let sources = project.sources.iter()
-        .filter(|source| source.source_set_id.to_string() == source_set_id.to_string()
-            && source.registration.role == MaterialChannelRole::BaseColor)
+    let sources = project
+        .sources
+        .iter()
+        .filter(|source| {
+            source.source_set_id.to_string() == source_set_id.to_string()
+                && source.registration.role == MaterialChannelRole::BaseColor
+        })
         .collect::<Vec<_>>();
-    if !sources.iter().any(|source| source.input.id == patch.source_id) {
-        return Err(format!("patch {} does not belong to material source set {source_set_id}", patch.id));
+    if !sources
+        .iter()
+        .any(|source| source.input.id == patch.source_id)
+    {
+        return Err(format!(
+            "patch {} does not belong to material source set {source_set_id}",
+            patch.id
+        ));
     }
     let (registered, encoded) = registered_inputs(&sources)?;
     let settings = NormalizationSettings {
@@ -2054,14 +2585,18 @@ fn build_direct_patch_domain(
         ..NormalizationSettings::default()
     };
     let prepared_key = hot_trimmer_image_io::prepared_cache_key(&registered, &settings);
-    let prepared = if let Some(found) = cache
-        .and_then(|cache| cache.lock().ok().and_then(|guard| guard.get_prepared(&prepared_key)))
-    {
+    let prepared = if let Some(found) = cache.and_then(|cache| {
+        cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get_prepared(&prepared_key))
+    }) {
         found
     } else {
-        let prepared = Arc::new(prepare_registered_channel_set(
-            &registered, &encoded, &settings, image_cancellation,
-        ).map_err(|error| format!("Stage 2 direct patch preparation failed: {error}"))?);
+        let prepared = Arc::new(
+            prepare_registered_channel_set(&registered, &encoded, &settings, image_cancellation)
+                .map_err(|error| format!("Stage 2 direct patch preparation failed: {error}"))?,
+        );
         if let Some(cache) = cache
             && let Ok(mut guard) = cache.lock()
         {
@@ -2075,7 +2610,9 @@ fn build_direct_patch_domain(
         &prepared,
         &PreparedExemplarRequest {
             exemplar_id: patch.id.to_string(),
-            area: PlanarArea::FourPoint { corners: patch.geometry.corners },
+            area: PlanarArea::FourPoint {
+                corners: patch.geometry.corners,
+            },
             lens_correction: None,
             mask: ExemplarMaskIntent {
                 crop_polygon: patch.geometry.assistance_mask.clone(),
@@ -2086,8 +2623,16 @@ fn build_direct_patch_domain(
             quality: RectificationQuality::Authoritative,
             limits: RectificationWorkLimits {
                 preview_max_edge: 1024,
-                authoritative_max_edge: if preserve_source_resolution { 8192 } else { 1024 },
-                max_pixels: if preserve_source_resolution { 67_108_864 } else { 1_048_576 },
+                authoritative_max_edge: if preserve_source_resolution {
+                    8192
+                } else {
+                    1024
+                },
+                max_pixels: if preserve_source_resolution {
+                    67_108_864
+                } else {
+                    1_048_576
+                },
                 tile_edge: 128,
             },
             scope: PreparedExemplarScope {
@@ -2098,12 +2643,14 @@ fn build_direct_patch_domain(
             },
         },
         render_cancellation,
-    ).map_err(|error| format!("Stage 3 direct patch rectification failed: {error}"))?;
+    )
+    .map_err(|error| format!("Stage 3 direct patch rectification failed: {error}"))?;
     hot_trimmer_material_synthesis::PreparedMaterialDomain::from_registered_channels(
         cache_key,
         exemplar.cache_key.0,
         exemplar.channels,
-    ).map_err(|error| format!("direct patch domain failed: {error}"))
+    )
+    .map_err(|error| format!("direct patch domain failed: {error}"))
 }
 
 fn build_domain(
@@ -2403,6 +2950,20 @@ fn mapping_window(mapping: &RegionMapping, width: u32, height: u32) -> SourceCro
         width: requested_width.min(width - x),
         height: requested_height.min(height - y),
     }
+}
+
+fn source_frame_preview_crop(
+    mapping: &RegionMapping,
+    fallback: SourceCrop,
+    width: u32,
+    height: u32,
+) -> SourceCrop {
+    if mapping.source_crop_intent == Some(hot_trimmer_domain::SourceCropIntent::Authored)
+        && matches!(mapping.projection, Projection::Crop { .. })
+    {
+        return mapping_window(mapping, width, height);
+    }
+    fallback
 }
 
 fn legal_gate1_mode(

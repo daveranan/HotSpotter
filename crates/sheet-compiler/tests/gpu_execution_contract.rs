@@ -30,7 +30,7 @@ use hot_trimmer_sheet_compiler::{
     AtlasRenderExecutionInput, AtlasRenderExecutor, AtlasRenderExecutorOutput,
     CompiledAtlasPlanValidationError, CompiledAtlasPlanV1, CompiledAtlasPreviewProfile,
     CompiledColorSpacePolicy, CompiledNormalConvention, CompiledRegionCommandV1,
-    CompiledSourceCommandV1, CompiledTileRequest, CpuAtlasRenderExecutor, IntermediateAtlasRequest,
+    CompiledSourceCommandV1, CompiledTileRequest, CompiledTileRequestKind, CpuAtlasRenderExecutor, IntermediateAtlasRequest,
     COMPILED_ATLAS_ALGORITHM_VERSION, COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
     OutputPixelRect, SourcePixelRect, SourceFramePreviewProfile,
 };
@@ -294,6 +294,8 @@ fn base_plan() -> CompiledAtlasPlanV1 {
         normal_convention: CompiledNormalConvention::OpenGl,
         color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
         tile_request: CompiledTileRequest {
+            kind: CompiledTileRequestKind::ExactViewport,
+            generation: 11,
             output_rect: OutputPixelRect(PixelBounds { x: 0, y: 0, width: 1024, height: 1024 }),
             mip_level: 0,
             halo_px: 0,
@@ -324,6 +326,7 @@ fn compile_source_frame_document(
                 draft_id: None,
                 input_hash: None,
                 profile: SourceFramePreviewProfile::Authoritative,
+                view_intent: None,
             },
             &hot_trimmer_domain::CancellationToken::new(),
             || true,
@@ -512,7 +515,7 @@ fn atlas_render_executor_contract_receives_exact_compiled_plan() {
         .expect("exact plan should be received by executor abstraction");
 
     assert_eq!(observed, plan);
-    assert!(output.regions.is_empty());
+    assert!(output.as_cpu_regions().expect("capturing executor returns CPU-region output").regions.is_empty());
 }
 
 #[test]

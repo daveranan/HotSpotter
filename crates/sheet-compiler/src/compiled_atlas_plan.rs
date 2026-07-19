@@ -90,6 +90,9 @@ pub enum CompiledAtlasPlanValidationError {
         region_id: RegionId,
         reason: &'static str,
     },
+
+    #[error("tile valid rect must be contained by the requested tile output rect")]
+    InvalidTileBounds,
 }
 
 #[derive(Serialize)]
@@ -127,6 +130,9 @@ fn checked_add_u32(
 pub enum CompiledAtlasPreviewProfile {
     Draft512,
     Refinement1024,
+    Preview2048,
+    Preview4096,
+    Preview8192,
     Authoritative,
 }
 
@@ -146,10 +152,110 @@ pub enum CompiledColorSpacePolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompiledTileRequest {
+    pub kind: CompiledTileRequestKind,
+    /// The native scheduler rejects publications older than this generation.
+    pub generation: u64,
     pub output_rect: OutputPixelRect,
     pub mip_level: u32,
     pub halo_px: u32,
     pub valid_rect: OutputPixelRect,
+}
+
+/// The caller's intent for a tile request.  All variants are compiled through the
+/// same persisted pipeline and therefore share atlas coordinates and sampling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompiledTileRequestKind {
+    CompleteDraft512,
+    CompleteRefinement1024,
+    CompletePreview2048,
+    CompletePreview4096,
+    CompletePreview8192,
+    ExactViewport,
+    ExactSelectedRegion,
+}
+
+/// A deterministic cache and publication identity for one rendered atlas tile.
+/// Selection state is deliberately excluded: it changes scheduling, not pixels.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledAtlasTileIdentity {
+    pub plan_hash: ContentDigest,
+    pub map: hot_trimmer_domain::MaterialMapKind,
+    pub mip_level: u32,
+    pub output_rect: OutputPixelRect,
+    pub halo_px: u32,
+    pub valid_rect: OutputPixelRect,
+    pub profile: CompiledAtlasPreviewProfile,
+    pub shader_version: String,
+    pub generation: u64,
+}
+
+/// Reusable pixel identity for a rendered tile. Publication generation is not
+/// part of this key because native jobs receive a new generation for the same
+/// pixels during ordinary panning or repeated inspection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledAtlasPixelIdentity {
+    pub plan_hash: ContentDigest,
+    pub map: hot_trimmer_domain::MaterialMapKind,
+    pub mip_level: u32,
+    pub output_rect: OutputPixelRect,
+    pub halo_px: u32,
+    pub valid_rect: OutputPixelRect,
+    pub profile: CompiledAtlasPreviewProfile,
+    pub shader_version: String,
+}
+
+impl CompiledAtlasTileIdentity {
+    #[must_use]
+    pub fn pixel_identity(&self) -> CompiledAtlasPixelIdentity {
+        CompiledAtlasPixelIdentity {
+            plan_hash: self.plan_hash.clone(),
+            map: self.map,
+            mip_level: self.mip_level,
+            output_rect: self.output_rect,
+            halo_px: self.halo_px,
+            valid_rect: self.valid_rect,
+            profile: self.profile,
+            shader_version: self.shader_version.clone(),
+        }
+    }
+}
+
+/// Stable metadata for a compact GPU `R32Uint` region-index tile.  Pixel payloads
+/// contain only `compact_index`; region UUIDs remain in this lookup table.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledCompactRegionIdLookup {
+    pub compact_index: u32,
+    pub region_id: RegionId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompiledTilePixelFormat {
+    Rgba8UnormSrgb,
+    R32Uint,
+}
+
+/// Metadata for a cache-owned raw tile. `opaque_handle` is intentionally not a
+/// filesystem path or data URL: callers can resolve it only through the cache.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledAtlasTileManifest {
+    pub identity: CompiledAtlasTileIdentity,
+    pub map: hot_trimmer_domain::MaterialMapKind,
+    pub mip_level: u32,
+    pub output_rect: OutputPixelRect,
+    pub valid_rect: OutputPixelRect,
+    pub halo_px: u32,
+    pub generation: u64,
+    pub pixel_format: CompiledTilePixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub row_stride: u32,
+    pub opaque_handle: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,6 +287,36 @@ pub struct CompiledAtlasPlanV1 {
 }
 
 impl CompiledAtlasPlanV1 {
+    #[must_use]
+    pub fn tile_identity(
+        &self,
+        map: hot_trimmer_domain::MaterialMapKind,
+        shader_version: impl Into<String>,
+    ) -> CompiledAtlasTileIdentity {
+        CompiledAtlasTileIdentity {
+            plan_hash: self.final_plan_hash.clone(),
+            map,
+            mip_level: self.tile_request.mip_level,
+            output_rect: self.tile_request.output_rect,
+            halo_px: self.tile_request.halo_px,
+            valid_rect: self.tile_request.valid_rect,
+            profile: self.preview_profile,
+            shader_version: shader_version.into(),
+            generation: self.tile_request.generation,
+        }
+    }
+
+    #[must_use]
+    pub fn compact_region_id_lookup(&self) -> Vec<CompiledCompactRegionIdLookup> {
+        self.ordered_regions
+            .iter()
+            .map(|region| CompiledCompactRegionIdLookup {
+                compact_index: region.compact_index,
+                region_id: region.region_id,
+            })
+            .collect()
+    }
+
     pub fn validate(&self) -> Result<(), CompiledAtlasPlanValidationError> {
         if !self.output_size.is_nonzero() {
             return Err(CompiledAtlasPlanValidationError::ZeroOutputSize {
@@ -209,6 +345,15 @@ impl CompiledAtlasPlanV1 {
 
         validate_output_rect(self.tile_request.output_rect, self.output_size, "tile output")?;
         validate_output_rect(self.tile_request.valid_rect, self.output_size, "tile valid")?;
+        let tile = self.tile_request.output_rect.0;
+        let valid = self.tile_request.valid_rect.0;
+        if valid.x < tile.x
+            || valid.y < tile.y
+            || valid.x.saturating_add(valid.width) > tile.x.saturating_add(tile.width)
+            || valid.y.saturating_add(valid.height) > tile.y.saturating_add(tile.height)
+        {
+            return Err(CompiledAtlasPlanValidationError::InvalidTileBounds);
+        }
 
         for region in &self.ordered_regions {
             if !seen_regions.insert(region.region_id) {

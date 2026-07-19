@@ -102,6 +102,8 @@ pub fn run() {
             commands::redo_document_command,
             commands::compile_trim_sheet_document,
             commands::preview_through_stage_14,
+            commands::get_gpu_tiled_preview_payload,
+            commands::release_gpu_tiled_preview_payload,
             commands::save_project,
             commands::save_project_as,
             commands::close_project,

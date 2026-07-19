@@ -3,7 +3,7 @@ import test from "node:test";
 import { SourceFramePreviewController, type PreviewControllerClock } from "./source-frame-preview-controller.ts";
 import { preserveViewAcrossContentResize } from "./source-workbench-geometry.ts";
 
-type Profile = "draft512" | "refinement1024" | "authoritative";
+type Profile = "draft512" | "refinement1024" | "preview2048" | "preview4096" | "preview8192" | "authoritative";
 
 test("source-frame-preview-performance preserves manual viewport intent across draft refinement", () => {
   const before = { x: -310, y: -180, scale: 1.5 };
@@ -65,7 +65,7 @@ test("source-frame-preview-performance coalesces drags and preserves a final pro
 
 test("source-frame-preview-performance profile requests do not alter source ownership", () => {
   const sourceCrop = { x: 2000, y: 0, width: 4000, height: 4000 };
-  const profiles: readonly Profile[] = ["draft512", "refinement1024", "authoritative"];
+  const profiles: readonly Profile[] = ["draft512", "refinement1024", "preview2048", "preview4096", "preview8192", "authoritative"];
   for (const profile of profiles) {
     assert.deepEqual(sourceCrop, { x: 2000, y: 0, width: 4000, height: 4000 }, profile);
   }

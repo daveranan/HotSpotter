@@ -1867,11 +1867,13 @@ dependencies = [
  "hot-trimmer-project-store",
  "hot-trimmer-render-core",
  "image",
+ "pollster",
  "serde",
  "serde_json",
  "sysinfo",
  "thiserror 2.0.18",
  "uuid",
+ "wgpu",
 ]
 
 [[package]]

@@ -17,8 +17,8 @@ use hot_trimmer_domain::{
 };
 use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
 use hot_trimmer_sheet_compiler::{
-    AlgorithmCompiler, PersistedStage14PreviewRequest, SourceFramePreviewCache,
-    SourceFramePreviewProfile,
+    AlgorithmCompiler, GpuAtlasRenderExecutor, GpuAtlasSourceTextureCache,
+    PersistedStage14PreviewRequest, SourceFramePreviewCache, SourceFramePreviewProfile,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde::Serialize;
@@ -75,12 +75,12 @@ struct BaselineRecord {
 }
 
 #[test]
-#[ignore = "real 7952x4016 decode and 8192x8192 CPU baseline; run explicitly in release mode"]
+#[ignore = "real 7952x4016 decode and 8192x8192 GPU Base Color qualification; run explicitly in release mode"]
 fn real_8k_cpu_baseline() {
     assert!(!cfg!(debug_assertions), "real-8K qualification must run with --release");
     let output_directory = std::env::var_os("HOT_TRIMMER_GPU_BASELINE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/gpu-prompt-1"));
+        .unwrap_or_else(|| PathBuf::from("target/gpu-prompt-002"));
     std::fs::create_dir_all(&output_directory).expect("create baseline output directory");
     let root = std::env::temp_dir().join(format!("hot-trimmer-real-8k-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create real baseline project directory");
@@ -186,6 +186,8 @@ fn real_8k_cpu_baseline() {
     let snapshot_ms = snapshot_started.elapsed().as_millis();
     let compiler = AlgorithmCompiler::new();
     let cache = Mutex::new(SourceFramePreviewCache::default());
+    let gpu_capabilities = hot_trimmer_preview::GpuCapabilityService::default();
+    let gpu_source_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
     let sampling_complete = Arc::new(AtomicBool::new(false));
     let peak_rss = Arc::new(AtomicU64::new(0));
     let sampler_complete = Arc::clone(&sampling_complete);
@@ -209,19 +211,26 @@ fn real_8k_cpu_baseline() {
     for label in ["cold", "warm-1", "warm-2"] {
         if label == "cold" {
             *cache.lock().expect("cache") = SourceFramePreviewCache::default();
+            *gpu_source_cache.lock().expect("gpu cache") = GpuAtlasSourceTextureCache::default();
         }
         let started = Instant::now();
-        let result = compiler.compile_persisted_stage_14_preview_with_cache(
+        let gpu_executor = GpuAtlasRenderExecutor {
+            service: &gpu_capabilities,
+            source_texture_cache: &gpu_source_cache,
+        };
+        let result = compiler.compile_persisted_stage_14_preview_with_cache_and_executor(
             PersistedStage14PreviewRequest {
                 project: &project,
                 revision: document.document_revision,
                 draft_id: Some(1),
                 input_hash: Some("gpu-prompt-1-real-8k".into()),
                 profile: SourceFramePreviewProfile::Authoritative,
+                view_intent: None,
             },
             &CancellationToken::new(),
             || true,
             Some(&cache),
+            Some(&gpu_executor),
         );
         let elapsed_ms = started.elapsed().as_millis();
         runs.push(match result {
@@ -271,7 +280,7 @@ fn real_8k_cpu_baseline() {
 
     let mut system = System::new_all();
     system.refresh_all();
-    let gpu_capability = match hot_trimmer_preview::GpuCapabilityService::default().initialize() {
+    let gpu_capability = match gpu_capabilities.initialize() {
         Ok(state) => state.capabilities().diagnostic_line(),
         Err(error) => format!("unsupported: {error}"),
     };
@@ -306,10 +315,10 @@ fn real_8k_cpu_baseline() {
         runs,
     };
     let json = serde_json::to_string_pretty(&record).expect("serialize baseline JSON");
-    std::fs::write(output_directory.join("gpu-prompt-1-real-8k.json"), &json).expect("write baseline JSON");
+    std::fs::write(output_directory.join("gpu-prompt-002-real-8k.json"), &json).expect("write baseline JSON");
     let statuses = record.runs.iter().map(|run| format!("- {}: {} in {} ms{}", run.label, if run.completed { "completed" } else { "failed" }, run.elapsed_ms, run.error.as_ref().map(|error| format!(" ({error})")).unwrap_or_default())).collect::<Vec<_>>().join("\n");
-    let markdown = format!("# GPU Prompt 1 real-8K CPU baseline\n\nActual decoded source: {SOURCE_WIDTH}x{SOURCE_HEIGHT} ({decoded_bytes} bytes); generation/encode: {decode_generate_ms} ms.\n\nRequested output: {OUTPUT_EDGE}x{OUTPUT_EDGE} Base Color through `compile_persisted`.\n\n{statuses}\n\nGPU capability: `{}`\n", record.gpu_capability);
-    std::fs::write(output_directory.join("gpu-prompt-1-real-8k.md"), markdown).expect("write baseline Markdown");
+    let markdown = format!("# GPU Prompt 002 real-8K Base Color\n\nActual decoded source: {SOURCE_WIDTH}x{SOURCE_HEIGHT} ({decoded_bytes} bytes); generation/encode: {decode_generate_ms} ms.\n\nRequested output: {OUTPUT_EDGE}x{OUTPUT_EDGE} Base Color through `compile_persisted`.\n\n{statuses}\n\nGPU capability: `{}`\n", record.gpu_capability);
+    std::fs::write(output_directory.join("gpu-prompt-002-real-8k.md"), markdown).expect("write baseline Markdown");
     println!("{}", output_directory.display());
 }
 
