@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use hot_trimmer_domain::{
-    ContentDigest, DocumentHash, EdgeEligibility, MappingTransform, MaterialChannelRole, OrientedPixelSize,
-    PatchId, PixelBounds, PixelSize, RegionContinuity, RegionId, RegionSampling, RadialMappingSettings,
-    SourceSetId,
+    ContentDigest, DocumentHash, EdgeEligibility, ManualRegionRole, MappingTransform, MaterialChannelRole,
+    OrientedPixelSize, PatchId, PixelBounds, PixelSize, RadialMappingSettings, RegionContinuity,
+    RegionId, RegionSampling, SourceSetId, StructuralProfile,
 };
 use hot_trimmer_placement_solver::SamplingPlan;
 
@@ -37,7 +37,9 @@ pub enum CompiledAtlasPlanValidationError {
         previous_region_id: RegionId,
     },
 
-    #[error("region {region_id} source crop is zero or out of bounds: {crop:?} against source {source_width}x{source_height}")]
+    #[error(
+        "region {region_id} source crop is zero or out of bounds: {crop:?} against source {source_width}x{source_height}"
+    )]
     SourceCropOutOfBounds {
         region_id: RegionId,
         crop: SourcePixelRect,
@@ -45,7 +47,9 @@ pub enum CompiledAtlasPlanValidationError {
         source_height: u32,
     },
 
-    #[error("region {region_id} destination is zero or out of bounds: {destination:?} against output {output:?}")]
+    #[error(
+        "region {region_id} destination is zero or out of bounds: {destination:?} against output {output:?}"
+    )]
     DestinationOutOfBounds {
         region_id: RegionId,
         destination: OutputPixelRect,
@@ -58,7 +62,9 @@ pub enum CompiledAtlasPlanValidationError {
     #[error("region {region_id} has non-finite radial values")]
     NonFiniteRadialParameters { region_id: RegionId },
 
-    #[error("region {region_id} has unsupported binding/sampling pair: {sampling:?} with patch binding")]
+    #[error(
+        "region {region_id} has unsupported binding/sampling pair: {sampling:?} with patch binding"
+    )]
     UnsupportedBindingSamplingPair {
         region_id: RegionId,
         sampling: RegionSampling,
@@ -113,16 +119,65 @@ struct CanonicalAtlasPlanIdentity<'a> {
     ordered_regions: &'a [CompiledRegionCommandV1],
 }
 
+#[derive(Serialize)]
+struct CanonicalAtlasPixelPlanIdentity<'a> {
+    schema_version: u16,
+    algorithm_version: &'a str,
+    topology_hash: &'a DocumentHash,
+    output_size: &'a PixelSize,
+    preview_profile: CompiledAtlasPreviewProfile,
+    normal_convention: Option<CompiledNormalConvention>,
+    color_space_policy: CompiledColorSpacePolicy,
+    tile_request: CanonicalAtlasPixelTileRequest,
+    ordered_sources: Vec<CompiledSourceCommandV1>,
+    ordered_regions: Vec<CompiledRegionCommandV1>,
+}
+
+#[derive(Serialize)]
+struct CanonicalAtlasPixelTileRequest {
+    kind: CompiledTileRequestKind,
+    output_rect: OutputPixelRect,
+    mip_level: u32,
+    halo_px: u32,
+    valid_rect: OutputPixelRect,
+}
+
+fn pixel_source_roles(
+    map: hot_trimmer_domain::MaterialMapKind,
+) -> &'static [MaterialChannelRole] {
+    use hot_trimmer_domain::MaterialMapKind;
+    match map {
+        MaterialMapKind::BaseColor => &[MaterialChannelRole::BaseColor],
+        MaterialMapKind::Height => &[MaterialChannelRole::Height],
+        MaterialMapKind::Normal => {
+            &[MaterialChannelRole::Height, MaterialChannelRole::Normal]
+        }
+        MaterialMapKind::Roughness => &[MaterialChannelRole::Roughness],
+        MaterialMapKind::Metallic => &[MaterialChannelRole::Metallic],
+        MaterialMapKind::AmbientOcclusion => &[MaterialChannelRole::AmbientOcclusion],
+        MaterialMapKind::Specular => &[MaterialChannelRole::Specular],
+        MaterialMapKind::Opacity => &[MaterialChannelRole::Opacity],
+        MaterialMapKind::EdgeMask => &[MaterialChannelRole::EdgeMask],
+        MaterialMapKind::MaterialId => &[MaterialChannelRole::MaterialId],
+        MaterialMapKind::RegionId => &[],
+    }
+}
+
+fn stable_pixel_source_id(source_set_id: SourceSetId, patch_id: Option<PatchId>) -> ContentDigest {
+    ContentDigest::sha256(
+        format!("stage-14-source-binding-v1|{source_set_id}|{patch_id:?}").as_bytes(),
+    )
+}
+
 fn checked_add_u32(
     first: u32,
     second: u32,
     region_id: RegionId,
     context: &'static str,
 ) -> Result<u32, CompiledAtlasPlanValidationError> {
-    first.checked_add(second).ok_or_else(|| CompiledAtlasPlanValidationError::ArithmeticOverflow {
-        region_id,
-        context,
-    })
+    first
+        .checked_add(second)
+        .ok_or_else(|| CompiledAtlasPlanValidationError::ArithmeticOverflow { region_id, context })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,12 +237,16 @@ pub enum CompiledTileRequestKind {
 pub struct CompiledAtlasTileIdentity {
     pub plan_hash: ContentDigest,
     pub map: hot_trimmer_domain::MaterialMapKind,
+    pub pixel_format: CompiledTilePixelFormat,
     pub mip_level: u32,
     pub output_rect: OutputPixelRect,
     pub halo_px: u32,
     pub valid_rect: OutputPixelRect,
     pub profile: CompiledAtlasPreviewProfile,
     pub shader_version: String,
+    pub structural_plan_id: ContentDigest,
+    pub scale_microunits: u64,
+    pub normal_convention: Option<CompiledNormalConvention>,
     pub generation: u64,
 }
 
@@ -199,12 +258,16 @@ pub struct CompiledAtlasTileIdentity {
 pub struct CompiledAtlasPixelIdentity {
     pub plan_hash: ContentDigest,
     pub map: hot_trimmer_domain::MaterialMapKind,
+    pub pixel_format: CompiledTilePixelFormat,
     pub mip_level: u32,
     pub output_rect: OutputPixelRect,
     pub halo_px: u32,
     pub valid_rect: OutputPixelRect,
     pub profile: CompiledAtlasPreviewProfile,
     pub shader_version: String,
+    pub structural_plan_id: ContentDigest,
+    pub scale_microunits: u64,
+    pub normal_convention: Option<CompiledNormalConvention>,
 }
 
 impl CompiledAtlasTileIdentity {
@@ -213,12 +276,16 @@ impl CompiledAtlasTileIdentity {
         CompiledAtlasPixelIdentity {
             plan_hash: self.plan_hash.clone(),
             map: self.map,
+            pixel_format: self.pixel_format,
             mip_level: self.mip_level,
             output_rect: self.output_rect,
             halo_px: self.halo_px,
             valid_rect: self.valid_rect,
             profile: self.profile,
             shader_version: self.shader_version.clone(),
+            structural_plan_id: self.structural_plan_id.clone(),
+            scale_microunits: self.scale_microunits,
+            normal_convention: self.normal_convention,
         }
     }
 }
@@ -230,12 +297,72 @@ impl CompiledAtlasTileIdentity {
 pub struct CompiledCompactRegionIdLookup {
     pub compact_index: u32,
     pub region_id: RegionId,
+    pub role: ManualRegionRole,
+    pub continuity: RegionContinuity,
+    pub sampling: RegionSampling,
+    pub edge_eligibility: EdgeEligibility,
+    pub structural_profile: StructuralProfile,
+    pub classification: CompiledRegionClassification,
+    pub display_rgba8: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompiledRegionClassification {
+    Panel,
+    Horizontal,
+    Vertical,
+    Unique,
+    Radial,
+    ContinuousXy,
+}
+
+impl CompiledRegionClassification {
+    #[must_use]
+    pub const fn gpu_code(self) -> u32 {
+        match self {
+            Self::Panel => 0,
+            Self::Horizontal => 1,
+            Self::Vertical => 2,
+            Self::Unique => 3,
+            Self::Radial => 4,
+            Self::ContinuousXy => 5,
+        }
+    }
+
+    #[must_use]
+    pub const fn display_rgba8(self, compact_index: u32) -> [u8; 4] {
+        // Reserve one RGB high-bit octant for each semantic class, then use
+        // all 21 remaining bits for region identity. Multiplication by an odd
+        // constant is a bijection modulo 2^21, so compact IDs cannot collide
+        // within a class until it contains more than 2,097,152 regions.
+        let mixed = compact_index
+            .wrapping_mul(0x0015_a4e3)
+            .wrapping_add(0x0006_d2b5)
+            & 0x001f_ffff;
+        let class_high_bits = match self {
+            Self::Panel => [0x80, 0x80, 0x80],
+            Self::Horizontal => [0x80, 0x00, 0x00],
+            Self::Vertical => [0x00, 0x80, 0x00],
+            Self::Unique => [0x80, 0x80, 0x00],
+            Self::Radial => [0x00, 0x80, 0x80],
+            Self::ContinuousXy => [0x80, 0x00, 0x80],
+        };
+        [
+            class_high_bits[0] | (mixed & 0x7f) as u8,
+            class_high_bits[1] | ((mixed >> 7) & 0x7f) as u8,
+            class_high_bits[2] | ((mixed >> 14) & 0x7f) as u8,
+            255,
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CompiledTilePixelFormat {
     Rgba8UnormSrgb,
+    Rgba8UnormLinear,
+    R32Float,
     R32Uint,
 }
 
@@ -293,17 +420,123 @@ impl CompiledAtlasPlanV1 {
         map: hot_trimmer_domain::MaterialMapKind,
         shader_version: impl Into<String>,
     ) -> CompiledAtlasTileIdentity {
+        let pixel_format = match map {
+            hot_trimmer_domain::MaterialMapKind::BaseColor => {
+                CompiledTilePixelFormat::Rgba8UnormSrgb
+            }
+            hot_trimmer_domain::MaterialMapKind::Height
+            | hot_trimmer_domain::MaterialMapKind::Roughness
+            | hot_trimmer_domain::MaterialMapKind::Metallic
+            | hot_trimmer_domain::MaterialMapKind::AmbientOcclusion => {
+                CompiledTilePixelFormat::R32Float
+            }
+            hot_trimmer_domain::MaterialMapKind::RegionId => CompiledTilePixelFormat::R32Uint,
+            _ => CompiledTilePixelFormat::Rgba8UnormLinear,
+        };
+        let plan_hash = self
+            .pixel_plan_hash(map)
+            .unwrap_or_else(|_| self.final_plan_hash.clone());
         CompiledAtlasTileIdentity {
-            plan_hash: self.final_plan_hash.clone(),
+            plan_hash,
             map,
+            pixel_format,
             mip_level: self.tile_request.mip_level,
             output_rect: self.tile_request.output_rect,
             halo_px: self.tile_request.halo_px,
             valid_rect: self.tile_request.valid_rect,
             profile: self.preview_profile,
             shader_version: shader_version.into(),
+            structural_plan_id: self.structural_plan_id(),
+            scale_microunits: self.scale_microunits(),
+            normal_convention: (map == hot_trimmer_domain::MaterialMapKind::Normal)
+                .then_some(self.normal_convention),
             generation: self.tile_request.generation,
         }
+    }
+
+    pub fn pixel_plan_hash(
+        &self,
+        map: hot_trimmer_domain::MaterialMapKind,
+    ) -> Result<ContentDigest, CompiledAtlasPlanValidationError> {
+        let source_roles = pixel_source_roles(map);
+        let mut ordered_sources = self
+            .ordered_sources
+            .iter()
+            .filter(|source| source_roles.contains(&source.channel_role))
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in &mut ordered_sources {
+            let patch_id = self
+                .ordered_regions
+                .iter()
+                .find(|region| {
+                    region.source_set_id == source.source_set_id
+                        && region.source_id == source.source_id
+                })
+                .and_then(|region| region.patch_id);
+            source.source_id = stable_pixel_source_id(source.source_set_id, patch_id);
+        }
+        let mut ordered_regions = self.ordered_regions.clone();
+        for region in &mut ordered_regions {
+            let stable = stable_pixel_source_id(region.source_set_id, region.patch_id);
+            region.source_id = stable.clone();
+            region.sampling_plan.candidate.source_id = stable.clone();
+            region.sampling_plan.candidate.domain_id = stable.clone();
+            region.sampling_plan.candidate.correspondence_reference = stable;
+        }
+        let identity = CanonicalAtlasPixelPlanIdentity {
+            schema_version: self.schema_version,
+            algorithm_version: &self.algorithm_version,
+            topology_hash: &self.topology_hash,
+            output_size: &self.output_size,
+            preview_profile: self.preview_profile,
+            normal_convention: (map == hot_trimmer_domain::MaterialMapKind::Normal)
+                .then_some(self.normal_convention),
+            color_space_policy: self.color_space_policy,
+            tile_request: CanonicalAtlasPixelTileRequest {
+                kind: self.tile_request.kind,
+                output_rect: self.tile_request.output_rect,
+                mip_level: self.tile_request.mip_level,
+                halo_px: self.tile_request.halo_px,
+                valid_rect: self.tile_request.valid_rect,
+            },
+            ordered_sources,
+            ordered_regions,
+        };
+        Ok(ContentDigest::sha256(&serde_json::to_vec(&identity)?))
+    }
+
+    #[must_use]
+    pub fn structural_plan_id(&self) -> ContentDigest {
+        let payload = self
+            .ordered_regions
+            .iter()
+            .map(|region| {
+                format!(
+                    "{}:{:?}:{:?}:{:?}:{}x{};",
+                    region.region_id,
+                    region.structural_profile,
+                    region.continuity,
+                    region.edge_eligibility,
+                    region.destination_rect.0.width,
+                    region.destination_rect.0.height
+                )
+            })
+            .collect::<String>();
+        ContentDigest::sha256(payload.as_bytes())
+    }
+
+    #[must_use]
+    pub fn scale_microunits(&self) -> u64 {
+        self.ordered_regions
+            .iter()
+            .map(|region| {
+                (region.sampling_plan.source_pixels_per_physical_unit * 1_000_000.0)
+                    .round()
+                    .max(0.0) as u64
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     #[must_use]
@@ -313,6 +546,15 @@ impl CompiledAtlasPlanV1 {
             .map(|region| CompiledCompactRegionIdLookup {
                 compact_index: region.compact_index,
                 region_id: region.region_id,
+                role: region.region_role,
+                continuity: region.continuity,
+                sampling: region.sampling,
+                edge_eligibility: region.edge_eligibility,
+                structural_profile: region.structural_profile,
+                classification: region.region_classification(),
+                display_rgba8: region
+                    .region_classification()
+                    .display_rgba8(region.compact_index),
             })
             .collect()
     }
@@ -343,7 +585,11 @@ impl CompiledAtlasPlanV1 {
             }
         }
 
-        validate_output_rect(self.tile_request.output_rect, self.output_size, "tile output")?;
+        validate_output_rect(
+            self.tile_request.output_rect,
+            self.output_size,
+            "tile output",
+        )?;
         validate_output_rect(self.tile_request.valid_rect, self.output_size, "tile valid")?;
         let tile = self.tile_request.output_rect.0;
         let valid = self.tile_request.valid_rect.0;
@@ -362,7 +608,9 @@ impl CompiledAtlasPlanV1 {
                     previous_region_id: region.region_id,
                 });
             }
-            if let Some(previous) = seen_compact_indices.insert(region.compact_index, region.region_id) {
+            if let Some(previous) =
+                seen_compact_indices.insert(region.compact_index, region.region_id)
+            {
                 return Err(CompiledAtlasPlanValidationError::DuplicateCompactIndex {
                     compact_index: region.compact_index,
                     region_id: region.region_id,
@@ -388,7 +636,9 @@ impl CompiledAtlasPlanV1 {
         Ok(())
     }
 
-    fn identity_payload(&self) -> Result<CanonicalAtlasPlanIdentity<'_>, CompiledAtlasPlanValidationError> {
+    fn identity_payload(
+        &self,
+    ) -> Result<CanonicalAtlasPlanIdentity<'_>, CompiledAtlasPlanValidationError> {
         Ok(CanonicalAtlasPlanIdentity {
             schema_version: self.schema_version,
             algorithm_version: &self.algorithm_version,
@@ -415,7 +665,8 @@ impl CompiledAtlasPlanV1 {
     pub fn finalize(mut self) -> Result<Self, CompiledAtlasPlanValidationError> {
         self.validate()?;
         let computed = self.identity_hash()?;
-        if self.final_plan_hash == ContentDigest(String::new()) || self.final_plan_hash.0.is_empty() {
+        if self.final_plan_hash == ContentDigest(String::new()) || self.final_plan_hash.0.is_empty()
+        {
             self.final_plan_hash = computed;
             return Ok(self);
         }
@@ -502,10 +753,12 @@ fn validate_region(
         });
     }
     if region.radial_parameters.is_some() && !matches!(region.sampling, RegionSampling::OneShot) {
-        return Err(CompiledAtlasPlanValidationError::UnsupportedBindingSamplingPair {
-            region_id: region.region_id,
-            sampling: region.sampling,
-        });
+        return Err(
+            CompiledAtlasPlanValidationError::UnsupportedBindingSamplingPair {
+                region_id: region.region_id,
+                sampling: region.sampling,
+            },
+        );
     }
 
     if !region
@@ -513,7 +766,10 @@ fn validate_region(
         .scale
         .iter()
         .all(|value| value.is_finite())
-        || !region.source_to_region_transform.rotation_degrees.is_finite()
+        || !region
+            .source_to_region_transform
+            .rotation_degrees
+            .is_finite()
         || !region
             .source_to_region_transform
             .offset
@@ -534,15 +790,20 @@ fn validate_region(
             && radial.blend_width.is_finite()
             && radial.seam_blend_width.is_finite())
     {
-        return Err(CompiledAtlasPlanValidationError::NonFiniteRadialParameters {
-            region_id: region.region_id,
-        });
+        return Err(
+            CompiledAtlasPlanValidationError::NonFiniteRadialParameters {
+                region_id: region.region_id,
+            },
+        );
     }
 
     let crop = region.source_crop.0;
     let crop_right = checked_add_u32(crop.x, crop.width, region.region_id, "source_crop.right")?;
     let crop_bottom = checked_add_u32(crop.y, crop.height, region.region_id, "source_crop.bottom")?;
-    if crop.width == 0 || crop.height == 0 || crop_right > source.oriented_dimensions.width || crop_bottom > source.oriented_dimensions.height
+    if crop.width == 0
+        || crop.height == 0
+        || crop_right > source.oriented_dimensions.width
+        || crop_bottom > source.oriented_dimensions.height
     {
         return Err(CompiledAtlasPlanValidationError::SourceCropOutOfBounds {
             region_id: region.region_id,
@@ -553,10 +814,18 @@ fn validate_region(
     }
 
     let destination = region.destination_rect.0;
-    let destination_right =
-        checked_add_u32(destination.x, destination.width, region.region_id, "destination.right")?;
-    let destination_bottom =
-        checked_add_u32(destination.y, destination.height, region.region_id, "destination.bottom")?;
+    let destination_right = checked_add_u32(
+        destination.x,
+        destination.width,
+        region.region_id,
+        "destination.right",
+    )?;
+    let destination_bottom = checked_add_u32(
+        destination.y,
+        destination.height,
+        region.region_id,
+        "destination.bottom",
+    )?;
     if destination.width == 0
         || destination.height == 0
         || destination_right > output_size.width
@@ -590,6 +859,7 @@ pub struct CompiledSourceCommandV1 {
 pub struct CompiledRegionCommandV1 {
     pub region_id: RegionId,
     pub compact_index: u32,
+    pub region_role: ManualRegionRole,
     pub source_set_id: SourceSetId,
     pub source_id: ContentDigest,
     pub patch_id: Option<PatchId>,
@@ -598,6 +868,7 @@ pub struct CompiledRegionCommandV1 {
     pub sampling: RegionSampling,
     pub source_to_region_transform: MappingTransform,
     pub radial_parameters: Option<RadialMappingSettings>,
+    pub structural_profile: StructuralProfile,
     pub continuity: RegionContinuity,
     pub padding_px: u32,
     pub edge_eligibility: EdgeEligibility,
@@ -605,4 +876,26 @@ pub struct CompiledRegionCommandV1 {
     /// later GPU parity implementations. It is compiled before pixel execution.
     pub sampling_plan: SamplingPlan,
     pub render_cache_key: ContentDigest,
+}
+
+impl CompiledRegionCommandV1 {
+    #[must_use]
+    pub const fn region_classification(&self) -> CompiledRegionClassification {
+        match self.region_role {
+            ManualRegionRole::Radial => CompiledRegionClassification::Radial,
+            ManualRegionRole::Unique => CompiledRegionClassification::Unique,
+            _ => match self.continuity {
+                RegionContinuity::X => CompiledRegionClassification::Horizontal,
+                RegionContinuity::Y => CompiledRegionClassification::Vertical,
+                RegionContinuity::Xy => CompiledRegionClassification::ContinuousXy,
+                RegionContinuity::None => match self.region_role {
+                    ManualRegionRole::HorizontalStrip => CompiledRegionClassification::Horizontal,
+                    ManualRegionRole::VerticalStrip => CompiledRegionClassification::Vertical,
+                    ManualRegionRole::Panel => CompiledRegionClassification::Panel,
+                    ManualRegionRole::Unique => CompiledRegionClassification::Unique,
+                    ManualRegionRole::Radial => CompiledRegionClassification::Radial,
+                },
+            },
+        }
+    }
 }

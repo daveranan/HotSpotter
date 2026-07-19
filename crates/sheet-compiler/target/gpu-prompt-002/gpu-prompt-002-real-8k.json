@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "buildProfile": "release",
+  "commit": "35b2aaddd0a3b92ec4e04bd0c8d4df8e105842fc",
+  "worktreeDirty": true,
+  "os": "Windows 10 Home",
+  "cpu": "AMD Ryzen 9 5900XT 16-Core Processor           ",
+  "logicalThreads": 32,
+  "physicalThreads": 16,
+  "ramBytes": 51444936704,
+  "gpuVramBytes": 25769803776,
+  "peakObservedRssBytes": 4637880320,
+  "gpuCapability": "gpu_capability_generation=1; adapter=NVIDIA GeForce RTX 3090; backend=Vulkan; driver=NVIDIA; driver_info=610.74; max_texture_2d=32768; tile_recommendation=2048; timestamp_queries=true; clear_texture=true; row_alignment=256; formats=Rgba8Unorm:sampled=true,storage=true|Rgba8UnormSrgb:sampled=true,storage=false|R16Float:sampled=true,storage=true|R32Float:sampled=true,storage=true|R32Uint:sampled=true,storage=true",
+  "sourceCount": 1,
+  "sourceFormat": "PNG/RGBA8",
+  "sourceDimensions": [
+    7952,
+    4016
+  ],
+  "decodedBytes": 127740928,
+  "sourceGenerationEncodeMs": 98,
+  "regionCount": 64,
+  "patchCount": 0,
+  "requestedMaps": [
+    "BaseColor",
+    "Height",
+    "Normal",
+    "Roughness",
+    "Metallic",
+    "AmbientOcclusion",
+    "RegionId"
+  ],
+  "outputDimensions": [
+    8192,
+    8192
+  ],
+  "profile": "Authoritative",
+  "snapshotMs": 3,
+  "uploadBytes": 0,
+  "uiPaintStatus": "not available in the headless release harness; capture separately in the native UI trace",
+  "runs": [
+    {
+      "label": "cold",
+      "completed": true,
+      "elapsedMs": 8200,
+      "error": null,
+      "telemetry": [
+        "executor=gpu; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; requested_maps=[BaseColor, Height, Normal, Roughness, Metallic, AmbientOcclusion, RegionId]; executed_gpu_passes=map-set; dependency_cache=enabled",
+        "executor=gpu; backend=Vulkan; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; requested_map=Normal; logical_passes=registered-source,hotspot-profile,structural-height,material-height,final-height,normal,publish; executed_gpu_passes=height-r32float,normal-from-final-height; dependency=Normal<-Height; intermediate_cache=final-height:live-gpu-hit; normal_publish=from-r32float-gpu-final-height; source_cache_hits=0; pipeline_cache_hits=0; upload_bytes=127740928; upload_ms=2750; command_count=128; command_bytes=19968; pipeline_ms=2; dispatch_ms=0; readback_bytes=536870912; readback_ms=328; render_ms=3493",
+        "executor=gpu; dependency=Normal<-Height; final_height_publication=R32Float; intermediate_cache=final-height:live-gpu-readback",
+        "executor=gpu; backend=Vulkan; plan_hash=d6e68902c87043602375a1a50df045f3cfa1f6d6ea4d0b3f81d8b9587895cf3b; requested_map=BaseColor; logical_passes=registered-source,publish; executed_gpu_passes=material-publish; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits=1; pipeline_cache_hits=0; upload_bytes=0; upload_ms=0; command_count=64; command_bytes=9984; pipeline_ms=2; dispatch_ms=0; readback_bytes=268435456; readback_ms=163; tile_nontransparent=66883880; tile_nonzero_rgb=66883880; composition_ms=0; render_ms=173",
+        "executor=gpu; backend=Vulkan; plan_hash=fb479a2513d7bf7fb7ea266c003a120bcb79a65e6e49d4e19f601e36f33f2ff5; requested_map=Roughness; logical_passes=registered-source,hotspot-profile,structural-height,roughness,publish; executed_gpu_passes=material-r32float-publish; pixel_format=R32Float; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits=1; pipeline_cache_hits=1; upload_bytes=0; upload_ms=0; command_count=64; command_bytes=9984; pipeline_ms=0; dispatch_ms=0; readback_bytes=268435456; readback_ms=168; tile_nontransparent=67108864; tile_nonzero_rgb=66883880; composition_ms=0; render_ms=203",
+        "executor=gpu; backend=Vulkan; plan_hash=93b6c66ea860786e925f6f833a16225734195f6efe57c7cdd7a8eb0a534f7c31; requested_map=Metallic; logical_passes=registered-source,metallic,publish; executed_gpu_passes=material-r32float-publish; pixel_format=R32Float; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits=1; pipeline_cache_hits=1; upload_bytes=0; upload_ms=0; command_count=64; command_bytes=9984; pipeline_ms=0; dispatch_ms=0; readback_bytes=268435456; readback_ms=195; tile_nontransparent=67108864; tile_nonzero_rgb=0; composition_ms=0; render_ms=235",
+        "executor=gpu; backend=Vulkan; plan_hash=7b02b8e7d63fa1861eeec13d7501b7883e0f90e264239bf06d202c6f9a1e71e0; requested_map=AmbientOcclusion; logical_passes=hotspot-profile,structural-height,ao,publish; executed_gpu_passes=material-r32float-publish; pixel_format=R32Float; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits=1; pipeline_cache_hits=1; upload_bytes=0; upload_ms=0; command_count=64; command_bytes=9984; pipeline_ms=0; dispatch_ms=0; readback_bytes=268435456; readback_ms=180; tile_nontransparent=67108864; tile_nonzero_rgb=66883880; composition_ms=0; render_ms=219",
+        "executor=gpu; backend=Vulkan; plan_hash=5090f6ed3e4e65409c95c3e9145deca95af7e7261ba089e74833ba364d532a8e; requested_map=RegionId; logical_passes=compact-region-id,publish; executed_gpu_passes=compact-region-id-r32uint; pixel_format=R32Uint; final_tile_cache=miss; pipeline_cache_hits=0; pipeline_ms=0; command_count=64; command_bytes=9984; dispatch_ms=0; readback_bytes=268435456; readback_ms=173; tile_nontransparent=67108864; tile_nonzero_rgb=66060288; render_ms=211",
+        "executor=gpu; dependency=Normal<-Height; intermediate_cache=final-height:live-gpu-hit",
+        "profile=Authoritative; source=7952x4016; oriented=7952x4016; output=8192x8192; output_padding_px=0; preview_padding_px=0; regions=64; patches=0; maps=BaseColor|Height|Normal|Roughness|Metallic|AmbientOcclusion|RegionId; stage3-8=bypassed; decode_cache=miss; decode_count=1; decode_ms=3446; plan_ms=1; executor=gpu; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; render_ms=4540; render_cache_hits=0; render_cache_misses=0; composed_cache=miss; compose_executor=gpu-direct; compose_ms=0; cpu_stage14_calls=0; cpu_atlas_composition_calls=0; allocated_bytes=536870912; decode_full_frame_allocations=1; elapsed_ms=8198"
+      ],
+      "encodeMs": 112,
+      "ipcPreparationMs": 1,
+      "ipcPayloadBytes": 1982024,
+      "uiPaintMs": null
+    },
+    {
+      "label": "warm-1",
+      "completed": true,
+      "elapsedMs": 647,
+      "error": null,
+      "telemetry": [
+        "executor=gpu; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; requested_maps=[BaseColor, Height, Normal, Roughness, Metallic, AmbientOcclusion, RegionId]; executed_gpu_passes=map-set; dependency_cache=enabled",
+        "executor=gpu; backend=Vulkan; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; requested_map=Normal; logical_passes=registered-source,hotspot-profile,structural-height,material-height,final-height,normal,publish; executed_gpu_passes=height-r32float,normal-from-final-height; dependency=Normal<-Height; intermediate_cache=final-height:live-gpu-hit; normal_publish=from-r32float-gpu-final-height; source_cache_hits=1; pipeline_cache_hits=3; upload_bytes=0; upload_ms=0; command_count=128; command_bytes=19968; pipeline_ms=0; dispatch_ms=0; readback_bytes=536870912; readback_ms=335; render_ms=378",
+        "executor=gpu; dependency=Normal<-Height; final_height_publication=R32Float; intermediate_cache=final-height:live-gpu-readback",
+        "executor=gpu; plan_hash=d6e68902c87043602375a1a50df045f3cfa1f6d6ea4d0b3f81d8b9587895cf3b; requested_map=BaseColor; logical_passes=registered-source,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=66883880; tile_nonzero_rgb=66883880",
+        "executor=gpu; plan_hash=fb479a2513d7bf7fb7ea266c003a120bcb79a65e6e49d4e19f601e36f33f2ff5; requested_map=Roughness; logical_passes=registered-source,hotspot-profile,structural-height,roughness,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=66883880",
+        "executor=gpu; plan_hash=93b6c66ea860786e925f6f833a16225734195f6efe57c7cdd7a8eb0a534f7c31; requested_map=Metallic; logical_passes=registered-source,metallic,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=0",
+        "executor=gpu; plan_hash=7b02b8e7d63fa1861eeec13d7501b7883e0f90e264239bf06d202c6f9a1e71e0; requested_map=AmbientOcclusion; logical_passes=hotspot-profile,structural-height,ao,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=66883880",
+        "executor=gpu; plan_hash=5090f6ed3e4e65409c95c3e9145deca95af7e7261ba089e74833ba364d532a8e; requested_map=RegionId; logical_passes=compact-region-id,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=66060288",
+        "executor=gpu; dependency=Normal<-Height; intermediate_cache=final-height:live-gpu-hit",
+        "profile=Authoritative; source=7952x4016; oriented=7952x4016; output=8192x8192; output_padding_px=0; preview_padding_px=0; regions=64; patches=0; maps=BaseColor|Height|Normal|Roughness|Metallic|AmbientOcclusion|RegionId; stage3-8=bypassed; decode_cache=hit; decode_count=0; decode_ms=0; plan_ms=0; executor=gpu; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; render_ms=385; render_cache_hits=0; render_cache_misses=0; composed_cache=miss; compose_executor=gpu-direct; compose_ms=0; cpu_stage14_calls=0; cpu_atlas_composition_calls=0; allocated_bytes=536870912; decode_full_frame_allocations=0; elapsed_ms=646"
+      ],
+      "encodeMs": 117,
+      "ipcPreparationMs": 0,
+      "ipcPayloadBytes": 1982024,
+      "uiPaintMs": null
+    },
+    {
+      "label": "warm-2",
+      "completed": true,
+      "elapsedMs": 772,
+      "error": null,
+      "telemetry": [
+        "executor=gpu; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; requested_maps=[BaseColor, Height, Normal, Roughness, Metallic, AmbientOcclusion, RegionId]; executed_gpu_passes=map-set; dependency_cache=enabled",
+        "executor=gpu; backend=Vulkan; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; requested_map=Normal; logical_passes=registered-source,hotspot-profile,structural-height,material-height,final-height,normal,publish; executed_gpu_passes=height-r32float,normal-from-final-height; dependency=Normal<-Height; intermediate_cache=final-height:live-gpu-hit; normal_publish=from-r32float-gpu-final-height; source_cache_hits=1; pipeline_cache_hits=3; upload_bytes=0; upload_ms=0; command_count=128; command_bytes=19968; pipeline_ms=0; dispatch_ms=0; readback_bytes=536870912; readback_ms=426; render_ms=481",
+        "executor=gpu; dependency=Normal<-Height; final_height_publication=R32Float; intermediate_cache=final-height:live-gpu-readback",
+        "executor=gpu; plan_hash=d6e68902c87043602375a1a50df045f3cfa1f6d6ea4d0b3f81d8b9587895cf3b; requested_map=BaseColor; logical_passes=registered-source,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=66883880; tile_nonzero_rgb=66883880",
+        "executor=gpu; plan_hash=fb479a2513d7bf7fb7ea266c003a120bcb79a65e6e49d4e19f601e36f33f2ff5; requested_map=Roughness; logical_passes=registered-source,hotspot-profile,structural-height,roughness,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=66883880",
+        "executor=gpu; plan_hash=93b6c66ea860786e925f6f833a16225734195f6efe57c7cdd7a8eb0a534f7c31; requested_map=Metallic; logical_passes=registered-source,metallic,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=0",
+        "executor=gpu; plan_hash=7b02b8e7d63fa1861eeec13d7501b7883e0f90e264239bf06d202c6f9a1e71e0; requested_map=AmbientOcclusion; logical_passes=hotspot-profile,structural-height,ao,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=66883880",
+        "executor=gpu; plan_hash=5090f6ed3e4e65409c95c3e9145deca95af7e7261ba089e74833ba364d532a8e; requested_map=RegionId; logical_passes=compact-region-id,publish; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent=67108864; tile_nonzero_rgb=66060288",
+        "executor=gpu; dependency=Normal<-Height; intermediate_cache=final-height:live-gpu-hit",
+        "profile=Authoritative; source=7952x4016; oriented=7952x4016; output=8192x8192; output_padding_px=0; preview_padding_px=0; regions=64; patches=0; maps=BaseColor|Height|Normal|Roughness|Metallic|AmbientOcclusion|RegionId; stage3-8=bypassed; decode_cache=hit; decode_count=0; decode_ms=0; plan_ms=1; executor=gpu; plan_hash=a5ad9c0a3763df84cb0a629e89197275eacf397ea0a48a07d7e022a490d1acb3; render_ms=489; render_cache_hits=0; render_cache_misses=0; composed_cache=miss; compose_executor=gpu-direct; compose_ms=0; cpu_stage14_calls=0; cpu_atlas_composition_calls=0; allocated_bytes=536870912; decode_full_frame_allocations=0; elapsed_ms=769"
+      ],
+      "encodeMs": 112,
+      "ipcPreparationMs": 0,
+      "ipcPayloadBytes": 1982024,
+      "uiPaintMs": null
+    }
+  ]
+}

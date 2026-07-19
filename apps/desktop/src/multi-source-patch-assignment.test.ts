@@ -111,8 +111,8 @@ test("resizing an assigned patch keeps the old sheet until selected preview qual
   assert.match(resize, /assignedToRegion/);
   assert.match(resize, /binding\.content\.type === "patch" && binding\.content\.id === patchId/);
   assert.doesNotMatch(resize, /requestPreview\(undefined, undefined, "draft512", revision, false\)/);
-  assert.match(resize, /requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false\)/);
-  assert.match(resize, /lastAutomaticPreviewKey\.current = automaticPreviewKey\(revision, interactivePreviewProfile\)/);
+  assert.match(resize, /requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false, true\)/);
+  assert.match(resize, /pendingAutomaticPreviewKey\.current = automaticPreviewKey\(revision, interactivePreviewProfile, mapView\)/);
 });
 
 test("solid content, replacement preflight, library metadata, and diagnostics are product connected", () => {

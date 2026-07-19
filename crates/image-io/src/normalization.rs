@@ -21,6 +21,10 @@ pub const DEFAULT_MAX_PYRAMID_BYTES: u64 = 1_073_741_824;
 /// squared length is `3 / 255^2`, so the validity floor must sit above that
 /// quantization artifact rather than merely above floating-point zero.
 pub const MIN_NORMAL_LENGTH_SQUARED: f32 = 1.0e-4;
+/// A normal map may contain an isolated quantization/export artifact without making the
+/// complete registered channel unusable. More than one invalid vector per 65,536 texels
+/// remains a hard error, and an entirely invalid map is always rejected.
+const MAX_REPAIRABLE_INVALID_NORMAL_DENOMINATOR: u64 = 65_536;
 
 // Conservative accounting constants. The tile allowance covers the tile value,
 // inner Vec, outer Vec growth, and alignment even when tile_edge is one pixel.
@@ -278,6 +282,7 @@ impl Default for NormalizationSettings {
 pub enum NormalizationDiagnostic {
     EmbeddedIccConverted,
     MissingIccAssumedSrgb,
+    RepairedInvalidNormalVectors { samples: u64 },
     AlphaModeResolved(ResolvedAlphaMode),
     ClippedHighlights { samples: u64 },
     CrushedShadows { samples: u64 },
@@ -543,7 +548,9 @@ fn decode_channel(
     };
     match channel.registration.role {
         MaterialChannelRole::BaseColor => decode_base_color(decoded, settings, cancellation, diagnostics),
-        MaterialChannelRole::Normal => decode_normal(channel, decoded.image, settings, cancellation),
+        MaterialChannelRole::Normal => {
+            decode_normal(channel, decoded.image, settings, cancellation, diagnostics)
+        }
         MaterialChannelRole::MaterialId => decode_ids(decoded.image, settings, cancellation),
         MaterialChannelRole::Opacity | MaterialChannelRole::EdgeMask => {
             decode_mask(channel.registration.role, decoded.image, settings, cancellation)
@@ -640,7 +647,13 @@ fn decode_ids(image: DynamicImage, settings: &NormalizationSettings, cancellatio
     Ok(PreparedChannel::MaterialId { pyramid: id_pyramid(level0, settings.max_levels, cancellation)? })
 }
 
-fn decode_normal(channel: &RegisteredChannel, image: DynamicImage, settings: &NormalizationSettings, cancellation: &CancellationToken) -> Result<PreparedChannel, NormalizationError> {
+fn decode_normal(
+    channel: &RegisteredChannel,
+    image: DynamicImage,
+    settings: &NormalizationSettings,
+    cancellation: &CancellationToken,
+    diagnostics: &mut Vec<NormalizationDiagnostic>,
+) -> Result<PreparedChannel, NormalizationError> {
     let convention = match channel.registration.normal_convention {
         NormalConvention::OpenGl => NormalConvention::OpenGl,
         NormalConvention::DirectX => NormalConvention::DirectX,
@@ -662,7 +675,17 @@ fn decode_normal(channel: &RegisteredChannel, image: DynamicImage, settings: &No
         };
         TangentNormal { xyz, alpha }
     })?;
-    if invalid > 0 { return Err(NormalizationError::InvalidNormalVectors { count: invalid }); }
+    let texel_count = u64::from(rgba.width()).saturating_mul(u64::from(rgba.height()));
+    if invalid > 0 {
+        let repairable = invalid < texel_count
+            && invalid.saturating_mul(MAX_REPAIRABLE_INVALID_NORMAL_DENOMINATOR) <= texel_count;
+        if !repairable {
+            return Err(NormalizationError::InvalidNormalVectors { count: invalid });
+        }
+        diagnostics.push(NormalizationDiagnostic::RepairedInvalidNormalVectors {
+            samples: invalid,
+        });
+    }
     let pyramid = normal_pyramid(level0, settings.max_levels, cancellation)?;
     Ok(PreparedChannel::Normal { pyramid, source_convention: convention, canonical_convention: NormalConvention::OpenGl, alpha_policy: settings.decode_policy.normal_alpha })
 }
@@ -904,5 +927,51 @@ mod tests {
         bytes.insert(channels[2].source_id, malformed);
         let malformed_set = RegisteredChannelSet { channels, ..set };
         assert!(matches!(prepare_registered_channel_set(&malformed_set, &bytes, &NormalizationSettings::default(), &CancellationToken::new()), Err(NormalizationError::InvalidNormalVectors { .. })));
+
+        let mut isolated_pixels = vec![[128, 64, 255, 255]; 256 * 256];
+        isolated_pixels[0] = [128, 128, 128, 255];
+        let isolated = png(isolated_pixels, 256, 256);
+        let isolated_base = png(vec![[128, 128, 128, 255]; 256 * 256], 256, 256);
+        let isolated_base_channel = registered(
+            MaterialChannelRole::BaseColor,
+            &isolated_base,
+            256,
+            256,
+            NormalConvention::NotApplicable,
+        );
+        let isolated_channel = registered(
+            MaterialChannelRole::Normal,
+            &isolated,
+            256,
+            256,
+            NormalConvention::OpenGl,
+        );
+        let isolated_set = RegisteredChannelSet {
+            oriented_size: OrientedPixelSize {
+                width: 256,
+                height: 256,
+            },
+            orientation: 1,
+            channels: vec![isolated_base_channel.clone(), isolated_channel.clone()],
+        };
+        let isolated_bytes = BTreeMap::from([
+            (isolated_base_channel.source_id, isolated_base),
+            (isolated_channel.source_id, isolated),
+        ]);
+        let repaired = prepare_registered_channel_set(
+            &isolated_set,
+            &isolated_bytes,
+            &NormalizationSettings::default(),
+            &CancellationToken::new(),
+        )
+        .expect("one isolated invalid normal texel should be repaired deterministically");
+        assert!(repaired.report.diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            NormalizationDiagnostic::RepairedInvalidNormalVectors { samples: 1 }
+        )));
+        let PreparedChannel::Normal { pyramid, .. } = &repaired.channels[1] else {
+            panic!("isolated Normal fixture must remain typed Normal data")
+        };
+        assert_eq!(pyramid.level(0).unwrap().pixel(0, 0).xyz, [0.0, 0.0, 1.0]);
     }
 }

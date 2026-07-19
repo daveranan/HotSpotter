@@ -1870,6 +1870,7 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "thiserror 2.0.18",
  "uuid",

@@ -484,6 +484,8 @@ export interface IntermediateAtlasProjection {
   placementPlanId: string;
   maps: Partial<Record<CompiledMapView, string>>;
   tileManifest: GpuTiledPreviewPublication;
+  tileManifests?: Partial<Record<CompiledMapView, GpuTiledPreviewPublication>>;
+  regionIdLookup: readonly RegionIdLookupEntry[];
   regions: readonly ResolvedRegion[];
   unavailableChannels: readonly string[];
   slots: readonly Stage14SlotProjection[];
@@ -493,6 +495,31 @@ export interface IntermediateAtlasProjection {
   exportAvailable: false;
   blenderAvailable: false;
   sourceFrame?: SourceFrame;
+}
+
+export interface RegionIdLookupEntry {
+  compactIndex: number;
+  regionId: string;
+  role: ManualRegionRole;
+  continuity: RegionContinuity;
+  sampling: RegionSampling;
+  edgeEligibility: EdgeEligibility;
+  structuralProfile:
+    | "flat"
+    | "bevel"
+    | "groove"
+    | "roundedBevel"
+    | "panelFrame"
+    | "radialDisc"
+    | "annulus";
+  classification:
+    | "panel"
+    | "horizontal"
+    | "vertical"
+    | "unique"
+    | "radial"
+    | "continuousXy";
+  displayRgba8: readonly [number, number, number, number];
 }
 
 /** Preview work profile; this changes requested output work only, never SourceFrame ownership. */
@@ -511,6 +538,16 @@ export type SourceFramePreviewViewIntent =
   | "exactViewport"
   | "exactSelectedRegion";
 
+export type SourceFramePreviewMaterialMap =
+  | "base_color"
+  | "normal"
+  | "height"
+  | "roughness"
+  | "metallic"
+  | "ambient_occlusion"
+  | "region_id"
+  | "material_id";
+
 export interface Stage14PreviewRequest {
   protocolVersion: number;
   revision: number;
@@ -520,6 +557,7 @@ export interface Stage14PreviewRequest {
   inputHash?: string;
   profile?: SourceFramePreviewProfile;
   viewIntent?: SourceFramePreviewViewIntent;
+  requestedMaps?: readonly SourceFramePreviewMaterialMap[];
   /** Exact output-atlas coordinates, used only by `exactViewport`. */
   viewportRect?: PixelBounds;
 }
@@ -545,7 +583,7 @@ export interface GpuTiledPreviewManifest {
   validRect: PixelBounds;
   haloPx: number;
   generation: number;
-  pixelFormat: "rgba8UnormSrgb" | "r32Uint";
+  pixelFormat: "rgba8UnormSrgb" | "rgba8UnormLinear" | "r32Float" | "r32Uint";
   width: number;
   height: number;
   rowStride: number;

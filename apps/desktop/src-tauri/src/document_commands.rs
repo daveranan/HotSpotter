@@ -16,12 +16,12 @@ use hot_trimmer_domain::{
     AuthoredLayoutPreset, CancellationToken as EngineCancellationToken, ChannelRegistration,
     CompilerRequestHeader, ContentDigest, ContentReference, DelightingIntent, ErrorCode,
     FoundationStatusRequest, IPC_PROTOCOL_VERSION, MaterialBehaviorClass,
-    MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole, MaterialMapKind,
-    MaterialClassificationCommand, MaterialClassificationIntent, NormalConvention,
+    MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole,
+    MaterialClassificationCommand, MaterialClassificationIntent, MaterialMapKind, NormalConvention,
     OrientedPixelSize, OriginalAssetProvenance, OutputSpecHeader, PartitionRecipe, PatchCommand,
-    PatchGeometry, PatchId, Projection, RegionId, RegisteredChannel, RegisteredChannelSet,
-    PixelBounds, SourceId, SourceOwnershipIntent, SourceSetId, TrimSheetDocument, TrimSheetDocumentCommand,
-    UserFacingError,
+    PatchGeometry, PatchId, PixelBounds, Projection, RegionId, RegisteredChannel,
+    RegisteredChannelSet, SourceId, SourceOwnershipIntent, SourceSetId, TrimSheetDocument,
+    TrimSheetDocumentCommand, UserFacingError,
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, NormalizationSettings,
@@ -42,8 +42,7 @@ use hot_trimmer_render_core::{
     RenderCancellationToken, prepare_registered_exemplar,
 };
 use hot_trimmer_sheet_compiler::{
-    AlgorithmCompiler, CompiledAtlasPreviewProfile, CompiledAtlasTileIdentity,
-    CompiledAtlasTileManifest, CompiledMapSet, CompiledTilePixelFormat, GpuAtlasTileCache,
+    AlgorithmCompiler, CompiledAtlasTileManifest, CompiledMapSet, GpuAtlasTileCache,
     OutputPixelRect, PreviewMapKind, ResolvedRegion,
 };
 use image::{
@@ -606,6 +605,8 @@ pub struct Stage14PreviewRequest {
     view_intent: Option<PreviewViewIntent>,
     #[serde(default)]
     viewport_rect: Option<PixelBounds>,
+    #[serde(default)]
+    requested_maps: Vec<MaterialMapKind>,
     /// A transient candidate is compiled by the same persisted spine against a cloned summary.
     /// It is never stored until the matching AcceptSourceFramePartition command is issued.
     #[serde(default)]
@@ -625,18 +626,63 @@ fn compiled_view_intent(
     request: &Stage14PreviewRequest,
 ) -> Result<Option<hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent>, UserFacingError> {
     let rect = |value: Option<PixelBounds>, label: &str| {
-        value.map(OutputPixelRect).ok_or_else(|| error(ErrorCode::InvalidInput, &format!("{label} requires an exact output rectangle.")))
+        value.map(OutputPixelRect).ok_or_else(|| {
+            error(
+                ErrorCode::InvalidInput,
+                &format!("{label} requires an exact output rectangle."),
+            )
+        })
     };
+    let maps = request.requested_maps.clone();
+    let has_maps = !maps.is_empty();
     match request.view_intent {
+        None if has_maps => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::MaterialMaps(maps),
+        )),
         None => Ok(None),
-        Some(PreviewViewIntent::CompleteDraft512) => Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::CompleteDraft512)),
-        Some(PreviewViewIntent::CompleteRefinement1024) => Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::CompleteRefinement1024)),
-        Some(PreviewViewIntent::ExactViewport) => Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewport(rect(request.viewport_rect, "Exact viewport")?))),
+        Some(PreviewViewIntent::CompleteDraft512) if has_maps => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::MaterialMaps(maps),
+        )),
+        Some(PreviewViewIntent::CompleteDraft512) => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::CompleteDraft512,
+        )),
+        Some(PreviewViewIntent::CompleteRefinement1024) if has_maps => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::MaterialMaps(maps),
+        )),
+        Some(PreviewViewIntent::CompleteRefinement1024) => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::CompleteRefinement1024,
+        )),
+        Some(PreviewViewIntent::ExactViewport) if has_maps => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewportMaterialMaps {
+                rect: rect(request.viewport_rect, "Exact viewport")?,
+                maps,
+            },
+        )),
+        Some(PreviewViewIntent::ExactViewport) => Ok(Some(
+            hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewport(rect(
+                request.viewport_rect,
+                "Exact viewport",
+            )?),
+        )),
         Some(PreviewViewIntent::ExactSelectedRegion) => {
             let Some(region_id) = request.region_id else {
-                return Err(error(ErrorCode::InvalidInput, "Exact selected-region preview requires a selected region."));
+                return Err(error(
+                    ErrorCode::InvalidInput,
+                    "Exact selected-region preview requires a selected region.",
+                ));
             };
-            Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactSelectedRegion(region_id)))
+            if has_maps {
+                Ok(Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactSelectedRegionMaterialMaps {
+                    region_id,
+                    maps,
+                }))
+            } else {
+                Ok(Some(
+                    hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactSelectedRegion(
+                        region_id,
+                    ),
+                ))
+            }
         }
     }
 }
@@ -721,6 +767,8 @@ pub struct IntermediateAtlasProjection {
     placement_plan_id: String,
     maps: BTreeMap<String, String>,
     tile_manifest: GpuTiledPreviewPublication,
+    tile_manifests: BTreeMap<String, GpuTiledPreviewPublication>,
+    region_id_lookup: Vec<hot_trimmer_sheet_compiler::CompiledCompactRegionIdLookup>,
     regions: Vec<ResolvedRegion>,
     unavailable_channels: Vec<String>,
     slots: Vec<Stage14SlotProjection>,
@@ -1629,7 +1677,12 @@ pub fn get_gpu_tiled_preview_payload(
         .resolve(&request.opaque_handle)
         .filter(|tile| tile.manifest.generation == request.generation)
         .map(|tile| tile.pixels().to_vec())
-        .ok_or_else(|| error(ErrorCode::InvalidInput, "The preview tile handle is unavailable."))?;
+        .ok_or_else(|| {
+            error(
+                ErrorCode::InvalidInput,
+                "The preview tile handle is unavailable.",
+            )
+        })?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -1646,7 +1699,10 @@ pub fn release_gpu_tiled_preview_payload(
         .map_err(|_| poisoned())?
         .release(request.generation, &request.opaque_handle);
     if !released {
-        return Err(error(ErrorCode::InvalidInput, "The preview tile handle is unavailable."));
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "The preview tile handle is unavailable.",
+        ));
     }
     Ok(())
 }
@@ -1664,10 +1720,16 @@ fn publish_gpu_tiled_preview(
     }
     let started = Instant::now();
     let published = {
-        let mut cache = preview_service.gpu_tile_cache.lock().map_err(|_| poisoned())?;
+        let mut cache = preview_service
+            .gpu_tile_cache
+            .lock()
+            .map_err(|_| poisoned())?;
         cache.begin_generation(manifest.generation);
         cache.publish(manifest, pixels).map_err(|failure| {
-            error(ErrorCode::Internal, &format!("Tiled preview publication failed: {failure}"))
+            error(
+                ErrorCode::Internal,
+                &format!("Tiled preview publication failed: {failure}"),
+            )
         })?
     };
     if preview_service.latest_draft_id.load(Ordering::Acquire) != published.generation {
@@ -2399,16 +2461,34 @@ fn build_stage_14_preview(
             "The compiled SourceFrame artifact did not publish profile-local region metadata.",
         ));
     }
-    let rendered_tile = artifact.rendered_tile.clone().ok_or_else(|| error(
-        ErrorCode::LayoutInvalid,
-        "The GPU executor completed without a bounded tile payload.",
-    ))?;
+    let rendered_tile = artifact.rendered_tile.clone().ok_or_else(|| {
+        error(
+            ErrorCode::LayoutInvalid,
+            "The GPU executor completed without a bounded tile payload.",
+        )
+    })?;
     let output_size = artifact.topology.output_size;
     let tile_manifest = publish_gpu_tiled_preview(
         preview_service,
         rendered_tile.manifest.clone(),
         rendered_tile.payload(),
     )?;
+    let mut tile_manifests = BTreeMap::new();
+    tile_manifests.insert(
+        material_map_view_key(rendered_tile.manifest.map).to_string(),
+        tile_manifest.clone(),
+    );
+    for (map, tile) in &artifact.rendered_display_tiles {
+        if *map == rendered_tile.manifest.map {
+            continue;
+        }
+        let publication = publish_gpu_tiled_preview(
+            preview_service,
+            tile.manifest.clone(),
+            tile.payload(),
+        )?;
+        tile_manifests.insert(material_map_view_key(*map).to_string(), publication);
+    }
     let maps = BTreeMap::new();
     if !preview_is_current() {
         cancellation.cancel();
@@ -2509,6 +2589,8 @@ fn build_stage_14_preview(
         placement_plan_id: artifact.placement_plan_id.0,
         maps,
         tile_manifest,
+        tile_manifests,
+        region_id_lookup: artifact.region_id_lookup,
         regions: artifact.regions,
         unavailable_channels: artifact
             .unavailable_channels
@@ -2537,7 +2619,24 @@ const fn channel_key(role: hot_trimmer_domain::MaterialChannelRole) -> &'static 
         MaterialChannelRole::Specular => "specular",
         MaterialChannelRole::Opacity => "opacity",
         MaterialChannelRole::EdgeMask => "edgeMask",
+        MaterialChannelRole::RegionId => "regionId",
         MaterialChannelRole::MaterialId => "materialId",
+    }
+}
+
+const fn material_map_view_key(map: MaterialMapKind) -> &'static str {
+    match map {
+        MaterialMapKind::BaseColor => "baseColor",
+        MaterialMapKind::Normal => "normal",
+        MaterialMapKind::Height => "height",
+        MaterialMapKind::Roughness => "roughness",
+        MaterialMapKind::Metallic => "metallic",
+        MaterialMapKind::AmbientOcclusion => "ambientOcclusion",
+        MaterialMapKind::RegionId => "regionId",
+        MaterialMapKind::MaterialId => "materialId",
+        MaterialMapKind::Specular => "specular",
+        MaterialMapKind::Opacity => "opacity",
+        MaterialMapKind::EdgeMask => "edgeMask",
     }
 }
 
@@ -3722,6 +3821,9 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 draft_id: Some(job),
                 input_hash: None,
                 profile: PreviewProfile::Authoritative,
+                view_intent: None,
+                viewport_rect: None,
+                requested_maps: Vec::new(),
                 candidate_recipe: None,
             },
             job,

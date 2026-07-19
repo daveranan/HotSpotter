@@ -90,7 +90,7 @@ export function isValidGpuTiledPreviewPayload(
   const expectedBytes = manifest.rowStride * manifest.height;
   const sourceX = manifest.validRect.x - manifest.outputRect.x;
   const sourceY = manifest.validRect.y - manifest.outputRect.y;
-  return manifest.pixelFormat === "rgba8UnormSrgb"
+  return isRgba8DisplayFormat(manifest.pixelFormat)
     && Number.isSafeInteger(expectedBytes)
     && payloadByteLength === expectedBytes
     && rowBytes <= manifest.rowStride
@@ -98,6 +98,10 @@ export function isValidGpuTiledPreviewPayload(
     && sourceY >= 0
     && sourceX + manifest.validRect.width <= manifest.width
     && sourceY + manifest.validRect.height <= manifest.height;
+}
+
+function isRgba8DisplayFormat(pixelFormat: string): boolean {
+  return pixelFormat === "rgba8UnormSrgb" || pixelFormat === "rgba8UnormLinear";
 }
 
 export function shouldDisplayGpuTiledPreview(
@@ -129,6 +133,9 @@ function normalizePreviewMapKey(value: string | undefined): string | undefined {
     case "EdgeMask":
     case "edge_mask":
       return "edgeMask";
+    case "RegionId":
+    case "region_id":
+      return "regionId";
     default:
       return value;
   }
@@ -159,7 +166,7 @@ export class GpuTiledPreviewPainter {
   ): Promise<boolean> {
     const { manifest } = publication;
     try {
-      if (manifest.generation !== this.latestGeneration || manifest.pixelFormat !== "rgba8UnormSrgb") return false;
+      if (manifest.generation !== this.latestGeneration || !isRgba8DisplayFormat(manifest.pixelFormat)) return false;
       const payload = gpuTiledPreviewPayloadBytes(await client.getPayload({ protocolVersion, generation: manifest.generation, opaqueHandle: manifest.opaqueHandle }));
       this.summary = summarizePayload(manifest.generation, payload, false, false);
       if (manifest.generation !== this.latestGeneration) return false;

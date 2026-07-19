@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 
 const suites = {
   "gpu-tiled-preview": "src/gpu-tiled-preview.test.ts",
+  "hotspot-preview-lifecycle": "src/hotspot-preview-lifecycle.test.ts",
   "manual-layout-presets": "src/manual-layout-presets.test.ts",
   "multi-source-patch-assignment": "src/multi-source-patch-assignment.test.ts",
 };

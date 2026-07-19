@@ -16,6 +16,7 @@ pub enum MaterialChannelRole {
     Specular,
     Opacity,
     EdgeMask,
+    RegionId,
     MaterialId,
 }
 
@@ -38,10 +39,12 @@ impl MaterialChannelRole {
             Self::Normal => ChannelInterpretation::TangentSpaceNormal,
             Self::Opacity => ChannelInterpretation::LinearOpacity,
             Self::EdgeMask => ChannelInterpretation::BinaryMask,
-            Self::MaterialId => ChannelInterpretation::CategoricalId,
-            Self::Height | Self::Roughness | Self::Metallic | Self::AmbientOcclusion | Self::Specular => {
-                ChannelInterpretation::LinearScalar
-            }
+            Self::RegionId | Self::MaterialId => ChannelInterpretation::CategoricalId,
+            Self::Height
+            | Self::Roughness
+            | Self::Metallic
+            | Self::AmbientOcclusion
+            | Self::Specular => ChannelInterpretation::LinearScalar,
         }
     }
 }
@@ -321,7 +324,9 @@ pub enum MaterialCalibrationCommand {
         confidence_milli: u16,
     },
     ResetScale,
-    OverrideOrientation { axis_millidegrees: u32 },
+    OverrideOrientation {
+        axis_millidegrees: u32,
+    },
     ResetOrientation,
 }
 
@@ -334,42 +339,72 @@ pub enum MaterialCalibrationError {
 }
 
 impl MaterialCalibrationIntent {
-    pub fn apply(&mut self, command: MaterialCalibrationCommand) -> Result<(), MaterialCalibrationError> {
+    pub fn apply(
+        &mut self,
+        command: MaterialCalibrationCommand,
+    ) -> Result<(), MaterialCalibrationError> {
         let next_scale = match command {
             MaterialCalibrationCommand::SetImportedMetadata {
                 source_pixels_per_meter_x_milli: x,
                 source_pixels_per_meter_y_milli: y,
                 confidence_milli,
-            } => Some(validated_scale(Some(x), Some(y), ScaleProvenance::Imported, confidence_milli)?),
-            MaterialCalibrationCommand::MeasureTwoPoints { start, end, distance_micrometers } => {
-                if distance_micrometers == 0 { return Err(MaterialCalibrationError::InvalidMeasurement); }
+            } => Some(validated_scale(
+                Some(x),
+                Some(y),
+                ScaleProvenance::Imported,
+                confidence_milli,
+            )?),
+            MaterialCalibrationCommand::MeasureTwoPoints {
+                start,
+                end,
+                distance_micrometers,
+            } => {
+                if distance_micrometers == 0 {
+                    return Err(MaterialCalibrationError::InvalidMeasurement);
+                }
                 let dx = (end.x - start.x) as f64;
                 let dy = (end.y - start.y) as f64;
                 let distance_pixels_milli = dx.hypot(dy);
                 if !distance_pixels_milli.is_finite() || distance_pixels_milli < 1.0 {
                     return Err(MaterialCalibrationError::InvalidMeasurement);
                 }
-                let ppm_milli = (distance_pixels_milli * 1_000_000.0 / distance_micrometers as f64).round();
+                let ppm_milli =
+                    (distance_pixels_milli * 1_000_000.0 / distance_micrometers as f64).round();
                 if !(1.0..=u64::MAX as f64).contains(&ppm_milli) {
                     return Err(MaterialCalibrationError::InvalidMeasurement);
                 }
                 let value = ppm_milli as u64;
-                Some(validated_scale(Some(value), Some(value), ScaleProvenance::UserMeasured, 1000)?)
+                Some(validated_scale(
+                    Some(value),
+                    Some(value),
+                    ScaleProvenance::UserMeasured,
+                    1000,
+                )?)
             }
             MaterialCalibrationCommand::SetKnownMotifSize {
-                motif_width_pixels_milli, motif_height_pixels_milli,
-                motif_width_micrometers, motif_height_micrometers, confidence_milli,
+                motif_width_pixels_milli,
+                motif_height_pixels_milli,
+                motif_width_micrometers,
+                motif_height_micrometers,
+                confidence_milli,
             } => {
                 if motif_width_micrometers == 0 || motif_height_micrometers == 0 {
                     return Err(MaterialCalibrationError::InvalidMeasurement);
                 }
-                let x = motif_width_pixels_milli.checked_mul(1_000_000)
+                let x = motif_width_pixels_milli
+                    .checked_mul(1_000_000)
                     .and_then(|value| value.checked_div(motif_width_micrometers))
                     .ok_or(MaterialCalibrationError::InvalidMeasurement)?;
-                let y = motif_height_pixels_milli.checked_mul(1_000_000)
+                let y = motif_height_pixels_milli
+                    .checked_mul(1_000_000)
                     .and_then(|value| value.checked_div(motif_height_micrometers))
                     .ok_or(MaterialCalibrationError::InvalidMeasurement)?;
-                Some(validated_scale(Some(x), Some(y), ScaleProvenance::MotifDerived, confidence_milli)?)
+                Some(validated_scale(
+                    Some(x),
+                    Some(y),
+                    ScaleProvenance::MotifDerived,
+                    confidence_milli,
+                )?)
             }
             MaterialCalibrationCommand::OverrideScale {
                 source_pixels_per_meter_x_milli: x,
@@ -379,7 +414,9 @@ impl MaterialCalibrationIntent {
             } => Some(validated_scale(x, y, provenance, confidence_milli)?),
             MaterialCalibrationCommand::ResetScale => Some(PhysicalScaleEvidence::default()),
             MaterialCalibrationCommand::OverrideOrientation { axis_millidegrees } => {
-                if axis_millidegrees >= 180_000 { return Err(MaterialCalibrationError::InvalidOrientation); }
+                if axis_millidegrees >= 180_000 {
+                    return Err(MaterialCalibrationError::InvalidOrientation);
+                }
                 self.orientation_override_millidegrees = Some(axis_millidegrees);
                 None
             }
@@ -388,19 +425,28 @@ impl MaterialCalibrationIntent {
                 None
             }
         };
-        if let Some(scale) = next_scale { self.scale = scale; }
+        if let Some(scale) = next_scale {
+            self.scale = scale;
+        }
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 }
 
 fn validated_scale(
-    x: Option<u64>, y: Option<u64>, provenance: ScaleProvenance, confidence_milli: u16,
+    x: Option<u64>,
+    y: Option<u64>,
+    provenance: ScaleProvenance,
+    confidence_milli: u16,
 ) -> Result<PhysicalScaleEvidence, MaterialCalibrationError> {
-    if confidence_milli > 1000 { return Err(MaterialCalibrationError::InvalidConfidence); }
+    if confidence_milli > 1000 {
+        return Err(MaterialCalibrationError::InvalidConfidence);
+    }
     let relative = provenance == ScaleProvenance::RelativeOnly;
     if relative {
-        if x.is_some() || y.is_some() { return Err(MaterialCalibrationError::InvalidScale); }
+        if x.is_some() || y.is_some() {
+            return Err(MaterialCalibrationError::InvalidScale);
+        }
         return Ok(PhysicalScaleEvidence::default());
     }
     if x.is_none() || y.is_none() || x == Some(0) || y == Some(0) {
@@ -476,7 +522,9 @@ impl Default for ClassicalDelightingSettings {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "route", rename_all = "snake_case")]
 pub enum DelightingRouteIntent {
-    PassThrough { reason: DelightingPassThroughReason },
+    PassThrough {
+        reason: DelightingPassThroughReason,
+    },
     ClassicalLowFrequency,
     LocalIntrinsicProvider {
         provider_id: String,

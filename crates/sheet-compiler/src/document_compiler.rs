@@ -1,18 +1,20 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use hot_trimmer_domain::{
-    AddressMode, CanonicalRect, CompiledTemplateTopology, ContentReference, DocumentHash, IdColor, MaterialMapKind,
-    PatchId, PixelBounds, PixelSize, Projection, RadialMappingSettings, RegionDefinition, RegionId, RegionMapping,
-    RegionBehavior,
-    SourceId, SourceSetId, NormalizedPoint,
-    GridRect, MappingOrigin, NormalizedBounds,
-    StructuralProfile, TemplateSlotRole, TrimSheetDocument, TrimSheetDocumentError,
+    AddressMode, CanonicalRect, CompiledTemplateTopology, ContentReference, DocumentHash, GridRect,
+    IdColor, MappingOrigin, MaterialMapKind, NormalizedBounds, NormalizedPoint, PatchId,
+    PixelBounds, PixelSize, Projection, RadialMappingSettings, RegionBehavior, RegionDefinition,
+    RegionId, RegionMapping, SourceId, SourceSetId, StructuralProfile, TemplateSlotRole,
+    TrimSheetDocument, TrimSheetDocumentError,
 };
+use hot_trimmer_geometry::{Point, Quadrilateral};
 use hot_trimmer_render_core::{
     NormalConvention, ProfileKind, StructuralProfile as RenderProfile, StructuralProfileRequest,
     compile_structural_profile,
 };
-use hot_trimmer_geometry::{Point, Quadrilateral};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -161,20 +163,35 @@ pub fn resolve_compile_plan(
         let binding = document.region_bindings.get(&region.id).unwrap();
         let (material_id, source_patch_id, source_id, mapping) = match binding.content {
             ContentReference::InheritPrimaryMaterial => (
-                document.primary_material.unwrap(), None, None, binding.mapping.clone()
+                document.primary_material.unwrap(),
+                None,
+                None,
+                binding.mapping.clone(),
             ),
             ContentReference::MaterialSource(id) => (id, None, None, binding.mapping.clone()),
             ContentReference::Patch(id) => {
-                let patch = document.patches.iter().find(|patch| patch.id == id && patch.enabled)
+                let patch = document
+                    .patches
+                    .iter()
+                    .find(|patch| patch.id == id && patch.enabled)
                     .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?;
                 let mut mapping = binding.mapping.clone();
-                mapping.projection = Projection::Perspective { quad: patch.geometry.corners };
-                (document.primary_material.unwrap(), Some(id), Some(patch.source_id), mapping)
+                mapping.projection = Projection::Perspective {
+                    quad: patch.geometry.corners,
+                };
+                (
+                    document.primary_material.unwrap(),
+                    Some(id),
+                    Some(patch.source_id),
+                    mapping,
+                )
             }
             _ => return Err(SheetCompileError::UnsupportedRegionContent(region.id)),
         };
-        if !matches!(mapping.projection, Projection::Crop { .. } | Projection::Perspective { .. })
-            || !binding.mapping.warps.is_empty()
+        if !matches!(
+            mapping.projection,
+            Projection::Crop { .. } | Projection::Perspective { .. }
+        ) || !binding.mapping.warps.is_empty()
             || !matches!(document.sheet_framing.projection, Projection::Crop { .. })
         {
             return Err(SheetCompileError::UnsupportedRegionMapping(region.id));
@@ -209,7 +226,11 @@ pub fn resolve_compile_plan(
             source_crop: resolved_source_crop(document, region),
             source_bounds: resolved_source_bounds(document, region),
             mapping_origin: resolved_source_bounds(document, region).map(|_| {
-                if document.source_overrides.contains_key(&region.id) { MappingOrigin::ExplicitOverride } else { MappingOrigin::Partition }
+                if document.source_overrides.contains_key(&region.id) {
+                    MappingOrigin::ExplicitOverride
+                } else {
+                    MappingOrigin::Partition
+                }
             }),
         });
     }
@@ -234,20 +255,44 @@ pub fn resolve_profile_regions(
     document.validate()?;
     let mut regions = Vec::with_capacity(topology.slots.len());
     for slot in &topology.slots {
-        let region = document.topology.regions.iter().find(|region| region.id.to_string() == slot.slot_key)
+        let region = document
+            .topology
+            .regions
+            .iter()
+            .find(|region| region.id.to_string() == slot.slot_key)
             .ok_or(SheetCompileError::UnsupportedRegionContent(RegionId::new()))?;
-        let binding = document.region_bindings.get(&region.id)
+        let binding = document
+            .region_bindings
+            .get(&region.id)
             .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?;
         let (material_id, source_patch_id, source_id, mut mapping) = match binding.content {
-            ContentReference::InheritPrimaryMaterial =>
-                (document.primary_material.ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?, None, None, binding.mapping.clone()),
+            ContentReference::InheritPrimaryMaterial => (
+                document
+                    .primary_material
+                    .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?,
+                None,
+                None,
+                binding.mapping.clone(),
+            ),
             ContentReference::MaterialSource(id) => (id, None, None, binding.mapping.clone()),
             ContentReference::Patch(id) => {
-                let patch = document.patches.iter().find(|patch| patch.id == id && patch.enabled)
+                let patch = document
+                    .patches
+                    .iter()
+                    .find(|patch| patch.id == id && patch.enabled)
                     .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?;
                 let mut mapping = binding.mapping.clone();
-                mapping.projection = Projection::Perspective { quad: patch.geometry.corners };
-                (document.primary_material.ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?, Some(id), Some(patch.source_id), mapping)
+                mapping.projection = Projection::Perspective {
+                    quad: patch.geometry.corners,
+                };
+                (
+                    document
+                        .primary_material
+                        .ok_or(SheetCompileError::UnsupportedRegionContent(region.id))?,
+                    Some(id),
+                    Some(patch.source_id),
+                    mapping,
+                )
             }
             _ => return Err(SheetCompileError::UnsupportedRegionContent(region.id)),
         };
@@ -256,11 +301,22 @@ pub fn resolve_profile_regions(
             let focus = NormalizedPoint::new(
                 bounds.x.get() + bounds.width.get() * 0.5,
                 bounds.y.get() + bounds.height.get() * 0.5,
-            ).map_err(|_| SheetCompileError::UnsupportedRegionMapping(region.id))?;
+            )
+            .map_err(|_| SheetCompileError::UnsupportedRegionMapping(region.id))?;
             mapping.projection = Projection::Crop { bounds, focus };
         }
-        let allocation_bounds = PixelBounds { x: slot.allocation.x, y: slot.allocation.y, width: slot.allocation.width, height: slot.allocation.height };
-        let hotspot_bounds = PixelBounds { x: slot.hotspot.x, y: slot.hotspot.y, width: slot.hotspot.width, height: slot.hotspot.height };
+        let allocation_bounds = PixelBounds {
+            x: slot.allocation.x,
+            y: slot.allocation.y,
+            width: slot.allocation.width,
+            height: slot.allocation.height,
+        };
+        let hotspot_bounds = PixelBounds {
+            x: slot.hotspot.x,
+            y: slot.hotspot.y,
+            width: slot.hotspot.width,
+            height: slot.hotspot.height,
+        };
         regions.push(ResolvedRegion {
             region_id: region.id,
             display_name: region.display_name.clone(),
@@ -281,14 +337,21 @@ pub fn resolve_profile_regions(
             source_crop: resolved_source_crop(document, region),
             source_bounds,
             mapping_origin: source_bounds.map(|_| {
-                if document.source_overrides.contains_key(&region.id) { MappingOrigin::ExplicitOverride } else { MappingOrigin::Partition }
+                if document.source_overrides.contains_key(&region.id) {
+                    MappingOrigin::ExplicitOverride
+                } else {
+                    MappingOrigin::Partition
+                }
             }),
         });
     }
     Ok(regions)
 }
 
-fn resolved_source_bounds(document: &TrimSheetDocument, region: &RegionDefinition) -> Option<NormalizedBounds> {
+fn resolved_source_bounds(
+    document: &TrimSheetDocument,
+    region: &RegionDefinition,
+) -> Option<NormalizedBounds> {
     if let Some(override_value) = document.source_overrides.get(&region.id) {
         return Some(override_value.source_bounds);
     }
@@ -297,7 +360,10 @@ fn resolved_source_bounds(document: &TrimSheetDocument, region: &RegionDefinitio
     Some(frame.region_bounds(grid, region.grid_rect?))
 }
 
-fn resolved_source_crop(document: &TrimSheetDocument, region: &RegionDefinition) -> Option<PixelBounds> {
+fn resolved_source_crop(
+    document: &TrimSheetDocument,
+    region: &RegionDefinition,
+) -> Option<PixelBounds> {
     let bounds = resolved_source_bounds(document, region)?;
     let dimensions = document.source_frame.as_ref()?.oriented_dimensions;
     Some(PixelBounds {
@@ -408,10 +474,20 @@ pub(crate) fn compile_document(
             &mut maps.metallic,
             &mut maps.ambient_occlusion,
         ] {
-            dilate_region(output, plan.dimensions.width, resolved.allocation_bounds, resolved.hotspot_bounds);
+            dilate_region(
+                output,
+                plan.dimensions.width,
+                resolved.allocation_bounds,
+                resolved.hotspot_bounds,
+            );
         }
         for output in maps.additional.values_mut() {
-            dilate_region(output, plan.dimensions.width, resolved.allocation_bounds, resolved.hotspot_bounds);
+            dilate_region(
+                output,
+                plan.dimensions.width,
+                resolved.allocation_bounds,
+                resolved.hotspot_bounds,
+            );
         }
     }
     Ok(CompiledSheet {
@@ -475,15 +551,21 @@ where
     let plan = resolve_compile_plan(&preview_document, registered_maps)?;
     let bytes = pixel_bytes(plan.dimensions)?;
     let background = match kind {
-        PreviewMapKind::BaseColor | PreviewMapKind::Metallic | PreviewMapKind::RegionId | PreviewMapKind::MaterialId => [0, 0, 0, 255],
+        PreviewMapKind::BaseColor
+        | PreviewMapKind::Metallic
+        | PreviewMapKind::RegionId
+        | PreviewMapKind::MaterialId => [0, 0, 0, 255],
         PreviewMapKind::Normal => [128, 128, 255, 255],
         PreviewMapKind::Height => [128, 128, 128, 255],
         PreviewMapKind::Roughness => [170, 170, 170, 255],
         PreviewMapKind::AmbientOcclusion => [255, 255, 255, 255],
     };
-    let mut pixels = base_pixels.filter(|pixels| pixels.len() == bytes)
+    let mut pixels = base_pixels
+        .filter(|pixels| pixels.len() == bytes)
         .unwrap_or_else(|| solid_map(bytes, background));
-    let selected: Vec<_> = plan.regions.iter()
+    let selected: Vec<_> = plan
+        .regions
+        .iter()
         .filter(|region| dirty_region.is_none_or(|dirty| region.region_id == dirty))
         .collect();
     for resolved in selected {
@@ -491,14 +573,36 @@ where
             return Err(SheetCompileError::Cancelled);
         }
         if dirty_region.is_some() {
-            fill_bounds(&mut pixels, plan.dimensions.width, resolved.allocation_bounds, background);
+            fill_bounds(
+                &mut pixels,
+                plan.dimensions.width,
+                resolved.allocation_bounds,
+                background,
+            );
         }
-        let definition = preview_document.topology.regions.iter()
-            .find(|region| region.id == resolved.region_id).unwrap();
-        let binding = preview_document.region_bindings.get(&resolved.region_id).unwrap();
+        let definition = preview_document
+            .topology
+            .regions
+            .iter()
+            .find(|region| region.id == resolved.region_id)
+            .unwrap();
+        let binding = preview_document
+            .region_bindings
+            .get(&resolved.region_id)
+            .unwrap();
         match kind {
-            PreviewMapKind::RegionId => paint_ids(&mut pixels, plan.dimensions.width, resolved.allocation_bounds, resolved.id_color.0),
-            PreviewMapKind::MaterialId => paint_ids(&mut pixels, plan.dimensions.width, resolved.allocation_bounds, resolved.material_id_color.0),
+            PreviewMapKind::RegionId => paint_ids(
+                &mut pixels,
+                plan.dimensions.width,
+                resolved.allocation_bounds,
+                resolved.id_color.0,
+            ),
+            PreviewMapKind::MaterialId => paint_ids(
+                &mut pixels,
+                plan.dimensions.width,
+                resolved.allocation_bounds,
+                resolved.material_id_color.0,
+            ),
             map_kind => {
                 let material_kind = match map_kind {
                     PreviewMapKind::BaseColor => MaterialMapKind::BaseColor,
@@ -509,14 +613,35 @@ where
                     PreviewMapKind::AmbientOcclusion => MaterialMapKind::AmbientOcclusion,
                     PreviewMapKind::RegionId | PreviewMapKind::MaterialId => unreachable!(),
                 };
-                if material_kind == MaterialMapKind::BaseColor || has_map(registered_maps, resolved.material_id, material_kind) {
-                    render_region_map(&mut pixels, plan.dimensions, resolved, registered_maps, material_kind, binding, &preview_document)?;
+                if material_kind == MaterialMapKind::BaseColor
+                    || has_map(registered_maps, resolved.material_id, material_kind)
+                {
+                    render_region_map(
+                        &mut pixels,
+                        plan.dimensions,
+                        resolved,
+                        registered_maps,
+                        material_kind,
+                        binding,
+                        &preview_document,
+                    )?;
                 }
                 if is_cancelled() {
                     return Err(SheetCompileError::Cancelled);
                 }
-                apply_structure_to_preview(&mut pixels, plan.dimensions, resolved, definition, map_kind)?;
-                dilate_region(&mut pixels, plan.dimensions.width, resolved.allocation_bounds, resolved.hotspot_bounds);
+                apply_structure_to_preview(
+                    &mut pixels,
+                    plan.dimensions,
+                    resolved,
+                    definition,
+                    map_kind,
+                )?;
+                dilate_region(
+                    &mut pixels,
+                    plan.dimensions.width,
+                    resolved.allocation_bounds,
+                    resolved.hotspot_bounds,
+                );
             }
         }
     }
@@ -562,7 +687,8 @@ fn apply_structure_to_preview(
                 PreviewMapKind::BaseColor => {
                     let shade = (0.80 + height * 0.38).clamp(0.0, 1.15);
                     for component in &mut output[offset..offset + 3] {
-                        *component = (f64::from(*component) * shade).round().clamp(0.0, 255.0) as u8;
+                        *component =
+                            (f64::from(*component) * shade).round().clamp(0.0, 255.0) as u8;
                     }
                 }
                 PreviewMapKind::Normal => output[offset..offset + 4]
@@ -572,12 +698,18 @@ fn apply_structure_to_preview(
                     output[offset..offset + 4].copy_from_slice(&[channel, channel, channel, 255]);
                 }
                 PreviewMapKind::Roughness => {
-                    let value = (170.0 + (0.5 - height).max(0.0) * 70.0).round().clamp(0.0, 255.0) as u8;
+                    let value = (170.0 + (0.5 - height).max(0.0) * 70.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                     output[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
                 }
-                PreviewMapKind::Metallic => output[offset..offset + 4].copy_from_slice(&[0, 0, 0, 255]),
+                PreviewMapKind::Metallic => {
+                    output[offset..offset + 4].copy_from_slice(&[0, 0, 0, 255])
+                }
                 PreviewMapKind::AmbientOcclusion => {
-                    let value = (255.0 - (0.5 - height).max(0.0) * 130.0).round().clamp(0.0, 255.0) as u8;
+                    let value = (255.0 - (0.5 - height).max(0.0) * 130.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                     output[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
                 }
                 PreviewMapKind::RegionId | PreviewMapKind::MaterialId => {}
@@ -629,13 +761,17 @@ fn render_region_map(
     binding: &hot_trimmer_domain::RegionBinding,
     document: &TrimSheetDocument,
 ) -> Result<(), SheetCompileError> {
-    let source = maps.iter().find(|map| {
-        if kind == MaterialMapKind::BaseColor && let Some(source_id) = region.source_id {
-            map.source_id == source_id
-        } else {
-            map.material_id == region.material_id && map.kind == kind
-        }
-    })
+    let source = maps
+        .iter()
+        .find(|map| {
+            if kind == MaterialMapKind::BaseColor
+                && let Some(source_id) = region.source_id
+            {
+                map.source_id == source_id
+            } else {
+                map.material_id == region.material_id && map.kind == kind
+            }
+        })
         .ok_or(SheetCompileError::MissingBaseColor(region.material_id))?;
     let bounds = region.hotspot_bounds;
     for y in 0..bounds.height {
@@ -705,8 +841,11 @@ fn preserve_crop_aspect(
     source_width: u32,
     source_height: u32,
 ) -> (f64, f64) {
-    let Projection::Crop { bounds, .. } = projection else { return (u, v) };
-    if destination.width == 0 || destination.height == 0 || source_width == 0 || source_height == 0 {
+    let Projection::Crop { bounds, .. } = projection else {
+        return (u, v);
+    };
+    if destination.width == 0 || destination.height == 0 || source_width == 0 || source_height == 0
+    {
         return (u, v);
     }
     let source_aspect = bounds.width.get() * f64::from(source_width)
@@ -729,7 +868,9 @@ fn mapped_uv(u: f64, v: f64, projection: &Projection, mode: AddressMode) -> (f64
             .and_then(Quadrilateral::source_from_output)
             .ok()
             .and_then(|transform| transform.transform(Point { x: u, y: v }))
-            .map_or((u, v), |point| (address(point.x, mode), address(point.y, mode))),
+            .map_or((u, v), |point| {
+                (address(point.x, mode), address(point.y, mode))
+            }),
     }
 }
 
@@ -837,16 +978,13 @@ fn paint_ids(output: &mut [u8], width: u32, bounds: PixelBounds, color: [u8; 3])
     }
 }
 
-fn dilate_region(
-    output: &mut [u8],
-    width: u32,
-    allocation: PixelBounds,
-    content: PixelBounds,
-) {
+fn dilate_region(output: &mut [u8], width: u32, allocation: PixelBounds, content: PixelBounds) {
     for y in allocation.y..allocation.y + allocation.height {
         for x in allocation.x..allocation.x + allocation.width {
-            if x >= content.x && x < content.x + content.width
-                && y >= content.y && y < content.y + content.height
+            if x >= content.x
+                && x < content.x + content.width
+                && y >= content.y
+                && y < content.y + content.height
             {
                 continue;
             }
@@ -854,7 +992,12 @@ fn dilate_region(
             let source_y = y.clamp(content.y, content.y + content.height - 1);
             let source = ((source_y * width + source_x) * 4) as usize;
             let target = ((y * width + x) * 4) as usize;
-            let pixel = [output[source], output[source + 1], output[source + 2], output[source + 3]];
+            let pixel = [
+                output[source],
+                output[source + 1],
+                output[source + 2],
+                output[source + 3],
+            ];
             output[target..target + 4].copy_from_slice(&pixel);
         }
     }
@@ -906,6 +1049,7 @@ fn is_standard_kind(kind: MaterialMapKind) -> bool {
             | MaterialMapKind::Roughness
             | MaterialMapKind::Metallic
             | MaterialMapKind::AmbientOcclusion
+            | MaterialMapKind::RegionId
             | MaterialMapKind::MaterialId
     )
 }
@@ -926,8 +1070,8 @@ fn pixel_bytes(size: PixelSize) -> Result<usize, SheetCompileError> {
 #[cfg(test)]
 mod tests {
     use hot_trimmer_domain::{
-        LayoutId, MaterialMapContent, MaterialSourceSet, SourceSetId, TemplateRegistry,
-        SourceCropIntent, TrimSheetDocumentCommand,
+        LayoutId, MaterialMapContent, MaterialSourceSet, SourceCropIntent, SourceSetId,
+        TemplateRegistry, TrimSheetDocumentCommand,
     };
 
     use super::*;
@@ -985,11 +1129,19 @@ mod tests {
         assert_eq!(compiled.regions.len(), document.topology.regions.len());
         assert!(compiled.maps.base_color.iter().any(|value| *value != 0));
         for region in &compiled.regions {
-            for y in region.allocation_bounds.y..region.allocation_bounds.y + region.allocation_bounds.height {
-                for x in region.allocation_bounds.x..region.allocation_bounds.x + region.allocation_bounds.width {
+            for y in region.allocation_bounds.y
+                ..region.allocation_bounds.y + region.allocation_bounds.height
+            {
+                for x in region.allocation_bounds.x
+                    ..region.allocation_bounds.x + region.allocation_bounds.width
+                {
                     let offset = ((y * compiled.dimensions.width + x) * 4) as usize;
                     let pixel = &compiled.maps.base_color[offset..offset + 4];
-                    assert_eq!(pixel[3], 255, "region {} contains transparent output", region.display_name);
+                    assert_eq!(
+                        pixel[3], 255,
+                        "region {} contains transparent output",
+                        region.display_name
+                    );
                     assert!(
                         pixel[..3].iter().any(|component| *component != 0),
                         "region {} contains black output at ({x}, {y})",
@@ -1093,7 +1245,10 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.display_name == title_from_slot_key(slot_key))
                 .expect("compiled region exists for sampled template slot");
-            assert_eq!(region.mapping.source_crop_intent, Some(SourceCropIntent::Unplaced));
+            assert_eq!(
+                region.mapping.source_crop_intent,
+                Some(SourceCropIntent::Unplaced)
+            );
             assert_eq!(region.mapping.projection, Projection::default());
             for local in sample_points {
                 let sheet_point = point_in_region(region.allocation_bounds, local);
@@ -1107,13 +1262,9 @@ mod tests {
                 );
             }
         }
-        let full_preview = compile_preview_map(
-            &document,
-            &registered_maps,
-            PreviewMapKind::BaseColor,
-            64,
-        )
-        .unwrap();
+        let full_preview =
+            compile_preview_map(&document, &registered_maps, PreviewMapKind::BaseColor, 64)
+                .unwrap();
         let preview_without_a_complete_base = compile_preview_map_incremental(
             &document,
             &registered_maps,
@@ -1156,7 +1307,12 @@ mod tests {
             / f64::from(region.allocation_bounds.width);
         let local_v = (f64::from(point.1 - region.allocation_bounds.y) + 0.5)
             / f64::from(region.allocation_bounds.height);
-        let (local_u, local_v) = role_local_uv(region.role, region.mapping.radial.as_ref(), local_u, local_v);
+        let (local_u, local_v) = role_local_uv(
+            region.role,
+            region.mapping.radial.as_ref(),
+            local_u,
+            local_v,
+        );
         let (local_u, local_v) = preserve_crop_aspect(
             local_u,
             local_v,

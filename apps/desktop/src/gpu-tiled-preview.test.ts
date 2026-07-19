@@ -47,6 +47,8 @@ test("gpu-tiled-preview prefers a matching manifest over legacy image absence", 
   assert.equal(shouldDisplayGpuTiledPreview("baseColor", "baseColor", false), true);
   assert.equal(shouldDisplayGpuTiledPreview("base_color", "baseColor", false), true);
   assert.equal(shouldDisplayGpuTiledPreview("BaseColor", "baseColor", false), true);
+  assert.equal(shouldDisplayGpuTiledPreview("region_id", "regionId", false), true);
+  assert.equal(shouldDisplayGpuTiledPreview("RegionId", "regionId", false), true);
   assert.equal(shouldDisplayGpuTiledPreview("baseColor", "baseColor", true), false);
   assert.equal(shouldDisplayGpuTiledPreview("baseColor", "normal", false), false);
 });

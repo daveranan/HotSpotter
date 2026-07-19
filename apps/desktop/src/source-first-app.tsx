@@ -36,6 +36,7 @@ import {
   type SourceChannel,
   type SourceProjection,
   type SourceFrame,
+  type SourceFramePreviewMaterialMap,
   type PartitionRecipe,
   type Stage14SlotProjection,
   type TrimSheetDocumentCommand,
@@ -88,6 +89,46 @@ const mapViews: readonly [CompiledMapView, string][] = [
   ["regionId", "Region ID"],
   ["materialId", "Material ID"],
 ];
+
+function materialMapForView(view: CompiledMapView): SourceFramePreviewMaterialMap | null {
+  switch (view) {
+    case "baseColor":
+      return "base_color";
+    case "normal":
+      return "normal";
+    case "height":
+      return "height";
+    case "roughness":
+      return "roughness";
+    case "metallic":
+      return "metallic";
+    case "ambientOcclusion":
+      return "ambient_occlusion";
+    case "regionId":
+      return "region_id";
+    case "materialId":
+      return null;
+  }
+}
+
+function requestedMaterialMapsForView(view: CompiledMapView): readonly SourceFramePreviewMaterialMap[] {
+  const map = materialMapForView(view);
+  return map ? [map] : ["base_color"];
+}
+
+function gpuTilePublicationForView(artifact: IntermediateAtlasProjection | null | undefined, view: CompiledMapView) {
+  if (!artifact) return undefined;
+  return artifact.tileManifests?.[view]
+    ?? (gpuTiledPreviewMapMatches(artifact.tileManifest.manifest.map, view) ? artifact.tileManifest : undefined);
+}
+
+function artifactMapAvailable(artifact: IntermediateAtlasProjection | null | undefined, view: CompiledMapView): boolean {
+  return !!artifact && (!!artifact.maps[view] || !!gpuTilePublicationForView(artifact, view));
+}
+
+function materialMapRouteAvailable(view: CompiledMapView): boolean {
+  return materialMapForView(view) !== null && view !== "materialId";
+}
 
 const materialBehaviorOptions: readonly [MaterialBehaviorClass, string][] = [
   ["already_tileable", "Already tileable"],
@@ -238,17 +279,32 @@ function isInteractivePreviewProfile(value: string | null): value is Interactive
     || value === "preview8192";
 }
 
-function automaticPreviewKey(revision: number, profile: PreviewProfile): string {
-  return `${revision}:${profile}`;
+function automaticPreviewKey(revision: number, profile: PreviewProfile, view: CompiledMapView): string {
+  return `${revision}:${profile}:${view}`;
+}
+
+function previewProfileDimensions(profile: PreviewProfile, outputSize?: { width: number; height: number }): { width: number; height: number } {
+  switch (profile) {
+    case "draft512": return { width: 512, height: 512 };
+    case "refinement1024": return { width: 1024, height: 1024 };
+    case "preview2048": return { width: 2048, height: 2048 };
+    case "preview4096": return { width: 4096, height: 4096 };
+    case "preview8192": return { width: 8192, height: 8192 };
+    case "authoritative": return outputSize ?? { width: 2048, height: 2048 };
+  }
 }
 
 type PreviewProgress = {
   requestId: number;
   phase: "compiling" | "received" | "painted" | "failed";
   profile: PreviewProfile;
+  requestedRevision: number;
+  requestedMap: CompiledMapView;
   startedAt: number;
   elapsedMs?: number;
+  targetDimensions?: { width: number; height: number };
   dimensions?: { width: number; height: number };
+  terminalOutcome?: "published" | "failed" | "superseded";
 };
 
 function App() {
@@ -312,8 +368,11 @@ function App() {
   const dirtyPreviewRegion = useRef<string | null>(null);
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
   const lastAutomaticPreviewKey = useRef<string | null>(null);
+  const pendingAutomaticPreviewKey = useRef<string | null>(null);
   const patchPreviewRequestId = useRef(0);
   const previewPublishStartedAt = useRef<number | null>(null);
+  const projectRef = useRef<ProjectProjection | null>(null);
+  const mapViewRef = useRef<CompiledMapView>("baseColor");
   const lastTransientCompletionAt = useRef(0);
   const smoothedTransientFps = useRef(0);
   const transientPreviewController = useRef(new SourceFramePreviewController<{
@@ -337,6 +396,8 @@ function App() {
     return () => window.clearInterval(timer);
   }, [previewProgress?.requestId, previewProgress?.phase]);
   const workbenchRef = useRef<HTMLElement | null>(null);
+  useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => { mapViewRef.current = mapView; }, [mapView]);
 
   useEffect(() => {
     if (!native) return;
@@ -396,26 +457,29 @@ function App() {
   const workbenchColumns = visibleTracks.length ? visibleTracks.join(" 6px ") : "minmax(0, 1fr)";
 
   useEffect(() => {
-    previewDraftId.current += 1;
+    // A topology command starts its replacement request before React commits this
+    // effect. Do not advance the client generation here: doing so discards that
+    // valid result and leaves the progress UI counting forever. The replacement
+    // request itself advances the generation and native revision guards cancel
+    // any genuinely older work.
     dirtyPreviewRegion.current = null;
     setPreview(null);
   }, [currentTopologyHash]);
 
   useEffect(() => {
     if (!native || !project?.document) return;
-    const key = automaticPreviewKey(project.document.documentRevision, interactivePreviewProfile);
+    const key = automaticPreviewKey(project.document.documentRevision, interactivePreviewProfile, mapView);
     if (suppressAutomaticPreviewRevision.current === project.document.documentRevision) {
       suppressAutomaticPreviewRevision.current = null;
-      lastAutomaticPreviewKey.current = key;
       return;
     }
-    if (lastAutomaticPreviewKey.current === key) return;
-    lastAutomaticPreviewKey.current = key;
+    if (lastAutomaticPreviewKey.current === key || pendingAutomaticPreviewKey.current === key) return;
+    pendingAutomaticPreviewKey.current = key;
     dirtyPreviewRegion.current = null;
     // Persisted appearance edits are not transient crop requests. The compiler's content
     // hashes reuse every unchanged region while the request remains contract-valid.
-    void requestPreview(undefined, undefined, interactivePreviewProfile, undefined, false);
-  }, [native, project?.document?.documentRevision, interactivePreviewProfile]);
+    void requestPreview(undefined, undefined, interactivePreviewProfile, project.document.documentRevision, false, true);
+  }, [native, project?.document?.documentRevision, interactivePreviewProfile, mapView]);
 
   useEffect(() => {
     const controller = transientPreviewController.current;
@@ -644,6 +708,7 @@ function App() {
     dirtyPreviewRegion.current = null;
     suppressAutomaticPreviewRevision.current = null;
     lastAutomaticPreviewKey.current = null;
+    pendingAutomaticPreviewKey.current = null;
     setSelectedSourceSetId(next.document?.primaryMaterial ?? next.materialSources[0]?.id ?? "");
     setSelectedChannel("base_color");
     setTemplateId(templates[0][0]);
@@ -839,7 +904,7 @@ function App() {
       setPreview(null);
       setArtifact(compiled);
       setSelectedRegionId((selected) => compiled.regions.some((region) => region.regionId === selected) ? selected : null);
-      window.setTimeout(() => void requestPreview(undefined, undefined, "refinement1024", current.document!.documentRevision), 120);
+      window.setTimeout(() => void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision), 120);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -863,7 +928,7 @@ function App() {
       });
       setArtifact(compiled);
       setSelectedRegionId(null);
-      window.setTimeout(() => void requestPreview(undefined, undefined, "refinement1024", current.document!.documentRevision), 120);
+      window.setTimeout(() => void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision), 120);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -923,10 +988,10 @@ function App() {
       setSelectedRegionId((selected) => current.document!.topology.regions.some((region) => region.id === selected) ? selected : null);
       if (pixelRegionId || topologyChanged) {
         dirtyPreviewRegion.current = null;
-        lastAutomaticPreviewKey.current = automaticPreviewKey(current.document!.documentRevision, interactivePreviewProfile);
+        pendingAutomaticPreviewKey.current = automaticPreviewKey(current.document!.documentRevision, interactivePreviewProfile, mapView);
         // Region identity without a projection is not a transient crop request. Compile the
         // persisted binding revision; the immediate overlay above covers publication latency.
-        void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision, false);
+        void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision, false, true);
       }
       return current;
     } catch (reason) { setProblem(failure(reason)); return null; }
@@ -951,12 +1016,13 @@ function App() {
       setPreview(null);
       suppressAutomaticPreviewRevision.current = current.document!.documentRevision;
       setProject(current);
+      const requestedMaps = requestedMaterialMapsForView(mapView);
       const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
-        request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
+        request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512", requestedMaps },
       });
       setArtifact(compiled);
       setSelectedRegionId(null);
-      window.setTimeout(() => void requestPreview(undefined, undefined, "refinement1024", current.document!.documentRevision), 120);
+      window.setTimeout(() => void requestPreview(undefined, undefined, interactivePreviewProfile, current.document!.documentRevision), 120);
     } catch (reason) {
       setProblem(failure(reason));
     } finally {
@@ -983,9 +1049,12 @@ function App() {
     }
   }
 
-  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true) {
+  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true, automatic = false) {
     const requestedRevision = revision ?? project?.document?.documentRevision;
     if (!native || requestedRevision === undefined) return;
+    const requestedMapView = mapViewRef.current;
+    const requestedMaps = requestedMaterialMapsForView(requestedMapView);
+    const automaticKey = automatic ? automaticPreviewKey(requestedRevision, profile, requestedMapView) : null;
     const viewIntent: "completeDraft512" | "completeRefinement1024" | "exactViewport" | "exactSelectedRegion" | undefined = profile === "draft512"
       ? "completeDraft512"
       : profile === "refinement1024"
@@ -996,10 +1065,11 @@ function App() {
     const viewportRect = undefined;
     const previewRegionId = viewIntent === "exactSelectedRegion" ? regionId : undefined;
     const draftId = ++previewDraftId.current;
+    const targetDimensions = previewProfileDimensions(profile, project?.document?.renderSettings.outputSize);
     setProblem(null);
     previewPublishStartedAt.current = performance.now();
     setPreviewElapsedMs(0);
-    setPreviewProgress({ requestId: draftId, phase: "compiling", profile, startedAt: previewPublishStartedAt.current });
+    setPreviewProgress({ requestId: draftId, phase: "compiling", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current, targetDimensions });
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: {
@@ -1008,34 +1078,54 @@ function App() {
           regionId: previewRegionId,
           transientProjection: projection,
           draftId,
-          inputHash: JSON.stringify({ revision: requestedRevision, regionId, projection }),
+          inputHash: JSON.stringify({ revision: requestedRevision, regionId, projection, requestedMaps }),
           profile,
           viewIntent,
+          requestedMaps,
           viewportRect,
         },
       });
-      setPreviewClientTelemetry([`profile=${profile}`, `artifact_dimensions=${next.width}x${next.height}`, `ipc_round_trip_ms=${Math.round(performance.now() - (previewPublishStartedAt.current ?? performance.now()))}`]);
+      setPreviewClientTelemetry([`profile=${profile}`, `requested_revision=${requestedRevision}`, `requested_map=${requestedMapView}`, `artifact_revision=${next.documentRevision}`, `artifact_dimensions=${next.width}x${next.height}`, `request_outcome=published`, `ipc_round_trip_ms=${Math.round(performance.now() - (previewPublishStartedAt.current ?? performance.now()))}`]);
+      if (automaticKey && draftId !== previewDraftId.current && pendingAutomaticPreviewKey.current === automaticKey) {
+        pendingAutomaticPreviewKey.current = null;
+      }
       if (draftId === previewDraftId.current) {
-        setPreviewProgress({ requestId: draftId, phase: "received", profile, startedAt: previewPublishStartedAt.current, elapsedMs: performance.now() - previewPublishStartedAt.current, dimensions: { width: next.width, height: next.height } });
+        setPreviewProgress({ requestId: draftId, phase: "received", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current, elapsedMs: performance.now() - previewPublishStartedAt.current, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published" });
         setArtifact(next);
         setPreview(null);
         setProblem(null);
+        if (automaticKey) {
+          lastAutomaticPreviewKey.current = automaticKey;
+          if (pendingAutomaticPreviewKey.current === automaticKey) pendingAutomaticPreviewKey.current = null;
+        }
         if (profile === "draft512" && scheduleRefinement) {
           window.setTimeout(() => {
             if (draftId === previewDraftId.current && requestedRevision === next.documentRevision) {
-              void requestPreview(regionId, projection, "refinement1024", requestedRevision);
+              void requestPreview(regionId, projection, interactivePreviewProfile, requestedRevision);
             }
           }, 120);
         }
       }
     } catch (reason) {
-      if (failure(reason).code !== "operation_cancelled") {
-        setProblem(failure(reason));
-        if (draftId === previewDraftId.current) setPreviewProgress({ requestId: draftId, phase: "failed", profile, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs: performance.now() - (previewPublishStartedAt.current ?? performance.now()) });
+      const failureReason = failure(reason);
+      const elapsedMs = performance.now() - (previewPublishStartedAt.current ?? performance.now());
+      if (automaticKey && pendingAutomaticPreviewKey.current === automaticKey) pendingAutomaticPreviewKey.current = null;
+      if (failureReason.code !== "operation_cancelled") {
+        setPreviewClientTelemetry([`profile=${profile}`, `requested_revision=${requestedRevision}`, `requested_map=${requestedMapView}`, `request_outcome=failed`, `problem=${failureReason.code}`]);
+        setProblem(failureReason);
+        if (draftId === previewDraftId.current) setPreviewProgress({ requestId: draftId, phase: "failed", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs, terminalOutcome: "failed" });
       } else if (draftId === previewDraftId.current) {
         // A superseded native job is terminal for this request. Do not leave the footer
-        // counting forever as though CPU/GPU work were still running.
-        setPreviewProgress(null);
+        // counting forever as though CPU/GPU work were still running, and immediately
+        // ask for the settled latest revision instead.
+        setPreviewClientTelemetry([`profile=${profile}`, `requested_revision=${requestedRevision}`, `requested_map=${requestedMapView}`, `request_outcome=superseded`]);
+        setPreviewProgress({ requestId: draftId, phase: "failed", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs, terminalOutcome: "superseded" });
+        const latestRevision = projectRef.current?.document?.documentRevision;
+        if (latestRevision !== undefined && latestRevision !== requestedRevision) {
+          const latestKey = automaticPreviewKey(latestRevision, profile, mapViewRef.current);
+          pendingAutomaticPreviewKey.current = latestKey;
+          window.setTimeout(() => void requestPreview(regionId, projection, profile, latestRevision, scheduleRefinement, true), 0);
+        }
       }
     }
   }
@@ -1057,6 +1147,12 @@ function App() {
       focus: { x: bounds.x + bounds.width * 0.5, y: bounds.y + bounds.height * 0.5 },
     };
     sourceFramePreviewController.current.enqueue({ regionId: selectedRegionId, projection, revision });
+  }
+
+  function exitRegionPatchEdit() {
+    setDraftPatchPreview(null);
+    setPatchTool(null);
+    setRegionPatchEditId(null);
   }
 
   async function history(redo: boolean) {
@@ -1088,7 +1184,6 @@ function App() {
       const restoringPatchId = redo && project?.canRedoPatch && project.canRedoDocument ? undoneRegionPatchConversion.current : null;
       if (redo && undoneRegionPatchConversion.current && !restoringPatchId) undoneRegionPatchConversion.current = null;
       if (restoringPatchId) await invoke<ProjectProjection>("redo_patch_command", { request: protocol });
-      const priorTopologyHash = project?.document ? hashBytes(project.document.topology.topologyHash) : null;
       let next = await invoke<ProjectProjection>(redo ? "redo_document_command" : "undo_document_command", { request: protocol });
       if (!redo && regionPatchId && regionPatchExists && patchFallbackContent.current.has(regionPatchId)
         && !Object.values(next.document?.regionBindings ?? {}).some((binding) => binding.content.type === "patch" && binding.content.id === regionPatchId)) {
@@ -1100,8 +1195,6 @@ function App() {
         lastRegionPatchId.current = restoringPatchId;
         undoneRegionPatchConversion.current = null;
       }
-      const nextTopologyHash = next.document ? hashBytes(next.document.topology.topologyHash) : null;
-      if (next.document && priorTopologyHash !== nextTopologyHash) suppressAutomaticPreviewRevision.current = next.document.documentRevision;
       setProject(next);
       setPreview(null);
       setArtifact((prior) => retopologizeArtifact(prior, next));
@@ -1405,13 +1498,13 @@ function App() {
         // An assigned patch is part of the persisted Stage 14 appearance. Keep the
         // previous artifact visible until the selected preview size publishes, so radial
         // or patch edits do not flash a lower-quality square intermediate.
-        lastAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile);
+        pendingAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile, mapView);
         dirtyPreviewRegion.current = null;
         // Set the suppression token before publishing the new projection. This closes the
         // race where React's revision effect could start a second native job first.
         setProject(next);
         setProblem(null);
-        void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
+        void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true);
       } else {
         setProject(next);
         setProblem(null);
@@ -1480,10 +1573,10 @@ function App() {
       // Source-side radial gestures bypass the Layout command helper, so publish their
       // persisted revision explicitly. Keep the previous artifact visible until the
       // selected preview size is ready rather than flashing a lower-quality square pass.
-      lastAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile);
+      pendingAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile, mapView);
       dirtyPreviewRegion.current = null;
       setProject(next);
-      void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false);
+      void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true);
     }
     catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
   }
@@ -1572,7 +1665,6 @@ function App() {
         /> : null}
         {showLibrary && showSourceWorkspace ? <PaneSplitter kind="library-source" paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         {showSourceWorkspace ? <section className={`source-workspace ${regionPatchEditId ? "region-patch-isolation" : ""}`}>
-          {regionPatchEditId ? <div className="region-edit-banner"><strong>Editing selected region as an isolated patch</strong><span>Transform this crop without changing any other region.</span><button onClick={() => setRegionPatchEditId(null)}>Done</button></div> : null}
           <MapSlots
             sources={activeSources}
             selectedChannel={selectedChannel}
@@ -1608,11 +1700,11 @@ function App() {
           </div>
           <SourceCanvas
             source={selectedSource}
-            sourceFrame={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.sourceFrame : undefined}
-            logicalGrid={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.logicalGrid : undefined}
-            partitionRegions={!regionPatchEditId && project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? artifact?.regions ?? [] : []}
-            selectedSlot={regionPatchEditId ? null : selectedSlot}
-            crop={regionPatchEditId ? null : selectedCanvasCrop ?? selectedCrop}
+            sourceFrame={project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.sourceFrame : undefined}
+            logicalGrid={project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? project?.document?.logicalGrid : undefined}
+            partitionRegions={project?.document?.sourceFrame?.sourceSetId === activeSourceSetId ? artifact?.regions ?? [] : []}
+            selectedSlot={selectedSlot}
+            crop={selectedCanvasCrop ?? selectedCrop}
             selectedRegion={selectedRegion}
             radialBehavior={selectedBinding?.mapping.behavior}
             radialSourceGeometry={selectedRadialSourceGeometry}
@@ -1625,7 +1717,7 @@ function App() {
             onCommitCrop={(bounds) => void editSelectedRegionAsPatch(bounds)}
             onDraftCrop={(bounds) => { if (selectedBindingContent?.type === "patch") previewSelectedCrop(bounds); }}
             onSetSourceFrame={(bounds) => void setSourceFrame(bounds)}
-            patches={project?.patches.filter((patch) => patch.sourceId === selectedSource?.id && (!regionPatchEditId || patch.id === activePatchId)) ?? []}
+            patches={project?.patches.filter((patch) => patch.sourceId === selectedSource?.id) ?? []}
             activePatchId={activePatchId}
             onEditPatch={selectPatchAndLinkedRegion}
             onCommitPatch={(patchId, geometry) => void replacePatchGeometry(patchId, geometry)}
@@ -1636,6 +1728,7 @@ function App() {
             onCreatePatch={(geometry, fourPoint) => void createPatch(geometry, fourPoint)}
             onCancelTool={() => setPatchTool(null)}
           />
+          {regionPatchEditId ? <div className="region-edit-toast" role="status" aria-live="polite"><strong>Editing region source</strong><span>Preview stays pinned until the selected size is ready.</span><button onClick={exitRegionPatchEdit}>Cancel</button><button onClick={exitRegionPatchEdit}>Done</button></div> : null}
         </section> : null}
         {showSourceWorkspace && hotspotSheetOpen ? <PaneSplitter kind="source-sheet" proportional libraryVisible={showLibrary} inspectorVisible={showInspector} onSourceShareChange={setSourceSheetShare} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
         {hotspotSheetOpen ? <SheetWorkbench
@@ -1646,6 +1739,7 @@ function App() {
           preparedPatchPreviews={preparedPatchPreviews}
           activePatchId={activePatchId}
           mapView={mapView}
+          setMapView={setMapView}
           selectedRegionId={selectedRegionId}
           setSelectedRegionId={(id) => { setSelectedRegionId(id); if (!id) { setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSourceFrameEditing(false); } }}
           sourceFrameEditing={sourceFrameEditing}
@@ -2535,15 +2629,15 @@ function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; m
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const painter = useRef(new GpuTiledPreviewPainter());
   const onPaint = useRef(props.onPaint);
-  const publication = props.artifact.tileManifest;
-  const manifest = publication.manifest;
+  const publication = gpuTilePublicationForView(props.artifact, props.mapView);
+  const manifest = publication?.manifest;
 
   onPaint.current = props.onPaint;
 
   useEffect(() => () => painter.current.dispose(), []);
   useEffect(() => {
     const surface = canvasRef.current;
-    if (!surface || !gpuTiledPreviewMapMatches(manifest.map, props.mapView)) return;
+    if (!surface || !publication || !manifest || !gpuTiledPreviewMapMatches(manifest.map, props.mapView)) return;
     painter.current.beginGeneration(manifest.generation);
     void painter.current.paint(surface, publication, {
       getPayload: (request) => invoke<Uint8Array>("get_gpu_tiled_preview_payload", { request }),
@@ -2552,7 +2646,7 @@ function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; m
       props.onDebugSummary(painter.current.lastSummary());
       if (painted) onPaint.current({ width: props.artifact.width, height: props.artifact.height });
     });
-  }, [manifest.generation, manifest.opaqueHandle, manifest.map, props.artifact.height, props.artifact.width, props.mapView, publication, props.onDebugSummary]);
+  }, [manifest?.generation, manifest?.opaqueHandle, manifest?.map, props.artifact.height, props.artifact.width, props.mapView, publication, props.onDebugSummary]);
 
   return <canvas
     ref={canvasRef}
@@ -2699,6 +2793,7 @@ function SheetWorkbench(props: {
   preparedPatchPreviews: Readonly<Record<string, PreparedPatchPreviewProjection>>;
   activePatchId: string | null;
   mapView: CompiledMapView;
+  setMapView: (view: CompiledMapView) => void;
   selectedRegionId: string | null;
   setSelectedRegionId: (id: string | null) => void;
   sourceFrameEditing: boolean;
@@ -2745,7 +2840,9 @@ function SheetWorkbench(props: {
       : null;
   const sheet = validPreview ?? artifact;
   const imageUrl = validPreview?.dataUrl ?? artifact?.maps[props.mapView];
-  const tiledManifestMatchesMap = artifact?.tileManifest.manifest.map === props.mapView;
+  const activeTilePublication = gpuTilePublicationForView(artifact, props.mapView);
+  const activeTileManifest = activeTilePublication?.manifest;
+  const tiledManifestMatchesMap = gpuTiledPreviewMapMatches(activeTileManifest?.map, props.mapView);
   const sheetMatchesDocument = !!sheet && sheet.topologyHash === topologyHash;
   const artifactRevisionMatchesDocument = !!props.project?.document
     && !!props.artifact
@@ -2764,6 +2861,7 @@ function SheetWorkbench(props: {
   const [gridOpacity, setGridOpacity] = useState(10);
   const [textureVisible, setTextureVisible] = useState(true);
   const [regionFillVisible, setRegionFillVisible] = useState(true);
+  const [regionBordersVisible, setRegionBordersVisible] = useState(true);
   const [edgeEligibilityVisible, setEdgeEligibilityVisible] = useState(false);
   const [debugCopyStatus, setDebugCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
   const [gpuPaintSummary, setGpuPaintSummary] = useState<GpuTiledPreviewPaintSummary | null>(null);
@@ -2798,25 +2896,24 @@ function SheetWorkbench(props: {
   // Do not substitute Source Frame pixels for Stage 14. During local edits, keep the last
   // painted Stage 14 sheet visible until native publishes replacement pixels.
   const hasTransientSourceFallback = false;
-  const currentTileGeneration = artifact?.tileManifest.manifest.generation;
+  const currentTileGeneration = activeTileManifest?.generation;
   const gpuTilePaintedBlank = gpuPaintSummary?.generation === currentTileGeneration
     && !!gpuPaintSummary?.painted
     && gpuPaintSummary.validPayload
     && gpuPaintSummary.payloadNonTransparent === 0
     && gpuPaintSummary.payloadNonZeroRgb === 0;
   const continuousTexture = null;
-  const displayGpuTiles = shouldDisplayGpuTiledPreview(artifact?.tileManifest.manifest.map, props.mapView, hasTransientSourceFallback);
+  const displayGpuTiles = !!activeTilePublication && shouldDisplayGpuTiledPreview(activeTileManifest?.map, props.mapView, hasTransientSourceFallback);
   const editorHasImage = !!continuousTexture || displayGpuTiles || !!imageUrl;
-  const sourceTextureProblem = props.mapView === "baseColor" && sourceFrame && !continuousTexture && !displayGpuTiles && !imageUrl
-    ? "The complete oriented Source Frame Diffuse texture is unavailable. Layout editing will not display a partial Stage 14 map. Re-register Diffuse for this Source Frame."
+  const previewInFlight = props.previewProgress?.phase === "compiling" || props.previewProgress?.phase === "received";
+  const previewPixelsProblem = !!sheet && !editorHasImage && !previewInFlight
+    ? "The compiled preview published metadata, but no paintable tile was available for this map view."
     : null;
   const workpieceSize = sheet
     ? { width: sheet.width, height: sheet.height }
-    : props.preparedPatchPreview
-      ? { width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height }
-      : null;
+    : null;
   const viewport = useViewportController(workpieceSize, props.project?.document?.id ?? "no-document");
-  useEffect(() => setGpuPaintSummary(null), [currentTileGeneration, artifact?.tileManifest.manifest.opaqueHandle, props.mapView]);
+  useEffect(() => setGpuPaintSummary(null), [currentTileGeneration, activeTileManifest?.opaqueHandle, props.mapView]);
   const gridSteps = adaptiveGridSteps(displayedGrid, sheet?.width ?? 1, sheet?.height ?? 1, viewport.view.scale);
   useEffect(() => {
     let disposed = false;
@@ -2963,7 +3060,7 @@ function SheetWorkbench(props: {
   }
   async function copyPreviewDebugInfo() {
     const canvas = sheetRef.current?.querySelector<HTMLCanvasElement>('canvas[data-gpu-preview-canvas="true"]') ?? null;
-    const manifest = props.artifact?.tileManifest.manifest;
+    const manifest = activeTileManifest;
     const telemetry = [...(props.artifact?.telemetry ?? []), ...props.previewClientTelemetry];
     const debug = {
       capturedAt: new Date().toISOString(),
@@ -2971,6 +3068,13 @@ function SheetWorkbench(props: {
       mapView: props.mapView,
       interactivePreviewProfile: props.interactivePreviewProfile,
       progress: props.previewProgress,
+      request: props.previewProgress ? {
+        profile: props.previewProgress.profile,
+        requestedRevision: props.previewProgress.requestedRevision,
+        requestedMap: props.previewProgress.requestedMap,
+        terminalOutcome: props.previewProgress.terminalOutcome ?? null,
+      } : null,
+      problem: props.problem,
       project: props.project?.document ? {
         documentRevision: props.project.document.documentRevision,
         topologyHash,
@@ -3008,6 +3112,7 @@ function SheetWorkbench(props: {
         artifactRevisionMatchesDocument,
         textureVisible,
         regionFillVisible,
+        regionBordersVisible,
         gridVisible,
         hasTransientSourceFallback,
         localTopologyPending,
@@ -3019,7 +3124,7 @@ function SheetWorkbench(props: {
         imageUrlLength: imageUrl?.length ?? 0,
         displayGpuTiles,
         editorHasImage,
-        sourceTextureProblem,
+        previewPixelsProblem,
         rawManifestMapMatchesMapView: tiledManifestMatchesMap,
         normalizedManifestMapMatchesMapView: gpuTiledPreviewMapMatches(manifest?.map, props.mapView),
       },
@@ -3031,7 +3136,7 @@ function SheetWorkbench(props: {
           height: Math.round(viewport.containerRef.current.getBoundingClientRect().height),
         } : null,
       },
-      gpuTile: props.artifact?.tileManifest ?? null,
+      gpuTile: activeTilePublication ?? null,
       canvas: canvasPixelSummary(canvas),
       telemetry,
     };
@@ -3059,6 +3164,19 @@ function SheetWorkbench(props: {
     window.addEventListener("keydown", copyShortcut);
     return () => window.removeEventListener("keydown", copyShortcut);
   });
+  const fullResolutionPreviewBusy = props.previewProgress?.profile === "authoritative"
+    && (props.previewProgress.phase === "compiling" || props.previewProgress.phase === "received");
+  const fullResolutionPreviewElapsedMs = props.previewProgress?.phase === "compiling"
+    ? props.previewElapsedMs
+    : props.previewProgress?.elapsedMs ?? props.previewElapsedMs;
+  const fullResolutionPreviewSeconds = Math.max(0, Math.round(fullResolutionPreviewElapsedMs / 100) / 10);
+  const fullResolutionPreviewStatus = props.previewProgress?.profile === "authoritative" && props.previewProgress.terminalOutcome
+    ? props.previewProgress.terminalOutcome === "published"
+      ? "Full-resolution preview succeeded"
+      : props.previewProgress.terminalOutcome === "superseded"
+        ? "Full-resolution preview superseded"
+        : "Full-resolution preview failed"
+    : null;
   return <section className="sheet-workbench">
     <header className="sheet-header">
       <div><strong>HOTSPOT SHEET</strong></div>
@@ -3070,7 +3188,7 @@ function SheetWorkbench(props: {
       {props.project?.document?.sourceFrame ? <fieldset className="trim-sheet-source-settings"><legend>Trim-sheet source</legend><p>Controls the source frame used by the entire authored layout.</p><button className={`source-frame-layout-action ${props.sourceFrameEditing ? "active" : ""}`} onClick={props.onEditSourceFrame}>{props.sourceFrameEditing ? "Editing entire trim-sheet source" : "Edit entire trim-sheet source position"}</button></fieldset> : null}
       <div className="layout-tool-row" role="toolbar" aria-label="Atlas editing tools"><button className={layoutTool === "select" ? "active" : ""} onClick={() => { setLayoutTool("select"); setDrawDraft(null); }}>Select / resize</button><button className={layoutTool === "draw" ? "active" : ""} onClick={() => { setLayoutTool("draw"); setLayoutMenu(null); }}>Draw region</button></div>
       <p className="layout-help">Draw snapped rectangles or resize the selected box with its handles. Middle-drag pans in either tool; pointer movement stays local and release publishes one refreshed artifact.</p>
-      <div className="display-controls"><label><input type="checkbox" checked={textureVisible} onChange={(event) => setTextureVisible(event.target.checked)} /> Texture</label><label><input type="checkbox" checked={regionFillVisible} onChange={(event) => setRegionFillVisible(event.target.checked)} /> Region colors</label><label><input type="checkbox" checked={edgeEligibilityVisible} onChange={(event) => setEdgeEligibilityVisible(event.target.checked)} /> Edge eligibility</label></div>
+      <div className="display-controls"><label><input type="checkbox" checked={textureVisible} onChange={(event) => setTextureVisible(event.target.checked)} /> Texture</label><label><input type="checkbox" checked={regionFillVisible} onChange={(event) => setRegionFillVisible(event.target.checked)} /> Region colors</label><label><input type="checkbox" checked={regionBordersVisible} onChange={(event) => setRegionBordersVisible(event.target.checked)} /> Region borders</label><label><input type="checkbox" checked={edgeEligibilityVisible} onChange={(event) => setEdgeEligibilityVisible(event.target.checked)} /> Edge eligibility</label></div>
       <div className="grid-controls"><label><input type="checkbox" checked={gridVisible} onChange={(event) => setGridVisible(event.target.checked)} /> Grid</label><label>Opacity <input aria-label="Grid opacity" type="range" min={0} max={100} value={gridOpacity} onChange={(event) => setGridOpacity(Number(event.target.value))} /></label></div>
       <fieldset className="preview-resolution-settings"><legend>Preview resolution</legend>
         <label>Size<select value={props.project?.document?.renderSettings.outputSize.width ?? 2048} onChange={(event) => void props.setResolution(Number(event.target.value))} disabled={!props.project?.document || props.activity !== "idle"}>
@@ -3079,10 +3197,18 @@ function SheetWorkbench(props: {
         <label>Preview<select value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as InteractivePreviewProfile)} disabled={!props.project?.document || props.activity !== "idle"}>
           <option value="refinement1024">1K · 1024</option><option value="preview2048">2K · 2048</option><option value="preview4096">4K · 4096</option><option value="preview8192">8K · 8192</option>
         </select></label>
-        <button onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle"}>Render full-resolution preview</button>
+        <button className={`render-preview-button ${fullResolutionPreviewBusy ? "busy" : ""}`} onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle" || fullResolutionPreviewBusy} aria-busy={fullResolutionPreviewBusy}>{fullResolutionPreviewBusy ? `Rendering full-res... ${fullResolutionPreviewSeconds.toFixed(1)}s` : "Render full-resolution preview"}</button>
+        {fullResolutionPreviewStatus ? <output className={`preview-terminal-status ${props.previewProgress?.terminalOutcome ?? ""}`}>{fullResolutionPreviewStatus}</output> : null}
         <small>Displayed now: {sheet ? `${sheet.width} × ${sheet.height}` : "not rendered"}. Edits keep the last painted sheet until the selected preview size is ready.</small>
       </fieldset>
       {selectedGridRect ? <output className="selection-readout">Selected: x {selectedGridRect.x}, y {selectedGridRect.y} · {selectedGridRect.width} × {selectedGridRect.height}</output> : drawRect ? <output className="selection-readout draw">Drawing: x {drawRect.x}, y {drawRect.y} · {drawRect.width} × {drawRect.height}</output> : <output className="selection-readout">No region selected</output>}
+      <fieldset className="map-view-section hotspot-map-view"><legend>Map view</legend>
+        <div className="map-view-grid">{mapViews.filter(([id]) => id !== "materialId").map(([id, label]) => {
+          const available = materialMapRouteAvailable(id);
+          const published = artifactMapAvailable(props.artifact, id);
+          return <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!available} title={!available ? "Unavailable through Stage 14" : published ? `${label} published` : "Render this material map"}>{label}</button>;
+        })}</div>
+      </fieldset>
       {selectedLayoutRegion && selectedLayoutBinding ? <fieldset className="layout-region-settings"><legend>Selected region</legend>
         <strong>{selectedLayoutRegion.displayName}</strong>
         <label>Replace source<select value={selectedLayoutBinding.content.type === "material_source" ? `source:${selectedLayoutBinding.content.id}` : selectedLayoutBinding.content.type === "patch" ? `patch:${selectedLayoutBinding.content.id}` : selectedLayoutBinding.content.type === "solid" ? "solid" : "inherit"} onChange={(event) => { const value = event.currentTarget.value; const content: ContentReference = value === "inherit" ? { type: "inherit_primary_material" } : value === "solid" ? { type: "solid", id: { baseColor: [128, 128, 128, 255] } } : value.startsWith("source:") ? { type: "material_source", id: value.slice(7) } : { type: "patch", id: value.slice(6) }; void props.onLayoutCommand({ type: "set_region_content", regionId: selectedLayoutRegion.id, content }); }}><option value="inherit">Primary source</option><option value="solid">Solid gray</option>{props.project?.materialSources.map((source) => <optgroup key={source.id} label={source.name}><option value={`source:${source.id}`}>Whole source</option>{props.project?.patches.filter((patch) => patch.enabled && source.registeredChannels?.channels.some((channel) => channel.id === patch.sourceId)).map((patch) => <option key={patch.id} value={`patch:${patch.id}`}>{patch.name}</option>)}</optgroup>)}</select></label>
@@ -3117,7 +3243,7 @@ function SheetWorkbench(props: {
       </section>
       <fieldset className="legacy-generator-controls" hidden aria-hidden="true"><p className={`layout-capacity ${candidateValid ? "" : "invalid"}`} aria-live="polite">{hierarchical ? `${requestedFloor}–${requestedMaximum} soft region range` : `${requestedFloor} minimum leaves / ${props.candidateRecipe.targetRegionCount} Count`} · {requestedArea / 10}% unified area</p>
       {props.problem ? <p className="layout-diagnostic" role="alert">{props.problem.message}<small>{props.problem.recovery}</small></p> : null}
-      {sourceTextureProblem ? <p className="layout-diagnostic" role="alert">{sourceTextureProblem}</p> : null}
+      {previewPixelsProblem ? <p className="layout-diagnostic" role="alert">{previewPixelsProblem}</p> : null}
       <span>SOURCE FRAME PARTITION</span>
       <strong>{props.candidatePreviewing && props.candidateIsCurrent ? `${props.artifact?.regions.length ?? 0} candidate ready` : props.candidatePreviewing ? "Draft changed — preview again" : props.artifact ? `${props.artifact.regions.length} accepted regions` : "Accepted layout"}</strong>
       <output aria-live="polite">{hierarchical ? `${hierarchical.protectedParentCount} protected / ${hierarchical.subdividableParentCount} hierarchical parents` : `${requestedFamilies} requested / ${props.candidateRecipe.targetRegionCount} available`}{candidateValid ? "" : " — correct the highlighted recipe constraints"}</output>
@@ -3177,25 +3303,9 @@ function SheetWorkbench(props: {
       onPointerUp={(event) => { finishDirectEdit(event.pointerId); viewport.endPan(event); }}
       onPointerCancel={(event) => { finishDirectEdit(event.pointerId, true); viewport.endPan(event); }}
     >
-      {!sheet || !editorHasImage ? sourceTextureProblem ? <div className="empty-sheet source-texture-error"><strong>Complete Diffuse unavailable</strong><span>{sourceTextureProblem}</span></div> : props.preparedPatchPreview ? <div
-        className="rectified-workpiece"
-        style={{ width: props.preparedPatchPreview.width, height: props.preparedPatchPreview.height, transform: `translate(${viewport.view.x}px, ${viewport.view.y}px) scale(${viewport.view.scale})` }}
-      >
-        <img src={props.preparedPatchPreview.dataUrl} alt="Selected Stage 3 rectified patch" />
-        <svg className="orientation-overlay" viewBox={`0 0 ${props.preparedPatchPreview.width} ${props.preparedPatchPreview.height}`} aria-label="Source-pixel orientation field">
-          {props.preparedPatchPreview.sourceAnalysis.orientationOverlay.map((sample, index) => {
-            if (sample.axisMillidegrees === null) return null;
-            const x = sample.sourceXMilli / 1000;
-            const y = sample.sourceYMilli / 1000;
-            const radians = sample.axisMillidegrees / 1000 * Math.PI / 180;
-            const radius = 7;
-            return <line key={index} x1={x - Math.cos(radians) * radius} y1={y - Math.sin(radians) * radius} x2={x + Math.cos(radians) * radius} y2={y + Math.sin(radians) * radius} />;
-          })}
-        </svg>
-        <span>Rectified patch</span>
-      </div> : <div className="empty-sheet">
-        <strong>{props.project?.legacyLayoutDiscarded ? "No trim sheet yet" : "No compiled sheet"}</strong>
-        <span>{props.project?.legacyLayoutDiscarded ? "Sources, maps, and patches were preserved. Old layout state is not shown or converted." : "Build from the current Diffuse texture when ready."}</span>
+      {!sheet || !editorHasImage ? previewPixelsProblem ? <div className="empty-sheet source-texture-error"><strong>Preview pixels unavailable</strong><span>{previewPixelsProblem}</span></div> : <div className="empty-sheet">
+        <strong>{previewInFlight ? "Rendering preview" : props.project?.legacyLayoutDiscarded ? "No trim sheet yet" : "No compiled sheet"}</strong>
+        <span>{previewInFlight ? "The source is imported. The hotspot sheet will appear when the compiled preview publishes." : props.project?.legacyLayoutDiscarded ? "Sources, maps, and patches were preserved. Old layout state is not shown or converted." : "Build from the current Diffuse texture when ready."}</span>
       </div> : <div
         ref={sheetRef}
         className="sheet"
@@ -3224,7 +3334,7 @@ function SheetWorkbench(props: {
           aria-label={`${region.displayName}${region.gridRect ? `, x ${region.gridRect.x}, y ${region.gridRect.y}, ${region.gridRect.width} by ${region.gridRect.height}` : ""}`}
           aria-pressed={region.regionId === props.selectedRegionId}
           className={`region ${region.regionId === props.selectedRegionId ? "selected" : ""} ${resizeDraft && (region.regionId === resizeDraft.regionId || resizeAffectedIds.has(region.regionId)) ? "affected" : ""}`}
-          style={overlayStyle(region, sheet, viewport.view.scale, regionFillVisible ? 0.2 : 0)}
+          style={overlayStyle(region, sheet, viewport.view.scale, regionFillVisible ? 0.2 : 0, regionBordersVisible ? 0.92 : 0)}
           onClick={(event) => { event.stopPropagation(); if (!props.candidatePreviewing && layoutTool !== "draw") props.setSelectedRegionId(region.regionId); }}
           onContextMenu={(event) => { event.preventDefault(); if (props.candidatePreviewing) return; event.stopPropagation(); props.setSelectedRegionId(region.regionId); setLayoutMenu({ regionId: region.regionId, x: Math.min(event.clientX, window.innerWidth - 196), y: Math.min(event.clientY, window.innerHeight - 156) }); }}
         >{(() => { const behavior = props.project?.document?.regionBindings[region.regionId]?.mapping.behavior ?? region.behavior; return <><span className="region-label">{region.displayName}</span><RegionBehaviorCue behavior={behavior} />{edgeEligibilityVisible ? <span className="edge-eligibility-overlay" aria-label={`Eligible edges: ${Object.entries(behavior.edgeEligibility).filter(([, value]) => value).map(([key]) => key).join(", ") || "none"}`}>{Object.entries(behavior.edgeEligibility).map(([edge, eligible]) => <i key={edge} className={`${edge} ${eligible ? "eligible" : "continuous"}`} />)}</span> : null}</>; })()}{region.regionId === props.selectedRegionId && region.gridRect && layoutTool === "select" && !props.candidatePreviewing ? resizeHandles.map((handle) => <i key={handle} className={`selection-handle ${handle}`} aria-label={`Resize ${handle}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); setResizeDraft({ pointerId: event.pointerId, regionId: region.regionId, handle, origin: region.gridRect!, rect: region.gridRect! }); }} />) : null}</button>)}</div>
@@ -3238,6 +3348,11 @@ function SheetWorkbench(props: {
           return <div className="content-source-group" key={source.id}><strong>{base?.displayName ?? source.name}</strong><button onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "material_source", id: source.id } }); setLayoutMenu(null); }}>Whole source</button>{sourcePatches.map((patch) => <button key={patch.id} onClick={() => { props.onLayoutCommand({ type: "set_region_content", regionId: layoutMenu.regionId, content: { type: "patch", id: patch.id } }); setLayoutMenu(null); }}>{patch.name}</button>)}</div>;
         })}</div> : null}{layoutSubmenu === "settings" ? (() => { const behavior = props.project?.document?.regionBindings[layoutMenu.regionId]?.mapping.behavior; if (!behavior) return null; const apply = (next: RegionBehavior) => { void props.onLayoutCommand({ type: "set_region_behavior", regionId: layoutMenu.regionId, behavior: next }); setLayoutMenu(null); }; return <div className="layout-submenu region-behavior-menu"><strong>Region settings</strong><label>Role<select value={behavior.role} onChange={(event) => apply(changedBehavior(behavior, { role: event.currentTarget.value as ManualRegionRole }))}>{manualRoleOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label>Continuity<select value={behavior.continuity} onChange={(event) => apply(changedBehavior(behavior, { continuity: event.currentTarget.value as RegionContinuity }))}>{continuityOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label>Sampling<select value={behavior.sampling} onChange={(event) => apply(changedBehavior(behavior, { sampling: event.currentTarget.value as RegionSampling }))}>{samplingOptions.map(([value, label]) => <option key={value} value={value} disabled={!!samplingPrerequisite(behavior.role, value)}>{label}</option>)}</select></label><label>Orientation<select value={behavior.orientation} onChange={(event) => apply(changedBehavior(behavior, { orientation: event.currentTarget.value as RegionBehavior["orientation"] }))}><option value="zero">0°</option><option value="ninety">90°</option><option value="one_eighty">180°</option><option value="two_seventy">270°</option></select></label></div>; })() : null}</div>, document.body) : null}
       </div>}
+      {fullResolutionPreviewBusy ? <div className="preview-busy-overlay" role="status" aria-live="polite" aria-atomic="true">
+        <strong>Rendering full-resolution preview</strong>
+        <span>{props.previewProgress?.phase === "received" ? "Decoding and painting" : "Compiling, rendering, and encoding"} - {fullResolutionPreviewSeconds.toFixed(1)}s</span>
+        <progress aria-label="Full-resolution preview in progress" />
+      </div> : null}
       {workpieceSize ? <div className="viewport-tools">
         <button onClick={() => viewport.zoom(0.8)}>-</button>
         <output>{Math.round(viewport.view.scale * 100)}%</output>
@@ -3269,7 +3384,8 @@ function PreviewProgressStatus(props: { progress: PreviewProgress | null; elapse
   if (!progress) return <div className="preview-progress idle"><span>Preview idle</span><progress value={0} max={1} /></div>;
   const elapsed = Math.round((progress.phase === "compiling" ? props.elapsedMs : progress.elapsedMs ?? 0) / 100) / 10;
   const dimensions = progress.dimensions ? ` · ${progress.dimensions.width}×${progress.dimensions.height}` : "";
-  const label = progress.phase === "compiling" ? `Rendering / encoding preview · ${elapsed.toFixed(1)}s`
+  const target = progress.targetDimensions ? ` · target ${progress.targetDimensions.width}×${progress.targetDimensions.height}` : "";
+  const label = progress.phase === "compiling" ? `Rendering / encoding preview${target} · ${elapsed.toFixed(1)}s`
     : progress.phase === "received" ? `Preview received, decoding${dimensions} · ${elapsed.toFixed(1)}s`
       : progress.phase === "painted" ? `Preview ready${dimensions} · ${elapsed.toFixed(1)}s`
         : `Preview failed · ${elapsed.toFixed(1)}s`;
@@ -3403,9 +3519,13 @@ function Inspector(props: {
       </> : null}
       <dl><dt>Points to</dt><dd>{boundPatch ? `${boundSource?.name ?? "Missing source"} / ${boundPatch.name}` : boundSource?.name ?? "Missing source"}</dd><dt>Exact crop</dt><dd>{boundsLabel(stage14Slot?.sourceCrop)}</dd><dt>Eligible structural edges</dt><dd>{binding ? Object.entries(binding.mapping.behavior.edgeEligibility).filter(([, eligible]) => eligible).map(([edge]) => edge).join(", ") || "none" : "-"}</dd></dl>
     </section> : null}
-    <section className="inspector-section">
+    <section className="inspector-section map-view-section">
       <span>MAP VIEW</span>
-      <div className="map-view-grid">{mapViews.map(([id, label]) => <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!props.artifact?.maps[id]} title={props.artifact && !props.artifact.maps[id] ? "Unavailable through Stage 14" : undefined}>{label}</button>)}</div>
+      <div className="map-view-grid">{mapViews.map(([id, label]) => {
+        const available = materialMapRouteAvailable(id);
+        const published = artifactMapAvailable(props.artifact, id);
+        return <button key={id} className={props.mapView === id ? "active" : ""} onClick={() => props.setMapView(id)} disabled={!available} title={!available ? "Unavailable through Stage 14" : published ? undefined : "Render this material map"}>{label}</button>;
+      })}</div>
     </section>
     {!layoutMode && selectedMaterial ? <section className="inspector-section source-inspector"><span>SOURCE INSPECTOR / ADVANCED MATERIAL PREPARATION</span>
       <h2>{selectedMaterial.name}</h2><dl><dt>Dimensions</dt><dd>{selectedMaterial.registeredChannels ? `${selectedMaterial.registeredChannels.orientedSize.width}×${selectedMaterial.registeredChannels.orientedSize.height}` : "-"}</dd><dt>Maps</dt><dd>{selectedMaterial.registeredChannels?.channels.length ?? 0}</dd><dt>Revision</dt><dd>{selectedMaterial.sourceRevision}</dd></dl>
@@ -3759,10 +3879,10 @@ function retopologizeArtifact(prior: IntermediateAtlasProjection | null, project
   const fallbackSlot = prior.slots[0];
   return {
     ...prior,
-    revision: document.documentRevision,
-    documentRevision: document.documentRevision,
-    topologyHash: hashBytes(document.topology.topologyHash),
-    topology: document.topology,
+    // These pixels still belong to `prior` until Stage 14 publishes. Preserve
+    // their revision/hash authority while using the current region rectangles as
+    // a temporary editing overlay. Claiming the new revision here made a stale
+    // tile pass the display gate and created mixed old/new split-region imagery.
     regions,
     slots: regions.flatMap((region) => {
       const slot = priorSlotById.get(region.regionId) ?? fallbackSlot;
@@ -4000,15 +4120,15 @@ function mergeCandidate(regions: readonly ResolvedRegion[], regionId: string) {
   }) ?? null;
 }
 
-function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasProjection, "width" | "height">, scale = 1, fillOpacity = 0): React.CSSProperties {
+function overlayStyle(region: ResolvedRegion, artifact: Pick<IntermediateAtlasProjection, "width" | "height">, scale = 1, fillOpacity = 0, borderOpacity = 1): React.CSSProperties {
   const bounds = region.allocationBounds;
   return {
     left: `${bounds.x / artifact.width * 100}%`,
     top: `${bounds.y / artifact.height * 100}%`,
     width: `${bounds.width / artifact.width * 100}%`,
     height: `${bounds.height / artifact.height * 100}%`,
-    borderColor: `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]})`,
     "--region-fill": `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]} / ${fillOpacity})`,
+    "--region-border": `rgb(${region.idColor[0]} ${region.idColor[1]} ${region.idColor[2]} / ${borderOpacity})`,
     "--region-stroke": `${Math.min(3, Math.max(0.75, 1 / scale))}px`,
     "--region-label-size": `${Math.min(16, Math.max(7, 10 / scale))}px`,
   } as React.CSSProperties;

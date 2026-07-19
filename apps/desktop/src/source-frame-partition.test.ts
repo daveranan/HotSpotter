@@ -133,19 +133,24 @@ test("layout editing keeps the texture stable, pans in draw mode, and auto-previ
   assert.match(app, /Region colors/);
   assert.match(app, /viewport\.beginPan\(event\)/);
   assert.doesNotMatch(app, /layoutTool !== "draw" &&/);
-  assert.match(app, /lastAutoPreviewFingerprint/);
+  assert.match(app, /candidatePreviewHash/);
   assert.match(app, /window\.setTimeout\(\(\) => \{[\s\S]*props\.previewCandidate\(props\.candidateRecipe\)/);
   assert.doesNotMatch(app, /Drag shared vertical boundary/);
   assert.doesNotMatch(app, /Reset boundary/);
-  assert.match(app, /props\.mapView === "baseColor" \? !!continuousTexture : !!imageUrl/);
-  assert.match(app, /will not display a partial Stage 14 map/);
-  assert.match(app, /Complete Base Color unavailable/);
+  assert.match(app, /const editorHasImage = !!continuousTexture \|\| displayGpuTiles \|\| !!imageUrl/);
+  assert.match(app, /const previewInFlight = props\.previewProgress\?\.phase === "compiling" \|\| props\.previewProgress\?\.phase === "received"/);
+  assert.match(app, /Rendering preview/);
+  assert.match(app, /Preview pixels unavailable/);
 });
 
 test("source-frame layout exposes the patch workbench and product-facing composition controls", () => {
   const app = readFileSync(new URL("./source-first-app.tsx", import.meta.url), "utf8");
-  assert.match(app, /Show Source Workbench/);
-  assert.match(app, /showSourceWorkspace \? <section className="source-workspace">/);
+  assert.match(app, />Workbench<\/button>/);
+  assert.match(app, /showSourceWorkspace \? <section className=\{`source-workspace \$\{regionPatchEditId \? "region-patch-isolation" : ""\}`\}>/);
+  assert.match(app, /className="region-edit-toast"/);
+  assert.match(app, /Editing region source/);
+  assert.match(app, /Preview stays pinned until the selected size is ready/);
+  assert.doesNotMatch(app, /region-edit-banner-slot/);
   assert.match(app, /Assign patch to region/);
   assert.match(app, /set_region_content/);
   assert.match(app, /assigned-patch-preview/);

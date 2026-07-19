@@ -352,8 +352,19 @@ fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
                     f64::from(c.y) + (center_y + dy) * ch, true)
             } else {
                 let planar = [(center_x + dx) * cw, (center_y + dy) * ch];
-                let polar = [theta * cw,
-                    ((radius - inner_radius) / radial_span).clamp(0.0, 1.0).powf(falloff) * ch];
+                // Extension pixels must sample the nearest usable interior texel,
+                // not the crop's transparent/antialiased outermost row.
+                let radial_inset = 1.5_f64.min((ch * 0.5).max(0.5));
+                let outer_extension_radius =
+                    (outer_radius - radial_span * radial_inset / ch.max(1.0)).max(inner_radius);
+                let sample_radius = if radius >= outer_radius {
+                    outer_extension_radius
+                } else {
+                    radius.clamp(inner_radius, outer_radius)
+                };
+                let polar = [(theta * cw).min(cw - f64::EPSILON),
+                    (((sample_radius - inner_radius) / radial_span).clamp(0.0, 1.0).powf(falloff) * ch)
+                        .min(ch - f64::EPSILON)];
                 let transition = blend_width.min(radial_span);
                 let t = if transition <= f64::EPSILON { 1.0 }
                     else { ((radius - inner_radius) / transition).clamp(0.0, 1.0) };
@@ -367,7 +378,7 @@ fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
                     let other_polar_x = ((1.0 - theta) * cw).min(cw - f64::EPSILON);
                     (Some([f64::from(c.x) + planar[0] * (1.0 - blend) + other_polar_x * blend, y]), feather)
                 } else { (None, 0.0) };
-                Position { x, y, valid: radius <= outer_radius, seam_sample, seam_blend }
+                Position { x, y, valid: true, seam_sample, seam_blend }
             }
         }
         SamplingMode::PlanarRadial => {
@@ -376,10 +387,16 @@ fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {
                     radial.inner_radius, radial.outer_radius, radial.falloff));
             let delta = [q[0] - center_x, q[1] - center_y];
             let radius = delta[0].hypot(delta[1]);
-            let warped_radius = if outer_radius.is_finite() {
+            let mut warped_radius = if outer_radius.is_finite() {
                 let span = (outer_radius - inner_radius).max(f64::EPSILON);
                 inner_radius + ((radius - inner_radius) / span).clamp(0.0, 1.0).powf(falloff) * span
             } else { radius };
+            if outer_radius.is_finite() && radius >= outer_radius {
+                let span = (outer_radius - inner_radius).max(f64::EPSILON);
+                let radial_inset = 1.5_f64.min((cw.min(ch) * 0.5).max(0.5));
+                warped_radius =
+                    (outer_radius - span * radial_inset / cw.min(ch).max(1.0)).max(inner_radius);
+            }
             let radial_scale = if radius > f64::EPSILON { warped_radius / radius } else { 0.0 };
             let radial_local = transform_local([delta[0] * radial_scale * destination_size[0],
                 delta[1] * radial_scale * destination_size[1]], transform.rotation, transform.mirror);

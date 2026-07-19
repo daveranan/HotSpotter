@@ -8,9 +8,9 @@ struct AtlasHeader {
     command_count: u32,
     source_width: u32,
     source_height: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    map_kind: u32,
+    normal_convention: u32,
+    source_role: u32,
 };
 
 struct RegionCommand {
@@ -35,7 +35,7 @@ struct RegionCommand {
     sampling_filter: u32,
     transform_mirror_x: u32,
     transform_mirror_y: u32,
-    _pad0: u32,
+    structural_profile: u32,
     slot_width: f32,
     slot_height: f32,
     pixels_per_unit: f32,
@@ -101,10 +101,34 @@ fn linear_to_srgb(v: f32) -> f32 {
     return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
 }
 
+fn encode_normal(v: f32) -> f32 {
+    return clamp(v, -1.0, 1.0) * 0.5 + 0.5;
+}
+
+fn transform_tangent_normal(normal: vec3<f32>, rotation: u32, mirror: u32) -> vec3<f32> {
+    var xy = normal.xy;
+    if (rotation == 1u) {
+        xy = vec2<f32>(-normal.y, normal.x);
+    } else if (rotation == 2u) {
+        xy = vec2<f32>(-normal.x, -normal.y);
+    } else if (rotation == 3u) {
+        xy = vec2<f32>(normal.y, -normal.x);
+    }
+    if (mirror == 1u) {
+        xy.x = -xy.x;
+    } else if (mirror == 2u) {
+        xy.y = -xy.y;
+    }
+    return normalize(vec3<f32>(xy, normal.z));
+}
+
 fn load_linear(p: vec2<f32>) -> vec4<f32> {
     let sx = i32(clamp(floor(p.x), 0.0, f32(header.source_width - 1u)));
     let sy = i32(clamp(floor(p.y), 0.0, f32(header.source_height - 1u)));
     let c = textureLoad(source_tex, vec2<i32>(sx, sy), 0);
+    if (header.source_role != 0u) {
+        return c;
+    }
     return vec4<f32>(srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b), c.a);
 }
 
@@ -119,6 +143,86 @@ fn sample_linear(p: vec2<f32>, linear_filter: bool) -> vec4<f32> {
     let c = load_linear(base + vec2<f32>(0.5, 1.5));
     let d = load_linear(base + vec2<f32>(1.5, 1.5));
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+fn linear_ramp(value: f32) -> f32 {
+    return clamp(value, 0.0, 1.0);
+}
+
+fn smooth_ramp(value: f32) -> f32 {
+    let x = linear_ramp(value);
+    return x * x * (3.0 - 2.0 * x);
+}
+
+fn structural_height_at(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
+    if (cmd.structural_profile == 0u) {
+        return 0.0;
+    }
+    let sem_x = clamp(pixel.x, cmd.semantic_x, cmd.semantic_x + cmd.semantic_width - 1u) - cmd.semantic_x;
+    let sem_y = clamp(pixel.y, cmd.semantic_y, cmd.semantic_y + cmd.semantic_height - 1u) - cmd.semantic_y;
+    let width = f32(max(cmd.semantic_width, 1u));
+    let height = f32(max(cmd.semantic_height, 1u));
+    let scale = max(min(width, height), 1.0);
+    let px = f32(sem_x) + 0.5;
+    let py = f32(sem_y) + 0.5;
+    let x_edge = min(px, width - px) / scale;
+    let y_edge = min(py, height - py) / scale;
+    var edge_distance = min(x_edge, y_edge);
+    if (cmd.mode == 2u) {
+        edge_distance = y_edge;
+    } else if (cmd.mode == 3u) {
+        edge_distance = x_edge;
+    } else if (cmd.mode == 1u) {
+        edge_distance = 1.0;
+    }
+    let center_x = px - width * 0.5;
+    let center_y = py - height * 0.5;
+    let radius = length(vec2<f32>(center_x, center_y)) / scale;
+    if (cmd.structural_profile == 1u) {
+        return 0.125 * linear_ramp(edge_distance / 0.125);
+    }
+    if (cmd.structural_profile == 2u) {
+        return -0.125 * (1.0 - linear_ramp(edge_distance / 0.125));
+    }
+    if (cmd.structural_profile == 3u) {
+        let phase = linear_ramp(edge_distance / 0.125) * 1.57079632679;
+        return 0.125 * sin(phase);
+    }
+    if (cmd.structural_profile == 4u) {
+        let outer = smooth_ramp(edge_distance / 0.04);
+        let inner = smooth_ramp((0.20 - edge_distance) / 0.04);
+        return 0.04 * outer * inner;
+    }
+    if (cmd.structural_profile == 5u) {
+        return 0.06 * smooth_ramp((0.42 - radius) / 0.06);
+    }
+    if (cmd.structural_profile == 6u) {
+        let inside = min(radius - 0.24, 0.44 - radius) / 0.04;
+        return 0.04 * smooth_ramp(inside);
+    }
+    return 0.0;
+}
+
+fn material_height_sample(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
+    if (header.source_role != 1u) {
+        return 0.0;
+    }
+    let position = source_position(cmd, pixel);
+    let p = position.primary;
+    if (!position.valid || p.x < 0.0 || p.x >= f32(header.source_width) || p.y < 0.0 || p.y >= f32(header.source_height)) {
+        return 0.0;
+    }
+    let linear = sample_linear(p, cmd.sampling_filter != 0u);
+    var blended = linear;
+    if (position.seam_blend > 0.0) {
+        let seam_linear = sample_linear(position.seam, cmd.sampling_filter != 0u);
+        blended = mix(linear, seam_linear, position.seam_blend);
+    }
+    return clamp(blended.r, 0.0, 1.0) - 0.5;
+}
+
+fn final_height_at(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
+    return clamp(0.5 + material_height_sample(cmd, pixel) + structural_height_at(cmd, pixel), 0.0, 1.0);
 }
 
 fn source_position(cmd: RegionCommand, pixel: vec2<u32>) -> SourcePosition {
@@ -160,7 +264,12 @@ fn source_position(cmd: RegionCommand, pixel: vec2<u32>) -> SourcePosition {
         let delta = q - vec2<f32>(cmd.radial_center_x, cmd.radial_center_y);
         let radius = length(delta);
         let span = max(cmd.radial_outer_radius - cmd.radial_inner_radius, 0.000001);
-        let warped_radius = cmd.radial_inner_radius + pow(clamp((radius - cmd.radial_inner_radius) / span, 0.0, 1.0), cmd.radial_falloff) * span;
+        var warped_radius = cmd.radial_inner_radius + pow(clamp((radius - cmd.radial_inner_radius) / span, 0.0, 1.0), cmd.radial_falloff) * span;
+        if (radius >= cmd.radial_outer_radius) {
+            let inset = min(1.5, max(min(crop_size.x, crop_size.y) * 0.5, 0.5));
+            let normalized_inset = inset / max(min(crop_size.x, crop_size.y), 1.0);
+            warped_radius = max(cmd.radial_inner_radius, cmd.radial_outer_radius - span * normalized_inset);
+        }
         let radial_scale = select(0.0, warped_radius / radius, radius > 0.000001);
         let radial_local = transform_local(vec2<f32>(delta.x * radial_scale * destination_size.x, delta.y * radial_scale * destination_size.y), cmd.rotation, cmd.mirror);
         p = crop_origin + vec2<f32>(cmd.radial_center_x * crop_size.x, cmd.radial_center_y * crop_size.y) + radial_local * scale;
@@ -168,11 +277,30 @@ fn source_position(cmd: RegionCommand, pixel: vec2<u32>) -> SourcePosition {
     } else if (cmd.mode == 5u) {
         let radial_local = transform_local(q - vec2<f32>(cmd.radial_center_x, cmd.radial_center_y), cmd.rotation, cmd.mirror);
         let radius = length(radial_local);
-        valid = radius <= cmd.radial_outer_radius;
+        // The rectangular atlas allocation owns every pixel. Outside the authored
+        // circular coverage, extend the nearest radial boundary sample instead of
+        // publishing transparent/black corners that bleed through filtering and mips.
+        let span = max(cmd.radial_outer_radius - cmd.radial_inner_radius, 0.000001);
+        let radial_inset = min(1.5, max(crop_size.y * 0.5, 0.5));
+        let outer_extension_radius = max(
+            cmd.radial_inner_radius,
+            cmd.radial_outer_radius - span * radial_inset / max(crop_size.y, 1.0),
+        );
+        let sample_radius = select(
+            clamp(radius, cmd.radial_inner_radius, cmd.radial_outer_radius),
+            outer_extension_radius,
+            radius >= cmd.radial_outer_radius,
+        );
+        valid = true;
         let theta = atan2(radial_local.y, radial_local.x) / 6.28318530718;
         let wrapped_theta = theta - floor(theta);
-        let span = max(cmd.radial_outer_radius - cmd.radial_inner_radius, 0.000001);
-        let polar = vec2<f32>(wrapped_theta * crop_size.x, pow(clamp((radius - cmd.radial_inner_radius) / span, 0.0, 1.0), cmd.radial_falloff) * crop_size.y);
+        let polar = vec2<f32>(
+            min(wrapped_theta * crop_size.x, crop_size.x - 0.000001),
+            min(
+                pow(clamp((sample_radius - cmd.radial_inner_radius) / span, 0.0, 1.0), cmd.radial_falloff) * crop_size.y,
+                crop_size.y - 0.000001,
+            ),
+        );
         let planar = vec2<f32>((cmd.radial_center_x + radial_local.x) * crop_size.x, (cmd.radial_center_y + radial_local.y) * crop_size.y);
         let transition = min(cmd.radial_blend_width, span);
         let t = select(1.0, clamp((radius - cmd.radial_inner_radius) / transition, 0.0, 1.0), transition > 0.000001);
@@ -217,7 +345,32 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     let seam_linear = sample_linear(position.seam, cmd.sampling_filter != 0u);
                     blended = mix(linear, seam_linear, position.seam_blend);
                 }
-                color = vec4<f32>(linear_to_srgb(blended.r), linear_to_srgb(blended.g), linear_to_srgb(blended.b), blended.a);
+                let final_height = final_height_at(cmd, pixel);
+                if (header.map_kind == 0u) {
+                    color = vec4<f32>(linear_to_srgb(blended.r), linear_to_srgb(blended.g), linear_to_srgb(blended.b), blended.a);
+                } else if (header.map_kind == 1u) {
+                    color = vec4<f32>(final_height, final_height, final_height, 1.0);
+                } else if (header.map_kind == 2u) {
+                    let decoded = blended.xyz * 2.0 - vec3<f32>(1.0);
+                    let authored = transform_tangent_normal(decoded, cmd.rotation, cmd.mirror);
+                    color = vec4<f32>(
+                        encode_normal(authored.x),
+                        encode_normal(authored.y),
+                        encode_normal(authored.z),
+                        blended.a,
+                    );
+                } else if (header.map_kind == 3u) {
+                    let base = select(170.0 / 255.0, clamp(blended.r, 0.0, 1.0), header.source_role == 3u);
+                    let value = clamp(base + max(0.0, 0.5 - final_height) * (70.0 / 255.0), 0.0, 1.0);
+                    color = vec4<f32>(value, value, value, 1.0);
+                } else if (header.map_kind == 4u) {
+                    let base = select(1.0, clamp(blended.r, 0.0, 1.0), header.source_role == 4u);
+                    let value = clamp(base - max(0.0, 0.5 - final_height) * (130.0 / 255.0), 0.0, 1.0);
+                    color = vec4<f32>(value, value, value, 1.0);
+                } else if (header.map_kind == 5u) {
+                    let value = select(0.0, clamp(blended.r, 0.0, 1.0), header.source_role == 5u);
+                    color = vec4<f32>(value, value, value, 1.0);
+                }
                 matched = true;
             }
         }

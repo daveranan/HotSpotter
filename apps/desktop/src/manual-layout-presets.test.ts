@@ -83,7 +83,8 @@ test("manual-layout-presets: Save As preserves keys by authored rectangle after 
 
 test("manual-layout-presets: settled Base Color and user preset storage use authoritative native paths", () => {
   const app = readFileSync("src/source-first-app.tsx", "utf8");
-  assert.match(app, /localTopologyPending \|\| !imageUrl/);
+  assert.match(app, /const displayGpuTiles = !!activeTilePublication/);
+  assert.match(app, /textureVisible && displayGpuTiles && artifact \? <GpuTiledPreviewCanvas/);
   assert.match(app, /textureVisible && imageUrl \? <img src=\{imageUrl\}/);
   assert.match(app, /invoke<AuthoredLayoutPreset\[]>\("list_authored_layout_presets"/);
   assert.match(app, /invoke<AuthoredLayoutPreset\[]>\("save_authored_layout_preset"/);

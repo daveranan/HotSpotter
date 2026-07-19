@@ -111,6 +111,10 @@ impl GpuDeviceState {
 }
 
 pub const BASE_COLOR_ATLAS_WGSL: &str = include_str!("gpu_base_color.wgsl");
+pub const FILL_R32_FLOAT_ATLAS_WGSL: &str = include_str!("gpu_fill_r32float.wgsl");
+pub const NORMAL_FROM_HEIGHT_ATLAS_WGSL: &str = include_str!("gpu_normal_from_height.wgsl");
+pub const REGION_ID_ATLAS_WGSL: &str = include_str!("gpu_region_id.wgsl");
+pub const REGION_ID_DISPLAY_ATLAS_WGSL: &str = include_str!("gpu_region_id_display.wgsl");
 
 /// Application-owned, one-time GPU initialization boundary. Prompt 1 only
 /// reports capabilities; no pixel executor consumes this state yet.
@@ -155,7 +159,8 @@ fn initialize_device(generation: u64) -> Result<Arc<GpuDeviceState>, GpuCapabili
     })?;
     let features = adapter.features();
     let limits = adapter.limits();
-    let requested_features = features & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::CLEAR_TEXTURE);
+    let requested_features =
+        features & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::CLEAR_TEXTURE);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("hot-trimmer-application-gpu"),
         required_features: requested_features,

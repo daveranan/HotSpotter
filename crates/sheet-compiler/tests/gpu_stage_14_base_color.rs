@@ -2,16 +2,20 @@ use std::{
     io::Cursor,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
+    time::Instant,
 };
 
 use hot_trimmer_domain::{
     CancellationToken, ContentDigest, DocumentHash, EdgeEligibility, MaterialChannelRole,
-    MaterialMapKind, NormalizedBounds, NormalizedPoint, NormalizedScalar, OrientedPixelSize,
+    MaterialMapKind, NormalConvention, NormalizedBounds, NormalizedPoint, NormalizedScalar, OrientedPixelSize,
     PixelBounds, PixelSize, Projection, QuarterTurn, RadialMappingSettings, RegionBehavior,
     RegionContinuity, RegionId, RegionSampling, SamplingMode, SamplingPolicy, SourceCropIntent,
-    SourceId, SourceSamplingMode, SourceSetId, TemplateSlotRole, TrimSheetDocumentCommand,
+    SourceId, SourceSamplingMode, SourceSetId, StructuralProfile, TemplateSlotRole,
+    TrimSheetDocumentCommand,
 };
-use hot_trimmer_image_io::{ImagePlane, LinearColor, ResolvedAlphaMode};
+use hot_trimmer_image_io::{
+    ImagePlane, LinearColor, LinearScalar, NormalAlphaPolicy, ResolvedAlphaMode, TangentNormal,
+};
 use hot_trimmer_material_synthesis::PreparedMaterialDomain;
 use hot_trimmer_placement_solver::{
     CandidateDescriptors, CandidateFamily, CandidateRoute, CandidateTransform, CropCandidate,
@@ -24,11 +28,12 @@ use hot_trimmer_sheet_compiler::{
     AlgorithmCompiler, AtlasFinalAtlasOutput, AtlasPreparedSource, AtlasRenderExecutionInput,
     AtlasRenderExecutor, AtlasRenderExecutorOutput, CompiledAtlasPlanV1,
     CompiledAtlasPreviewProfile, CompiledColorSpacePolicy, CompiledNormalConvention,
-    CompiledRegionCommandV1, CompiledSourceCommandV1, CompiledTileRequest,
-    CompiledTileRequestKind, GpuAtlasRenderExecutor, GpuAtlasSourceTextureCache, OutputPixelRect,
-    PersistedStage14PreviewRequest, SlotSynthesisLimits, SlotSynthesisRequest, SourceFramePreviewCache,
-    SourceFramePreviewProfile, SourcePixelRect, atlas_cpu_execution_counters,
-    clear_atlas_cpu_execution_counters, synthesize_slot_material_with_guard,
+    CompiledRegionCommandV1, CompiledSourceCommandV1, CompiledTileRequest, CompiledTileRequestKind,
+    GpuAtlasRenderExecutor, GpuAtlasSourceTextureCache, OutputPixelRect,
+    PersistedStage14PreviewRequest, SlotSynthesisLimits, SlotSynthesisRequest,
+    SourceFramePreviewCache, SourceFramePreviewProfile, SourceFramePreviewViewIntent,
+    SourcePixelRect, atlas_cpu_execution_counters, clear_atlas_cpu_execution_counters,
+    synthesize_slot_material_with_guard,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use uuid::Uuid;
@@ -67,6 +72,11 @@ fn output_pixel(output: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         output[offset + 2],
         output[offset + 3],
     ]
+}
+
+fn output_f32(output: &[u8], width: u32, x: u32, y: u32) -> f32 {
+    let offset = ((y * width + x) * 4) as usize;
+    f32::from_le_bytes(output[offset..offset + 4].try_into().expect("f32 pixel"))
 }
 
 fn expected_domain_pixel(x: u32, y: u32) -> [u8; 4] {
@@ -126,18 +136,17 @@ fn sample_f32<T: Copy>(
 ) -> f32 {
     let (x0, y0, x1, y1, tx, ty) = sample_bounds(plane, at);
     if !linear {
-        return value(plane.pixel(if tx < 0.5 { x0 } else { x1 }, if ty < 0.5 { y0 } else { y1 }));
+        return value(plane.pixel(
+            if tx < 0.5 { x0 } else { x1 },
+            if ty < 0.5 { y0 } else { y1 },
+        ));
     }
     let a = value(plane.pixel(x0, y0)) * (1.0 - tx) + value(plane.pixel(x1, y0)) * tx;
     let b = value(plane.pixel(x0, y1)) * (1.0 - tx) + value(plane.pixel(x1, y1)) * tx;
     a * (1.0 - ty) + b * ty
 }
 
-fn sample_linear_color(
-    plane: &ImagePlane<LinearColor>,
-    at: [f32; 2],
-    linear: bool,
-) -> LinearColor {
+fn sample_linear_color(plane: &ImagePlane<LinearColor>, at: [f32; 2], linear: bool) -> LinearColor {
     LinearColor {
         rgb: std::array::from_fn(|index| sample_f32(plane, at, linear, |pixel| pixel.rgb[index])),
         alpha: sample_f32(plane, at, linear, |pixel| pixel.alpha),
@@ -151,7 +160,12 @@ fn expected_domain_sample(domain: &PreparedMaterialDomain, at: [f32; 2], linear:
     linear_rgba8(sample_linear_color(plane, at, linear))
 }
 
-fn expected_encoded_gradient_sample(width: u32, height: u32, at: [f32; 2], linear: bool) -> [u8; 4] {
+fn expected_encoded_gradient_sample(
+    width: u32,
+    height: u32,
+    at: [f32; 2],
+    linear: bool,
+) -> [u8; 4] {
     let pixels = (0..height)
         .flat_map(|y| {
             (0..width).map(move |x| LinearColor {
@@ -316,11 +330,18 @@ fn plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
         channel_role: MaterialChannelRole::BaseColor,
     };
     let make_region = |index: u32, id: RegionId, crop: SourceCrop, dst: PixelBounds, mode| {
-        let sampling_plan =
-            sampling_plan(id, source_id.clone(), domain.cache_key.clone(), [domain.width, domain.height], crop, mode);
+        let sampling_plan = sampling_plan(
+            id,
+            source_id.clone(),
+            domain.cache_key.clone(),
+            [domain.width, domain.height],
+            crop,
+            mode,
+        );
         CompiledRegionCommandV1 {
             region_id: id,
             compact_index: index,
+            region_role: hot_trimmer_domain::ManualRegionRole::Panel,
             source_set_id,
             source_id: source_id.clone(),
             patch_id: None,
@@ -338,6 +359,7 @@ fn plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
             },
             source_to_region_transform: Default::default(),
             radial_parameters: None,
+            structural_profile: StructuralProfile::Flat,
             continuity: RegionContinuity::None,
             padding_px: 0,
             edge_eligibility: EdgeEligibility::default(),
@@ -478,8 +500,919 @@ fn prepared_source(
     AtlasPreparedSource {
         source_set_id: source.source_set_id,
         source_id: source.source_id.clone(),
-        channel_role: MaterialChannelRole::BaseColor,
+        channel_role: source.channel_role,
         domain,
+    }
+}
+
+fn material_domain() -> Arc<PreparedMaterialDomain> {
+    let width = 4;
+    let height = 4;
+    let colors = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| LinearColor {
+                rgb: [x as f32 / 3.0, y as f32 / 3.0, 0.0],
+                alpha: 1.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    let scalar = |value: f32| vec![LinearScalar(value); (width * height) as usize];
+    Arc::new(
+        PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(b"gpu-material-map-domain"),
+            ContentDigest::sha256(b"gpu-material-map-source"),
+            vec![
+                PreparedExemplarChannel::BaseColor {
+                    plane: ImagePlane::from_row_major(width, height, 4, &colors).unwrap(),
+                    alpha_mode: ResolvedAlphaMode::Opaque,
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Height,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalar(0.75)).unwrap(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Roughness,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalar(0.25)).unwrap(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::AmbientOcclusion,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalar(0.5)).unwrap(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Metallic,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalar(1.0)).unwrap(),
+                },
+            ],
+        )
+        .unwrap(),
+    )
+}
+
+fn material_domain_with_transparent_outer_row() -> Arc<PreparedMaterialDomain> {
+    let width = 4;
+    let height = 4;
+    let colors = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |_| LinearColor {
+                rgb: [0.4, 0.6, 0.8],
+                alpha: if y == height - 1 { 0.0 } else { 1.0 },
+            })
+        })
+        .collect::<Vec<_>>();
+    Arc::new(
+        PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(b"gpu-radial-transparent-edge-domain"),
+            ContentDigest::sha256(b"gpu-radial-transparent-edge-source"),
+            vec![PreparedExemplarChannel::BaseColor {
+                plane: ImagePlane::from_row_major(width, height, 4, &colors).unwrap(),
+                alpha_mode: ResolvedAlphaMode::Straight,
+            }],
+        )
+        .unwrap(),
+    )
+}
+
+fn material_domain_with_authored_landmarks() -> Arc<PreparedMaterialDomain> {
+    let width = 4;
+    let height = 4;
+    let colors = vec![
+        LinearColor {
+            rgb: [0.2, 0.3, 0.4],
+            alpha: 1.0,
+        };
+        (width * height) as usize
+    ];
+    let scalars = |low: f32, high: f32| {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| LinearScalar(if (x + y) % 2 == 0 { low } else { high }))
+            })
+            .collect::<Vec<_>>()
+    };
+    let normals = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                if x < 2 && y < 2 {
+                    TangentNormal {
+                        xyz: [0.6, 0.6, 0.529_150_25],
+                        alpha: 1.0,
+                    }
+                } else {
+                    TangentNormal {
+                        xyz: [0.0, 0.0, 1.0],
+                        alpha: 1.0,
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    Arc::new(
+        PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(b"gpu-material-map-landmark-domain"),
+            ContentDigest::sha256(b"gpu-material-map-landmark-source"),
+            vec![
+                PreparedExemplarChannel::BaseColor {
+                    plane: ImagePlane::from_row_major(width, height, 4, &colors).unwrap(),
+                    alpha_mode: ResolvedAlphaMode::Opaque,
+                },
+                PreparedExemplarChannel::Normal {
+                    plane: ImagePlane::from_row_major(width, height, 4, &normals).unwrap(),
+                    source_convention: NormalConvention::OpenGl,
+                    canonical_convention: NormalConvention::OpenGl,
+                    alpha_policy: NormalAlphaPolicy::Ignore,
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Height,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalars(0.5, 0.5))
+                        .unwrap(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Roughness,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalars(0.2, 0.8))
+                        .unwrap(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::AmbientOcclusion,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalars(0.35, 0.9))
+                        .unwrap(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Metallic,
+                    plane: ImagePlane::from_row_major(width, height, 4, &scalars(0.1, 1.0))
+                        .unwrap(),
+                },
+            ],
+        )
+        .unwrap(),
+    )
+}
+
+fn material_source_record(
+    domain: &PreparedMaterialDomain,
+    source_set_id: SourceSetId,
+    role: MaterialChannelRole,
+) -> CompiledSourceCommandV1 {
+    CompiledSourceCommandV1 {
+        source_set_id,
+        source_id: domain.prepared_source_digest.clone(),
+        digest: domain.prepared_source_digest.clone(),
+        oriented_dimensions: OrientedPixelSize {
+            width: domain.width,
+            height: domain.height,
+        },
+        decoder_version: "test-decoder".into(),
+        decoded_format: "rgba8".into(),
+        color_version: "test-color".into(),
+        channel_role: role,
+    }
+}
+
+fn material_map_plan(domain: &PreparedMaterialDomain, map: MaterialMapKind) -> CompiledAtlasPlanV1 {
+    let source_set_id = SourceSetId::from_bytes([42; 16]);
+    let base_source = material_source_record(domain, source_set_id, MaterialChannelRole::BaseColor);
+    let mut region = region_command(
+        0,
+        RegionId::from_bytes([42; 16]),
+        &base_source,
+        domain,
+        SourceCrop {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        },
+        PixelBounds {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        },
+        SamplingMode::DirectCrop,
+        RegionSampling::OneShot,
+    );
+    region.structural_profile = StructuralProfile::Flat;
+    CompiledAtlasPlanV1 {
+        schema_version: 1,
+        algorithm_version: "gpu-material-map-test".into(),
+        document_revision: 1,
+        request_generation: Some(1),
+        topology_hash: DocumentHash([1; 32]),
+        appearance_hash: DocumentHash([2; 32]),
+        output_size: PixelSize {
+            width: 4,
+            height: 4,
+        },
+        preview_profile: CompiledAtlasPreviewProfile::Authoritative,
+        normal_convention: CompiledNormalConvention::OpenGl,
+        color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
+        tile_request: CompiledTileRequest {
+            kind: CompiledTileRequestKind::ExactViewport,
+            generation: 1,
+            output_rect: OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+            mip_level: 0,
+            halo_px: 0,
+            valid_rect: OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+        },
+        requested_maps: vec![map],
+        ordered_sources: domain
+        .registered_channels()
+        .iter()
+        .map(PreparedExemplarChannel::role)
+        .map(|role| material_source_record(domain, source_set_id, role))
+        .collect(),
+        ordered_regions: vec![region],
+        final_plan_hash: ContentDigest(String::new()),
+    }
+    .finalize()
+    .unwrap()
+}
+
+fn material_map_modes_plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
+    let source_set_id = SourceSetId::from_bytes([43; 16]);
+    let base_source = material_source_record(domain, source_set_id, MaterialChannelRole::BaseColor);
+    let modes = [
+        (
+            SamplingMode::DirectCrop,
+            RegionSampling::OneShot,
+            StructuralProfile::Flat,
+            None,
+        ),
+        (
+            SamplingMode::RepeatX,
+            RegionSampling::LoopX,
+            StructuralProfile::Bevel,
+            None,
+        ),
+        (
+            SamplingMode::RepeatY,
+            RegionSampling::LoopY,
+            StructuralProfile::Groove,
+            None,
+        ),
+        (
+            SamplingMode::PeriodicTile,
+            RegionSampling::LoopXy,
+            StructuralProfile::PanelFrame,
+            None,
+        ),
+        (
+            SamplingMode::PolarRadial,
+            RegionSampling::OneShot,
+            StructuralProfile::RadialDisc,
+            Some(RadialMappingSettings {
+                center_x: 0.5,
+                center_y: 0.5,
+                inner_radius: 0.0,
+                outer_radius: 0.5,
+                falloff: 1.0,
+                blend_width: 0.05,
+                seam_blend_width: 0.05,
+            }),
+        ),
+    ];
+    let ordered_regions = modes
+        .into_iter()
+        .enumerate()
+        .map(|(index, (mode, sampling, profile, radial))| {
+            let mut region = region_command(
+                index as u32,
+                RegionId::from_bytes([index as u8 + 50; 16]),
+                &base_source,
+                domain,
+                SourceCrop {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                PixelBounds {
+                    x: (index as u32) * 4,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                mode,
+                sampling,
+            );
+            region.structural_profile = profile;
+            region.region_role = match mode {
+                SamplingMode::DirectCrop => hot_trimmer_domain::ManualRegionRole::Unique,
+                SamplingMode::RepeatX => hot_trimmer_domain::ManualRegionRole::HorizontalStrip,
+                SamplingMode::RepeatY => hot_trimmer_domain::ManualRegionRole::VerticalStrip,
+                SamplingMode::PolarRadial | SamplingMode::PlanarRadial => {
+                    hot_trimmer_domain::ManualRegionRole::Radial
+                }
+                _ => hot_trimmer_domain::ManualRegionRole::Panel,
+            };
+            region.continuity = match mode {
+                SamplingMode::RepeatX => RegionContinuity::X,
+                SamplingMode::RepeatY => RegionContinuity::Y,
+                SamplingMode::PeriodicTile => RegionContinuity::Xy,
+                _ => RegionContinuity::None,
+            };
+            region.edge_eligibility = EdgeEligibility::for_continuity(region.continuity);
+            region.radial_parameters = radial;
+            region.sampling_plan.radial_mapping = radial;
+            region
+        })
+        .collect();
+    CompiledAtlasPlanV1 {
+        schema_version: 1,
+        algorithm_version: "gpu-material-map-modes-test".into(),
+        document_revision: 1,
+        request_generation: Some(1),
+        topology_hash: DocumentHash([3; 32]),
+        appearance_hash: DocumentHash([4; 32]),
+        output_size: PixelSize {
+            width: 20,
+            height: 4,
+        },
+        preview_profile: CompiledAtlasPreviewProfile::Authoritative,
+        normal_convention: CompiledNormalConvention::OpenGl,
+        color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
+        tile_request: CompiledTileRequest {
+            kind: CompiledTileRequestKind::ExactViewport,
+            generation: 1,
+            output_rect: OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 4,
+            }),
+            mip_level: 0,
+            halo_px: 0,
+            valid_rect: OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 4,
+            }),
+        },
+        requested_maps: vec![
+            MaterialMapKind::Height,
+            MaterialMapKind::Normal,
+            MaterialMapKind::Roughness,
+            MaterialMapKind::AmbientOcclusion,
+            MaterialMapKind::Metallic,
+            MaterialMapKind::RegionId,
+        ],
+        ordered_sources: domain
+        .registered_channels()
+        .iter()
+        .map(PreparedExemplarChannel::role)
+        .map(|role| material_source_record(domain, source_set_id, role))
+        .collect(),
+        ordered_regions,
+        final_plan_hash: ContentDigest(String::new()),
+    }
+    .finalize()
+    .unwrap()
+}
+
+fn radial_base_color_plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
+    let source_set_id = SourceSetId::from_bytes([44; 16]);
+    let source = material_source_record(domain, source_set_id, MaterialChannelRole::BaseColor);
+    let mut region = region_command(
+        0,
+        RegionId::from_bytes([77; 16]),
+        &source,
+        domain,
+        SourceCrop {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        },
+        PixelBounds {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        },
+        SamplingMode::PolarRadial,
+        RegionSampling::OneShot,
+    );
+    region.region_role = hot_trimmer_domain::ManualRegionRole::Radial;
+    region.structural_profile = StructuralProfile::RadialDisc;
+    let radial = RadialMappingSettings {
+        center_x: 0.5,
+        center_y: 0.5,
+        inner_radius: 0.0,
+        outer_radius: 0.5,
+        falloff: 1.0,
+        blend_width: 0.0,
+        seam_blend_width: 0.0,
+    };
+    region.radial_parameters = Some(radial);
+    region.sampling_plan.radial_mapping = Some(radial);
+    CompiledAtlasPlanV1 {
+        schema_version: 1,
+        algorithm_version: "gpu-radial-edge-extension-test".into(),
+        document_revision: 1,
+        request_generation: Some(1),
+        topology_hash: DocumentHash([5; 32]),
+        appearance_hash: DocumentHash([6; 32]),
+        output_size: PixelSize {
+            width: 4,
+            height: 4,
+        },
+        preview_profile: CompiledAtlasPreviewProfile::Authoritative,
+        normal_convention: CompiledNormalConvention::OpenGl,
+        color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
+        tile_request: CompiledTileRequest {
+            kind: CompiledTileRequestKind::ExactViewport,
+            generation: 1,
+            output_rect: OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+            mip_level: 0,
+            halo_px: 0,
+            valid_rect: OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+        },
+        requested_maps: vec![MaterialMapKind::BaseColor],
+        ordered_sources: vec![source],
+        ordered_regions: vec![region],
+        final_plan_hash: ContentDigest(String::new()),
+    }
+    .finalize()
+    .unwrap()
+}
+
+fn prepared_sources_for_plan(
+    plan: &CompiledAtlasPlanV1,
+    domain: Arc<PreparedMaterialDomain>,
+) -> Vec<AtlasPreparedSource> {
+    plan.ordered_sources
+        .iter()
+        .map(|source| prepared_source(source, Arc::clone(&domain)))
+        .collect()
+}
+
+#[test]
+fn gpu_material_map_pipeline() {
+    let domain = material_domain();
+    let height_plan = material_map_plan(&domain, MaterialMapKind::Height);
+    let height = execute_final_atlas(
+        &height_plan,
+        prepared_sources_for_plan(&height_plan, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        height.interactive_tile.manifest.map,
+        MaterialMapKind::Height
+    );
+    assert_eq!(
+        height.interactive_tile.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear
+    );
+    let height_typed = height
+        .map_tiles
+        .get(&MaterialMapKind::Height)
+        .expect("Height request should retain its typed map tile");
+    assert_eq!(
+        height_typed.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Float
+    );
+    assert!((0.74..=0.76).contains(&output_f32(height_typed.pixels(), 4, 0, 0)));
+    assert!(height.telemetry.iter().any(|line| {
+        line.contains("requested_map=Height")
+            && line.contains("executed_gpu_passes=material-r32float-publish")
+            && line.contains("intermediate_cache=not-available")
+    }));
+
+    let normal_plan = material_map_plan(&domain, MaterialMapKind::Normal);
+    let normal = execute_final_atlas(
+        &normal_plan,
+        prepared_sources_for_plan(&normal_plan, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        normal.interactive_tile.manifest.map,
+        MaterialMapKind::Normal
+    );
+    assert!(
+        normal
+            .interactive_tile
+            .pixels()
+            .chunks_exact(4)
+            .all(|pixel| pixel[2] >= 250),
+        "flat material height should derive a flat final normal",
+    );
+
+    let prereq_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+    let _height_prereq = execute_final_atlas_with_cache(
+        &height_plan,
+        prepared_sources_for_plan(&height_plan, Arc::clone(&domain)),
+        &prereq_cache,
+    );
+    let mut normal_from_cached_height_plan = normal_plan.clone();
+    normal_from_cached_height_plan.tile_request.generation = 2;
+    normal_from_cached_height_plan.final_plan_hash = ContentDigest(String::new());
+    normal_from_cached_height_plan = normal_from_cached_height_plan.finalize().unwrap();
+    let normal_from_cached_height = execute_final_atlas_with_cache(
+        &normal_from_cached_height_plan,
+        prepared_sources_for_plan(&normal_from_cached_height_plan, Arc::clone(&domain)),
+        &prereq_cache,
+    );
+    assert!(normal_from_cached_height.telemetry.iter().any(|line| {
+        line.contains("requested_map=Normal")
+            && line.contains("executed_gpu_passes=height-r32float-gpu-resource-cache,normal-from-final-height")
+            && line.contains("intermediate_cache=final-height:persistent-gpu-resource-hit")
+    }));
+
+    let roughness_plan = material_map_plan(&domain, MaterialMapKind::Roughness);
+    let roughness = execute_final_atlas(
+        &roughness_plan,
+        prepared_sources_for_plan(&roughness_plan, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        roughness.interactive_tile.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear
+    );
+    let roughness_typed = roughness
+        .map_tiles
+        .get(&MaterialMapKind::Roughness)
+        .expect("Roughness request should retain its typed map tile");
+    assert_eq!(
+        roughness_typed.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Float
+    );
+    assert!((0.24..=0.26).contains(&output_f32(roughness_typed.pixels(), 4, 0, 0)));
+
+    let ao_plan = material_map_plan(&domain, MaterialMapKind::AmbientOcclusion);
+    let ao = execute_final_atlas(
+        &ao_plan,
+        prepared_sources_for_plan(&ao_plan, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        ao.interactive_tile.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear
+    );
+    let ao_typed = ao
+        .map_tiles
+        .get(&MaterialMapKind::AmbientOcclusion)
+        .expect("AO request should retain its typed map tile");
+    assert!((0.49..=0.51).contains(&output_f32(ao_typed.pixels(), 4, 0, 0)));
+
+    let metallic_plan = material_map_plan(&domain, MaterialMapKind::Metallic);
+    let metallic = execute_final_atlas(
+        &metallic_plan,
+        prepared_sources_for_plan(&metallic_plan, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        metallic.interactive_tile.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear
+    );
+    let metallic_typed = metallic
+        .map_tiles
+        .get(&MaterialMapKind::Metallic)
+        .expect("Metallic request should retain its typed map tile");
+    assert_eq!(output_f32(metallic_typed.pixels(), 4, 0, 0), 1.0);
+
+    let region_id_plan = material_map_plan(&domain, MaterialMapKind::RegionId);
+    let region_id = execute_final_atlas(
+        &region_id_plan,
+        prepared_sources_for_plan(&region_id_plan, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        region_id.interactive_tile.manifest.map,
+        MaterialMapKind::RegionId
+    );
+    assert_eq!(
+        region_id.interactive_tile.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear
+    );
+    let region_id_typed = region_id
+        .map_tiles
+        .get(&MaterialMapKind::RegionId)
+        .expect("Region ID request should retain its typed map tile");
+    assert_eq!(
+        region_id_typed.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Uint
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            region_id_typed.pixels()[0..4]
+                .try_into()
+                .expect("compact index bytes")
+        ),
+        0
+    );
+    assert!(region_id.telemetry.iter().any(|line| {
+        line.contains("requested_map=RegionId")
+            && line.contains("executed_gpu_passes=compact-region-id-r32uint")
+            && line.contains("pixel_format=R32Uint")
+    }));
+
+    let mut multi = height_plan.clone();
+    multi.requested_maps = vec![MaterialMapKind::Height, MaterialMapKind::Normal];
+    multi.final_plan_hash = ContentDigest(String::new());
+    multi = multi.finalize().unwrap();
+    let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+    let result = with_gpu_executor(&cache, |executor| {
+        executor.execute(
+            &multi,
+            &AtlasRenderExecutionInput {
+                prepared_sources: prepared_sources_for_plan(&multi, Arc::clone(&domain)),
+                source_frame_cache: None,
+            },
+            &CancellationToken::new(),
+            &|| true,
+        )
+    });
+    let multi_output = result
+        .expect("multi-map GPU request should execute")
+        .as_final_atlas()
+        .expect("multi-map GPU request should publish final tiles")
+        .clone();
+    assert!(
+        multi_output
+            .map_tiles
+            .contains_key(&MaterialMapKind::Height)
+    );
+    assert!(
+        multi_output
+            .map_tiles
+            .contains_key(&MaterialMapKind::Normal)
+    );
+    assert_eq!(
+        multi_output.interactive_tile.manifest.map,
+        MaterialMapKind::Height
+    );
+    assert!(
+        multi_output
+            .intermediate_tiles
+            .contains_key("normal.final-height")
+    );
+    assert!(multi_output.telemetry.iter().any(|line| {
+        line.contains("dependency=Normal<-Height")
+            && line.contains("intermediate_cache=final-height:live-gpu-hit")
+            && line.contains("normal_publish=from-r32float-gpu-final-height")
+    }));
+    assert!(
+        multi_output
+            .telemetry
+            .iter()
+            .any(|line| line.contains("gpu_pass_timing=normal-from-final-height")),
+        "real GPU work should report timestamp-query pass timing"
+    );
+
+    let mut cached_normal_plan = normal_plan.clone();
+    cached_normal_plan.tile_request.generation = 2;
+    cached_normal_plan.final_plan_hash = ContentDigest(String::new());
+    cached_normal_plan = cached_normal_plan.finalize().unwrap();
+    let cached_started = Instant::now();
+    let cached_result = with_gpu_executor(&cache, |executor| {
+        executor.execute(
+            &cached_normal_plan,
+            &AtlasRenderExecutionInput {
+                prepared_sources: prepared_sources_for_plan(
+                    &cached_normal_plan,
+                    Arc::clone(&domain),
+                ),
+                source_frame_cache: None,
+            },
+            &CancellationToken::new(),
+            &|| true,
+        )
+    });
+    let cached_elapsed_ms = cached_started.elapsed().as_millis();
+    let cached_output = cached_result
+        .expect("cached Normal switch should execute")
+        .as_final_atlas()
+        .expect("cached Normal switch should publish a final tile")
+        .clone();
+    assert_eq!(cached_output.render_ms, 0);
+    assert!(
+        cached_elapsed_ms <= 50,
+        "cached Normal switch should stay under 50 ms, observed {cached_elapsed_ms} ms"
+    );
+    assert!(cached_output.telemetry.iter().any(|line| {
+        line.contains("requested_map=Normal")
+            && line.contains("executed_gpu_passes=none")
+            && line.contains("final_tile_cache=hit")
+            && line.contains("readback_ms=0")
+    }));
+}
+
+#[test]
+fn gpu_material_map_imported_normal_landmark_and_cache_scope() {
+    let domain = material_domain_with_authored_landmarks();
+    let normal_plan = material_map_plan(&domain, MaterialMapKind::Normal);
+    let normal = execute_final_atlas(
+        &normal_plan,
+        prepared_sources_for_plan(&normal_plan, Arc::clone(&domain)),
+    );
+    let open_gl_landmark = output_pixel(normal.interactive_tile.pixels(), 4, 0, 0);
+    assert!(
+        open_gl_landmark[0] > 180 && open_gl_landmark[1] > 180 && open_gl_landmark[2] < 230,
+        "flat Height must preserve the unmistakable imported Normal landmark, got {open_gl_landmark:?}"
+    );
+    assert!(normal.telemetry.iter().any(|line| {
+        line.contains("executed_gpu_passes=height-r32float,authored-normal-sample,normal-from-final-height")
+    }));
+
+    let mut direct_x_plan = normal_plan.clone();
+    direct_x_plan.normal_convention = CompiledNormalConvention::DirectX;
+    direct_x_plan.final_plan_hash = ContentDigest(String::new());
+    direct_x_plan = direct_x_plan.finalize().unwrap();
+    let direct_x = execute_final_atlas(
+        &direct_x_plan,
+        prepared_sources_for_plan(&direct_x_plan, Arc::clone(&domain)),
+    );
+    let direct_x_landmark = output_pixel(direct_x.interactive_tile.pixels(), 4, 0, 0);
+    assert_eq!(direct_x_landmark[0], open_gl_landmark[0]);
+    assert!(
+        direct_x_landmark[1] < 80 && open_gl_landmark[1] > 180,
+        "the OpenGL/DirectX Y convention must be applied exactly once at publication"
+    );
+
+    let modes_plan = material_map_modes_plan(&domain);
+    let modes = execute_final_atlas(
+        &modes_plan,
+        prepared_sources_for_plan(&modes_plan, Arc::clone(&domain)),
+    );
+    let mapped_normals = modes
+        .map_tiles
+        .get(&MaterialMapKind::Normal)
+        .expect("mapped Normal tile");
+    for region in 0..5_u32 {
+        let landmark_survived = (0..4_u32).any(|y| {
+            (region * 4..region * 4 + 4).any(|x| {
+                let pixel = output_pixel(mapped_normals.pixels(), 20, x, y);
+                pixel[3] > 0
+                    && (pixel[0].abs_diff(128) > 35 || pixel[1].abs_diff(128) > 35)
+                    && pixel[2] < 245
+            })
+        });
+        assert!(
+            landmark_survived,
+            "imported Normal landmark was lost in mapped region {region}"
+        );
+    }
+
+    let base_hash = normal_plan.pixel_plan_hash(MaterialMapKind::BaseColor).unwrap();
+    let height_hash = normal_plan.pixel_plan_hash(MaterialMapKind::Height).unwrap();
+    let normal_hash = normal_plan.pixel_plan_hash(MaterialMapKind::Normal).unwrap();
+    let mut replaced_normal = normal_plan.clone();
+    replaced_normal
+        .ordered_sources
+        .iter_mut()
+        .find(|source| source.channel_role == MaterialChannelRole::Normal)
+        .expect("Normal source record")
+        .digest = ContentDigest::sha256(b"replacement-normal-only");
+    assert_eq!(
+        replaced_normal.pixel_plan_hash(MaterialMapKind::BaseColor).unwrap(),
+        base_hash,
+        "replacing Normal must not invalidate Base Color pixels"
+    );
+    assert_eq!(
+        replaced_normal.pixel_plan_hash(MaterialMapKind::Height).unwrap(),
+        height_hash,
+        "replacing Normal must not invalidate final Height pixels"
+    );
+    assert_ne!(
+        replaced_normal.pixel_plan_hash(MaterialMapKind::Normal).unwrap(),
+        normal_hash,
+        "replacing Normal must invalidate Normal pixels"
+    );
+}
+
+#[test]
+fn gpu_material_maps_cover_direct_loop_and_radial_modes() {
+    let domain = material_domain();
+    let plan = material_map_modes_plan(&domain);
+    let output = execute_final_atlas(
+        &plan,
+        prepared_sources_for_plan(&plan, Arc::clone(&domain)),
+    );
+    for map in [
+        MaterialMapKind::Height,
+        MaterialMapKind::Normal,
+        MaterialMapKind::Roughness,
+        MaterialMapKind::AmbientOcclusion,
+        MaterialMapKind::Metallic,
+        MaterialMapKind::RegionId,
+    ] {
+        assert!(
+            output.map_tiles.contains_key(&map),
+            "multi-mode material fixture omitted {map:?}"
+        );
+        assert!(
+            output.display_tiles.contains_key(&map),
+            "multi-mode material fixture omitted display tile for {map:?}"
+        );
+    }
+
+    let height = output.map_tiles.get(&MaterialMapKind::Height).unwrap();
+    let roughness = output.map_tiles.get(&MaterialMapKind::Roughness).unwrap();
+    let ao = output
+        .map_tiles
+        .get(&MaterialMapKind::AmbientOcclusion)
+        .unwrap();
+    let normal = output.map_tiles.get(&MaterialMapKind::Normal).unwrap();
+    let region_id = output.map_tiles.get(&MaterialMapKind::RegionId).unwrap();
+    let region_class = output
+        .display_tiles
+        .get(&MaterialMapKind::RegionId)
+        .unwrap();
+    let lookup = plan.compact_region_id_lookup();
+    let expected_classes = lookup
+        .iter()
+        .map(|entry| entry.display_rgba8)
+        .collect::<Vec<_>>();
+    for index in 0..5_u32 {
+        let x = index * 4 + 2;
+        assert!(
+            (0.0..=2.0).contains(&output_f32(height.pixels(), 20, x, 2)),
+            "Height center for mapping fixture region {index} should be authored/structural"
+        );
+        assert!(
+            (0.20..=0.30).contains(&output_f32(roughness.pixels(), 20, x, 2)),
+            "Roughness center for mapping fixture region {index} should use authored scalar"
+        );
+        assert!(
+            (0.45..=0.55).contains(&output_f32(ao.pixels(), 20, x, 2)),
+            "AO center for mapping fixture region {index} should use authored scalar"
+        );
+        let normal_offset = ((2 * 20 + x) * 4) as usize;
+        assert!(
+            normal.pixels()[normal_offset + 3] > 0,
+            "Normal center for mapping fixture region {index} should remain valid"
+        );
+        let id_offset = normal_offset;
+        assert_eq!(
+            u32::from_le_bytes(
+                region_id.pixels()[id_offset..id_offset + 4]
+                    .try_into()
+                    .expect("compact region id")
+            ),
+            index,
+            "Region ID center should resolve compact index for mapping fixture region {index}"
+        );
+        let classification = output_pixel(region_class.pixels(), 20, x, 2);
+        assert!(
+            classification
+                .iter()
+                .zip(expected_classes[index as usize])
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
+            "region classification palette mismatch for region {index}: {classification:?}"
+        );
+    }
+    let radial_corner_height = output_f32(height.pixels(), 20, 16, 0);
+    let radial_corner_normal = output_pixel(normal.pixels(), 20, 16, 0);
+    assert!(
+        radial_corner_height >= 0.0 && radial_corner_normal[3] > 0,
+        "polar radial corners must receive ownership-constrained boundary extension: height={radial_corner_height}, normal={radial_corner_normal:?}"
+    );
+    assert_eq!(lookup[0].role, hot_trimmer_domain::ManualRegionRole::Unique);
+    assert_eq!(lookup[1].continuity, RegionContinuity::X);
+    assert_eq!(lookup[2].continuity, RegionContinuity::Y);
+    assert_eq!(lookup[3].continuity, RegionContinuity::Xy);
+    assert_eq!(lookup[4].role, hot_trimmer_domain::ManualRegionRole::Radial);
+    assert_ne!(
+        hot_trimmer_sheet_compiler::CompiledRegionClassification::Horizontal
+            .display_rgba8(0),
+        hot_trimmer_sheet_compiler::CompiledRegionClassification::Horizontal
+            .display_rgba8(1),
+        "different regions in the same semantic class need distinct display shades"
+    );
+}
+
+#[test]
+fn gpu_material_map_radial_extension_uses_opaque_interior_pixels() {
+    let domain = material_domain_with_transparent_outer_row();
+    let plan = radial_base_color_plan(&domain);
+    let output = execute_final_atlas(
+        &plan,
+        prepared_sources_for_plan(&plan, Arc::clone(&domain)),
+    );
+    let base_color = output
+        .display_tiles
+        .get(&MaterialMapKind::BaseColor)
+        .expect("radial Base Color display tile");
+    for (x, y) in [(0, 0), (3, 0), (0, 3), (3, 3)] {
+        let pixel = output_pixel(base_color.pixels(), 4, x, y);
+        assert_eq!(
+            pixel[3], 255,
+            "radial extension corner ({x}, {y}) must push the nearest opaque interior pixel, got {pixel:?}"
+        );
     }
 }
 
@@ -505,6 +1438,7 @@ fn region_command(
     CompiledRegionCommandV1 {
         region_id,
         compact_index: index,
+        region_role: hot_trimmer_domain::ManualRegionRole::Panel,
         source_set_id: source.source_set_id,
         source_id: source.source_id.clone(),
         patch_id: None,
@@ -518,6 +1452,7 @@ fn region_command(
         sampling,
         source_to_region_transform: hot_trimmer_domain::MappingTransform::default(),
         radial_parameters: None,
+        structural_profile: StructuralProfile::Flat,
         continuity: RegionContinuity::None,
         padding_px: 0,
         edge_eligibility: EdgeEligibility::default(),
@@ -601,7 +1536,8 @@ fn cpu_expected_base_color(
     let PreparedExemplarChannel::BaseColor { plane, .. } = &synthesized.channels[0] else {
         panic!("CPU oracle must produce Base Color");
     };
-    plane.to_row_major()
+    plane
+        .to_row_major()
         .iter()
         .flat_map(|pixel| {
             [
@@ -637,9 +1573,25 @@ fn encoded_gradient_png(width: u32, height: u32) -> Vec<u8> {
     encoded.into_inner()
 }
 
-fn base_color_rgba8(
-    artifact: &hot_trimmer_sheet_compiler::IntermediateAtlasArtifact,
-) -> &[u8] {
+fn encoded_channel_landmark_png(
+    width: u32,
+    height: u32,
+    pixel: impl Fn(u32, u32) -> [u8; 4],
+) -> Vec<u8> {
+    let mut image = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            image.put_pixel(x, y, Rgba(pixel(x, y)));
+        }
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .expect("encode companion channel fixture");
+    encoded.into_inner()
+}
+
+fn base_color_rgba8(artifact: &hot_trimmer_sheet_compiler::IntermediateAtlasArtifact) -> &[u8] {
     artifact
         .channels
         .iter()
@@ -688,17 +1640,44 @@ fn gpu_stage_14_base_color() {
     assert_eq!(first.command_count, 2);
     assert_eq!(first.upload_bytes, 4 * 4 * 4);
     assert_eq!(first.base_color_rgba8.len(), 4 * 2 * 4);
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 0, 0), expected_domain_pixel(0, 0));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 1, 0), expected_domain_pixel(1, 0));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 0, 1), expected_domain_pixel(0, 1));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 1, 1), expected_domain_pixel(1, 1));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 2, 0), expected_domain_pixel(0, 0));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 3, 0), expected_domain_pixel(1, 0));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 2, 1), expected_domain_pixel(0, 1));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 3, 1), expected_domain_pixel(1, 1));
-    assert!(first.region_valid_pixel_counts.iter().any(|(region, count)| {
-        *region == RegionId::from_bytes([1; 16]) && *count == 4
-    }));
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 0, 0),
+        expected_domain_pixel(0, 0)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 1, 0),
+        expected_domain_pixel(1, 0)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 0, 1),
+        expected_domain_pixel(0, 1)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 1, 1),
+        expected_domain_pixel(1, 1)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 2, 0),
+        expected_domain_pixel(0, 0)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 3, 0),
+        expected_domain_pixel(1, 0)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 2, 1),
+        expected_domain_pixel(0, 1)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 3, 1),
+        expected_domain_pixel(1, 1)
+    );
+    assert!(
+        first
+            .region_valid_pixel_counts
+            .iter()
+            .any(|(region, count)| { *region == RegionId::from_bytes([1; 16]) && *count == 4 })
+    );
     assert!(
         first
             .telemetry
@@ -715,7 +1694,11 @@ fn gpu_stage_14_base_color() {
         panic!("warm supported GPU route must not return CPU region buffers");
     };
     assert_eq!(warm.upload_bytes, 0);
-    assert!(warm.telemetry.iter().any(|line| line.contains("gpu_tile_cache=hit")));
+    assert!(
+        warm.telemetry
+            .iter()
+            .any(|line| line.contains("gpu_tile_cache=hit"))
+    );
 }
 
 #[test]
@@ -784,19 +1767,51 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
     );
     let repeat = execute_final_atlas(
         &repeat_plan,
-        vec![prepared_source(&repeat_plan.ordered_sources[0], Arc::clone(&domain))],
+        vec![prepared_source(
+            &repeat_plan.ordered_sources[0],
+            Arc::clone(&domain),
+        )],
     );
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 0, 0), expected_domain_pixel(1, 0));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 1, 0), expected_domain_pixel(0, 0));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 3, 1), expected_domain_pixel(0, 1));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 0, 2), expected_domain_pixel(0, 1));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 1, 3), expected_domain_pixel(1, 0));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 2, 2), expected_domain_pixel(1, 1));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 3, 3), expected_domain_pixel(0, 0));
-    assert_eq!(output_pixel(&repeat.base_color_rgba8, 6, 5, 5), expected_domain_pixel(0, 0));
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 0, 0),
+        expected_domain_pixel(1, 0)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 1, 0),
+        expected_domain_pixel(0, 0)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 3, 1),
+        expected_domain_pixel(0, 1)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 0, 2),
+        expected_domain_pixel(0, 1)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 1, 3),
+        expected_domain_pixel(1, 0)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 2, 2),
+        expected_domain_pixel(1, 1)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 3, 3),
+        expected_domain_pixel(0, 0)
+    );
+    assert_eq!(
+        output_pixel(&repeat.base_color_rgba8, 6, 5, 5),
+        expected_domain_pixel(0, 0)
+    );
 
-    let non_square_domain =
-        domain_with_size(b"gpu-stage-14-non-square-domain", b"gpu-stage-14-non-square-source", 3, 2, 173);
+    let non_square_domain = domain_with_size(
+        b"gpu-stage-14-non-square-domain",
+        b"gpu-stage-14-non-square-source",
+        3,
+        2,
+        173,
+    );
     let non_square_source = plan(&non_square_domain).ordered_sources[0].clone();
     let non_square_region = region_command(
         0,
@@ -879,11 +1894,19 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
     );
     let transformed = execute_final_atlas(
         &transform_plan,
-        vec![prepared_source(&transform_plan.ordered_sources[0], Arc::clone(&domain))],
+        vec![prepared_source(
+            &transform_plan.ordered_sources[0],
+            Arc::clone(&domain),
+        )],
     );
     assert_eq!(
         transformed.base_color_rgba8,
-        cpu_expected_base_color(&transform_plan.ordered_regions[0].sampling_plan, &domain, [4, 4]).into()
+        cpu_expected_base_color(
+            &transform_plan.ordered_regions[0].sampling_plan,
+            &domain,
+            [4, 4]
+        )
+        .into()
     );
 
     let offset_domain = domain_with_size(
@@ -948,7 +1971,10 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
         )],
     );
     let shifted = output_pixel(&fractional_offset.base_color_rgba8, 4, 0, 0);
-    assert_eq!(shifted, expected_domain_sample(&offset_domain, [1.0, 0.5], true));
+    assert_eq!(
+        shifted,
+        expected_domain_sample(&offset_domain, [1.0, 0.5], true)
+    );
     assert_ne!(
         shifted,
         output_pixel(&baseline_offset.base_color_rgba8, 4, 0, 0),
@@ -1020,11 +2046,19 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
     );
     let planar = execute_final_atlas(
         &planar_plan,
-        vec![prepared_source(&planar_plan.ordered_sources[0], Arc::clone(&domain))],
+        vec![prepared_source(
+            &planar_plan.ordered_sources[0],
+            Arc::clone(&domain),
+        )],
     );
     assert_eq!(
         planar.base_color_rgba8,
-        cpu_expected_base_color(&planar_plan.ordered_regions[0].sampling_plan, &domain, [4, 4]).into()
+        cpu_expected_base_color(
+            &planar_plan.ordered_regions[0].sampling_plan,
+            &domain,
+            [4, 4]
+        )
+        .into()
     );
 
     let mut polar_region = region_command(
@@ -1063,16 +2097,21 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
     );
     let polar = execute_final_atlas(
         &polar_plan,
-        vec![prepared_source(&polar_plan.ordered_sources[0], Arc::clone(&domain))],
+        vec![prepared_source(
+            &polar_plan.ordered_sources[0],
+            Arc::clone(&domain),
+        )],
     );
-    assert_eq!(output_pixel(&polar.base_color_rgba8, 4, 0, 0), [0, 0, 0, 0]);
+    assert_ne!(output_pixel(&polar.base_color_rgba8, 4, 0, 0), [0, 0, 0, 0]);
     assert_ne!(output_pixel(&polar.base_color_rgba8, 4, 1, 1), [0, 0, 0, 0]);
     assert_eq!(
         polar
             .region_valid_pixel_counts
             .iter()
-            .find_map(|(region, count)| (*region == RegionId::from_bytes([9; 16])).then_some(*count)),
-        Some(4)
+            .find_map(
+                |(region, count)| (*region == RegionId::from_bytes([9; 16])).then_some(*count)
+            ),
+        Some(16)
     );
 
     let mut no_seam_region = region_command(
@@ -1107,7 +2146,10 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
     );
     let no_seam = execute_final_atlas(
         &no_seam_plan,
-        vec![prepared_source(&no_seam_plan.ordered_sources[0], Arc::clone(&domain))],
+        vec![prepared_source(
+            &no_seam_plan.ordered_sources[0],
+            Arc::clone(&domain),
+        )],
     );
 
     let mut seam_region = no_seam_plan.ordered_regions[0].clone();
@@ -1128,7 +2170,10 @@ fn gpu_stage_14_base_color_repeat_transform_and_radial_pixels() {
     );
     let seam = execute_final_atlas(
         &seam_plan,
-        vec![prepared_source(&seam_plan.ordered_sources[0], Arc::clone(&domain))],
+        vec![prepared_source(
+            &seam_plan.ordered_sources[0],
+            Arc::clone(&domain),
+        )],
     );
     assert_ne!(
         output_pixel(&seam.base_color_rgba8, 4, 3, 1),
@@ -1208,10 +2253,22 @@ fn gpu_stage_14_base_color_multiple_sources_and_cache_invalidation() {
     let AtlasRenderExecutorOutput::FinalAtlas(first) = first else {
         panic!("GPU route must return a final atlas");
     };
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 0, 0), expected_domain_pixel(0, 0));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 1, 1), expected_domain_pixel(1, 1));
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 2, 0), [201, 17, 93, 128]);
-    assert_eq!(output_pixel(&first.base_color_rgba8, 4, 3, 1), [201, 17, 93, 128]);
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 0, 0),
+        expected_domain_pixel(0, 0)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 1, 1),
+        expected_domain_pixel(1, 1)
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 2, 0),
+        [201, 17, 93, 128]
+    );
+    assert_eq!(
+        output_pixel(&first.base_color_rgba8, 4, 3, 1),
+        [201, 17, 93, 128]
+    );
 
     let warm = with_gpu_executor(&cache, |executor| {
         executor
@@ -1222,17 +2279,25 @@ fn gpu_stage_14_base_color_multiple_sources_and_cache_invalidation() {
         panic!("warm GPU route must return a final atlas");
     };
     assert_eq!(warm.upload_bytes, 0);
-    assert!(warm.telemetry.iter().any(|line| line.contains("gpu_tile_cache=hit")));
+    assert!(
+        warm.telemetry
+            .iter()
+            .any(|line| line.contains("gpu_tile_cache=hit"))
+    );
 
     let changed_domain = solid_domain(b"gpu-stage-14-second-source-mutated", [19, 211, 41, 255]);
     let mut changed_plan = plan.clone();
     changed_plan.ordered_sources[1].source_id = changed_domain.prepared_source_digest.clone();
     changed_plan.ordered_sources[1].digest = changed_domain.prepared_source_digest.clone();
     changed_plan.ordered_regions[1].source_id = changed_domain.prepared_source_digest.clone();
-    changed_plan.ordered_regions[1].sampling_plan.candidate.source_id =
-        changed_domain.prepared_source_digest.clone();
-    changed_plan.ordered_regions[1].sampling_plan.candidate.domain_id =
-        changed_domain.cache_key.clone();
+    changed_plan.ordered_regions[1]
+        .sampling_plan
+        .candidate
+        .source_id = changed_domain.prepared_source_digest.clone();
+    changed_plan.ordered_regions[1]
+        .sampling_plan
+        .candidate
+        .domain_id = changed_domain.cache_key.clone();
     changed_plan.ordered_regions[1]
         .sampling_plan
         .candidate
@@ -1270,15 +2335,16 @@ fn gpu_stage_14_base_color_multiple_sources_and_cache_invalidation() {
         panic!("changed GPU route must return a final atlas");
     };
     assert!(changed.upload_bytes > 0);
-    assert_eq!(output_pixel(&changed.base_color_rgba8, 4, 2, 0), [19, 211, 41, 255]);
+    assert_eq!(
+        output_pixel(&changed.base_color_rgba8, 4, 2, 0),
+        [19, 211, 41, 255]
+    );
 }
 
 #[test]
 fn gpu_stage_14_base_color_compile_persisted_route_counters_and_transform_parity() {
-    let root = std::env::temp_dir().join(format!(
-        "hot-trimmer-gpu-stage-14-route-{}",
-        Uuid::new_v4()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("hot-trimmer-gpu-stage-14-route-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create production route fixture directory");
     let project_path = root.join("gpu-stage-14-route.hottrimmer");
     let mut store =
@@ -1308,6 +2374,78 @@ fn gpu_stage_14_base_color_compile_persisted_route_counters_and_transform_parity
             },
         )
         .expect("register production route source");
+    let companion_maps = [
+        (
+            SourceChannel::Normal,
+            "gpu-stage-14-normal.png",
+            encoded_channel_landmark_png(256, 256, |x, y| {
+                if x < 96 && y < 96 {
+                    [204, 204, 195, 255]
+                } else {
+                    [128, 128, 255, 255]
+                }
+            }),
+        ),
+        (
+            SourceChannel::Height,
+            "gpu-stage-14-height.png",
+            encoded_channel_landmark_png(256, 256, |_, _| [128, 128, 128, 255]),
+        ),
+        (
+            SourceChannel::Roughness,
+            "gpu-stage-14-roughness.png",
+            encoded_channel_landmark_png(256, 256, |x, y| {
+                let value = if (x / 32 + y / 32) % 2 == 0 { 38 } else { 217 };
+                [value, value, value, 255]
+            }),
+        ),
+        (
+            SourceChannel::Metallic,
+            "gpu-stage-14-metallic.png",
+            encoded_channel_landmark_png(256, 256, |x, _| {
+                let value = if x < 128 { 20 } else { 235 };
+                [value, value, value, 255]
+            }),
+        ),
+        (
+            SourceChannel::AmbientOcclusion,
+            "gpu-stage-14-ao.png",
+            encoded_channel_landmark_png(256, 256, |_, y| {
+                let value = if y < 128 { 64 } else { 196 };
+                [value, value, value, 255]
+            }),
+        ),
+    ];
+    for (channel, name, encoded) in companion_maps {
+        let input = SourceInput {
+            id: SourceId::new(),
+            ownership: SourceOwnership::OwnedCopy,
+            external_path: None,
+            origin_path: PathBuf::from(name),
+            sha256: ContentDigest::sha256(&encoded).0,
+            width: 256,
+            height: 256,
+            format: "PNG".into(),
+            color_type: "Rgba8".into(),
+            has_alpha: true,
+            exif_orientation: 1,
+            has_embedded_icc_profile: false,
+            encoded_bytes: encoded.len() as u64,
+            owned_bytes: Some(encoded),
+        };
+        if channel == SourceChannel::Normal {
+            let mut registration =
+                hot_trimmer_domain::ChannelRegistration::explicit(MaterialChannelRole::Normal);
+            registration.normal_convention = NormalConvention::OpenGl;
+            store
+                .replace_registered_source_in_set(source_set_id, &input, registration)
+                .expect("register production OpenGL Normal companion channel");
+        } else {
+            store
+                .replace_source_in_set(source_set_id, channel, &input)
+                .expect("register production companion channel");
+        }
+    }
     store
         .create_source_frame_document()
         .expect("create source-frame route document");
@@ -1341,7 +2479,11 @@ fn gpu_stage_14_base_color_compile_persisted_route_counters_and_transform_parity
         view_intent: None,
     };
     let zero_offset_artifact = compiler
-        .compile_persisted_stage_14_preview(zero_offset_request(), &CancellationToken::new(), || true)
+        .compile_persisted_stage_14_preview(
+            zero_offset_request(),
+            &CancellationToken::new(),
+            || true,
+        )
         .expect("zero-offset CPU production route baseline");
     let mut project = store.summary().expect("route project summary");
     project.document = Some(document.clone());
@@ -1371,6 +2513,89 @@ fn gpu_stage_14_base_color_compile_persisted_route_counters_and_transform_parity
             )
             .expect("GPU production route")
     });
+    let map_set_request = || PersistedStage14PreviewRequest {
+        project: &project,
+        revision: document.document_revision,
+        draft_id: None,
+        input_hash: None,
+        profile: SourceFramePreviewProfile::Authoritative,
+        view_intent: Some(SourceFramePreviewViewIntent::MaterialMaps(vec![
+            MaterialMapKind::BaseColor,
+            MaterialMapKind::Height,
+            MaterialMapKind::Normal,
+            MaterialMapKind::Roughness,
+            MaterialMapKind::Metallic,
+            MaterialMapKind::AmbientOcclusion,
+            MaterialMapKind::RegionId,
+        ])),
+    };
+    let gpu_map_set_artifact = with_gpu_executor(&gpu_source_cache, |gpu_executor| {
+        compiler
+            .compile_persisted_stage_14_preview_with_cache_and_executor(
+                map_set_request(),
+                &CancellationToken::new(),
+                || true,
+                Some(&source_frame_cache),
+                Some(gpu_executor),
+            )
+            .expect("GPU production map-set route")
+    });
+    assert!(
+        [
+            MaterialMapKind::BaseColor,
+            MaterialMapKind::Height,
+            MaterialMapKind::Normal,
+            MaterialMapKind::Roughness,
+            MaterialMapKind::Metallic,
+            MaterialMapKind::AmbientOcclusion,
+            MaterialMapKind::RegionId,
+        ]
+        .into_iter()
+        .all(|map| gpu_map_set_artifact.rendered_tiles.contains_key(&map))
+    );
+    let production_normal = gpu_map_set_artifact
+        .rendered_tiles
+        .get(&MaterialMapKind::Normal)
+        .expect("production Normal tile");
+    assert!(
+        production_normal.pixels().chunks_exact(4).any(|pixel| {
+            pixel[3] > 0 && pixel[0] > 180 && pixel[1] > 180 && pixel[2] < 230
+        }),
+        "production Source Frame route must sample the imported tangent-space Normal landmark"
+    );
+    for (map, low, high) in [
+        (MaterialMapKind::Roughness, 0.2_f32, 0.7_f32),
+        (MaterialMapKind::Metallic, 0.12_f32, 0.8_f32),
+        (MaterialMapKind::AmbientOcclusion, 0.3_f32, 0.7_f32),
+    ] {
+        let tile = gpu_map_set_artifact
+            .rendered_tiles
+            .get(&map)
+            .expect("production scalar companion tile");
+        let values = tile
+            .pixels()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .collect::<Vec<_>>();
+        assert!(values.iter().any(|value| *value <= low));
+        assert!(values.iter().any(|value| *value >= high));
+    }
+    assert_eq!(
+        gpu_map_set_artifact
+            .rendered_tiles
+            .get(&MaterialMapKind::RegionId)
+            .expect("Region ID rendered tile")
+            .manifest
+            .pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Uint
+    );
+    assert!(
+        gpu_map_set_artifact
+            .unavailable_channels
+            .iter()
+            .all(|role| *role != MaterialChannelRole::RegionId)
+    );
     assert_eq!(
         atlas_cpu_execution_counters(),
         hot_trimmer_sheet_compiler::AtlasCpuExecutionCounters {
@@ -1378,7 +2603,10 @@ fn gpu_stage_14_base_color_compile_persisted_route_counters_and_transform_parity
             atlas_composition_calls: 0,
         }
     );
-    assert_eq!(base_color_rgba8(&gpu_artifact), base_color_rgba8(&cpu_artifact));
+    assert_eq!(
+        base_color_rgba8(&gpu_artifact),
+        base_color_rgba8(&cpu_artifact)
+    );
     let slot = gpu_artifact
         .slots
         .iter()
@@ -1422,8 +2650,8 @@ fn gpu_stage_14_base_color_source_frame_authored_crop_and_radial_preview_metadat
     ));
     std::fs::create_dir_all(&root).expect("create source-frame crop fixture directory");
     let project_path = root.join("gpu-stage-14-source-frame-crop.hottrimmer");
-    let mut store =
-        ProjectStore::create(&project_path, "GPU Stage 14 SourceFrame Crop").expect("create project");
+    let mut store = ProjectStore::create(&project_path, "GPU Stage 14 SourceFrame Crop")
+        .expect("create project");
     let encoded = encoded_gradient_png(128, 128);
     let initial = store.summary().expect("initial crop summary");
     let source_set_id = Uuid::from_bytes(initial.source_sets[0].id.to_bytes());
@@ -1528,7 +2756,12 @@ fn gpu_stage_14_base_color_source_frame_authored_crop_and_radial_preview_metadat
     );
     assert_eq!(slot.mapping_mode, SamplingMode::PolarRadial);
     assert_eq!(slot.executed_mode, SamplingMode::PolarRadial);
-    assert!(artifact.telemetry.iter().any(|line| line.contains("executor=gpu")));
+    assert!(
+        artifact
+            .telemetry
+            .iter()
+            .any(|line| line.contains("executor=gpu"))
+    );
 }
 
 #[test]

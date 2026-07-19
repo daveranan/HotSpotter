@@ -10,15 +10,16 @@ use std::{
 
 use base64::Engine as _;
 use hot_trimmer_domain::{
-    AuthoredLayoutPreset, AuthoredLayoutPresetRegion, CancellationToken, ContentDigest,
-    GridRect, LogicalGridSpec, ManualRegionRole, PixelSize, RegionBehavior, RegionOrientation,
+    AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION, AuthoredLayoutPreset, AuthoredLayoutPresetRegion,
+    CancellationToken, ContentDigest, GridRect, LogicalGridSpec, ManualRegionRole,
+    MaterialChannelRole, MaterialMapKind, PixelSize, RegionBehavior, RegionOrientation,
     RegionSampling, StructuralProfile, TemplateSlotRole, TrimSheetDocumentCommand,
-    AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION,
 };
 use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
 use hot_trimmer_sheet_compiler::{
     AlgorithmCompiler, GpuAtlasRenderExecutor, GpuAtlasSourceTextureCache,
     PersistedStage14PreviewRequest, SourceFramePreviewCache, SourceFramePreviewProfile,
+    SourceFramePreviewViewIntent,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde::Serialize;
@@ -65,7 +66,7 @@ struct BaselineRecord {
     source_generation_encode_ms: u128,
     region_count: usize,
     patch_count: usize,
-    requested_maps: [&'static str; 1],
+    requested_maps: Vec<&'static str>,
     output_dimensions: [u32; 2],
     profile: &'static str,
     snapshot_ms: u128,
@@ -75,9 +76,12 @@ struct BaselineRecord {
 }
 
 #[test]
-#[ignore = "real 7952x4016 decode and 8192x8192 GPU Base Color qualification; run explicitly in release mode"]
+#[ignore = "real 7952x4016 decode and 8192x8192 GPU material-map set qualification; run explicitly in release mode"]
 fn real_8k_cpu_baseline() {
-    assert!(!cfg!(debug_assertions), "real-8K qualification must run with --release");
+    assert!(
+        !cfg!(debug_assertions),
+        "real-8K qualification must run with --release"
+    );
     let output_directory = std::env::var_os("HOT_TRIMMER_GPU_BASELINE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/gpu-prompt-002"));
@@ -132,7 +136,9 @@ fn real_8k_cpu_baseline() {
             },
         )
         .expect("register real source");
-    store.create_source_frame_document().expect("create SourceFrame document");
+    store
+        .create_source_frame_document()
+        .expect("create SourceFrame document");
     let seed = store.document().expect("document").topology.regions[0].clone();
     let regions = (0..8_u32)
         .flat_map(|y| (0..8_u32).map(move |x| (x, y)))
@@ -140,7 +146,12 @@ fn real_8k_cpu_baseline() {
         .map(|(index, (x, y))| AuthoredLayoutPresetRegion {
             preset_region_key: format!("cell-{index:02}"),
             display_name: format!("Cell {}", index + 1),
-            grid_rect: GridRect { x: x * 8, y: y * 8, width: 8, height: 8 },
+            grid_rect: GridRect {
+                x: x * 8,
+                y: y * 8,
+                width: 8,
+                height: 8,
+            },
             role: TemplateSlotRole::Planar,
             orientation: RegionOrientation::Unspecified,
             uv_fit: seed.uv_fit.clone(),
@@ -164,20 +175,44 @@ fn real_8k_cpu_baseline() {
         .expect("apply 64-region authored layout");
     store
         .execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
-            output_size: PixelSize { width: OUTPUT_EDGE, height: OUTPUT_EDGE },
+            output_size: PixelSize {
+                width: OUTPUT_EDGE,
+                height: OUTPUT_EDGE,
+            },
         })
         .expect("request authoritative 8192 output");
-    let region_ids = store.document().expect("document").topology.regions.iter().map(|region| region.id).collect::<Vec<_>>();
-    for (index, sampling) in [(1_usize, RegionSampling::LoopX), (2, RegionSampling::LoopY), (3, RegionSampling::LoopXy)] {
+    let region_ids = store
+        .document()
+        .expect("document")
+        .topology
+        .regions
+        .iter()
+        .map(|region| region.id)
+        .collect::<Vec<_>>();
+    for (index, sampling) in [
+        (1_usize, RegionSampling::LoopX),
+        (2, RegionSampling::LoopY),
+        (3, RegionSampling::LoopXy),
+    ] {
         let mut behavior = RegionBehavior::default();
         behavior.sampling = sampling;
         behavior.period_pixels = Some([64, 64]);
         behavior.synchronize_derived_fields();
-        store.execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id: region_ids[index], behavior }).expect("set loop behavior");
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior {
+                region_id: region_ids[index],
+                behavior,
+            })
+            .expect("set loop behavior");
     }
     let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
     radial.synchronize_derived_fields();
-    store.execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior { region_id: region_ids[4], behavior: radial }).expect("set radial behavior");
+    store
+        .execute_document_command(&TrimSheetDocumentCommand::SetRegionBehavior {
+            region_id: region_ids[4],
+            behavior: radial,
+        })
+        .expect("set radial behavior");
 
     let snapshot_started = Instant::now();
     let document = store.document().expect("complete document").clone();
@@ -193,7 +228,9 @@ fn real_8k_cpu_baseline() {
     let sampler_complete = Arc::clone(&sampling_complete);
     let sampler_peak = Arc::clone(&peak_rss);
     let sampler = std::thread::spawn(move || {
-        let Ok(pid) = sysinfo::get_current_pid() else { return };
+        let Ok(pid) = sysinfo::get_current_pid() else {
+            return;
+        };
         let mut system = System::new();
         while !sampler_complete.load(Ordering::Acquire) {
             system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
@@ -208,6 +245,15 @@ fn real_8k_cpu_baseline() {
         }
     });
     let mut runs = Vec::new();
+    let requested_maps = vec![
+        MaterialMapKind::BaseColor,
+        MaterialMapKind::Height,
+        MaterialMapKind::Normal,
+        MaterialMapKind::Roughness,
+        MaterialMapKind::Metallic,
+        MaterialMapKind::AmbientOcclusion,
+        MaterialMapKind::RegionId,
+    ];
     for label in ["cold", "warm-1", "warm-2"] {
         if label == "cold" {
             *cache.lock().expect("cache") = SourceFramePreviewCache::default();
@@ -225,7 +271,9 @@ fn real_8k_cpu_baseline() {
                 draft_id: Some(1),
                 input_hash: Some("gpu-prompt-1-real-8k".into()),
                 profile: SourceFramePreviewProfile::Authoritative,
-                view_intent: None,
+                view_intent: Some(SourceFramePreviewViewIntent::MaterialMaps(
+                    requested_maps.clone(),
+                )),
             },
             &CancellationToken::new(),
             || true,
@@ -235,14 +283,32 @@ fn real_8k_cpu_baseline() {
         let elapsed_ms = started.elapsed().as_millis();
         runs.push(match result {
             Ok(artifact) => {
+                for map in &requested_maps {
+                    assert!(
+                        artifact.rendered_tiles.contains_key(map),
+                        "real-8K material-map set omitted {map:?}"
+                    );
+                }
+                assert!(
+                    artifact
+                        .rendered_tiles
+                        .get(&MaterialMapKind::RegionId)
+                        .is_some_and(|tile| tile.manifest.pixel_format
+                            == hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Uint),
+                    "real-8K material-map set must publish compact Region ID"
+                );
                 let encode_started = Instant::now();
-                let base_color = artifact.channels.iter()
-                    .find(|channel| channel.role == hot_trimmer_domain::MaterialChannelRole::BaseColor)
+                let base_color = artifact
+                    .channels
+                    .iter()
+                    .find(|channel| channel.role == MaterialChannelRole::BaseColor)
                     .expect("real-8K artifact must contain Base Color");
-                let pixels = RgbaImage::from_raw(OUTPUT_EDGE, OUTPUT_EDGE, base_color.rgba8.clone())
-                    .expect("Base Color dimensions must match the requested output");
+                let pixels =
+                    RgbaImage::from_raw(OUTPUT_EDGE, OUTPUT_EDGE, base_color.rgba8.clone())
+                        .expect("Base Color dimensions must match the requested output");
                 let mut png = Cursor::new(Vec::new());
-                DynamicImage::ImageRgba8(pixels).write_to(&mut png, ImageFormat::Png)
+                DynamicImage::ImageRgba8(pixels)
+                    .write_to(&mut png, ImageFormat::Png)
                     .expect("encode real-8K compiler output");
                 let encode_ms = encode_started.elapsed().as_millis();
                 let png = png.into_inner();
@@ -275,6 +341,66 @@ fn real_8k_cpu_baseline() {
             },
         });
     }
+    let switch_started = Instant::now();
+    let gpu_executor = GpuAtlasRenderExecutor {
+        service: &gpu_capabilities,
+        source_texture_cache: &gpu_source_cache,
+    };
+    let switch_result = compiler.compile_persisted_stage_14_preview_with_cache_and_executor(
+        PersistedStage14PreviewRequest {
+            project: &project,
+            revision: document.document_revision,
+            draft_id: Some(2),
+            input_hash: Some("gpu-prompt-004-cached-normal-switch".into()),
+            profile: SourceFramePreviewProfile::Authoritative,
+            view_intent: Some(SourceFramePreviewViewIntent::MaterialMaps(vec![
+                MaterialMapKind::Normal,
+            ])),
+        },
+        &CancellationToken::new(),
+        || true,
+        Some(&cache),
+        Some(&gpu_executor),
+    );
+    let switch_elapsed_ms = switch_started.elapsed().as_millis();
+    runs.push(match switch_result {
+        Ok(artifact) => {
+            assert!(
+                artifact.rendered_tiles.contains_key(&MaterialMapKind::Normal),
+                "cached single-map switch must publish Normal"
+            );
+            assert!(
+                artifact.telemetry.iter().any(|line| {
+                    line.contains("requested_map=Normal")
+                        && line.contains("executed_gpu_passes=none")
+                        && line.contains("readback_ms=0")
+                }),
+                "cached single-map switch must avoid new GPU dispatch/readback"
+            );
+            RunRecord {
+                label: "cached-normal-switch",
+                completed: true,
+                elapsed_ms: switch_elapsed_ms,
+                error: None,
+                telemetry: artifact.telemetry,
+                encode_ms: 0,
+                ipc_preparation_ms: 0,
+                ipc_payload_bytes: 0,
+                ui_paint_ms: None,
+            }
+        }
+        Err(error) => RunRecord {
+            label: "cached-normal-switch",
+            completed: false,
+            elapsed_ms: switch_elapsed_ms,
+            error: Some(error.to_string()),
+            telemetry: Vec::new(),
+            encode_ms: 0,
+            ipc_preparation_ms: 0,
+            ipc_payload_bytes: 0,
+            ui_paint_ms: None,
+        },
+    });
     sampling_complete.store(true, Ordering::Release);
     sampler.join().expect("RSS sampler thread");
 
@@ -284,15 +410,32 @@ fn real_8k_cpu_baseline() {
         Ok(state) => state.capabilities().diagnostic_line(),
         Err(error) => format!("unsupported: {error}"),
     };
-    let commit = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()).unwrap_or_else(|| "unknown".into());
-    let worktree_dirty = std::process::Command::new("git").args(["status", "--porcelain"]).output().ok().is_some_and(|output| !output.stdout.is_empty());
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let worktree_dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .is_some_and(|output| !output.stdout.is_empty());
     let record = BaselineRecord {
         schema_version: 1,
-        build_profile: if cfg!(debug_assertions) { "debug" } else { "release" },
+        build_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
         commit,
         worktree_dirty,
         os: System::long_os_version().unwrap_or_else(|| std::env::consts::OS.into()),
-        cpu: system.cpus().first().map(|cpu| cpu.brand().to_owned()).unwrap_or_else(|| "unknown".into()),
+        cpu: system
+            .cpus()
+            .first()
+            .map(|cpu| cpu.brand().to_owned())
+            .unwrap_or_else(|| "unknown".into()),
         logical_threads: system.cpus().len(),
         physical_threads: system.physical_core_count(),
         ram_bytes: system.total_memory(),
@@ -306,7 +449,15 @@ fn real_8k_cpu_baseline() {
         source_generation_encode_ms: decode_generate_ms,
         region_count: region_ids.len(),
         patch_count: 0,
-        requested_maps: ["BaseColor"],
+        requested_maps: vec![
+            "BaseColor",
+            "Height",
+            "Normal",
+            "Roughness",
+            "Metallic",
+            "AmbientOcclusion",
+            "RegionId",
+        ],
         output_dimensions: [OUTPUT_EDGE, OUTPUT_EDGE],
         profile: "Authoritative",
         snapshot_ms,
@@ -315,19 +466,61 @@ fn real_8k_cpu_baseline() {
         runs,
     };
     let json = serde_json::to_string_pretty(&record).expect("serialize baseline JSON");
-    std::fs::write(output_directory.join("gpu-prompt-002-real-8k.json"), &json).expect("write baseline JSON");
-    let statuses = record.runs.iter().map(|run| format!("- {}: {} in {} ms{}", run.label, if run.completed { "completed" } else { "failed" }, run.elapsed_ms, run.error.as_ref().map(|error| format!(" ({error})")).unwrap_or_default())).collect::<Vec<_>>().join("\n");
-    let markdown = format!("# GPU Prompt 002 real-8K Base Color\n\nActual decoded source: {SOURCE_WIDTH}x{SOURCE_HEIGHT} ({decoded_bytes} bytes); generation/encode: {decode_generate_ms} ms.\n\nRequested output: {OUTPUT_EDGE}x{OUTPUT_EDGE} Base Color through `compile_persisted`.\n\n{statuses}\n\nGPU capability: `{}`\n", record.gpu_capability);
-    std::fs::write(output_directory.join("gpu-prompt-002-real-8k.md"), markdown).expect("write baseline Markdown");
+    std::fs::write(output_directory.join("gpu-prompt-002-real-8k.json"), &json)
+        .expect("write baseline JSON");
+    let statuses = record
+        .runs
+        .iter()
+        .map(|run| {
+            format!(
+                "- {}: {} in {} ms{}",
+                run.label,
+                if run.completed { "completed" } else { "failed" },
+                run.elapsed_ms,
+                run.error
+                    .as_ref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let telemetry_excerpt = telemetry_markdown_excerpt(&record.runs);
+    let markdown = format!(
+        "# GPU Prompt 004 real-8K material-map set\n\nActual decoded source: {SOURCE_WIDTH}x{SOURCE_HEIGHT} ({decoded_bytes} bytes); generation/encode: {decode_generate_ms} ms.\n\nRequested output: {OUTPUT_EDGE}x{OUTPUT_EDGE} Base Color, Height, Normal, Roughness, Metallic, Ambient Occlusion, and Region ID through `compile_persisted`.\n\n{statuses}\n\n{telemetry_excerpt}\n\nGPU capability: `{}`\n",
+        record.gpu_capability
+    );
+    std::fs::write(output_directory.join("gpu-prompt-002-real-8k.md"), markdown)
+        .expect("write baseline Markdown");
     println!("{}", output_directory.display());
+}
+
+fn telemetry_markdown_excerpt(runs: &[RunRecord]) -> String {
+    let mut lines = vec!["## Telemetry excerpt".to_string()];
+    for run in runs {
+        lines.push(format!("### {}", run.label));
+        let mut selected = run
+            .telemetry
+            .iter()
+            .filter(|line| {
+                line.contains("gpu_pass_timing=")
+                    || line.contains("executed_gpu_passes=")
+                    || line.contains("readback_bytes=")
+            })
+            .take(12)
+            .map(|line| format!("- `{line}`"))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            selected.push("- `no telemetry`".into());
+        }
+        lines.extend(selected);
+    }
+    lines.join("\n")
 }
 
 fn detected_nvidia_vram_bytes() -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total",
-            "--format=csv,noheader,nounits",
-        ])
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
     if !output.status.success() {
