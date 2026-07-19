@@ -1,32 +1,36 @@
 use std::{
+    collections::BTreeMap,
     io::Cursor,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use hot_trimmer_domain::{
-    ContentDigest, DocumentHash, EdgeEligibility, MaterialChannelRole, MaterialMapKind, MappingTransform,
-    ManualRegionRole, OrientedPixelSize, PatchId, PixelBounds, PixelSize, RegionBehavior,
-    QuarterTurn, RegionContinuity, RegionId, RegionSampling, RadialMappingSettings,
-    SamplingMode, SamplingPolicy, SourceId, SourceSetId, TemplateSlotRole, TrimSheetDocument,
-    TrimSheetDocumentCommand,
+    AlgorithmProvenance, ContentDigest, DocumentHash, EdgeEligibility, MaterialChannelRole,
+    MaterialMapKind, MappingTransform, ManualRegionRole, OrientedPixelSize, PatchId, PixelBounds,
+    PixelSize, RegionBehavior, QuarterTurn, RegionContinuity, RegionId, RegionSampling,
+    RadialMappingSettings, SamplingMode, SamplingPolicy, SourceId, SourceSetId, StageResult,
+    TemplateSlotRole, TrimSheetDocument, TrimSheetDocumentCommand,
 };
 use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
 use hot_trimmer_placement_solver::{
     CandidateDescriptors, CandidateFamily, CandidateRoute, CandidateTransform, CropCandidate,
-    EligibilityEvidence, MirrorTransform, PositionStrategy, SamplingPlan, SliceGeometry,
-    SourceCrop, StretchOverrideProvenance,
+    EligibilityEvidence, MirrorTransform, PlacementObjectiveBreakdown, PlacementPlan,
+    PlacementPlanQaView, PlacementValidationSummary, PositionStrategy, SamplingPlan,
+    SliceGeometry, SourceCrop, StretchOverrideProvenance,
 };
 
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use uuid::Uuid;
 
 use hot_trimmer_sheet_compiler::{
-    compiled_atlas_plan_from_persisted, AtlasRenderExecutionError,
+    captured_cpu_atlas_executor_plan, clear_cpu_atlas_executor_plan_capture,
+    compiled_atlas_plan_from_persisted, AtlasComposeExecutionInput, AtlasComposeExecutorOutput,
+    AtlasRenderExecutionError,
     AtlasRenderExecutionInput, AtlasRenderExecutor, AtlasRenderExecutorOutput,
     CompiledAtlasPlanValidationError, CompiledAtlasPlanV1, CompiledAtlasPreviewProfile,
     CompiledColorSpacePolicy, CompiledNormalConvention, CompiledRegionCommandV1,
-    CompiledSourceCommandV1, CompiledTileRequest,
+    CompiledSourceCommandV1, CompiledTileRequest, CpuAtlasRenderExecutor, IntermediateAtlasRequest,
     COMPILED_ATLAS_ALGORITHM_VERSION, COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
     OutputPixelRect, SourcePixelRect, SourceFramePreviewProfile,
 };
@@ -378,6 +382,23 @@ impl AtlasRenderExecutor for CapturingAtlasRenderExecutor {
         }
         Ok(capturing_executor_output())
     }
+
+    fn compose(
+        &self,
+        _input: &AtlasComposeExecutionInput<'_>,
+        cancellation: &hot_trimmer_domain::CancellationToken,
+        is_current: &dyn Fn() -> bool,
+    ) -> Result<AtlasComposeExecutorOutput, AtlasRenderExecutionError> {
+        if cancellation.is_cancelled() {
+            return Err(AtlasRenderExecutionError::Cancelled);
+        }
+        if !is_current() {
+            return Err(AtlasRenderExecutionError::Superseded);
+        }
+        Err(AtlasRenderExecutionError::Composition(
+            "capturing executor does not compose atlas artifacts".into(),
+        ))
+    }
 }
 
 fn striped_source(width: u32, height: u32) -> Vec<u8> {
@@ -401,6 +422,79 @@ fn striped_source(width: u32, height: u32) -> Vec<u8> {
         .write_to(&mut encoded, ImageFormat::Png)
         .expect("encode behavior fixture");
     encoded.into_inner()
+}
+
+fn telemetry_value<'a>(telemetry: &'a str, key: &str) -> Option<&'a str> {
+    telemetry
+        .split(';')
+        .map(str::trim)
+        .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn empty_compose_topology() -> hot_trimmer_domain::CompiledTemplateTopology {
+    hot_trimmer_domain::CompiledTemplateTopology {
+        identity: hot_trimmer_domain::TemplateIdentity {
+            template_id: "compose-guard".into(),
+            template_version: "test".into(),
+            compatibility_key: "compose-guard".into(),
+        },
+        output_size: PixelSize {
+            width: 1,
+            height: 1,
+        },
+        slots: Vec::new(),
+    }
+}
+
+fn empty_compose_placement() -> PlacementPlan {
+    PlacementPlan {
+        stage_result: StageResult::Executed {
+            algorithm: AlgorithmProvenance {
+                algorithm_id: "compose-guard".into(),
+                version: "test".into(),
+            },
+            settings_hash: ContentDigest::sha256(b"compose-guard"),
+            diagnostics: Vec::new(),
+        },
+        solver: AlgorithmProvenance {
+            algorithm_id: "compose-guard".into(),
+            version: "test".into(),
+        },
+        seed: 0,
+        placements: Vec::new(),
+        objective: PlacementObjectiveBreakdown {
+            unary_cost: 0.0,
+            pairwise_cost: 0.0,
+            pairwise_lambda: 0.0,
+            weighted_pairwise_cost: 0.0,
+            total_cost: 0.0,
+        },
+        pairwise_decisions: Vec::new(),
+        crop_reuse_heatmap: Vec::new(),
+        validation: PlacementValidationSummary {
+            complete_assignment: true,
+            required_slots_present: true,
+            isotropic_scale_only: true,
+            registered_mapping_only: true,
+            slot_count: 0,
+        },
+        qa_views: vec![PlacementPlanQaView::Validation],
+    }
+}
+
+fn empty_compose_request<'a>(
+    topology: &'a hot_trimmer_domain::CompiledTemplateTopology,
+    placement: &'a PlacementPlan,
+) -> IntermediateAtlasRequest<'a> {
+    IntermediateAtlasRequest {
+        topology,
+        placement_plan: placement,
+        slots: Vec::new(),
+        revision: 7,
+        algorithm_versions: BTreeMap::new(),
+        diagnostics: Vec::new(),
+        regions: Vec::new(),
+    }
 }
 
 #[test]
@@ -706,4 +800,115 @@ fn gpu_execution_contract_production_compile_persisted_uses_cpu_executor() {
     assert_eq!(radial_slot.requested_sampling, RegionSampling::OneShot);
     assert_eq!(radial_slot.executed_mode, SamplingMode::PolarRadial);
     assert!(radial_slot.source_crop.is_some());
+}
+
+#[test]
+fn gpu_executor_owns_base_color_composition() {
+    let root = std::env::temp_dir().join(format!("hot-trimmer-compose-contract-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create composition contract directory");
+    let project_path = root.join("source-frame-compose.hottrimmer");
+    let mut store = ProjectStore::create(&project_path, "Executor Composition").expect("create composition project");
+
+    let encoded = striped_source(64, 64);
+    let summary = store.summary().expect("project summary");
+    let source_set_id = summary.source_sets[0].id;
+    let input = SourceInput {
+        id: SourceId::new(),
+        ownership: SourceOwnership::OwnedCopy,
+        external_path: None,
+        origin_path: PathBuf::from("composition-source.png"),
+        sha256: ContentDigest::sha256(&encoded).0,
+        width: 64,
+        height: 64,
+        format: "PNG".into(),
+        color_type: "Rgba8".into(),
+        has_alpha: true,
+        exif_orientation: 1,
+        has_embedded_icc_profile: false,
+        encoded_bytes: encoded.len() as u64,
+        owned_bytes: Some(encoded),
+    };
+    store
+        .replace_source_in_set(Uuid::from_bytes(source_set_id.to_bytes()), SourceChannel::BaseColor, &input)
+        .expect("register composition source");
+    store
+        .create_source_frame_document()
+        .expect("create composition source-frame document");
+    store
+        .execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
+            output_size: PixelSize {
+                width: 64,
+                height: 64,
+            },
+        })
+        .expect("set composition output resolution");
+
+    let document = store.document().expect("composition document").clone();
+    let region_id = document.topology.regions[0].id;
+    let document = document
+        .apply_command(&TrimSheetDocumentCommand::SetRegionContent {
+            region_id,
+            content: hot_trimmer_domain::ContentReference::MaterialSource(
+                document.primary_material.expect("primary"),
+            ),
+        })
+        .expect("assign composition material");
+    let mut direct = RegionBehavior::default();
+    direct.synchronize_derived_fields();
+    let document = document
+        .apply_command(&TrimSheetDocumentCommand::SetRegionBehavior {
+            region_id,
+            behavior: direct,
+        })
+        .expect("set composition direct behavior");
+
+    clear_cpu_atlas_executor_plan_capture();
+    let artifact = compile_source_frame_document(&store, &document);
+    let captured_plan = captured_cpu_atlas_executor_plan()
+        .expect("CPU executor should capture the compiled plan before execution");
+    let telemetry = artifact
+        .telemetry
+        .iter()
+        .find(|line| line.contains("executor=cpu") && line.contains("compose_executor=cpu"))
+        .expect("production compile_persisted should publish executor-owned composition telemetry");
+    assert!(
+        !captured_plan.final_plan_hash.0.is_empty(),
+        "the captured CompiledAtlasPlanV1 must have a real identity",
+    );
+    assert_eq!(
+        telemetry_value(telemetry, "plan_hash"),
+        Some(captured_plan.final_plan_hash.0.as_str()),
+    );
+    assert!(telemetry.contains("output=64x64"));
+    assert!(telemetry.contains("compose_ms="));
+    assert_eq!(artifact.channels[0].rgba8.len(), 64 * 64 * 4);
+    assert_eq!(
+        ContentDigest::sha256(&artifact.channels[0].rgba8).0,
+        "e226611667fc2fa8d52355677346a7846553b4cab4484e1bcfffabf39ea5687e",
+        "Base Color pixels must match the fixed CPU composition golden for this persisted document",
+    );
+
+    let compose_plan = finalize_base_plan();
+    let compose_topology = empty_compose_topology();
+    let compose_placement = empty_compose_placement();
+    let compose_request = empty_compose_request(&compose_topology, &compose_placement);
+    let compose_input = AtlasComposeExecutionInput {
+        plan: &compose_plan,
+        request: &compose_request,
+    };
+    let compose_executor = CpuAtlasRenderExecutor;
+    let cancelled = hot_trimmer_domain::CancellationToken::new();
+    cancelled.cancel();
+    let cancelled_result = compose_executor.compose(&compose_input, &cancelled, &|| true);
+    assert!(
+        matches!(cancelled_result, Err(AtlasRenderExecutionError::Cancelled)),
+        "cancelled composition must not publish an artifact",
+    );
+
+    let stale_result =
+        compose_executor.compose(&compose_input, &hot_trimmer_domain::CancellationToken::new(), &|| false);
+    assert!(
+        matches!(stale_result, Err(AtlasRenderExecutionError::Superseded)),
+        "stale composition must not publish an artifact",
+    );
 }

@@ -1,16 +1,20 @@
 //! Immutable atlas render-execution boundary introduced by GPU migration Prompt 1.
 
-use std::{sync::{Arc, Mutex}, time::Instant};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
 
 use hot_trimmer_domain::{CancellationToken, ContentDigest, MaterialChannelRole, RegionId, SourceSetId};
 use hot_trimmer_material_synthesis::PreparedMaterialDomain;
 use hot_trimmer_placement_solver::SamplingPlan;
 
 use crate::{
+    AlgorithmCompiler,
     compiled_atlas_plan::CompiledAtlasPlanV1,
     persisted_pipeline::{SourceFramePreviewCache, semantic_rect_for_padding},
-    synthesize_slot_material_with_guard, SlotSynthesisLimits, SlotSynthesisRequest,
-    SynthesizedSlotMaterial,
+    synthesize_slot_material_with_guard, IntermediateAtlasArtifact, IntermediateAtlasRequest,
+    SlotSynthesisLimits, SlotSynthesisRequest, SynthesizedSlotMaterial,
 };
 
 #[derive(Debug, Clone)]
@@ -42,6 +46,18 @@ pub struct AtlasRenderExecutorOutput {
 }
 
 #[derive(Debug)]
+pub struct AtlasComposeExecutionInput<'a> {
+    pub plan: &'a CompiledAtlasPlanV1,
+    pub request: &'a IntermediateAtlasRequest<'a>,
+}
+
+#[derive(Debug)]
+pub struct AtlasComposeExecutorOutput {
+    pub artifact: IntermediateAtlasArtifact,
+    pub compose_ms: u128,
+}
+
+#[derive(Debug)]
 pub enum AtlasRenderExecutionError {
     Cancelled,
     Superseded,
@@ -51,6 +67,7 @@ pub enum AtlasRenderExecutionError {
     },
     InvalidInput(String),
     Stage14(String),
+    Composition(String),
 }
 
 impl std::fmt::Display for AtlasRenderExecutionError {
@@ -64,6 +81,7 @@ impl std::fmt::Display for AtlasRenderExecutionError {
             } => write!(formatter, "missing prepared source {source_set_id}/{source_id:?}"),
             Self::InvalidInput(message) => write!(formatter, "atlas render input was invalid: {message}"),
             Self::Stage14(message) => write!(formatter, "Stage 14 CPU execution failed: {message}"),
+            Self::Composition(message) => write!(formatter, "atlas composition failed: {message}"),
         }
     }
 }
@@ -78,12 +96,48 @@ pub trait AtlasRenderExecutor {
         cancellation: &CancellationToken,
         is_current: &dyn Fn() -> bool,
     ) -> Result<AtlasRenderExecutorOutput, AtlasRenderExecutionError>;
+
+    fn compose(
+        &self,
+        input: &AtlasComposeExecutionInput<'_>,
+        cancellation: &CancellationToken,
+        is_current: &dyn Fn() -> bool,
+    ) -> Result<AtlasComposeExecutorOutput, AtlasRenderExecutionError>;
 }
 
 /// Prompt 1 production executor. It deliberately retains the established CPU
 /// sampler while forcing every Stage 14 request through the immutable boundary.
 #[derive(Debug, Default)]
 pub struct CpuAtlasRenderExecutor;
+
+static CPU_ATLAS_EXECUTOR_PLAN_CAPTURE: OnceLock<Mutex<Option<CompiledAtlasPlanV1>>> = OnceLock::new();
+
+pub fn clear_cpu_atlas_executor_plan_capture() {
+    if let Ok(mut capture) = CPU_ATLAS_EXECUTOR_PLAN_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *capture = None;
+    }
+}
+
+#[must_use]
+pub fn captured_cpu_atlas_executor_plan() -> Option<CompiledAtlasPlanV1> {
+    CPU_ATLAS_EXECUTOR_PLAN_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|capture| capture.clone())
+}
+
+fn record_cpu_atlas_executor_plan(plan: &CompiledAtlasPlanV1) {
+    if let Ok(mut capture) = CPU_ATLAS_EXECUTOR_PLAN_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *capture = Some(plan.clone());
+    }
+}
 
 impl AtlasRenderExecutor for CpuAtlasRenderExecutor {
     fn execute(
@@ -93,6 +147,7 @@ impl AtlasRenderExecutor for CpuAtlasRenderExecutor {
         cancellation: &CancellationToken,
         is_current: &dyn Fn() -> bool,
     ) -> Result<AtlasRenderExecutorOutput, AtlasRenderExecutionError> {
+        record_cpu_atlas_executor_plan(plan);
         plan.validate().map_err(|error| AtlasRenderExecutionError::InvalidInput(error.to_string()))?;
         let started = Instant::now();
         let mut regions = Vec::with_capacity(plan.ordered_regions.len());
@@ -163,6 +218,32 @@ impl AtlasRenderExecutor for CpuAtlasRenderExecutor {
             regions,
             render_ms: started.elapsed().as_millis(),
             rendered_cache_hits,
+        })
+    }
+
+    fn compose(
+        &self,
+        input: &AtlasComposeExecutionInput<'_>,
+        cancellation: &CancellationToken,
+        is_current: &dyn Fn() -> bool,
+    ) -> Result<AtlasComposeExecutorOutput, AtlasRenderExecutionError> {
+        input.plan.validate().map_err(|error| AtlasRenderExecutionError::InvalidInput(error.to_string()))?;
+        if cancellation.is_cancelled() {
+            return Err(AtlasRenderExecutionError::Cancelled);
+        }
+        if !is_current() {
+            return Err(AtlasRenderExecutionError::Superseded);
+        }
+        let started = Instant::now();
+        let artifact = AlgorithmCompiler::new()
+            .compile_intermediate_atlas(input.request, cancellation, || input.plan.document_revision)
+            .map_err(|error| AtlasRenderExecutionError::Composition(error.to_string()))?;
+        if !is_current() {
+            return Err(AtlasRenderExecutionError::Superseded);
+        }
+        Ok(AtlasComposeExecutorOutput {
+            artifact,
+            compose_ms: started.elapsed().as_millis(),
         })
     }
 }

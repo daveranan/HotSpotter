@@ -4,13 +4,16 @@ Run these prompts directly in normal Codex tasks, one at a time. Do not use an o
 subagent, or parallel implementation. Each prompt is self-contained and is the only task document the implementation
 task should read.
 
+After each prompt, use [`manual-review.md`](manual-review.md) for the product-facing acceptance check. The implementation
+task should not read that review guide; it is for the human reviewer after the prompt reports completion.
+
 ## Queue
 
 | Prompt | State | Result |
 | --- | --- | --- |
 | [`prompt-001.md`](prompt-001.md) | Completed | Real 8K baseline, `CompiledAtlasPlanV1`, CPU synthesis executor, GPU capability skeleton |
-| [`prompt-001.5.md`](prompt-001.5.md) | Next | Make the executor own complete CPU Base Color composition |
-| [`prompt-002.md`](prompt-002.md) | Blocked by 001.5 | GPU compact region commands, sampling, and direct Base Color atlas writes |
+| [`prompt-001.5.md`](prompt-001.5.md) | Completed | Executor-owned complete CPU Base Color composition |
+| [`prompt-002.md`](prompt-002.md) | Next | GPU compact region commands, sampling, and direct Base Color atlas writes |
 | [`prompt-003.md`](prompt-003.md) | Blocked by 002 | GPU tiles, padding, compact Region ID, exact preview, binary IPC |
 | [`prompt-004.md`](prompt-004.md) | Blocked by 003 | Requested GPU material-map pass graph |
 | [`prompt-005.md`](prompt-005.md) | Blocked by 004 | 16K/24K source/output tiling, streaming export, hardening |
@@ -60,4 +63,3 @@ Do not create by default:
 - All material maps when one was requested.
 
 Read back only the requested final preview/export tile or bounded export batch.
-

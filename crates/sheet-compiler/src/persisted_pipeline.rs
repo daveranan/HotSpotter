@@ -97,10 +97,10 @@ impl MaterialDomainView for MappedDomainView<'_> {
 }
 
 use crate::{
-    AlgorithmCompiler, AtlasPreparedSource, AtlasRenderExecutionInput, AtlasRenderExecutor,
-    CompiledAtlasPreviewProfile, CompiledAtlasPlanValidationError, CompiledAtlasPlanV1,
-    CompiledRegionCommandV1, CompiledSourceCommandV1, CompilerFacadeError, IntermediateAtlasArtifact,
-    IntermediateAtlasRequest, IntermediateSlotInput, OutputPixelRect, SourcePixelRect,
+    AlgorithmCompiler, AtlasComposeExecutionInput, AtlasPreparedSource, AtlasRenderExecutionInput,
+    AtlasRenderExecutor, CompiledAtlasPreviewProfile, CompiledAtlasPlanValidationError,
+    CompiledAtlasPlanV1, CompiledRegionCommandV1, CompiledSourceCommandV1, CompilerFacadeError,
+    IntermediateAtlasArtifact, IntermediateAtlasRequest, IntermediateSlotInput, OutputPixelRect, SourcePixelRect,
     CpuAtlasRenderExecutor, SlotSynthesisLimits, SlotSynthesisRequest, SynthesizedSlotMaterial,
     synthesize_slot_material_with_guard, COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
     COMPILED_ATLAS_ALGORITHM_VERSION, CompiledColorSpacePolicy, CompiledNormalConvention,
@@ -1255,7 +1255,8 @@ fn compile_source_frame(
         prepared_sources: prepared_sources.into_values().collect(),
         source_frame_cache,
     };
-    let execution = CpuAtlasRenderExecutor.execute(
+    let executor = CpuAtlasRenderExecutor;
+    let execution = executor.execute(
         &source_frame_atlas_plan,
         &execution_input,
         cancellation,
@@ -1481,7 +1482,6 @@ fn compile_source_frame(
         results.push(result);
     }
     let render_ms = execution.render_ms;
-    let compose_started = Instant::now();
     let topology = hot_trimmer_domain::CompiledTemplateTopology {
         identity: hot_trimmer_domain::TemplateIdentity {
             template_id: "source-frame".into(),
@@ -1575,10 +1575,16 @@ fn compile_source_frame(
         diagnostics: Vec::new(),
         regions: profile_regions,
     };
-    let mut artifact = AlgorithmCompiler::new()
-        .compile_intermediate_atlas(&atlas_request, cancellation, || request.revision)
-        .map_err(|error| error.to_string())?;
-    let compose_ms = compose_started.elapsed().as_millis();
+    let composition = executor.compose(
+        &AtlasComposeExecutionInput {
+            plan: &source_frame_atlas_plan,
+            request: &atlas_request,
+        },
+        cancellation,
+        &is_current,
+    ).map_err(|error| error.to_string())?;
+    let mut artifact = composition.artifact;
+    let compose_ms = composition.compose_ms;
     artifact.pending.retain(|pending| *pending != "profiles");
     artifact.pending.insert(
         0,
@@ -1596,11 +1602,11 @@ fn compile_source_frame(
         + artifact.validity.len()
         + artifact.correspondence.len() * std::mem::size_of::<[f32; 2]>()
         + artifact.region_ownership.len() * std::mem::size_of::<hot_trimmer_domain::RegionId>();
-    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; plan_ms={plan_ms}; executor=cpu; plan_hash={:?}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_ms={compose_ms}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
+    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; plan_ms={plan_ms}; executor=cpu; plan_hash={}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_executor=cpu; compose_ms={compose_ms}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
         request.profile, frame.oriented_dimensions.width, frame.oriented_dimensions.height,
         frame_domain.width, frame_domain.height, output_size.width, output_size.height,
         document.render_settings.atlas_padding_px, preview_padding_px, document.topology.regions.len(), document.patches.len(),
-        u8::from(!decode_cache_hit), source_frame_atlas_plan.final_plan_hash,
+        u8::from(!decode_cache_hit), source_frame_atlas_plan.final_plan_hash.0.as_str(),
         u8::from(!decode_cache_hit), started.elapsed().as_millis()));
     if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
         && let Some(cache) = source_frame_cache {

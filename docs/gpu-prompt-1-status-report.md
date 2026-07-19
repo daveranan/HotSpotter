@@ -2,12 +2,13 @@
 
 Date: 2026-07-18
 
-Status: **implementation and focused verification are green; Prompt 1 is not yet accepted**.
+Status: **Prompt 1 accepted as the compiler/baseline phase; Prompt 1.5 accepted for executor-owned CPU composition**.
 
 ## Implemented
 
 - Added and validated the deterministic `CompiledAtlasPlanV1` contract.
 - Routed production SourceFrame Stage 14 pixel synthesis through `CpuAtlasRenderExecutor` beneath `compile_persisted`.
+- Moved complete SourceFrame Base Color atlas composition behind `CpuAtlasRenderExecutor`, while retaining the existing CPU composition implementation byte-for-byte.
 - Kept the existing CPU sampler as the Prompt 1 pixel implementation.
 - Added the long-lived native GPU capability-service skeleton and application-owned lifetime.
 - Pinned `wgpu` 26.0.1 and the published compatible `wgpu-hal` 26.0.0 dependency graph.
@@ -21,6 +22,14 @@ cargo test -p hot-trimmer-sheet-compiler gpu_execution_contract
 ```
 
 Result: 1 matching production contract test passed. The test confirms that a production SourceFrame request executed through the CPU executor and published the immutable plan identity.
+
+Prompt 1.5 focused verification:
+
+```text
+cargo test -p hot-trimmer-sheet-compiler gpu_executor_owns_base_color_composition
+```
+
+Result: passed. The test confirms that production `compile_persisted` publishes the immutable plan identity, records `compose_executor=cpu`, preserves the fixed CPU-composed Base Color output digest, and rejects cancelled/stale work at the composition boundary without returning an artifact.
 
 ## Real-8K baseline
 
@@ -58,9 +67,8 @@ Workload and results:
 
 The machine-readable trace is `docs/gpu-prompt-1-real-8k-baseline.json`.
 
-## Remaining acceptance blockers
+## Native Qualification
 
-1. `docs/gpu-rendering-migration-plan.md` requires the four Manual Layout Product prompts to be accepted before this migration pack. Only an explicitly unaccepted Prompt 1 report currently exists.
-2. The headless harness cannot capture browser UI paint. Native request-generation and UI-paint evidence still needs to be recorded.
+Native request-to-paint qualification is deferred to Prompt 3, where publication behavior changes.
 
 No Prompt 2 work has started.
