@@ -20,7 +20,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+hot-trimmer-preview = { path = "../preview" }
 image.workspace = true
+sysinfo.workspace = true
 uuid.workspace = true
 
 [lints]

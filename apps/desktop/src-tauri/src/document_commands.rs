@@ -167,6 +167,7 @@ pub struct PreviewService {
     cancellation_count: AtomicU64,
     source_frame_cache: Mutex<hot_trimmer_sheet_compiler::SourceFramePreviewCache>,
     previewed_candidate_recipes: Mutex<BTreeSet<(u64, hot_trimmer_domain::DocumentHash)>>,
+    gpu_capabilities: hot_trimmer_preview::GpuCapabilityService,
 }
 
 impl PreviewService {
@@ -2246,6 +2247,15 @@ fn build_stage_14_preview(
     }
     let ipc_payload_chars: usize = maps.values().map(String::len).sum();
     let mut artifact = artifact;
+    match preview_service.gpu_capabilities.initialize() {
+        Ok(state) => artifact
+            .telemetry
+            .push(state.capabilities().diagnostic_line()),
+        Err(error) => artifact.telemetry.push(format!(
+            "gpu_capability_generation={}; status=unsupported; reason={error}",
+            preview_service.gpu_capabilities.generation()
+        )),
+    }
     let base_color_bounds = artifact
         .channels
         .iter()

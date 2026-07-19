@@ -22,11 +22,13 @@ renderer, layout authority, or preview-specific approximation. It executes the e
 crops, sampling modes, transforms, radial parameters, destination rectangles, padding rules, edge eligibility, and
 requested channels compiled by `compile_persisted`.
 
-Run the five prompts in this document sequentially, one Codex task at a time. Do not run them in parallel. Each prompt
-has a visible acceptance gate and depends on the previous one.
+The architecture and acceptance rationale live in this document. Direct implementation tasks must use the small,
+self-contained files in [`docs/render/README.md`](render/README.md), one normal Codex task at a time. Do not paste this
+whole plan into an implementation task and do not run phases in parallel.
 
-This pack should be started after the four prompts in
-`docs/manual-layout-preset-product-prompt-pack.md` are accepted. It should precede broad CPU implementation of the
+GPU pixel work depends on a frozen manual-layout sampling contract, not on the presence of historical prompt reports.
+Before Prompt 2, focused production tests must lock stable region/source/patch identity plus exact direct, explicit
+loop, planar, and radial parameters through `CompiledAtlasPlanV1`. It should precede broad CPU implementation of the
 material/effect stack. Existing material algorithms may be ported in Prompt 4 below; do not invent new material
 algorithms as part of this migration.
 
@@ -43,9 +45,10 @@ The current production route is structurally CPU-bound and memory-heavy:
   correspondence, validity, and per-pixel `RegionId` buffers and composes them with nested CPU loops.
 - `apps/desktop/src-tauri/src/document_commands.rs` runs compilation off the UI thread with `spawn_blocking`, but then
   clones pixels, PNG-encodes them, Base64-encodes them, and publishes data URLs before the webview can paint them.
-- `crates/preview` currently contains only a declared `wgpu` boundary; it has no GPU dependency or implementation.
-- The workspace currently declares Rust 1.85. Current `wgpu` documentation declares an MSRV of 1.87, so Prompt 1 must
-  make an explicit toolchain/version decision instead of casually adding the newest crate.
+- Prompt 1 added `CompiledAtlasPlanV1`, routed production SourceFrame Stage 14 synthesis through
+  `CpuAtlasRenderExecutor`, and added an application-owned GPU capability-service skeleton.
+- `wgpu` 26.0.1 is deliberately pinned with its compatible published `wgpu-hal` 26.0.0 dependency graph. Prompt 2
+  extends that existing service; it must not introduce a second GPU owner.
 
 The existing large-source test names are not performance evidence. Some fixtures are named as 7952/8000-pixel
 sources while registering small in-memory images. The GPU migration must use real dimensions and release builds for
@@ -72,6 +75,53 @@ larger limits are adapter-dependent. The product must query capabilities and til
 24K texture is legal. See the official [`wgpu` crate documentation](https://wgpu.rs/doc/wgpu/) and
 [`wgpu::Limits`](https://wgpu.rs/doc/wgpu/struct.Limits.html).
 
+## Prompt 1 measured baseline
+
+Prompt 1 produced a genuine release measurement, not a small coordinate fixture with an 8K filename. The immutable
+plan hash was stable across all three runs. The machine-readable trace is
+[`docs/gpu-prompt-1-real-8k-baseline.json`](gpu-prompt-1-real-8k-baseline.json), and the implementation/acceptance state
+is recorded in [`docs/gpu-prompt-1-status-report.md`](gpu-prompt-1-status-report.md).
+
+Qualification workload:
+
+- Windows 10 Home; AMD Ryzen 9 5900XT; 16 physical / 32 logical CPU cores; 51.4 GB RAM.
+- NVIDIA GeForce RTX 3090; Vulkan; NVIDIA driver 610.74; 25.77 GB VRAM.
+- Actual 7952 x 4016 PNG/RGBA8 source; 8192 x 8192 Base Color output; 64 regions.
+- Authoritative CPU pixel executor; one cold run and two unchanged warm runs.
+
+| Run | Total compile | Decode | Stage 14 synthesis | Atlas composition | Decode cache | Region render cache |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| Cold | 24.904 s | 3.370 s | 8.802 s | 12.728 s | miss | 0/64 hits |
+| Warm 1 | 13.401 s | 0 ms | 0 ms | 13.398 s | hit | 64/64 hits |
+| Warm 2 | 13.351 s | 0 ms | 0 ms | 13.346 s | hit | 64/64 hits |
+
+Additional measured facts:
+
+- Peak observed RSS: 5,500,157,952 bytes (approximately 5.12 GiB).
+- Reported artifact allocation: 1,946,157,056 bytes per run (approximately 1.81 GiB), validating the predicted memory
+  shape above.
+- Base Color PNG encode: 110-128 ms.
+- Base64 preparation: 0-1 ms for this unusually compressible 1,968,956-byte payload.
+- GPU upload: zero bytes, as expected for the Prompt 1 CPU executor.
+- Adapter maximum 2D texture dimension: 32768; selected tile recommendation: 2048; timestamp queries supported.
+- Qualified formats: `Rgba8Unorm`, `R16Float`, `R32Float`, and `R32Uint` support sampled/storage use;
+  `Rgba8UnormSrgb` is sampled but not storage-capable on this adapter.
+
+### Baseline consequences
+
+The warm bottleneck is not source decode or Stage 14 region sampling: both are already complete cache hits. Unchanged
+warm requests spend effectively all 13.4 seconds recomposing the atlas. Cold composition is approximately 51% of the
+compile, Stage 14 synthesis approximately 35%, and decode approximately 14%.
+
+Therefore Prompt 2 cannot meet a 1-3 second warm 8K target by moving slot sampling alone. The executor boundary must
+own complete Base Color sampling **and destination composition**, and Prompt 2 must replace both with GPU work. Prompt
+1.5 below moves the existing CPU composition behind that boundary without changing pixels. Prompt 3 then adds formal
+tiling, padding, compact Region ID, progressive publication, and binary preview transport.
+
+PNG/Base64 removal remains necessary for interactive tiles, arbitrary less-compressible materials, memory control,
+and browser upload latency. It is not the dominant cause of the measured 25-second compile and must not be presented
+as such.
+
 ## Product target
 
 The migration is complete when all of the following are true:
@@ -89,8 +139,9 @@ The migration is complete when all of the following are true:
 
 ### Performance targets
 
-These are release-build targets on a documented midrange discrete GPU, measured with real source dimensions. Prompt 1
-must capture adapter, driver, CPU, RAM, VRAM, source formats, channel count, and exact workload with every result.
+These are release-build targets measured with real source dimensions. The current reference machine is the Prompt 1
+RTX 3090 qualification machine documented above; later integrated/midrange qualification must record its own adapter,
+driver, CPU, RAM, VRAM, source formats, channel count, and exact workload rather than inheriting the 3090 result.
 
 | Interaction | Target |
 | --- | ---: |
@@ -125,8 +176,8 @@ webview paint is responsible.
 
 - CPU construction of full-frame position, seam, correspondence, ownership, and validity arrays.
 - Serial per-region CPU rasterization and serial per-channel sampling.
-- CPU atlas composition, padding/dilation, structural profile composition, and map derivation once each corresponding
-  GPU phase is accepted.
+- CPU Base Color atlas composition together with Stage 14 sampling in Prompt 2; padding/dilation, structural profile
+  composition, and map derivation once each corresponding later GPU phase is accepted.
 - PNG + Base64 data URLs in the interactive preview hot path.
 - Full-atlas recompilation for a selected-region edit or a viewport pan.
 - Per-pixel UUID ownership. Store a compact `u32` region-table index in the GPU ID target and resolve it through the
@@ -169,7 +220,8 @@ Refactor `compile_persisted` internally into two responsibilities without changi
 1. Compile and validate immutable instructions.
 2. Submit those instructions to the configured production pixel executor.
 
-An illustrative internal contract is:
+Prompt 1 implemented the versioned `CompiledAtlasPlanV1` form of this internal contract. The following remains a
+semantic summary rather than a request to create another plan type:
 
 ```rust
 struct CompiledAtlasPlan {
@@ -209,8 +261,8 @@ exact upstream identity.
 
 ### 2. Long-lived GPU service
 
-Use `crates/preview` as the existing declared GPU/application-resource boundary unless direct inspection shows a
-better existing home. Do not create a new orchestration crate merely to hold `wgpu`.
+Use the application-owned GPU capability-service boundary established by Prompt 1. Do not create a new GPU owner or
+orchestration crate merely to hold `wgpu`.
 
 The native Tauri application should own one long-lived service containing:
 
@@ -248,7 +300,9 @@ CPU responsibilities that remain:
 
 ### 4. Formats and memory policy
 
-- Base Color: sRGB-capable RGBA8 storage with explicit linear/sRGB behavior at shader boundaries.
+- Base Color: sampled sRGB source views where appropriate, with explicit linear/sRGB behavior at shader boundaries.
+  The qualification adapter cannot use `Rgba8UnormSrgb` as a storage texture, so compute writes use a qualified
+  storage-capable format such as `Rgba8Unorm` with explicit encoding/view semantics rather than assuming sRGB storage.
 - Height/intermediate math: use a qualified single-channel float format such as R16Float/R32Float where supported;
   do not collapse the working range into RGBA8.
 - Normal: use float intermediates where needed and pack only at publication/export.
@@ -312,24 +366,27 @@ interactive path can use raw binary responses or a scoped local resource protoco
 
 | Prompt | Product result | Depends on | Review gate |
 | --- | --- | --- | --- |
-| 1 | Real 8K baseline and stable compiler/executor contract | Manual layout prompts accepted | Reproducible trace and unchanged pixels |
-| 2 | Stage 14 Base Color samples on the GPU | Prompt 1 | Truthful direct/loop/radial parity and faster real 8K |
-| 3 | GPU atlas + exact tiled preview + binary publication | Prompt 2 | 1:1 edits are interactive; no PNG/Base64 hot path |
-| 4 | Requested material maps are generated/composed on GPU | Prompt 3 | Correct map set, registration, normals, profiles, and map switching |
-| 5 | 16K/24K tiled export and production hardening | Prompt 4 | Bounded memory, multi-source export, device recovery, CPU route retired |
+| [1](render/prompt-001.md) | Real 8K baseline, immutable plan, synthesis executor, and GPU capability skeleton | Frozen sampling tests | Accepted as compiler baseline; UI paint qualification moves to Prompt 3 |
+| [1.5](render/prompt-001.5.md) | Complete Base Color composition moves behind the executor boundary | Prompt 1 | CPU pixels unchanged; no composition remains outside the executor |
+| [2](render/prompt-002.md) | Stage 14 sampling and final Base Color destination composition execute on GPU | Prompt 1.5 | Truthful direct/loop/radial parity and faster real 8K end to end |
+| [3](render/prompt-003.md) | GPU tiling, padding/ID, exact 1:1 preview, and binary publication | Prompt 2 | 1:1 edits are interactive; no PNG/Base64 hot path |
+| [4](render/prompt-004.md) | Requested material maps are generated/composed on GPU | Prompt 3 | Correct map set, registration, normals, profiles, and map switching |
+| [5](render/prompt-005.md) | 16K/24K tiled export and production hardening | Prompt 4 | Bounded memory, multi-source export, device recovery, CPU route retired |
 
 Estimated implementation effort after the manual-layout product work is accepted:
 
 | Prompt | Realistic engineering effort |
 | --- | ---: |
-| 1 | 3-5 days |
-| 2 | 7-12 days |
-| 3 | 7-12 days |
+| 1 | Implemented; acceptance evidence pending |
+| 1.5 | 1-2 days |
+| 2 | 8-14 days |
+| 3 | 6-10 days |
 | 4 | 10-18 days |
 | 5 | 8-15 days |
-| **Total** | **35-62 engineering days** |
+| **Remaining after Prompt 1** | **33-59 engineering days** |
 
-The critical path is Prompt 1 -> Prompt 2 -> Prompt 3. Prompt 4 should not begin while preview publication still
+The critical path is Prompt 1.5 -> Prompt 2 -> Prompt 3. Prompt 2 owns both dominant CPU pixel passes: Stage 14
+sampling and final Base Color destination composition. Prompt 4 should not begin while preview publication still
 forces full-frame CPU copies. Prompt 5 cannot be proven with synthetic small fixtures.
 
 ---
@@ -391,11 +448,24 @@ command separately because the real-8K benchmark is not an ordinary unit test. D
 
 ---
 
-## Prompt 2 - Execute authoritative Stage 14 Base Color on the GPU
+## Prompt 1.5 - Put complete Base Color composition behind the executor
+
+The self-contained implementation handoff is
+[`docs/render/prompt-001.5.md`](render/prompt-001.5.md). It exists because Prompt 1 proved that the executor currently
+owns region synthesis while the dominant atlas-composition pass remains outside it. Prompt 1.5 changes no sampling
+algorithm and adds no GPU shader. It moves the existing CPU composition responsibility behind the same executor
+boundary and locks the complete-output contract. Native request-to-paint qualification is intentionally deferred to
+Prompt 3, where publication actually changes. Prompt 2 can then replace one complete CPU Base Color executor instead
+of leaving a 13.4-second CPU tail.
+
+---
+
+## Prompt 2 - Execute and compose authoritative Base Color on the GPU
 
 ```text
-Implement GPU Migration Prompt 2: make the existing compile_persisted Stage 14 Base Color route execute direct,
-looped, planar, and planar-to-radial sampling on a long-lived native wgpu service.
+Implement GPU Migration Prompt 2: make the existing compile_persisted Base Color executor perform direct, looped,
+planar, and planar-to-radial sampling **and final destination atlas composition** on the long-lived native wgpu
+service.
 
 Read AGENTS.md; docs/gpu-rendering-migration-plan.md; the accepted Prompt 1 report and trace; the compiled plan and
 executor contract; SamplingPlan/RegionBinding/manual region semantics; slot_synthesis.rs; the current Stage 14 cache;
@@ -410,6 +480,11 @@ Required implementation:
 - Implement the exact compiled Base Color modes already supported by the product: DirectCrop, explicit LoopX/LoopY/
   LoopXY where legal, planar sampling, and planar-to-radial mapping with its exact center/radius/angle/warp/seam
   parameters. Unsupported pairs fail with typed diagnostics; they never fall back to stretch or centered sampling.
+- Write sampled results directly into their exact compiled Base Color atlas destinations. Replace the CPU
+  `compose_intermediate_atlas` Base Color work for this route, including the minimum validity/ownership information
+  required to publish a truthful artifact. Do not read GPU-sampled regions back merely to recompose them on CPU.
+- Avoid unconditional dense correspondence and per-pixel UUID buffers on the production GPU Base Color path. Use a
+  compact region index and stable lookup where ownership is required; Prompt 3 formalizes the tiled Region ID artifact.
 - Preserve aspect behavior, crop coordinate conventions, orientation, bilinear/filter policy, alpha, color space,
   radial seam behavior, and cross-channel-ready transform identity.
 - Submit region commands in GPU batches. Do not allocate CPU full-frame position/seam arrays or call the serial CPU
@@ -424,6 +499,7 @@ Acceptance:
   where GPU filtering differs.
 - One test covers each mode, crop boundaries, non-square oriented sources, alpha, and radial seam/warp.
 - Stable RegionId, source ID, crop, destination, and plan hashes match the CPU reference.
+- No production supported-GPU Base Color request calls CPU slot synthesis or CPU atlas composition.
 - A real 8K manual-layout Base Color run is measured cold and warm. Warm target is 1-3 seconds and cold target is 2-6
   seconds on the documented qualification GPU. If missed, report pass-level telemetry; do not hide it by lowering the
   requested output.
@@ -439,19 +515,20 @@ direct crop, explicit loop, and radial region at the same document revision. Do 
 
 ---
 
-## Prompt 3 - Move atlas composition and exact interactive preview to GPU tiles
+## Prompt 3 - Tile the GPU atlas and publish an exact interactive preview
 
 ```text
-Implement GPU Migration Prompt 3: GPU atlas composition, padding/Region ID, exact ROI/tile preview, and binary pixel
-publication through the existing compile_persisted artifact route.
+Implement GPU Migration Prompt 3: extend the accepted GPU Base Color atlas into capability-bounded tiles with
+padding/Region ID, exact ROI preview, and binary pixel publication through the existing compile_persisted artifact
+route.
 
 Read AGENTS.md; docs/gpu-rendering-migration-plan.md; accepted Prompt 1-2 reports; intermediate_atlas.rs; GPU Stage 14
 executor/cache; document_commands.rs publication; IPC contracts; source-first-app.tsx preview controller; and the
 preview canvas/image upload code. Do not use subagents.
 
 Required implementation:
-- Move atlas destination writes, validity, overlap validation, padding/dilation, and Region ID generation to GPU
-  passes using the exact compiled destination rectangles.
+- Tile the accepted GPU destination writes and add padding/dilation plus formal Region ID generation using the exact
+  compiled destination rectangles.
 - Replace per-pixel UUID ownership with a compact u32 region index and artifact-level stable RegionId table.
 - Make dense correspondence optional diagnostic output and tile-scoped. Do not allocate it for ordinary preview.
 - Add a capability-selected tile scheduler, normally 1024/2048, with valid rect and halo. The scheduler supports full
@@ -612,4 +689,3 @@ Do not call the migration complete until a reviewer can answer yes to all of the
 - Do cancellation, stale revisions, and device loss fail without stale publication?
 - Do real-resolution release benchmarks, rather than synthetic filenames, prove the performance claims?
 - Is the old CPU production executor retired rather than retained as an unpredictable fallback?
-

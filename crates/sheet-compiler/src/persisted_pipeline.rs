@@ -97,9 +97,14 @@ impl MaterialDomainView for MappedDomainView<'_> {
 }
 
 use crate::{
-    AlgorithmCompiler, CompilerFacadeError, IntermediateAtlasArtifact, IntermediateAtlasRequest,
-    IntermediateSlotInput, SlotSynthesisLimits, SlotSynthesisRequest, SynthesizedSlotMaterial,
-    synthesize_slot_material_with_guard,
+    AlgorithmCompiler, AtlasPreparedSource, AtlasRenderExecutionInput, AtlasRenderExecutor,
+    CompiledAtlasPreviewProfile, CompiledAtlasPlanValidationError, CompiledAtlasPlanV1,
+    CompiledRegionCommandV1, CompiledSourceCommandV1, CompilerFacadeError, IntermediateAtlasArtifact,
+    IntermediateAtlasRequest, IntermediateSlotInput, OutputPixelRect, SourcePixelRect,
+    CpuAtlasRenderExecutor, SlotSynthesisLimits, SlotSynthesisRequest, SynthesizedSlotMaterial,
+    synthesize_slot_material_with_guard, COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
+    COMPILED_ATLAS_ALGORITHM_VERSION, CompiledColorSpacePolicy, CompiledNormalConvention,
+    CompiledTileRequest,
 };
 
 /// Gate 1 must show source subdivisions, not a second copy of the whole source in
@@ -190,11 +195,11 @@ impl SourceFramePreviewCache {
         }
         self.direct_domains.insert(key, domain);
     }
-    fn get_rendered(&self, key: &ContentDigest) -> Option<Arc<SynthesizedSlotMaterial>> {
+    pub(crate) fn get_rendered(&self, key: &ContentDigest) -> Option<Arc<SynthesizedSlotMaterial>> {
         self.rendered_regions.get(key).cloned()
     }
-    fn insert_rendered(&mut self, key: ContentDigest, result: Arc<SynthesizedSlotMaterial>) {
-        const MAX_RENDERED_REGIONS: usize = 32;
+    pub(crate) fn insert_rendered(&mut self, key: ContentDigest, result: Arc<SynthesizedSlotMaterial>) {
+        const MAX_RENDERED_REGIONS: usize = 64;
         if self.rendered_regions.len() >= MAX_RENDERED_REGIONS
             && !self.rendered_regions.contains_key(&key)
         {
@@ -307,7 +312,8 @@ fn compile_persisted(
     }
     let mut domains = Vec::<DomainArtifacts>::new();
     let mut domain_keys = BTreeMap::<String, usize>::new();
-    let mut region_domains = Vec::with_capacity(document.topology.regions.len());
+    let mut region_domains: Vec<usize> =
+        Vec::with_capacity(document.topology.regions.len());
     for region in &document.topology.regions {
         let binding = document
             .region_bindings
@@ -881,11 +887,7 @@ fn compile_source_frame(
     let decode_started = Instant::now();
     // SourceFrame geometry is owned by its persisted sourceSetId. Selection and primary
     // material are independent UI/document state and must never choose the frame validator.
-    let reusable_source_cache = if matches!(request.profile, SourceFramePreviewProfile::Authoritative) {
-        None
-    } else {
-        source_frame_cache
-    };
+    let reusable_source_cache = source_frame_cache;
     let (frame_domain, decode_cache_hit) = direct_source_frame_domain(
         request.project,
         frame.source_set_id,
@@ -900,7 +902,7 @@ fn compile_source_frame(
     // Resolve the existing RegionBinding authority once per region. Inherited content uses
     // the pinned primary, an explicit material source uses that whole registered source, and
     // a patch uses its owning source plus rectified authored geometry.
-    let mut region_domains = Vec::with_capacity(document.topology.regions.len());
+    let mut region_sources = Vec::with_capacity(document.topology.regions.len());
     let mut direct_domains = BTreeMap::new();
     direct_domains.insert(frame.source_set_id, Arc::clone(&frame_domain));
     for region in &document.topology.regions {
@@ -954,9 +956,11 @@ fn compile_source_frame(
             direct_domains.insert(source_set_id, Arc::clone(&domain));
             domain
         };
-        region_domains.push((
+        let source_set_id = source_set_id.unwrap_or(frame.source_set_id);
+        region_sources.push((
             source_set_id,
-            patch.map(|value| value.id.to_string()),
+            patch.map(|value| value.id),
+            domain.prepared_source_digest.clone(),
             domain,
         ));
     }
@@ -972,11 +976,295 @@ fn compile_source_frame(
     let source_y = hot_trimmer_domain::resolve_boundaries(source_top, source_height, grid.height);
     let destination_x = hot_trimmer_domain::resolve_boundaries(0, output_size.width, grid.width);
     let destination_y = hot_trimmer_domain::resolve_boundaries(0, output_size.height, grid.height);
+    let plan_started = Instant::now();
+    let mut source_records = Vec::<CompiledSourceCommandV1>::with_capacity(region_sources.len());
+    let mut region_records = Vec::<CompiledRegionCommandV1>::with_capacity(region_sources.len());
+    let mut source_index =
+        BTreeMap::<(hot_trimmer_domain::SourceSetId, ContentDigest), usize>::new();
+    for (region_index, region) in document.topology.regions.iter().enumerate() {
+        let binding = document
+            .region_bindings
+            .get(&region.id)
+            .ok_or_else(|| format!("region {} has no persisted content binding", region.id))?;
+        let (source_set_id, patch_id, source_id, domain) = &region_sources[region_index];
+        let behavior = &binding.mapping.behavior;
+        let uses_frame_partition =
+            matches!(&binding.content, ContentReference::InheritPrimaryMaterial)
+                && *source_set_id == frame.source_set_id;
+        let rect = region
+            .grid_rect
+            .ok_or_else(|| format!("region {} has no persisted GridRect", region.id))?;
+        let allocation = hot_trimmer_domain::CanonicalRect {
+            x: destination_x[rect.x as usize],
+            y: destination_y[rect.y as usize],
+            width: destination_x[(rect.x + rect.width) as usize] - destination_x[rect.x as usize],
+            height: destination_y[(rect.y + rect.height) as usize] - destination_y[rect.y as usize],
+        };
+        let source_to_region_transform = hot_trimmer_domain::MappingTransform {
+            scale: binding.mapping.transform.scale,
+            rotation_degrees: quarter_turn_degrees(behavior.orientation),
+            mirror_x: binding.mapping.transform.mirror_x,
+            mirror_y: binding.mapping.transform.mirror_y,
+            offset: binding.mapping.transform.offset,
+        };
+        let crop = if uses_frame_partition {
+            document
+                .source_overrides
+                .get(&region.id)
+                .map(|value| {
+                    let bounds = value.source_bounds;
+                    let x = (bounds.x.get() * f64::from(frame_domain.width)).round()
+                        as u32;
+                    let y = (bounds.y.get() * f64::from(frame_domain.height)).round()
+                        as u32;
+                    SourceCrop {
+                        x,
+                        y,
+                        width: (bounds.width.get() * f64::from(frame_domain.width))
+                            .round() as u32,
+                        height: (bounds.height.get() * f64::from(frame_domain.height))
+                            .round() as u32,
+                    }
+                })
+                .unwrap_or(SourceCrop {
+                    x: source_x[rect.x as usize],
+                    y: source_y[rect.y as usize],
+                    width: source_x[(rect.x + rect.width) as usize] - source_x[rect.x as usize],
+                    height: source_y[(rect.y + rect.height) as usize] - source_y[rect.y as usize],
+                })
+        } else {
+            SourceCrop {
+                x: 0,
+                y: 0,
+                width: domain.width,
+                height: domain.height,
+            }
+        };
+        if crop.width == 0 || crop.height == 0 || allocation.width == 0 || allocation.height == 0 {
+            return Err(format!(
+                "source-frame region {} collapsed at resolved pixel boundaries",
+                region.id
+            ));
+        }
+        if behavior.period_pixels.is_some_and(|period| period[0] > crop.width || period[1] > crop.height) {
+            return Err(format!("region {} authored repeat period exceeds its exact source crop", region.id));
+        }
+        if uses_frame_partition
+            && document.source_overrides.contains_key(&region.id)
+            && !aspect_matches(
+                f64::from(crop.width),
+                f64::from(crop.height),
+                f64::from(allocation.width),
+                f64::from(allocation.height),
+            )
+        {
+            return Err(format!(
+                "detached SourceFrame region {} does not preserve its destination aspect",
+                region.id
+            ));
+        }
+        validate_manual_mapping(region.id, &binding.mapping)?;
+        let mapping_mode = manual_sampling_mode(behavior.role, behavior.sampling);
+        let sampling = match mapping_mode {
+            SamplingMode::RepeatX => RegionSampling::LoopX,
+            SamplingMode::RepeatY => RegionSampling::LoopY,
+            SamplingMode::PeriodicTile => RegionSampling::LoopXy,
+            SamplingMode::DirectCrop | SamplingMode::PlanarRadial | SamplingMode::PolarRadial => {
+                RegionSampling::OneShot
+            }
+            _ => behavior.sampling,
+        };
+        let semantic = semantic_rect_for_padding(
+            allocation,
+            preview_padding_px,
+            behavior.edge_eligibility,
+        );
+        let mapping_origin = if uses_frame_partition {
+            if document.source_overrides.contains_key(&region.id) {
+                "explicit_override"
+            } else {
+                "partition"
+            }
+        } else if matches!(&binding.content, ContentReference::Solid(_)) {
+            "solid_binding"
+        } else if patch_id.is_some() {
+            "patch_binding"
+        } else {
+            "whole_source_binding"
+        };
+        let candidate_id = ContentDigest::sha256(
+            format!(
+                "source-frame|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|mapping={:?}",
+                frame.identity.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                region.id, crop.x, crop.y, crop.width, crop.height, mapping_origin,
+                source_set_id, patch_id, binding.mapping
+            )
+            .as_bytes(),
+        );
+        let authored_repeat = behavior.sampling != RegionSampling::OneShot;
+        let mirror = match (binding.mapping.transform.mirror_x, binding.mapping.transform.mirror_y) {
+            (true, false) => MirrorTransform::X,
+            (false, true) => MirrorTransform::Y,
+            _ => MirrorTransform::None,
+        };
+        let (family, route) = match mapping_mode {
+            SamplingMode::RepeatX => (CandidateFamily::RepeatXSegment, CandidateRoute::Repeat),
+            SamplingMode::RepeatY => (CandidateFamily::RepeatYSegment, CandidateRoute::Repeat),
+            SamplingMode::PeriodicTile => (CandidateFamily::PanelSeamlessTile, CandidateRoute::Repeat),
+            SamplingMode::PlanarRadial => (CandidateFamily::PlanarRadialSquare, CandidateRoute::PlanarRadial),
+            SamplingMode::PolarRadial => (CandidateFamily::PolarRadialSynthesis, CandidateRoute::PolarRadial),
+            _ => (CandidateFamily::PanelDirect, CandidateRoute::Direct),
+        };
+        let candidate = CropCandidate {
+            candidate_id,
+            source_id: domain.prepared_source_digest.clone(),
+            domain_id: domain.cache_key.clone(),
+            slot_id: region.id,
+            crop: Some(crop),
+            transform: CandidateTransform { rotation: behavior.orientation, mirror },
+            isotropic_scale: 1.0,
+            mapping_mode,
+            family,
+            route,
+            position_strategy: PositionStrategy::DenseLowResolution,
+            period_pixels: authored_repeat.then_some(
+                behavior.period_pixels.unwrap_or([crop.width, crop.height]),
+            ),
+            seam_indices: Vec::new(),
+            correspondence_reference: domain.cache_key.clone(),
+            descriptors: CandidateDescriptors {
+                saliency_milli: 0,
+                stationarity_milli: 0,
+                feature_strength_milli: 0,
+                usability_milli: 1000,
+            },
+            seed: provenance.recipe.seed,
+            eligibility: EligibilityEvidence {
+                mapping_permitted: true,
+                transform_permitted: true,
+                isotropic_scale: true,
+                exact_aspect: true,
+                entire_crop_usable: Some(true),
+                cross_axis_preserved: Some(true),
+                lattice_aligned: Some(true),
+                direct_crop_applicable: true,
+                direct_crop_rejection: None,
+                reasons: vec!["accepted SourceFrame + GridRect direct mapping".into()],
+            },
+        };
+        let (slot_physical_size, source_pixels_per_physical_unit) =
+            manual_physical_mapping(behavior.sampling, crop, semantic);
+        let sampling_plan = SamplingPlan {
+            slot_id: region.id,
+            role: manual_template_role(behavior.role),
+            variation_group: region.material_group.clone(),
+            prepared_domain_dimensions: [domain.width, domain.height],
+            candidate,
+            slot_physical_size,
+            source_pixels_per_physical_unit,
+            sampling_policy: SamplingPolicy {
+                filter: binding.mapping.sampling.filter,
+                scale: binding.mapping.sampling.scale
+                    * binding.mapping.transform.scale[0].abs(),
+                correct_tangent_normals: binding.mapping.sampling.correct_tangent_normals,
+            },
+            radial_mapping: behavior.radial,
+            stretch_override: StretchOverrideProvenance::NotAuthorized,
+            slice_geometry: SliceGeometry::None,
+            maximum_seam_cost_milli: 0,
+            unary_cost: 0.0,
+        };
+        let render_cache_key = ContentDigest::sha256(format!(
+            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|domain={:?}|semantic={}x{}|padding={preview_padding_px}",
+            request.profile, output_size.width, output_size.height,
+            sampling_plan.candidate.candidate_id, domain.cache_key, semantic.width, semantic.height,
+        ).as_bytes());
+        let source_key = (*source_set_id, source_id.clone());
+        if !source_index.contains_key(&source_key) {
+            source_records.push(CompiledSourceCommandV1 {
+                source_set_id: *source_set_id,
+                source_id: source_id.clone(),
+                digest: domain.prepared_source_digest.clone(),
+                oriented_dimensions: hot_trimmer_domain::OrientedPixelSize {
+                    width: domain.width,
+                    height: domain.height,
+                },
+                decoder_version: DIRECT_SOURCE_FRAME_DECODER_VERSION.to_string(),
+                decoded_format: "rgba8".to_string(),
+                color_version: DIRECT_SOURCE_FRAME_DECODER_VERSION.to_string(),
+                channel_role: MaterialChannelRole::BaseColor,
+            });
+            source_index.insert(source_key, source_records.len());
+        }
+        region_records.push(CompiledRegionCommandV1 {
+            region_id: region.id,
+            compact_index: region_index.try_into().map_err(|_| {
+                format!("source-frame compact index for region {} overflows u32", region.id)
+            })?,
+            source_set_id: *source_set_id,
+            source_id: source_id.clone(),
+            patch_id: *patch_id,
+            source_crop: SourcePixelRect(hot_trimmer_domain::PixelBounds {
+                x: crop.x,
+                y: crop.y,
+                width: crop.width,
+                height: crop.height,
+            }),
+            destination_rect: OutputPixelRect(hot_trimmer_domain::PixelBounds {
+                x: allocation.x,
+                y: allocation.y,
+                width: allocation.width,
+                height: allocation.height,
+            }),
+            sampling,
+            source_to_region_transform,
+            radial_parameters: behavior.radial,
+            continuity: behavior.continuity,
+            padding_px: preview_padding_px,
+            edge_eligibility: behavior.edge_eligibility,
+            sampling_plan,
+            render_cache_key,
+        });
+    }
+    let source_frame_atlas_plan = compiled_atlas_plan_from_persisted(
+        request.revision,
+        request.draft_id,
+        document.topology.topology_hash,
+        document
+            .appearance_hash()
+            .map_err(|error| error.to_string())?,
+        output_size,
+        request.profile,
+        source_records,
+        region_records,
+    )
+    .map_err(|error| error.to_string())?;
+    let plan_ms = plan_started.elapsed().as_millis();
+    let mut prepared_sources = BTreeMap::new();
+    for (source_set_id, _patch_id, source_id, domain) in &region_sources {
+        prepared_sources.entry((*source_set_id, source_id.clone())).or_insert_with(|| {
+            AtlasPreparedSource {
+                source_set_id: *source_set_id,
+                source_id: source_id.clone(),
+                channel_role: MaterialChannelRole::BaseColor,
+                domain: Arc::clone(domain),
+            }
+        });
+    }
+    let execution_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources.into_values().collect(),
+        source_frame_cache,
+    };
+    let execution = CpuAtlasRenderExecutor.execute(
+        &source_frame_atlas_plan,
+        &execution_input,
+        cancellation,
+        is_current,
+    ).map_err(|error| error.to_string())?;
     let mut slots = Vec::with_capacity(document.topology.regions.len());
     let mut plans = Vec::with_capacity(document.topology.regions.len());
     let mut results = Vec::with_capacity(document.topology.regions.len());
-    let render_started = Instant::now();
-    let mut rendered_cache_hits = 0_u32;
+    let rendered_cache_hits = execution.rendered_cache_hits;
     for (region_index, region) in document.topology.regions.iter().enumerate() {
         if !active() {
             return Err("preview cancelled or superseded in source-frame stages".into());
@@ -985,10 +1273,10 @@ fn compile_source_frame(
             .region_bindings
             .get(&region.id)
             .ok_or_else(|| format!("region {} has no persisted content binding", region.id))?;
-        let (source_set_id, patch_id, domain) = &region_domains[region_index];
+        let (source_set_id, patch_id, _source_id, domain) = &region_sources[region_index];
         let uses_frame_partition =
             matches!(&binding.content, ContentReference::InheritPrimaryMaterial)
-                && *source_set_id == Some(frame.source_set_id);
+                && *source_set_id == frame.source_set_id;
         let rect = region
             .grid_rect
             .ok_or_else(|| format!("region {} has no persisted GridRect", region.id))?;
@@ -1178,50 +1466,21 @@ fn compile_source_frame(
             allocation,
             hotspot: semantic,
         };
-        let rendered_key = ContentDigest::sha256(format!(
-            "{SOURCE_FRAME_COMPILER_VERSION}|render|profile={:?}|output={}x{}|candidate={:?}|domain={:?}|semantic={}x{}|padding={preview_padding_px}",
-            request.profile, output_size.width, output_size.height, plan.candidate.candidate_id,
-            domain.cache_key,
-            semantic.width, semantic.height,
-        ).as_bytes());
-        let result = if let Some(cached) = (!matches!(request.profile, SourceFramePreviewProfile::Authoritative))
-            .then_some(source_frame_cache).flatten().and_then(|cache| {
-            cache
-                .lock()
-                .ok()
-                .and_then(|guard| guard.get_rendered(&rendered_key))
-        }) {
-            rendered_cache_hits += 1;
-            cached
-        } else {
-            let result = Arc::new(synthesize_slot_material_with_guard(
-                SlotSynthesisRequest {
-                    plan: &plan,
-                    domain: domain.as_ref(),
-                    output_dimensions: [semantic.width, semantic.height],
-                    limits: SlotSynthesisLimits::default(),
-                },
-                &|| !active(),
-            )
-            .map_err(|error| {
-                format!(
-                    "Stage 14 direct SourceFrame sampling failed for {}: {error}",
-                    region.id
-                )
-            })?);
-            if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
-                && let Some(cache) = source_frame_cache {
-                if let Ok(mut guard) = cache.lock() {
-                    guard.insert_rendered(rendered_key, Arc::clone(&result));
-                }
-            }
-            result
-        };
+        let executed = execution.regions.get(region_index).ok_or_else(|| {
+            format!("CPU atlas executor omitted region {}", region.id)
+        })?;
+        if executed.region_id != region.id || executed.sampling_plan != plan {
+            return Err(format!(
+                "CPU atlas executor returned an instruction mismatch for region {}",
+                region.id
+            ));
+        }
+        let result = Arc::clone(&executed.result);
         slots.push(topology_slot);
         plans.push(plan);
         results.push(result);
     }
-    let render_ms = render_started.elapsed().as_millis();
+    let render_ms = execution.render_ms;
     let compose_started = Instant::now();
     let topology = hot_trimmer_domain::CompiledTemplateTopology {
         identity: hot_trimmer_domain::TemplateIdentity {
@@ -1282,8 +1541,11 @@ fn compile_source_frame(
                 slot_key: slot.slot_key.as_str(),
                 display_name: region.display_name.as_str(),
                 required: true,
-                patch_id: region_domains[index].1.clone(),
-                domain: region_domains[index].2.as_ref(),
+                patch_id: region_sources[index]
+                    .1
+                    .as_ref()
+                    .map(|value| value.to_string()),
+                domain: region_sources[index].3.as_ref(),
                 plan,
                 result: result.as_ref(),
                 grid_rect: region.grid_rect,
@@ -1334,11 +1596,12 @@ fn compile_source_frame(
         + artifact.validity.len()
         + artifact.correspondence.len() * std::mem::size_of::<[f32; 2]>()
         + artifact.region_ownership.len() * std::mem::size_of::<hot_trimmer_domain::RegionId>();
-    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_ms={compose_ms}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
+    artifact.telemetry.push(format!("profile={:?}; source={}x{}; oriented={}x{}; output={}x{}; output_padding_px={}; preview_padding_px={}; regions={}; patches={}; maps=BaseColor; stage3-8=bypassed; decode_cache={cache}; decode_count={}; decode_ms={decode_ms}; plan_ms={plan_ms}; executor=cpu; plan_hash={:?}; render_ms={render_ms}; render_cache_hits={rendered_cache_hits}; render_cache_misses={rendered_cache_misses}; composed_cache=miss; compose_ms={compose_ms}; allocated_bytes={allocated_bytes}; decode_full_frame_allocations={}; elapsed_ms={}",
         request.profile, frame.oriented_dimensions.width, frame.oriented_dimensions.height,
         frame_domain.width, frame_domain.height, output_size.width, output_size.height,
         document.render_settings.atlas_padding_px, preview_padding_px, document.topology.regions.len(), document.patches.len(),
-        u8::from(!decode_cache_hit), u8::from(!decode_cache_hit), started.elapsed().as_millis()));
+        u8::from(!decode_cache_hit), source_frame_atlas_plan.final_plan_hash,
+        u8::from(!decode_cache_hit), started.elapsed().as_millis()));
     if !matches!(request.profile, SourceFramePreviewProfile::Authoritative)
         && let Some(cache) = source_frame_cache {
         if let Ok(mut guard) = cache.lock() {
@@ -1346,6 +1609,58 @@ fn compile_source_frame(
         }
     }
     Ok(artifact)
+}
+
+pub fn compiled_atlas_plan_from_persisted(
+    revision: u64,
+    request_generation: Option<u64>,
+    topology_hash: hot_trimmer_domain::DocumentHash,
+    appearance_hash: hot_trimmer_domain::DocumentHash,
+    output_size: hot_trimmer_domain::PixelSize,
+    profile: SourceFramePreviewProfile,
+    sources: Vec<CompiledSourceCommandV1>,
+    regions: Vec<CompiledRegionCommandV1>,
+) -> Result<CompiledAtlasPlanV1, CompiledAtlasPlanValidationError> {
+    CompiledAtlasPlanV1 {
+        schema_version: COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
+        algorithm_version: COMPILED_ATLAS_ALGORITHM_VERSION.to_string(),
+        document_revision: revision,
+        request_generation,
+        topology_hash,
+        appearance_hash,
+        output_size,
+        preview_profile: match profile {
+            SourceFramePreviewProfile::Draft512 => CompiledAtlasPreviewProfile::Draft512,
+            SourceFramePreviewProfile::Refinement1024 => CompiledAtlasPreviewProfile::Refinement1024,
+            SourceFramePreviewProfile::Authoritative => CompiledAtlasPreviewProfile::Authoritative,
+        },
+        normal_convention: CompiledNormalConvention::OpenGl,
+        color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
+        tile_request: CompiledTileRequest {
+            output_rect: OutputPixelRect(hot_trimmer_domain::PixelBounds {
+                x: 0, y: 0, width: output_size.width, height: output_size.height,
+            }),
+            mip_level: 0,
+            halo_px: 0,
+            valid_rect: OutputPixelRect(hot_trimmer_domain::PixelBounds {
+                x: 0, y: 0, width: output_size.width, height: output_size.height,
+            }),
+        },
+        requested_maps: vec![hot_trimmer_domain::MaterialMapKind::BaseColor],
+        ordered_sources: sources,
+        ordered_regions: regions,
+        final_plan_hash: ContentDigest(String::new()),
+    }
+    .finalize()
+}
+
+fn quarter_turn_degrees(orientation: QuarterTurn) -> f64 {
+    match orientation {
+        QuarterTurn::Zero => 0.0,
+        QuarterTurn::Ninety => 90.0,
+        QuarterTurn::OneEighty => 180.0,
+        QuarterTurn::TwoSeventy => 270.0,
+    }
 }
 
 fn direct_source_frame_domain(
@@ -1585,7 +1900,7 @@ fn scaled_atlas_padding(
     u32::try_from(scaled_width.min(scaled_height).max(1)).unwrap_or(u32::MAX)
 }
 
-fn semantic_rect_for_padding(
+pub(crate) fn semantic_rect_for_padding(
     allocation: hot_trimmer_domain::CanonicalRect,
     padding_px: u32,
     edges: hot_trimmer_domain::EdgeEligibility,

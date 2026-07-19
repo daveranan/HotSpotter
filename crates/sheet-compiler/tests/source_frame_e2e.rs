@@ -3,7 +3,8 @@ use std::{io::Cursor, path::PathBuf};
 use hot_trimmer_domain::{
     generate_partition, resolve_boundaries, ContentDigest, LogicalGridSpec, MaterialMapContent,
     MaterialMapKind, MaterialSourceSet, OrientedPixelSize, PartitionRecipe, PixelSize,
-    SamplingMode, SourceFrame, SourceId, TrimSheetDocument, TrimSheetDocumentCommand, NormalizedBounds, NormalizedScalar,
+    SamplingMode, SourceFrame, SourceId, TrimSheetDocument, TrimSheetDocumentCommand, NormalizedBounds,
+    NormalizedScalar, source_frame_region_id,
     ManualRegionRole, QuarterTurn, RegionBehavior, RegionContinuity, RegionSampling,
 };
 use hot_trimmer_placement_solver::MirrorTransform;
@@ -384,6 +385,126 @@ fn fixture_project_with_output(target: u32, output: PixelSize) -> (ProjectStore,
 }
 
 #[test]
+fn gpu_migration_cpu_baseline_contract() {
+    let (store, _source, document) = fixture_project(16);
+    let provenance = document.partition_provenance.as_ref().expect("source-frame provenance");
+    let direct_region = document.topology.regions[0].id;
+    let loop_region = document.topology.regions[1].id;
+    let radial_region = document.topology.regions[2].id;
+    assert_eq!(
+        direct_region,
+        source_frame_region_id(&provenance.recipe, document.topology.regions[0].grid_rect.expect("direct grid"), 0),
+        "direct region id changed"
+    );
+    assert_eq!(
+        loop_region,
+        source_frame_region_id(&provenance.recipe, document.topology.regions[1].grid_rect.expect("loop grid"), 1),
+        "loop region id changed"
+    );
+    assert_eq!(
+        radial_region,
+        source_frame_region_id(&provenance.recipe, document.topology.regions[2].grid_rect.expect("radial grid"), 2),
+        "radial region id changed"
+    );
+
+    let mut loop_behavior = RegionBehavior::default();
+    loop_behavior.sampling = RegionSampling::LoopX;
+    loop_behavior.period_pixels = Some([1, 1]);
+    loop_behavior.synchronize_derived_fields();
+    let mut radial_behavior = RegionBehavior::new(ManualRegionRole::Radial);
+    radial_behavior.synchronize_derived_fields();
+
+    let mut modified = document
+        .apply_command(&TrimSheetDocumentCommand::SetRegionBehavior {
+            region_id: loop_region,
+            behavior: loop_behavior,
+        })
+        .expect("author loop sampling");
+    modified = modified
+        .apply_command(&TrimSheetDocumentCommand::SetRegionBehavior {
+            region_id: radial_region,
+            behavior: radial_behavior,
+        })
+        .expect("author radial role");
+
+    let compiler = hot_trimmer_sheet_compiler::AlgorithmCompiler::new();
+    let cache = Mutex::new(hot_trimmer_sheet_compiler::SourceFramePreviewCache::default());
+    let compile = |store: &ProjectStore, document: &TrimSheetDocument, input_hash: &str| {
+        let mut summary = store.summary().expect("artifact summary");
+        summary.document = Some(document.clone());
+        compiler
+            .compile_persisted_stage_14_preview_with_cache(
+                hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                    project: &summary,
+                    revision: document.document_revision,
+                    draft_id: None,
+                    input_hash: Some(input_hash.to_owned()),
+                    profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+                },
+                &CancellationToken::new(),
+                || true,
+                Some(&cache),
+            )
+            .expect("compile source-frame artifact")
+    };
+
+    let baseline_artifact = compile(&store, &modified, "gpu-migration-cpu-baseline");
+    let warm_artifact = compile(&store, &modified, "gpu-migration-cpu-baseline");
+
+    let baseline_base = baseline_artifact
+        .channels
+        .iter()
+        .find(|channel| channel.role == hot_trimmer_domain::MaterialChannelRole::BaseColor)
+        .expect("baseline base color");
+    let warm_base = warm_artifact
+        .channels
+        .iter()
+        .find(|channel| channel.role == hot_trimmer_domain::MaterialChannelRole::BaseColor)
+        .expect("warm base color");
+    let baseline_digest = ContentDigest::sha256(&baseline_base.rgba8);
+    assert_eq!(baseline_digest.0, "caea75196f8746fa0303e11547c6fbebb85c40d1121b086bd3efdd9357c26ee6");
+    assert_eq!(baseline_base.rgba8, warm_base.rgba8);
+
+    let contract_rows = [
+        (direct_region, SamplingMode::DirectCrop, RegionSampling::OneShot),
+        (loop_region, SamplingMode::RepeatX, RegionSampling::LoopX),
+        (radial_region, SamplingMode::PolarRadial, RegionSampling::OneShot),
+    ];
+    let mut warm_expectations = Vec::with_capacity(contract_rows.len());
+    for (region_id, expected_mode, expected_sampling) in contract_rows {
+        let slot = baseline_artifact
+            .slots
+            .iter()
+            .find(|slot| slot.region_id == region_id)
+            .expect("contract slot");
+        assert_eq!(slot.requested_sampling, expected_sampling);
+        assert_eq!(slot.mapping_mode, expected_mode);
+        assert_eq!(slot.executed_mode, expected_mode);
+        assert!(!slot.sampling_plan_id.0.is_empty(), "sampling-plan id is empty");
+        assert!(!slot.stage_14_result_id.0.is_empty(), "stage14 id is empty");
+        warm_expectations.push((
+            region_id,
+            slot.source_crop.clone(),
+            slot.atlas_destination,
+            slot.sampling_plan_id.clone(),
+            slot.stage_14_result_id.clone(),
+        ));
+    }
+    for (region_id, expected_crop, expected_destination, expected_sampling_plan_id, expected_stage_14_id) in warm_expectations {
+        let warm_slot = warm_artifact
+            .slots
+            .iter()
+            .find(|slot| slot.region_id == region_id)
+            .expect("warm slot");
+        assert_eq!(expected_sampling_plan_id, warm_slot.sampling_plan_id, "sampling-plan identity changed while warm");
+        assert_eq!(expected_stage_14_id, warm_slot.stage_14_result_id, "stage14 identity changed while warm");
+        assert_eq!(region_id, warm_slot.region_id, "region id changed while warm");
+        assert_eq!(expected_crop, warm_slot.source_crop, "crop changed while warm");
+        assert_eq!(expected_destination, warm_slot.atlas_destination, "destination changed while warm");
+    }
+}
+
+#[test]
 fn source_frame_persisted_pipeline_is_pixel_exact_for_accepted_partitions() {
     for target in [16_u32, 63, 103] {
         let (store, source, document) = fixture_project(target);
@@ -445,7 +566,7 @@ fn source_frame_persisted_pipeline_is_pixel_exact_for_accepted_partitions() {
             }
             if let Some(directory) = std::env::var_os("SOURCE_FRAME_VISUAL_DIR").map(PathBuf::from) {
                 let source_image = RgbaImage::from_raw(128, 64, source.clone()).expect("source dimensions");
-                source_image.save(directory.join("source-frame-fixture-8000x4000.png")).expect("write source fixture");
+                source_image.save(directory.join("source-frame-coordinate-fixture-128x64.png")).expect("write source fixture");
                 let scale = 4_u32;
                 let mut grid_image = RgbaImage::new(128 * scale, 64 * scale);
                 for y in 0..64_u32 { for x in 0..128_u32 {
@@ -603,8 +724,8 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
     };
     use std::collections::{BTreeMap, BTreeSet};
 
-    // Dimension qualification is deliberately metadata/coordinate-only: source size is not
-    // atlas size and this proof must not allocate a synthetic 24K RGBA frame.
+    // Large-dimension coordinate arithmetic only. This is deliberately not a
+    // decoded-pixel or performance qualification; the ignored release harness owns that proof.
     for (width, height) in [(7_952, 4_016), (8_000, 8_000), (16_384, 8_192), (24_576, 12_288)] {
         let frame = SourceFrame::centered_largest(
             hot_trimmer_domain::SourceSetId::new(),
@@ -633,8 +754,8 @@ fn manual_base_color_product_owns_padding_persists_large_source_coordinates_and_
     let source_a = SourceId::new();
     let source_b = SourceId::new();
     for (source_set_id, source_id, encoded, width, height, name) in [
-        (source_a_set, source_a, encoded_a, 128, 64, "representative-7952x4016.png"),
-        (source_b_set, source_b, encoded_b, 96, 128, "secondary-8000x8000.png"),
+        (source_a_set, source_a, encoded_a, 128, 64, "coordinate-fixture-128x64.png"),
+        (source_b_set, source_b, encoded_b, 96, 128, "coordinate-fixture-96x128.png"),
     ] {
         let input = SourceInput {
             id: source_id, ownership: SourceOwnership::OwnedCopy, external_path: None,

@@ -40,6 +40,11 @@ thiserror = "2"
 tracing = "0.1"
 sysinfo = "0.33"
 uuid = { version = "1", features = ["serde", "v4"] }
+wgpu = { version = "=26.0.1", default-features = true }
+# wgpu 26.0.1 permits later 26.x HAL patches. Pin the published baseline HAL so
+# the Rust 1.85 workspace does not drift to the incompatible 26.0.6 Windows graph.
+wgpu-hal = "=26.0.0"
+pollster = "=0.4.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

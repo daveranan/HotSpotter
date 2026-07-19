@@ -21,6 +21,7 @@ hot-trimmer-material-analysis.workspace = true
 hot-trimmer-material-synthesis.workspace = true
 hot-trimmer-placement-solver.workspace = true
 hot-trimmer-project-store = { path = "../../../crates/project-store" }
+hot-trimmer-preview = { path = "../../../crates/preview" }
 hot-trimmer-render-core = { path = "../../../crates/render-core" }
 hot-trimmer-sheet-compiler = { path = "../../../crates/sheet-compiler" }
 image.workspace = true

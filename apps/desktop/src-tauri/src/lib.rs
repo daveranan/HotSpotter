@@ -58,7 +58,8 @@ pub fn run() {
             );
             app.manage(Arc::new(Mutex::new(ProjectSession::new(&paths))) as SharedProjectSession);
             app.manage(Arc::new(Mutex::new(None)) as SharedImportJob);
-            app.manage(Arc::new(PreviewService::default()) as SharedPreviewService);
+            let preview_service = Arc::new(PreviewService::default());
+            app.manage(Arc::clone(&preview_service) as SharedPreviewService);
             app.manage(StartupState {
                 previous_shutdown_clean: !previous_unclean,
             });
