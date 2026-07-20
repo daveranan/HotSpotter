@@ -13,6 +13,14 @@ struct AtlasHeader {
     map_kind: u32,
     normal_convention: u32,
     source_role: u32,
+    source_page_width: u32,
+    source_page_height: u32,
+    source_page_interior_width: u32,
+    source_page_interior_height: u32,
+    source_page_count_x: u32,
+    source_page_count_y: u32,
+    source_page_halo: u32,
+    source_page_mode: u32,
 };
 
 struct RegionCommand {
@@ -64,10 +72,18 @@ struct SourcePosition {
     valid: bool,
 };
 
+struct SourcePageEntry {
+    page_x: u32,
+    page_y: u32,
+    layer: u32,
+    _pad: u32,
+};
+
 @group(0) @binding(0) var<uniform> header: AtlasHeader;
 @group(0) @binding(1) var<storage, read> commands: array<RegionCommand>;
-@group(0) @binding(2) var source_tex: texture_2d<f32>;
+@group(0) @binding(2) var source_tex: texture_2d_array<f32>;
 @group(0) @binding(3) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(4) var<storage, read> source_pages: array<SourcePageEntry>;
 
 fn transform_local(local: vec2<f32>, rotation: u32, mirror: u32) -> vec2<f32> {
     var p = local;
@@ -125,10 +141,53 @@ fn transform_tangent_normal(normal: vec3<f32>, rotation: u32, mirror: u32) -> ve
 }
 
 fn load_linear(p: vec2<f32>) -> vec4<f32> {
-    let local = p - vec2<f32>(f32(header.source_origin_x), f32(header.source_origin_y));
-    let sx = i32(clamp(floor(local.x), 0.0, f32(header.source_width - 1u)));
-    let sy = i32(clamp(floor(local.y), 0.0, f32(header.source_height - 1u)));
-    let c = textureLoad(source_tex, vec2<i32>(sx, sy), 0);
+    let source_min = vec2<f32>(f32(header.source_origin_x), f32(header.source_origin_y));
+    let source_extent = vec2<f32>(f32(header.source_width), f32(header.source_height));
+    let source_max = source_min + source_extent - vec2<f32>(1.0, 1.0);
+    let global = vec2<u32>(
+        u32(clamp(floor(p.x), source_min.x, source_max.x)),
+        u32(clamp(floor(p.y), source_min.y, source_max.y)),
+    );
+    var texel = global - vec2<u32>(header.source_origin_x, header.source_origin_y);
+    var layer = 0u;
+
+    if (header.source_page_mode == 1u || header.source_page_mode == 2u) {
+        let interior_size = vec2<u32>(
+            max(header.source_page_interior_width, 1u),
+            max(header.source_page_interior_height, 1u),
+        );
+        let page_count = vec2<u32>(
+            max(header.source_page_count_x, 1u),
+            max(header.source_page_count_y, 1u),
+        );
+        let page = min(texel / interior_size, page_count - vec2<u32>(1u, 1u));
+        layer = page.y * page_count.x + page.x;
+        if (header.source_page_mode == 2u) {
+            layer = 0u;
+            let page_table_len = arrayLength(&source_pages);
+            for (var page_index = 0u; page_index < page_table_len; page_index = page_index + 1u) {
+                let entry = source_pages[page_index];
+                if (entry.page_x == page.x && entry.page_y == page.y) {
+                    layer = entry.layer;
+                    break;
+                }
+            }
+        }
+
+        let page_origin = vec2<u32>(header.source_origin_x, header.source_origin_y) + page * interior_size;
+        let halo = vec2<u32>(header.source_page_halo, header.source_page_halo);
+        let halo_origin = max(
+            vec2<u32>(header.source_origin_x, header.source_origin_y),
+            page_origin - min(page_origin, halo),
+        );
+        let page_size = vec2<u32>(
+            max(header.source_page_width, 1u),
+            max(header.source_page_height, 1u),
+        );
+        texel = min(global - halo_origin, page_size - vec2<u32>(1u, 1u));
+    }
+
+    let c = textureLoad(source_tex, vec2<i32>(i32(texel.x), i32(texel.y)), i32(layer), 0);
     if (header.source_role != 0u) {
         return c;
     }
@@ -302,6 +361,13 @@ fn source_position(cmd: RegionCommand, pixel: vec2<u32>) -> SourcePosition {
         // circular coverage, extend the nearest radial boundary sample instead of
         // publishing transparent/black corners that bleed through filtering and mips.
         let span = max(cmd.radial_outer_radius - cmd.radial_inner_radius, 0.000001);
+        if (radius < cmd.radial_inner_radius) {
+            let planar = crop_origin + vec2<f32>(
+                (cmd.radial_center_x + radial_local.x) * crop_size.x,
+                (cmd.radial_center_y + radial_local.y) * crop_size.y,
+            );
+            return SourcePosition(planar, planar, 0.0, true);
+        }
         let radial_inset = min(1.5, max(crop_size.y * 0.5, 0.5));
         let outer_extension_radius = max(
             cmd.radial_inner_radius,

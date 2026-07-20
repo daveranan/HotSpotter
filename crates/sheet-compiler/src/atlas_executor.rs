@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    hash::{Hash, Hasher},
     num::NonZeroU64,
     sync::{
         Arc, Mutex, OnceLock,
@@ -584,6 +585,11 @@ pub struct GpuSourceTextureKey {
     decoder_version: String,
     color_version: String,
     channel_role: MaterialChannelRole,
+    page_interior_width: u32,
+    page_interior_height: u32,
+    page_halo: u32,
+    page_mode: u32,
+    page_table_hash: u64,
 }
 
 impl GpuSourceTextureKey {
@@ -600,19 +606,68 @@ impl GpuSourceTextureKey {
     }
 
     fn from_source_rect(source: &CompiledSourceCommandV1, rect: PixelRect) -> Self {
+        Self::from_source_page_layout(source, &single_layer_source_page_layout(rect))
+    }
+
+    fn from_source_page_layout(
+        source: &CompiledSourceCommandV1,
+        layout: &GpuSourcePageLayout,
+    ) -> Self {
         Self {
             source_set_id: source.source_set_id,
             source_id: source.source_id.clone(),
             digest: source.digest.clone(),
-            origin_x: rect.x,
-            origin_y: rect.y,
-            width: rect.width,
-            height: rect.height,
+            origin_x: layout.source_rect.x,
+            origin_y: layout.source_rect.y,
+            width: layout.source_rect.width,
+            height: layout.source_rect.height,
             decoded_format: source.decoded_format.clone(),
             decoder_version: source.decoder_version.clone(),
             color_version: source.color_version.clone(),
             channel_role: source.channel_role,
+            page_interior_width: layout.source_page_interior_width,
+            page_interior_height: layout.source_page_interior_height,
+            page_halo: layout.source_page_halo,
+            page_mode: layout.source_page_mode,
+            page_table_hash: layout.source_page_table_hash,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct GpuResidentSourcePage {
+    x: u32,
+    y: u32,
+}
+
+#[derive(Clone, Debug)]
+struct GpuSourcePageLayout {
+    source_rect: PixelRect,
+    source_page_width: u32,
+    source_page_height: u32,
+    source_page_interior_width: u32,
+    source_page_interior_height: u32,
+    source_page_count_x: u32,
+    source_page_count_y: u32,
+    source_page_halo: u32,
+    source_page_mode: u32,
+    source_page_table_hash: u64,
+    source_page_table: Vec<GpuResidentSourcePage>,
+}
+
+fn single_layer_source_page_layout(source_rect: PixelRect) -> GpuSourcePageLayout {
+    GpuSourcePageLayout {
+        source_rect,
+        source_page_width: source_rect.width,
+        source_page_height: source_rect.height,
+        source_page_interior_width: source_rect.width,
+        source_page_interior_height: source_rect.height,
+        source_page_count_x: 1,
+        source_page_count_y: 1,
+        source_page_halo: 0,
+        source_page_mode: 0,
+        source_page_table_hash: 0,
+        source_page_table: vec![GpuResidentSourcePage { x: 0, y: 0 }],
     }
 }
 
@@ -620,7 +675,100 @@ struct GpuCachedSourceTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     byte_len: u64,
+    layer_count: u32,
     last_used: u64,
+}
+
+struct GpuSourceTextureReservation<'a> {
+    cache: &'a Mutex<GpuAtlasSourceTextureCache>,
+    byte_len: u64,
+    active: bool,
+}
+
+impl<'a> GpuSourceTextureReservation<'a> {
+    fn commit(
+        mut self,
+        key: GpuSourceTextureKey,
+        cached: Arc<GpuCachedSourceTexture>,
+    ) -> Result<(Arc<GpuCachedSourceTexture>, GpuSourceTextureLease<'a>), AtlasRenderExecutionError>
+    {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+        cache.source_reserved_bytes = cache.source_reserved_bytes.saturating_sub(self.byte_len);
+        let cached = if let Some(existing) = cache.sources.get(&key) {
+            Arc::clone(existing)
+        } else {
+            cache.sources.insert(key.clone(), Arc::clone(&cached));
+            cached
+        };
+        *cache.source_pins.entry(key.clone()).or_insert(0) += 1;
+        self.active = false;
+        Ok((
+            cached,
+            GpuSourceTextureLease {
+                cache: self.cache,
+                key,
+                active: true,
+            },
+        ))
+    }
+}
+
+impl Drop for GpuSourceTextureReservation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.source_reserved_bytes = cache.source_reserved_bytes.saturating_sub(self.byte_len);
+        }
+    }
+}
+
+struct GpuSourceTextureLease<'a> {
+    cache: &'a Mutex<GpuAtlasSourceTextureCache>,
+    key: GpuSourceTextureKey,
+    active: bool,
+}
+
+impl Drop for GpuSourceTextureLease<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut cache) = self.cache.lock()
+            && let Some(count) = cache.source_pins.get_mut(&self.key)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                cache.source_pins.remove(&self.key);
+            }
+        }
+    }
+}
+
+struct GpuMaterialSourceGroup<'a, 'cache> {
+    source: &'a CompiledSourceCommandV1,
+    cached: Arc<GpuCachedSourceTexture>,
+    _lease: GpuSourceTextureLease<'cache>,
+    cache_hit: bool,
+    commands: Vec<GpuRegionCommand>,
+    source_role: MaterialChannelRole,
+    source_layout: GpuSourcePageLayout,
+}
+
+struct GpuMaterialSourceGroupPlan<'a> {
+    source: &'a CompiledSourceCommandV1,
+    commands: Vec<GpuRegionCommand>,
+    source_role: MaterialChannelRole,
+    residency: GpuMaterialSourceResidency,
+}
+
+enum GpuMaterialSourceResidency {
+    Full(PixelRect),
+    Pages(GpuResidentSourcePagePlan),
 }
 
 struct GpuAtlasPipeline {
@@ -641,6 +789,8 @@ enum GpuAtlasPipelineKind {
 #[derive(Default)]
 pub struct GpuAtlasSourceTextureCache {
     clock: u64,
+    source_reserved_bytes: u64,
+    source_pins: BTreeMap<GpuSourceTextureKey, u32>,
     sources: BTreeMap<GpuSourceTextureKey, Arc<GpuCachedSourceTexture>>,
     pipelines: BTreeMap<GpuAtlasPipelineKind, Arc<GpuAtlasPipeline>>,
     rendered_tiles: Vec<Arc<GpuAtlasRenderedTile>>,
@@ -659,11 +809,29 @@ impl GpuAtlasSourceTextureCache {
     }
 
     #[must_use]
+    pub fn source_layer_count(&self) -> u32 {
+        self.sources
+            .values()
+            .map(|texture| texture.layer_count)
+            .sum::<u32>()
+    }
+
+    #[must_use]
     pub fn source_resident_bytes(&self) -> u64 {
         self.sources
             .values()
             .map(|texture| texture.byte_len)
             .sum::<u64>()
+    }
+
+    #[must_use]
+    pub fn source_reserved_bytes(&self) -> u64 {
+        self.source_reserved_bytes
+    }
+
+    #[must_use]
+    pub fn source_pinned_count(&self) -> usize {
+        self.source_pins.len()
     }
 
     #[must_use]
@@ -1051,6 +1219,14 @@ struct GpuAtlasHeader {
     map_kind: u32,
     normal_convention: u32,
     source_role: u32,
+    source_page_width: u32,
+    source_page_height: u32,
+    source_page_interior_width: u32,
+    source_page_interior_height: u32,
+    source_page_count_x: u32,
+    source_page_count_y: u32,
+    source_page_halo: u32,
+    source_page_mode: u32,
 }
 
 #[repr(C)]
@@ -1097,9 +1273,9 @@ struct GpuRegionCommand {
     transform_rotation_cos: f32,
 }
 
-const GPU_HEADER_BYTES: usize = 56;
+const GPU_HEADER_BYTES: usize = 88;
 const GPU_COMMAND_BYTES: usize = 156;
-const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v10-authored-normal-height-fallback";
+const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v13-sparse-source-pages";
 
 fn requested_material_maps(
     plan: &CompiledAtlasPlanV1,
@@ -1619,6 +1795,96 @@ fn compiled_region_source_footprints(
     Ok(rects)
 }
 
+fn execution_source_footprint_rects_for_commands(
+    commands: &[GpuRegionCommand],
+    output_rect: PixelRect,
+    source_width: u32,
+    source_height: u32,
+) -> Vec<PixelRect> {
+    let mut rects = Vec::new();
+    for command in commands {
+        let Some(intersection) = intersect_rect(output_rect, command_output_rect(command)) else {
+            continue;
+        };
+        rects.extend(command_source_footprint_rects(
+            command,
+            intersection,
+            source_width,
+            source_height,
+        ));
+    }
+    rects
+}
+
+fn command_source_footprint_rects(
+    command: &GpuRegionCommand,
+    intersection: PixelRect,
+    source_width: u32,
+    source_height: u32,
+) -> Vec<PixelRect> {
+    let points = footprint_sample_points(intersection, command);
+    let mut primary = Vec::with_capacity(points.len());
+    let mut seam = Vec::new();
+    for point in points {
+        let position = source_position_for_command(command, point);
+        primary.push(position.primary);
+        if let Some(other) = position.seam {
+            seam.push(other);
+        }
+    }
+    add_wrapped_axis_extrema(command, &mut primary);
+    add_wrapped_axis_extrema(command, &mut seam);
+    let mut rects = if command.mode == 5 {
+        source_bounds_rects_wrapped_x(command, &primary, source_width, source_height)
+    } else {
+        source_bounds_rects(&primary, source_width, source_height)
+    };
+    rects.extend(if command.mode == 5 {
+        source_bounds_rects_wrapped_x(command, &seam, source_width, source_height)
+    } else {
+        source_bounds_rects(&seam, source_width, source_height)
+    });
+    if rects.is_empty() {
+        rects.push(PixelRect {
+            x: command.crop_x.min(source_width.saturating_sub(1)),
+            y: command.crop_y.min(source_height.saturating_sub(1)),
+            width: command
+                .crop_width
+                .min(source_width.saturating_sub(command.crop_x))
+                .max(1),
+            height: command
+                .crop_height
+                .min(source_height.saturating_sub(command.crop_y))
+                .max(1),
+        });
+    }
+    rects
+}
+
+fn command_output_rect(command: &GpuRegionCommand) -> PixelRect {
+    PixelRect {
+        x: command.dst_x,
+        y: command.dst_y,
+        width: command.dst_width,
+        height: command.dst_height,
+    }
+}
+
+fn union_rect(a: PixelRect, b: PixelRect) -> PixelRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
+    let bottom =
+        a.y.saturating_add(a.height)
+            .max(b.y.saturating_add(b.height));
+    PixelRect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
 fn ensure_compiled_pixel_format_supported(
     caps: &hot_trimmer_preview::GpuCapabilityRecord,
     format: CompiledTilePixelFormat,
@@ -1734,7 +2000,7 @@ fn footprint_sample_step(command: &GpuRegionCommand) -> u32 {
         1 => repeat_step(command.period_x.min(command.period_y)),
         2 => repeat_step(command.period_x),
         3 => repeat_step(command.period_y),
-        4 | 5 => 16,
+        4 | 5 => 4,
         _ => 64,
     }
 }
@@ -1755,13 +2021,18 @@ fn add_wrapped_axis_extrema(command: &GpuRegionCommand, points: &mut Vec<[f32; 2
         command.crop_x as f32 + command.transform_offset_x * crop_size[0],
         command.crop_y as f32 + command.transform_offset_y * crop_size[1],
     ];
-    let wraps_x = matches!(command.mode, 1 | 2 | 5);
+    let wraps_x = matches!(command.mode, 1 | 2);
     let wraps_y = matches!(command.mode, 1 | 3);
     if !wraps_x && !wraps_y {
         return;
     }
     let x0 = crop_origin[0];
-    let x1 = crop_origin[0] + command.period_x.max(1).min(command.crop_width.max(1)) as f32 - 0.001;
+    let wrapped_x_extent = if command.mode == 5 {
+        command.crop_width.max(1)
+    } else {
+        command.period_x.max(1).min(command.crop_width.max(1))
+    };
+    let x1 = crop_origin[0] + wrapped_x_extent as f32 - 0.001;
     let y0 = crop_origin[1];
     let y1 =
         crop_origin[1] + command.period_y.max(1).min(command.crop_height.max(1)) as f32 - 0.001;
@@ -1891,6 +2162,13 @@ fn source_position_for_command(cmd: &GpuRegionCommand, pixel: [u32; 2]) -> Plann
             let radius =
                 (radial_local[0] * radial_local[0] + radial_local[1] * radial_local[1]).sqrt();
             let span = (cmd.radial_outer_radius - cmd.radial_inner_radius).max(0.000_001);
+            if radius < cmd.radial_inner_radius {
+                p = [
+                    crop_origin[0] + (cmd.radial_center_x + radial_local[0]) * crop_size[0],
+                    crop_origin[1] + (cmd.radial_center_y + radial_local[1]) * crop_size[1],
+                ];
+                return PlannedSourcePosition { primary: p, seam };
+            }
             let radial_inset = 1.5_f32.min((crop_size[1] * 0.5).max(0.5));
             let outer_extension_radius = cmd
                 .radial_inner_radius
@@ -1943,9 +2221,47 @@ fn source_position_for_command(cmd: &GpuRegionCommand, pixel: [u32; 2]) -> Plann
                 crop_origin[1] + m[1] / source_size[1] * crop_size[1],
             ];
         }
+        7 => {
+            p = [
+                slice_axis_repeat_cpu(
+                    m[0],
+                    source_size[0],
+                    crop_origin[0],
+                    crop_size[0],
+                    cmd.period_x,
+                    cmd.period_y,
+                    scale,
+                ),
+                crop_origin[1] + (m[1] - source_size[1] * 0.5) * scale + crop_size[1] * 0.5,
+            ];
+        }
         _ => {}
     }
     PlannedSourcePosition { primary: p, seam }
+}
+
+fn slice_axis_repeat_cpu(
+    value: f32,
+    destination: f32,
+    origin: f32,
+    extent: f32,
+    leading: u32,
+    trailing: u32,
+    scale: f32,
+) -> f32 {
+    let leading_px = leading as f32;
+    let trailing_px = trailing as f32;
+    let leading_world = leading_px / scale;
+    let trailing_world = trailing_px / scale;
+    if value < leading_world {
+        return origin + value * scale;
+    }
+    if value >= destination - trailing_world {
+        return origin + extent - trailing_px + (value - (destination - trailing_world)) * scale;
+    }
+    let center_pixels = (extent - leading_px - trailing_px).max(1.0);
+    let offset = (value - leading_world) * scale;
+    origin + leading_px + positive_mod(offset, center_pixels)
 }
 
 fn source_bounds_rects(
@@ -1965,25 +2281,25 @@ fn source_bounds_rects(
         .map(|point| point[0])
         .fold(f32::INFINITY, f32::min)
         .floor() as i64
-        - 2;
+        - 8;
     let min_y = valid
         .iter()
         .map(|point| point[1])
         .fold(f32::INFINITY, f32::min)
         .floor() as i64
-        - 2;
+        - 8;
     let max_x = valid
         .iter()
         .map(|point| point[0])
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil() as i64
-        + 3;
+        + 9;
     let max_y = valid
         .iter()
         .map(|point| point[1])
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil() as i64
-        + 3;
+        + 9;
     let x = min_x.clamp(0, i64::from(source_width.saturating_sub(1))) as u32;
     let y = min_y.clamp(0, i64::from(source_height.saturating_sub(1))) as u32;
     let right = max_x.clamp(i64::from(x + 1), i64::from(source_width)) as u32;
@@ -1994,6 +2310,48 @@ fn source_bounds_rects(
         width: right.saturating_sub(x).max(1),
         height: bottom.saturating_sub(y).max(1),
     }]
+}
+
+fn source_bounds_rects_wrapped_x(
+    command: &GpuRegionCommand,
+    points: &[[f32; 2]],
+    source_width: u32,
+    source_height: u32,
+) -> Vec<PixelRect> {
+    let valid = points
+        .iter()
+        .copied()
+        .filter(|point| point[0].is_finite() && point[1].is_finite())
+        .collect::<Vec<_>>();
+    if valid.is_empty() {
+        return Vec::new();
+    }
+    let crop_width = command.crop_width.max(1) as f32;
+    let crop_origin_x = command.crop_x as f32 + command.transform_offset_x * crop_width;
+    let min_x = valid
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::INFINITY, f32::min);
+    let max_x = valid
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_x - min_x <= crop_width * 0.5 {
+        return source_bounds_rects(&valid, source_width, source_height);
+    }
+    let split_x = crop_origin_x + crop_width * 0.5;
+    let mut low = Vec::new();
+    let mut high = Vec::new();
+    for point in valid {
+        if point[0] < split_x {
+            low.push(point);
+        } else {
+            high.push(point);
+        }
+    }
+    let mut rects = source_bounds_rects(&low, source_width, source_height);
+    rects.extend(source_bounds_rects(&high, source_width, source_height));
+    rects
 }
 
 fn transform_local_cpu(local: [f32; 2], rotation: u32, mirror: u32) -> [f32; 2] {
@@ -2506,8 +2864,28 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
 
         let mut upload_bytes = 0_u64;
         let mut source_cache_hits = 0_u32;
-        let upload_started = Instant::now();
-        let mut source_groups = Vec::with_capacity(plan.ordered_sources.len());
+        let mut upload_ms = 0_u128;
+        let mut checked_out_source_resident_bytes_peak = 0_u64;
+        let mut checked_out_source_layers_peak = 0_u32;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("hot-trimmer-base-color-clear-encoder"),
+        });
+        let timing: Option<GpuPassTimingRecorder> = None;
+        encoder.clear_texture(
+            &output_texture,
+            &wgpu::ImageSubresourceRange {
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                base_array_layer: 0,
+                array_layer_count: Some(1),
+            },
+        );
+        submit_encoder_and_wait(device, queue, encoder)?;
+        let dispatch_started = Instant::now();
+        let mut command_count = 0_u32;
+        let mut command_bytes = 0_u64;
         for source in &plan.ordered_sources {
             if cancellation.is_cancelled() {
                 return Err(AtlasRenderExecutionError::Cancelled);
@@ -2534,18 +2912,6 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                     source_set_id: source.source_set_id,
                     source_id: source.source_id.clone(),
                 })?;
-            let (cached, hit) = source_texture(
-                device,
-                queue,
-                self.source_texture_cache,
-                source,
-                prepared.domain.as_ref(),
-            )?;
-            if hit {
-                source_cache_hits = source_cache_hits.saturating_add(1);
-            } else {
-                upload_bytes = upload_bytes.saturating_add(cached.byte_len);
-            }
             let commands = plan
                 .ordered_regions
                 .iter()
@@ -2556,110 +2922,65 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 })
                 .map(pack_command)
                 .collect::<Result<Vec<_>, _>>()?;
-            if !commands.is_empty() {
-                source_groups.push((source, cached, commands, source_role));
-            }
-        }
-        let upload_ms = upload_started.elapsed().as_millis();
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("hot-trimmer-base-color-atlas-encoder"),
-        });
-        let mut timing = GpuPassTimingRecorder::new(
-            device,
-            queue,
-            caps,
-            (plan.ordered_sources.len() as u32).saturating_add(1),
-        );
-        encoder.clear_texture(
-            &output_texture,
-            &wgpu::ImageSubresourceRange {
-                aspect: wgpu::TextureAspect::All,
-                base_mip_level: 0,
-                mip_level_count: Some(1),
-                base_array_layer: 0,
-                array_layer_count: Some(1),
-            },
-        );
-        let dispatch_started = Instant::now();
-        let mut command_count = 0_u32;
-        let mut command_bytes = 0_u64;
-        for (source, cached, commands, source_role) in source_groups {
-            if cancellation.is_cancelled() {
-                return Err(AtlasRenderExecutionError::Cancelled);
-            }
-            if !is_current() {
-                return Err(AtlasRenderExecutionError::Superseded);
-            }
-            command_count = command_count.saturating_add(commands.len() as u32);
-            let header = GpuAtlasHeader {
-                output_width: plan.output_size.width,
-                output_height: plan.output_size.height,
-                tile_x: tile.x,
-                tile_y: tile.y,
-                tile_width,
-                tile_height,
-                command_count: commands.len() as u32,
-                source_width: source.oriented_dimensions.width,
-                source_height: source.oriented_dimensions.height,
-                source_origin_x: 0,
-                source_origin_y: 0,
-                map_kind: gpu_map_code(requested_map),
-                normal_convention: match plan.normal_convention {
-                    crate::CompiledNormalConvention::OpenGl => 0,
-                    crate::CompiledNormalConvention::DirectX => 1,
-                },
-                source_role: gpu_channel_role_code(source_role),
-            };
-            let header_bytes = encode_header(header);
-            let command_buffer_bytes = encode_commands(&commands);
-            command_bytes = command_bytes.saturating_add(command_buffer_bytes.len() as u64);
-            let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("hot-trimmer-base-color-header"),
-                contents: &header_bytes,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let commands_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("hot-trimmer-base-color-region-commands"),
-                contents: &command_buffer_bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("hot-trimmer-base-color-bind-group"),
-                layout: &pipeline.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: header_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: commands_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&cached.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&output_view),
-                    },
-                ],
-            });
-            {
-                let timestamp_writes = timing.as_mut().and_then(|recorder| {
-                    recorder.timestamp_writes(format!("material-publish:{:?}", source.source_id))
+            for group_plan in material_source_group_plans_for_tile(
+                source,
+                commands,
+                source_role,
+                tile,
+                caps.maximum_texture_dimension_2d,
+                device.limits().max_texture_array_layers,
+            )? {
+                let group_upload_started = Instant::now();
+                let group = load_material_source_group(
+                    device,
+                    queue,
+                    self.source_texture_cache,
+                    prepared.domain.as_ref(),
+                    group_plan,
+                )?;
+                upload_ms = upload_ms.saturating_add(group_upload_started.elapsed().as_millis());
+                if group.cache_hit {
+                    source_cache_hits = source_cache_hits.saturating_add(1);
+                } else {
+                    upload_bytes = upload_bytes.saturating_add(group.cached.byte_len);
+                }
+                let (live_source_bytes, live_source_layers) = self
+                    .source_texture_cache
+                    .lock()
+                    .map(|cache| (cache.source_resident_bytes(), cache.source_layer_count()))
+                    .unwrap_or((group.cached.byte_len, group.cached.layer_count));
+                checked_out_source_resident_bytes_peak =
+                    checked_out_source_resident_bytes_peak.max(live_source_bytes);
+                checked_out_source_layers_peak =
+                    checked_out_source_layers_peak.max(live_source_layers);
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("hot-trimmer-base-color-material-encoder"),
                 });
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("hot-trimmer-base-color-dispatch"),
-                    timestamp_writes,
-                });
-                pass.set_pipeline(&pipeline.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(tile_width.div_ceil(16), tile_height.div_ceil(16), 1);
+                encode_material_source_dispatch(
+                    device,
+                    &mut encoder,
+                    None,
+                    "material-publish",
+                    pipeline.as_ref(),
+                    plan,
+                    requested_map,
+                    &output_view,
+                    group.source,
+                    group.cached.as_ref(),
+                    &group.commands,
+                    group.source_role,
+                    group.source_layout,
+                    tile,
+                    &mut command_count,
+                    &mut command_bytes,
+                )?;
+                submit_encoder_and_wait(device, queue, encoder)?;
             }
         }
         let dispatch_ms = dispatch_started.elapsed().as_millis();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("hot-trimmer-base-color-readback-encoder"),
+        });
         let padded_bytes_per_row = align_to(
             u64::from(tile_width) * 4,
             u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
@@ -2745,8 +3066,13 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         map_tiles.insert(requested_map, Arc::clone(&interactive_tile));
         let mut display_tiles = BTreeMap::new();
         display_tiles.insert(requested_map, Arc::clone(&interactive_tile));
+        let (source_resident_bytes, source_resident_layers) = self
+            .source_texture_cache
+            .lock()
+            .map(|cache| (cache.source_resident_bytes(), cache.source_layer_count()))
+            .unwrap_or((0, 0));
         let mut telemetry = vec![format!(
-            "executor=gpu; backend={}; plan_hash={}; requested_map={requested_map:?}; logical_passes={logical_passes}; executed_gpu_passes=material-publish; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits={source_cache_hits}; pipeline_cache_hits={}; upload_bytes={upload_bytes}; upload_ms={upload_ms}; command_count={command_count}; command_bytes={command_bytes}; pipeline_ms={pipeline_ms}; dispatch_ms={dispatch_ms}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; composition_ms=0; render_ms={render_ms}",
+            "executor=gpu; backend={}; plan_hash={}; requested_map={requested_map:?}; logical_passes={logical_passes}; executed_gpu_passes=material-publish; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits={source_cache_hits}; source_resident_bytes={source_resident_bytes}; source_resident_layers={source_resident_layers}; checked_out_source_resident_bytes_peak={checked_out_source_resident_bytes_peak}; checked_out_source_layers_peak={checked_out_source_layers_peak}; pipeline_cache_hits={}; upload_bytes={upload_bytes}; upload_ms={upload_ms}; command_count={command_count}; command_bytes={command_bytes}; pipeline_ms={pipeline_ms}; dispatch_ms={dispatch_ms}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; composition_ms=0; render_ms={render_ms}",
             caps.backend,
             plan.final_plan_hash.0,
             u32::from(pipeline_cache_hit)
@@ -2805,8 +3131,9 @@ fn pipeline(
         GpuAtlasPipelineKind::MaterialRgba8 => vec![
             header_layout_entry(0),
             command_layout_entry(1),
-            texture_layout_entry(2),
+            texture_array_layout_entry(2),
             storage_texture_layout_entry(3, wgpu::TextureFormat::Rgba8Unorm),
+            source_page_table_layout_entry(4),
         ],
         GpuAtlasPipelineKind::NormalFromHeight => vec![
             header_layout_entry(0),
@@ -2818,8 +3145,9 @@ fn pipeline(
         GpuAtlasPipelineKind::MaterialR32Float => vec![
             header_layout_entry(0),
             command_layout_entry(1),
-            texture_layout_entry(2),
+            texture_array_layout_entry(2),
             storage_texture_layout_entry(3, wgpu::TextureFormat::R32Float),
+            source_page_table_layout_entry(4),
         ],
         GpuAtlasPipelineKind::FillR32Float => vec![storage_texture_layout_entry(
             0,
@@ -2931,6 +3259,19 @@ fn command_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn source_page_table_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: NonZeroU64::new(16),
+        },
+        count: None,
+    }
+}
+
 fn uint_storage_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -2951,6 +3292,19 @@ fn texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_array_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         },
         count: None,
@@ -3126,6 +3480,8 @@ struct GpuMaterialDispatchStats {
     source_cache_hits: u32,
     upload_bytes: u64,
     upload_ms: u128,
+    checked_out_source_resident_bytes_peak: u64,
+    checked_out_source_layers_peak: u32,
     command_count: u32,
     command_bytes: u64,
     dispatch_ms: u128,
@@ -3234,7 +3590,7 @@ fn execute_r32float_material_tile(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("hot-trimmer-r32float-material-encoder"),
     });
-    let mut timing = GpuPassTimingRecorder::new(device, queue, state.capabilities(), 8);
+    let timing = GpuPassTimingRecorder::new(device, queue, state.capabilities(), 8);
     if requested_map == MaterialMapKind::Height {
         let fill_pipeline = pipeline(
             device,
@@ -3245,7 +3601,7 @@ fn execute_r32float_material_tile(
         dispatch_fill_r32float_with_pipeline(
             device,
             &mut encoder,
-            timing.as_mut(),
+            None,
             &fill_pipeline,
             &output_view,
             tile.width,
@@ -3282,12 +3638,11 @@ fn execute_r32float_material_tile(
             array_layer_count: Some(1),
         },
     );
+    submit_encoder_and_wait(device, queue, encoder)?;
     let stats = dispatch_material_map_to_view(
         device,
         queue,
         executor.source_texture_cache,
-        &mut encoder,
-        timing.as_mut(),
         "material-r32float-publish",
         &material_pipeline,
         plan,
@@ -3302,8 +3657,6 @@ fn execute_r32float_material_tile(
         device,
         queue,
         executor.source_texture_cache,
-        &mut encoder,
-        timing.as_mut(),
         "material-rgba8-display-publish",
         &display_pipeline,
         plan,
@@ -3314,6 +3667,9 @@ fn execute_r32float_material_tile(
         cancellation,
         is_current,
     )?;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-r32float-material-readback-encoder"),
+    });
     let pending = schedule_readback(
         device,
         executor.source_texture_cache,
@@ -3332,9 +3688,6 @@ fn execute_r32float_material_tile(
         tile.height,
         4,
     )?;
-    if let Some(timing) = &timing {
-        timing.resolve(&mut encoder);
-    }
     queue.submit(Some(encoder.finish()));
     if requested_map == MaterialMapKind::Height {
         executor
@@ -3374,8 +3727,19 @@ fn execute_r32float_material_tile(
     )?;
     let (nontransparent, nonzero_rgb) =
         payload_counts(display_tile.pixels(), display_tile.manifest.pixel_format);
+    let (source_resident_bytes, source_resident_layers) = executor
+        .source_texture_cache
+        .lock()
+        .map(|cache| (cache.source_resident_bytes(), cache.source_layer_count()))
+        .unwrap_or((0, 0));
+    let checked_out_source_resident_bytes_peak = stats
+        .checked_out_source_resident_bytes_peak
+        .max(display_stats.checked_out_source_resident_bytes_peak);
+    let checked_out_source_layers_peak = stats
+        .checked_out_source_layers_peak
+        .max(display_stats.checked_out_source_layers_peak);
     let mut telemetry = vec![format!(
-        "executor=gpu; backend={}; plan_hash={}; requested_map={requested_map:?}; logical_passes={}; executed_gpu_passes=material-r32float-publish,material-rgba8-display-publish; pixel_format=R32Float; display_pixel_format=Rgba8UnormLinear; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits={}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={}; readback_ms={}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; composition_ms=0; render_ms={}",
+        "executor=gpu; backend={}; plan_hash={}; requested_map={requested_map:?}; logical_passes={}; executed_gpu_passes=material-r32float-publish,material-rgba8-display-publish; pixel_format=R32Float; display_pixel_format=Rgba8UnormLinear; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits={}; source_resident_bytes={source_resident_bytes}; source_resident_layers={source_resident_layers}; checked_out_source_resident_bytes_peak={checked_out_source_resident_bytes_peak}; checked_out_source_layers_peak={checked_out_source_layers_peak}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={}; readback_ms={}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; composition_ms=0; render_ms={}",
         state.capabilities().backend,
         plan.final_plan_hash.0,
         logical_passes_for_map(requested_map),
@@ -3563,6 +3927,14 @@ fn execute_region_id_gpu_tile(
         map_kind: gpu_map_code(requested_map),
         normal_convention: 0,
         source_role: 0,
+        source_page_width: 0,
+        source_page_height: 0,
+        source_page_interior_width: 0,
+        source_page_interior_height: 0,
+        source_page_count_x: 1,
+        source_page_count_y: 1,
+        source_page_halo: 0,
+        source_page_mode: 0,
     };
     let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("hot-trimmer-region-id-header"),
@@ -3917,7 +4289,7 @@ fn execute_height_normal_gpu(
         dispatch_fill_r32float_with_pipeline(
             device,
             &mut encoder,
-            timing.as_mut(),
+            None,
             &fill_pipeline,
             &height_view,
             tile.width,
@@ -3961,6 +4333,7 @@ fn execute_height_normal_gpu(
             },
         );
     }
+    submit_encoder_and_wait(device, queue, encoder)?;
     let height_stats = if cached_height_texture.is_some() {
         GpuMaterialDispatchStats::default()
     } else {
@@ -3968,8 +4341,6 @@ fn execute_height_normal_gpu(
             device,
             queue,
             executor.source_texture_cache,
-            &mut encoder,
-            timing.as_mut(),
             "height-r32float",
             &height_pipeline,
             plan,
@@ -3989,8 +4360,6 @@ fn execute_height_normal_gpu(
             device,
             queue,
             executor.source_texture_cache,
-            &mut encoder,
-            timing.as_mut(),
             "height-rgba8-display",
             height_display_pipeline,
             plan,
@@ -4010,8 +4379,6 @@ fn execute_height_normal_gpu(
                 device,
                 queue,
                 executor.source_texture_cache,
-                &mut encoder,
-                timing.as_mut(),
                 "authored-normal-sample",
                 authored_normal_pipeline,
                 plan,
@@ -4025,6 +4392,9 @@ fn execute_height_normal_gpu(
         } else {
             None
         };
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-height-normal-final-encoder"),
+    });
     let (command_count, command_buffer_bytes_len, normal_dispatch_ms) = {
         let commands = plan
             .ordered_regions
@@ -4053,6 +4423,14 @@ fn execute_height_normal_gpu(
             } else {
                 MaterialChannelRole::Height
             }),
+            source_page_width: 0,
+            source_page_height: 0,
+            source_page_interior_width: 0,
+            source_page_interior_height: 0,
+            source_page_count_x: 1,
+            source_page_count_y: 1,
+            source_page_halo: 0,
+            source_page_mode: 0,
         };
         let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("hot-trimmer-normal-from-height-header"),
@@ -4234,8 +4612,37 @@ fn execute_height_normal_gpu(
     )?;
     map_tiles.insert(MaterialMapKind::Normal, Arc::clone(&normal_tile));
     display_tiles.insert(MaterialMapKind::Normal, Arc::clone(&normal_tile));
+    let (source_resident_bytes, source_resident_layers) = executor
+        .source_texture_cache
+        .lock()
+        .map(|cache| (cache.source_resident_bytes(), cache.source_layer_count()))
+        .unwrap_or((0, 0));
+    let checked_out_source_resident_bytes_peak = height_stats
+        .checked_out_source_resident_bytes_peak
+        .max(
+            height_display_stats
+                .as_ref()
+                .map_or(0, |stats| stats.checked_out_source_resident_bytes_peak),
+        )
+        .max(
+            authored_normal_stats
+                .as_ref()
+                .map_or(0, |stats| stats.checked_out_source_resident_bytes_peak),
+        );
+    let checked_out_source_layers_peak = height_stats
+        .checked_out_source_layers_peak
+        .max(
+            height_display_stats
+                .as_ref()
+                .map_or(0, |stats| stats.checked_out_source_layers_peak),
+        )
+        .max(
+            authored_normal_stats
+                .as_ref()
+                .map_or(0, |stats| stats.checked_out_source_layers_peak),
+        );
     let mut telemetry = vec![format!(
-        "executor=gpu; backend={}; plan_hash={}; requested_map=Normal; logical_passes={}; executed_gpu_passes={}; dependency={}; intermediate_cache={}; normal_publish={}; source_cache_hits={}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; render_ms={}",
+        "executor=gpu; backend={}; plan_hash={}; requested_map=Normal; logical_passes={}; executed_gpu_passes={}; dependency={}; intermediate_cache={}; normal_publish={}; source_cache_hits={}; source_resident_bytes={source_resident_bytes}; source_resident_layers={source_resident_layers}; checked_out_source_resident_bytes_peak={checked_out_source_resident_bytes_peak}; checked_out_source_layers_peak={checked_out_source_layers_peak}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; render_ms={}",
         state.capabilities().backend,
         plan.final_plan_hash.0,
         logical_passes_for_map(MaterialMapKind::Normal),
@@ -4474,8 +4881,6 @@ fn dispatch_material_map_to_view(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     cache: &Mutex<GpuAtlasSourceTextureCache>,
-    encoder: &mut wgpu::CommandEncoder,
-    timing: Option<&mut GpuPassTimingRecorder>,
     pass_label: &'static str,
     pipeline: &GpuAtlasPipeline,
     plan: &CompiledAtlasPlanV1,
@@ -4486,14 +4891,14 @@ fn dispatch_material_map_to_view(
     cancellation: &CancellationToken,
     is_current: &dyn Fn() -> bool,
 ) -> Result<GpuMaterialDispatchStats, AtlasRenderExecutionError> {
-    let upload_started = Instant::now();
     let mut upload_bytes = 0_u64;
     let mut source_cache_hits = 0_u32;
-    let mut source_groups = Vec::with_capacity(plan.ordered_sources.len());
+    let mut upload_ms = 0_u128;
+    let mut checked_out_source_resident_bytes_peak = 0_u64;
+    let mut checked_out_source_layers_peak = 0_u32;
     let mut command_count = 0_u32;
     let mut command_bytes = 0_u64;
     let tile = plan.tile_request.output_rect.0;
-    let mut timing = timing;
     let dispatch_started = Instant::now();
     for source in &plan.ordered_sources {
         if cancellation.is_cancelled() {
@@ -4533,153 +4938,71 @@ fn dispatch_material_map_to_view(
         if commands.is_empty() {
             continue;
         }
-        let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
-        let bytes_per_pixel = export_source_bytes_per_pixel(source.channel_role);
-        let full_source_bytes = bounded_tile_byte_len(
-            source.oriented_dimensions.width,
-            source.oriented_dimensions.height,
-            bytes_per_pixel,
-            0,
-            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
-        )
-        .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
-        let full_source_fits = source.oriented_dimensions.width <= max_texture_dimension_2d
-            && source.oriented_dimensions.height <= max_texture_dimension_2d
-            && full_source_bytes <= budget;
-        if full_source_fits {
-            let (cached, hit) =
-                source_texture(device, queue, cache, source, prepared.domain.as_ref())?;
-            if hit {
+        for group_plan in material_source_group_plans_for_tile(
+            source,
+            commands,
+            source_role,
+            tile,
+            max_texture_dimension_2d,
+            device.limits().max_texture_array_layers,
+        )? {
+            if cancellation.is_cancelled() {
+                return Err(AtlasRenderExecutionError::Cancelled);
+            }
+            if !is_current() {
+                return Err(AtlasRenderExecutionError::Superseded);
+            }
+            let group_upload_started = Instant::now();
+            let group = load_material_source_group(
+                device,
+                queue,
+                cache,
+                prepared.domain.as_ref(),
+                group_plan,
+            )?;
+            upload_ms = upload_ms.saturating_add(group_upload_started.elapsed().as_millis());
+            if group.cache_hit {
                 source_cache_hits = source_cache_hits.saturating_add(1);
             } else {
-                upload_bytes = upload_bytes.saturating_add(cached.byte_len);
+                upload_bytes = upload_bytes.saturating_add(group.cached.byte_len);
             }
-            source_groups.push((
-                source,
-                cached,
-                commands,
-                source_role,
-                0,
-                0,
-                source.oriented_dimensions.width,
-                source.oriented_dimensions.height,
-            ));
-        } else {
-            let tile_edge = choose_bounded_tile_edge(
-                source
-                    .oriented_dimensions
-                    .width
-                    .max(source.oriented_dimensions.height),
-                max_texture_dimension_2d,
-                bytes_per_pixel,
-                1,
-                budget,
-                wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
-            )
-            .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
-            for y in (0..source.oriented_dimensions.height).step_by(tile_edge as usize) {
-                for x in (0..source.oriented_dimensions.width).step_by(tile_edge as usize) {
-                    let rect = PixelRect {
-                        x,
-                        y,
-                        width: tile_edge.min(source.oriented_dimensions.width - x),
-                        height: tile_edge.min(source.oriented_dimensions.height - y),
-                    };
-                    let halo_rect = inflate_rect(
-                        rect,
-                        1,
-                        source.oriented_dimensions.width,
-                        source.oriented_dimensions.height,
-                    );
-                    let tile_commands = commands
-                        .iter()
-                        .copied()
-                        .filter(|command| command_intersects_source_tile(*command, halo_rect))
-                        .collect::<Vec<_>>();
-                    if tile_commands.is_empty() {
-                        continue;
-                    }
-                    let cached = source_texture_tile(
-                        device,
-                        queue,
-                        cache,
-                        source,
-                        prepared.domain.as_ref(),
-                        halo_rect,
-                    )?;
-                    if cached.1 {
-                        source_cache_hits = source_cache_hits.saturating_add(1);
-                    } else {
-                        upload_bytes = upload_bytes.saturating_add(cached.0.byte_len);
-                    }
-                    encode_material_source_dispatch(
-                        device,
-                        encoder,
-                        timing.as_deref_mut(),
-                        pass_label,
-                        pipeline,
-                        plan,
-                        requested_map,
-                        output_view,
-                        source,
-                        cached.0.as_ref(),
-                        &tile_commands,
-                        source_role,
-                        halo_rect,
-                        tile,
-                        &mut command_count,
-                        &mut command_bytes,
-                    )?;
-                }
-            }
+            let (live_source_bytes, live_source_layers) = cache
+                .lock()
+                .map(|cache| (cache.source_resident_bytes(), cache.source_layer_count()))
+                .unwrap_or((group.cached.byte_len, group.cached.layer_count));
+            checked_out_source_resident_bytes_peak =
+                checked_out_source_resident_bytes_peak.max(live_source_bytes);
+            checked_out_source_layers_peak = checked_out_source_layers_peak.max(live_source_layers);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(pass_label),
+            });
+            encode_material_source_dispatch(
+                device,
+                &mut encoder,
+                None,
+                pass_label,
+                pipeline,
+                plan,
+                requested_map,
+                output_view,
+                group.source,
+                group.cached.as_ref(),
+                &group.commands,
+                group.source_role,
+                group.source_layout,
+                tile,
+                &mut command_count,
+                &mut command_bytes,
+            )?;
+            submit_encoder_and_wait(device, queue, encoder)?;
         }
-    }
-    let upload_ms = upload_started.elapsed().as_millis();
-    for (
-        source,
-        cached,
-        commands,
-        source_role,
-        source_origin_x,
-        source_origin_y,
-        source_width,
-        source_height,
-    ) in source_groups
-    {
-        if cancellation.is_cancelled() {
-            return Err(AtlasRenderExecutionError::Cancelled);
-        }
-        if !is_current() {
-            return Err(AtlasRenderExecutionError::Superseded);
-        }
-        encode_material_source_dispatch(
-            device,
-            encoder,
-            timing.as_deref_mut(),
-            pass_label,
-            pipeline,
-            plan,
-            requested_map,
-            output_view,
-            source,
-            cached.as_ref(),
-            &commands,
-            source_role,
-            PixelRect {
-                x: source_origin_x,
-                y: source_origin_y,
-                width: source_width,
-                height: source_height,
-            },
-            tile,
-            &mut command_count,
-            &mut command_bytes,
-        )?;
     }
     Ok(GpuMaterialDispatchStats {
         source_cache_hits,
         upload_bytes,
         upload_ms,
+        checked_out_source_resident_bytes_peak,
+        checked_out_source_layers_peak,
         command_count,
         command_bytes,
         dispatch_ms: dispatch_started.elapsed().as_millis(),
@@ -4700,12 +5023,13 @@ fn encode_material_source_dispatch(
     cached: &GpuCachedSourceTexture,
     commands: &[GpuRegionCommand],
     source_role: MaterialChannelRole,
-    source_rect: PixelRect,
+    source_layout: GpuSourcePageLayout,
     tile: PixelBounds,
     command_count: &mut u32,
     command_bytes: &mut u64,
 ) -> Result<(), AtlasRenderExecutionError> {
     *command_count = command_count.saturating_add(commands.len() as u32);
+    let source_rect = source_layout.source_rect;
     let header = GpuAtlasHeader {
         output_width: plan.output_size.width,
         output_height: plan.output_size.height,
@@ -4724,6 +5048,14 @@ fn encode_material_source_dispatch(
             crate::CompiledNormalConvention::DirectX => 1,
         },
         source_role: gpu_channel_role_code(source_role),
+        source_page_width: source_layout.source_page_width,
+        source_page_height: source_layout.source_page_height,
+        source_page_interior_width: source_layout.source_page_interior_width,
+        source_page_interior_height: source_layout.source_page_interior_height,
+        source_page_count_x: source_layout.source_page_count_x,
+        source_page_count_y: source_layout.source_page_count_y,
+        source_page_halo: source_layout.source_page_halo,
+        source_page_mode: source_layout.source_page_mode,
     };
     let command_buffer_bytes = encode_commands(commands);
     *command_bytes = command_bytes.saturating_add(command_buffer_bytes.len() as u64);
@@ -4735,6 +5067,11 @@ fn encode_material_source_dispatch(
     let commands_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("hot-trimmer-material-region-commands"),
         contents: &command_buffer_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let source_page_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-material-source-page-table"),
+        contents: &encode_source_page_table(&source_layout),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4756,6 +5093,10 @@ fn encode_material_source_dispatch(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::TextureView(output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: source_page_table_buffer.as_entire_binding(),
             },
         ],
     });
@@ -4800,6 +5141,7 @@ fn dispatch_fill_r32float_with_pipeline(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn command_intersects_source_tile(command: GpuRegionCommand, source_tile: PixelRect) -> bool {
     let crop = PixelRect {
         x: command.crop_x,
@@ -4924,6 +5266,18 @@ fn finish_readback(
     Ok((pixels, readback_started.elapsed().as_millis()))
 }
 
+fn submit_encoder_and_wait(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: wgpu::CommandEncoder,
+) -> Result<(), AtlasRenderExecutionError> {
+    queue.submit(Some(encoder.finish()));
+    device
+        .poll(wgpu::PollType::Wait)
+        .map(|_| ())
+        .map_err(|error| AtlasRenderExecutionError::Gpu(format!("device poll failed: {error:?}")))
+}
+
 fn remember_rendered_tile(
     cache: &Mutex<GpuAtlasSourceTextureCache>,
     plan: &CompiledAtlasPlanV1,
@@ -5043,13 +5397,420 @@ fn require_format(
     }
 }
 
-fn source_texture(
+#[derive(Clone, Debug)]
+struct GpuResidentSourcePagePlan {
+    source_rect: PixelRect,
+    interior_width: u32,
+    interior_height: u32,
+    pages: Vec<GpuResidentSourcePage>,
+    byte_len: u64,
+}
+
+impl GpuResidentSourcePagePlan {
+    fn layer_count(&self) -> u32 {
+        self.pages.len() as u32
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn material_source_group_plans_for_tile<'a>(
+    source: &'a CompiledSourceCommandV1,
+    commands: Vec<GpuRegionCommand>,
+    source_role: MaterialChannelRole,
+    tile: PixelBounds,
+    max_texture_dimension_2d: u32,
+    max_texture_array_layers: u32,
+) -> Result<Vec<GpuMaterialSourceGroupPlan<'a>>, AtlasRenderExecutionError> {
+    let tile_rect = pixel_rect(tile);
+    let active_commands = commands
+        .into_iter()
+        .filter(|command| intersect_rect(tile_rect, command_output_rect(command)).is_some())
+        .collect::<Vec<_>>();
+    if active_commands.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
+    let bytes_per_pixel = export_source_bytes_per_pixel(source.channel_role);
+    let full_source_bytes = bounded_tile_byte_len(
+        source.oriented_dimensions.width,
+        source.oriented_dimensions.height,
+        bytes_per_pixel,
+        0,
+        wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+    )
+    .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
+    let full_source_fits = source.oriented_dimensions.width <= max_texture_dimension_2d
+        && source.oriented_dimensions.height <= max_texture_dimension_2d
+        && full_source_bytes <= budget;
+    if full_source_fits {
+        return Ok(vec![GpuMaterialSourceGroupPlan {
+            source,
+            commands: active_commands,
+            source_role,
+            residency: GpuMaterialSourceResidency::Full(PixelRect {
+                x: 0,
+                y: 0,
+                width: source.oriented_dimensions.width,
+                height: source.oriented_dimensions.height,
+            }),
+        }]);
+    }
+
+    let all_commands_plan = resident_source_page_plan_for_commands(
+        &active_commands,
+        tile_rect,
+        source.oriented_dimensions.width,
+        source.oriented_dimensions.height,
+        max_texture_dimension_2d,
+        max_texture_array_layers,
+        bytes_per_pixel,
+        budget,
+    );
+    let command_batches = if let Ok(plan) = all_commands_plan {
+        vec![(active_commands, plan)]
+    } else {
+        let mut batches = Vec::with_capacity(active_commands.len());
+        for command in active_commands {
+            let plan = resident_source_page_plan_for_commands(
+                std::slice::from_ref(&command),
+                tile_rect,
+                source.oriented_dimensions.width,
+                source.oriented_dimensions.height,
+                max_texture_dimension_2d,
+                max_texture_array_layers,
+                bytes_per_pixel,
+                budget,
+            )?;
+            batches.push((vec![command], plan));
+        }
+        batches
+    };
+
+    let mut groups = Vec::with_capacity(command_batches.len());
+    for (commands, plan) in command_batches {
+        groups.push(GpuMaterialSourceGroupPlan {
+            source,
+            commands,
+            source_role,
+            residency: GpuMaterialSourceResidency::Pages(plan),
+        });
+    }
+    Ok(groups)
+}
+
+fn load_material_source_group<'a, 'cache>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    cache: &Mutex<GpuAtlasSourceTextureCache>,
+    cache: &'cache Mutex<GpuAtlasSourceTextureCache>,
+    domain: &PreparedMaterialDomain,
+    plan: GpuMaterialSourceGroupPlan<'a>,
+) -> Result<GpuMaterialSourceGroup<'a, 'cache>, AtlasRenderExecutionError> {
+    let (cached, lease, source_layout, cache_hit) = match plan.residency {
+        GpuMaterialSourceResidency::Full(source_rect) => {
+            let (cached, lease, cache_hit) =
+                source_texture(device, queue, cache, plan.source, domain)?;
+            (
+                cached,
+                lease,
+                single_layer_source_page_layout(source_rect),
+                cache_hit,
+            )
+        }
+        GpuMaterialSourceResidency::Pages(page_plan) => {
+            let (cached, lease, layout, cache_hit) = source_texture_page_array(
+                device,
+                queue,
+                cache,
+                plan.source,
+                domain,
+                page_plan.source_rect,
+                page_plan.interior_width,
+                page_plan.interior_height,
+                page_plan.pages,
+                1,
+            )?;
+            (cached, lease, layout, cache_hit)
+        }
+    };
+    Ok(GpuMaterialSourceGroup {
+        source: plan.source,
+        cached,
+        _lease: lease,
+        cache_hit,
+        commands: plan.commands,
+        source_role: plan.source_role,
+        source_layout,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resident_source_page_plan_for_commands(
+    commands: &[GpuRegionCommand],
+    tile_rect: PixelRect,
+    source_width: u32,
+    source_height: u32,
+    max_texture_dimension_2d: u32,
+    max_texture_array_layers: u32,
+    bytes_per_pixel: u64,
+    budget: u64,
+) -> Result<GpuResidentSourcePagePlan, AtlasRenderExecutionError> {
+    let footprints = execution_source_footprint_rects_for_commands(
+        commands,
+        tile_rect,
+        source_width,
+        source_height,
+    );
+    if footprints.is_empty() {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "source command batch has no resident source footprint".into(),
+        ));
+    }
+    resident_source_page_plan(
+        &footprints,
+        source_width,
+        source_height,
+        max_texture_dimension_2d,
+        max_texture_array_layers,
+        bytes_per_pixel,
+        budget,
+        1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resident_source_page_plan(
+    footprints: &[PixelRect],
+    source_width: u32,
+    source_height: u32,
+    max_texture_dimension_2d: u32,
+    max_texture_array_layers: u32,
+    bytes_per_pixel: u64,
+    budget: u64,
+    halo: u32,
+) -> Result<GpuResidentSourcePagePlan, AtlasRenderExecutionError> {
+    if max_texture_array_layers == 0 {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "adapter reports zero texture array layers for source residency".into(),
+        ));
+    }
+    let max_interior = max_texture_dimension_2d
+        .checked_sub(halo.saturating_mul(2))
+        .ok_or_else(|| {
+            AtlasRenderExecutionError::Gpu(
+                "adapter maximum texture size cannot contain source page halo".into(),
+            )
+        })?
+        .max(1);
+    let Some(footprint_bounds) = union_rects(footprints) else {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "source command batch has no resident source footprint".into(),
+        ));
+    };
+    let widest_footprint = footprints.iter().map(|rect| rect.width).max().unwrap_or(1);
+    let tallest_footprint = footprints.iter().map(|rect| rect.height).max().unwrap_or(1);
+    let width_candidates =
+        resident_interior_candidates(widest_footprint, max_interior, max_texture_array_layers);
+    let height_candidates =
+        resident_interior_candidates(tallest_footprint, max_interior, max_texture_array_layers);
+    let mut best = None;
+    for interior_width in width_candidates {
+        for &interior_height in &height_candidates {
+            let source_rect = align_resident_rect_to_page_grid(
+                footprint_bounds,
+                interior_width,
+                interior_height,
+                source_width,
+                source_height,
+            );
+            let pages =
+                required_resident_pages(footprints, source_rect, interior_width, interior_height);
+            let layer_count = pages.len() as u32;
+            if layer_count == 0 || layer_count > max_texture_array_layers {
+                continue;
+            }
+            let Some(page_width) = interior_width.checked_add(halo.saturating_mul(2)) else {
+                continue;
+            };
+            let Some(page_height) = interior_height.checked_add(halo.saturating_mul(2)) else {
+                continue;
+            };
+            if page_width > max_texture_dimension_2d || page_height > max_texture_dimension_2d {
+                continue;
+            }
+            let Some(byte_len) = u64::from(page_width)
+                .checked_mul(u64::from(page_height))
+                .and_then(|bytes| bytes.checked_mul(bytes_per_pixel))
+                .and_then(|bytes| bytes.checked_mul(u64::from(layer_count)))
+            else {
+                continue;
+            };
+            if byte_len > budget {
+                continue;
+            }
+            let candidate = GpuResidentSourcePagePlan {
+                source_rect,
+                interior_width,
+                interior_height,
+                pages,
+                byte_len,
+            };
+            best = Some(match best {
+                Some(existing)
+                    if resident_plan_sort_key(&existing) <= resident_plan_sort_key(&candidate) =>
+                {
+                    existing
+                }
+                _ => candidate,
+            });
+        }
+    }
+    best.ok_or_else(|| {
+        AtlasRenderExecutionError::Gpu(format!(
+            "source footprint {}x{} at {},{} cannot fit resident source pages within {} array layers and {} bytes",
+            footprint_bounds.width,
+            footprint_bounds.height,
+            footprint_bounds.x,
+            footprint_bounds.y,
+            max_texture_array_layers,
+            budget
+        ))
+    })
+}
+
+fn resident_plan_sort_key(plan: &GpuResidentSourcePagePlan) -> (u32, u64) {
+    (plan.layer_count(), plan.byte_len)
+}
+
+fn union_rects(rects: &[PixelRect]) -> Option<PixelRect> {
+    rects
+        .iter()
+        .copied()
+        .reduce(|existing, rect| union_rect(existing, rect))
+}
+
+fn required_resident_pages(
+    rects: &[PixelRect],
+    source_rect: PixelRect,
+    interior_width: u32,
+    interior_height: u32,
+) -> Vec<GpuResidentSourcePage> {
+    let mut pages = BTreeSet::new();
+    let interior_width = interior_width.max(1);
+    let interior_height = interior_height.max(1);
+    let max_page_x = source_rect.width.div_ceil(interior_width).saturating_sub(1);
+    let max_page_y = source_rect
+        .height
+        .div_ceil(interior_height)
+        .saturating_sub(1);
+    for rect in rects {
+        let Some(intersection) = intersect_rect(*rect, source_rect) else {
+            continue;
+        };
+        let local_x0 = intersection.x.saturating_sub(source_rect.x);
+        let local_y0 = intersection.y.saturating_sub(source_rect.y);
+        let local_x1 = intersection
+            .x
+            .saturating_add(intersection.width.saturating_sub(1))
+            .saturating_sub(source_rect.x);
+        let local_y1 = intersection
+            .y
+            .saturating_add(intersection.height.saturating_sub(1))
+            .saturating_sub(source_rect.y);
+        let page_x0 = (local_x0 / interior_width).min(max_page_x);
+        let page_y0 = (local_y0 / interior_height).min(max_page_y);
+        let page_x1 = (local_x1 / interior_width).min(max_page_x);
+        let page_y1 = (local_y1 / interior_height).min(max_page_y);
+        for page_y in page_y0..=page_y1 {
+            for page_x in page_x0..=page_x1 {
+                pages.insert(GpuResidentSourcePage {
+                    x: page_x,
+                    y: page_y,
+                });
+            }
+        }
+    }
+    let mut pages = pages.into_iter().collect::<Vec<_>>();
+    pages.sort_by_key(|page| (page.y, page.x));
+    pages
+}
+
+fn source_page_table_hash(pages: &[GpuResidentSourcePage]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pages.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn encode_source_page_table(layout: &GpuSourcePageLayout) -> Vec<u8> {
+    let pages = if layout.source_page_table.is_empty() {
+        vec![GpuResidentSourcePage { x: 0, y: 0 }]
+    } else {
+        layout.source_page_table.clone()
+    };
+    let mut bytes = Vec::with_capacity(pages.len() * 16);
+    for (layer, page) in pages.iter().enumerate() {
+        bytes.extend_from_slice(&page.x.to_le_bytes());
+        bytes.extend_from_slice(&page.y.to_le_bytes());
+        bytes.extend_from_slice(&(layer as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+    }
+    bytes
+}
+
+fn resident_interior_candidates(length: u32, max_interior: u32, max_layers: u32) -> Vec<u32> {
+    let length = length.max(1);
+    let max_interior = max_interior.max(1);
+    let max_counts = max_layers.max(1).min(length);
+    let mut candidates = BTreeSet::new();
+    candidates.insert(length.min(max_interior));
+    candidates.insert(1);
+    for count in 1..=max_counts.min(64) {
+        candidates.insert(length.div_ceil(count).min(max_interior).max(1));
+    }
+    let mut count = 1_u32;
+    while count <= max_counts {
+        candidates.insert(length.div_ceil(count).min(max_interior).max(1));
+        count = count.saturating_mul(2);
+        if count == 0 {
+            break;
+        }
+    }
+    candidates.into_iter().rev().collect()
+}
+
+fn align_resident_rect_to_page_grid(
+    rect: PixelRect,
+    interior_width: u32,
+    interior_height: u32,
+    source_width: u32,
+    source_height: u32,
+) -> PixelRect {
+    let aligned_width = rect.width.div_ceil(interior_width) * interior_width;
+    let aligned_height = rect.height.div_ceil(interior_height) * interior_height;
+    let right = rect.x.saturating_add(aligned_width).min(source_width);
+    let bottom = rect.y.saturating_add(aligned_height).min(source_height);
+    PixelRect {
+        x: rect.x,
+        y: rect.y,
+        width: right.saturating_sub(rect.x).max(rect.width),
+        height: bottom.saturating_sub(rect.y).max(rect.height),
+    }
+}
+
+fn source_texture<'cache>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &'cache Mutex<GpuAtlasSourceTextureCache>,
     source: &CompiledSourceCommandV1,
     domain: &PreparedMaterialDomain,
-) -> Result<(Arc<GpuCachedSourceTexture>, bool), AtlasRenderExecutionError> {
+) -> Result<
+    (
+        Arc<GpuCachedSourceTexture>,
+        GpuSourceTextureLease<'cache>,
+        bool,
+    ),
+    AtlasRenderExecutionError,
+> {
     let key = GpuSourceTextureKey::from_source(source);
     let mut cache_guard = cache
         .lock()
@@ -5057,10 +5818,29 @@ fn source_texture(
     cache_guard.clock = cache_guard.clock.saturating_add(1);
     let clock = cache_guard.clock;
     if let Some(texture) = cache_guard.sources.get(&key) {
-        return Ok((Arc::clone(texture), true));
+        let texture = Arc::clone(texture);
+        *cache_guard.source_pins.entry(key.clone()).or_insert(0) += 1;
+        drop(cache_guard);
+        return Ok((
+            texture,
+            GpuSourceTextureLease {
+                cache,
+                key,
+                active: true,
+            },
+            true,
+        ));
     }
     drop(cache_guard);
     let payload = source_texture_payload(domain, source.channel_role)?;
+    let byte_len = payload.bytes.len() as u64;
+    let reservation = reserve_source_texture_cache_space(
+        cache,
+        key.clone(),
+        byte_len,
+        source.oriented_dimensions.width,
+        source.oriented_dimensions.height,
+    )?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("hot-trimmer-base-color-source-texture"),
         size: wgpu::Extent3d {
@@ -5094,77 +5874,50 @@ fn source_texture(
             depth_or_array_layers: 1,
         },
     );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-base-color-source-texture-array-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
     let cached = Arc::new(GpuCachedSourceTexture {
         _texture: texture,
         view,
-        byte_len: payload.bytes.len() as u64,
+        byte_len,
+        layer_count: 1,
         last_used: clock,
     });
-    let mut cache_guard = cache
-        .lock()
-        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
-    let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
-    if cached.byte_len > budget {
-        return Err(AtlasRenderExecutionError::Gpu(format!(
-            "source texture {}x{} exceeds the declared GPU source residency budget",
-            source.oriented_dimensions.width, source.oriented_dimensions.height
-        )));
-    }
-    while !cache_guard.sources.is_empty()
-        && cache_guard
-            .source_resident_bytes()
-            .saturating_add(cached.byte_len)
-            > budget
-    {
-        let Some(oldest) = cache_guard
-            .sources
-            .iter()
-            .min_by_key(|(_, value)| value.last_used)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache_guard.sources.remove(&oldest);
-    }
-    const MAX_GPU_SOURCES: usize = 8;
-    while cache_guard.sources.len() >= MAX_GPU_SOURCES && !cache_guard.sources.contains_key(&key) {
-        let Some(oldest) = cache_guard
-            .sources
-            .iter()
-            .min_by_key(|(_, value)| value.last_used)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache_guard.sources.remove(&oldest);
-    }
-    cache_guard.sources.insert(key, Arc::clone(&cached));
-    Ok((cached, false))
+    let (cached, lease) = reservation.commit(key, cached)?;
+    Ok((cached, lease, false))
 }
 
-fn remember_source_texture_in_cache(
-    cache_guard: &mut GpuAtlasSourceTextureCache,
+fn reserve_source_texture_cache_space<'a>(
+    cache: &'a Mutex<GpuAtlasSourceTextureCache>,
     key: GpuSourceTextureKey,
-    cached: Arc<GpuCachedSourceTexture>,
+    byte_len: u64,
     width: u32,
     height: u32,
-) -> Result<(), AtlasRenderExecutionError> {
+) -> Result<GpuSourceTextureReservation<'a>, AtlasRenderExecutionError> {
     let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
-    if cached.byte_len > budget {
+    if byte_len > budget {
         return Err(AtlasRenderExecutionError::Gpu(format!(
             "source texture {width}x{height} exceeds the declared GPU source residency budget",
         )));
     }
+    let mut cache_guard = cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
     while !cache_guard.sources.is_empty()
         && cache_guard
             .source_resident_bytes()
-            .saturating_add(cached.byte_len)
+            .saturating_add(cache_guard.source_reserved_bytes)
+            .saturating_add(byte_len)
             > budget
     {
         let Some(oldest) = cache_guard
             .sources
             .iter()
+            .filter(|(key, _)| !cache_guard.source_pins.contains_key(*key))
             .min_by_key(|(_, value)| value.last_used)
             .map(|(key, _)| key.clone())
         else {
@@ -5177,6 +5930,7 @@ fn remember_source_texture_in_cache(
         let Some(oldest) = cache_guard
             .sources
             .iter()
+            .filter(|(key, _)| !cache_guard.source_pins.contains_key(*key))
             .min_by_key(|(_, value)| value.last_used)
             .map(|(key, _)| key.clone())
         else {
@@ -5184,18 +5938,41 @@ fn remember_source_texture_in_cache(
         };
         cache_guard.sources.remove(&oldest);
     }
-    cache_guard.sources.insert(key, cached);
-    Ok(())
+    if cache_guard
+        .source_resident_bytes()
+        .saturating_add(cache_guard.source_reserved_bytes)
+        .saturating_add(byte_len)
+        > budget
+    {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "source texture {width}x{height} cannot reserve GPU source residency budget",
+        )));
+    }
+    cache_guard.source_reserved_bytes = cache_guard.source_reserved_bytes.saturating_add(byte_len);
+    drop(cache_guard);
+    Ok(GpuSourceTextureReservation {
+        cache,
+        byte_len,
+        active: true,
+    })
 }
 
-fn source_texture_tile(
+#[allow(dead_code)]
+fn source_texture_tile<'cache>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    cache: &Mutex<GpuAtlasSourceTextureCache>,
+    cache: &'cache Mutex<GpuAtlasSourceTextureCache>,
     source: &CompiledSourceCommandV1,
     domain: &PreparedMaterialDomain,
     rect: PixelRect,
-) -> Result<(Arc<GpuCachedSourceTexture>, bool), AtlasRenderExecutionError> {
+) -> Result<
+    (
+        Arc<GpuCachedSourceTexture>,
+        GpuSourceTextureLease<'cache>,
+        bool,
+    ),
+    AtlasRenderExecutionError,
+> {
     let key = GpuSourceTextureKey::from_source_rect(source, rect);
     let mut cache_guard = cache
         .lock()
@@ -5203,10 +5980,24 @@ fn source_texture_tile(
     cache_guard.clock = cache_guard.clock.saturating_add(1);
     let clock = cache_guard.clock;
     if let Some(texture) = cache_guard.sources.get(&key) {
-        return Ok((Arc::clone(texture), true));
+        let texture = Arc::clone(texture);
+        *cache_guard.source_pins.entry(key.clone()).or_insert(0) += 1;
+        drop(cache_guard);
+        return Ok((
+            texture,
+            GpuSourceTextureLease {
+                cache,
+                key,
+                active: true,
+            },
+            true,
+        ));
     }
     drop(cache_guard);
     let payload = source_texture_payload_rect(domain, source.channel_role, rect)?;
+    let byte_len = payload.bytes.len() as u64;
+    let reservation =
+        reserve_source_texture_cache_space(cache, key.clone(), byte_len, rect.width, rect.height)?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("hot-trimmer-source-tile-texture"),
         size: wgpu::Extent3d {
@@ -5240,24 +6031,261 @@ fn source_texture_tile(
             depth_or_array_layers: 1,
         },
     );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-source-tile-texture-array-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
     let cached = Arc::new(GpuCachedSourceTexture {
         _texture: texture,
         view,
-        byte_len: payload.bytes.len() as u64,
+        byte_len,
+        layer_count: 1,
         last_used: clock,
     });
+    let (cached, lease) = reservation.commit(key, cached)?;
+    Ok((cached, lease, false))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_texture_page_array<'cache>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &'cache Mutex<GpuAtlasSourceTextureCache>,
+    source: &CompiledSourceCommandV1,
+    domain: &PreparedMaterialDomain,
+    source_rect: PixelRect,
+    interior_width: u32,
+    interior_height: u32,
+    pages: Vec<GpuResidentSourcePage>,
+    halo: u32,
+) -> Result<
+    (
+        Arc<GpuCachedSourceTexture>,
+        GpuSourceTextureLease<'cache>,
+        GpuSourcePageLayout,
+        bool,
+    ),
+    AtlasRenderExecutionError,
+> {
+    if interior_width == 0 || interior_height == 0 {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "source page array interior dimensions must be non-zero".into(),
+        ));
+    }
+    if source_rect.x.saturating_add(source_rect.width) > domain.width
+        || source_rect.y.saturating_add(source_rect.height) > domain.height
+        || source_rect.width == 0
+        || source_rect.height == 0
+    {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "source page array exceeds prepared source bounds".into(),
+        ));
+    }
+    let page_width = interior_width
+        .checked_add(halo.saturating_mul(2))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page width overflow".into()))?;
+    let page_height = interior_height
+        .checked_add(halo.saturating_mul(2))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page height overflow".into()))?;
+    let count_x = source_rect.width.div_ceil(interior_width);
+    let count_y = source_rect.height.div_ceil(interior_height);
+    let dense_layer_count = count_x
+        .checked_mul(count_y)
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page layer count overflow".into()))?;
+    let pages = if pages.is_empty() {
+        (0..count_y)
+            .flat_map(|page_y| {
+                (0..count_x).map(move |page_x| GpuResidentSourcePage {
+                    x: page_x,
+                    y: page_y,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        pages
+    };
+    let layer_count = u32::try_from(pages.len())
+        .map_err(|_| AtlasRenderExecutionError::Gpu("source page layer count overflow".into()))?;
+    let limits = device.limits();
+    if page_width > limits.max_texture_dimension_2d || page_height > limits.max_texture_dimension_2d
+    {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "source page array page {}x{} exceeds adapter 2D texture limit {}",
+            page_width, page_height, limits.max_texture_dimension_2d
+        )));
+    }
+    if layer_count > limits.max_texture_array_layers {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "source page array layer count {} exceeds adapter texture array layer limit {}",
+            layer_count, limits.max_texture_array_layers
+        )));
+    }
+    let layout = GpuSourcePageLayout {
+        source_rect,
+        source_page_width: page_width,
+        source_page_height: page_height,
+        source_page_interior_width: interior_width,
+        source_page_interior_height: interior_height,
+        source_page_count_x: count_x,
+        source_page_count_y: count_y,
+        source_page_halo: halo,
+        source_page_mode: if layer_count == dense_layer_count {
+            1
+        } else {
+            2
+        },
+        source_page_table_hash: source_page_table_hash(&pages),
+        source_page_table: pages,
+    };
+    let key = GpuSourceTextureKey::from_source_page_layout(source, &layout);
     let mut cache_guard = cache
         .lock()
         .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
-    remember_source_texture_in_cache(
-        &mut cache_guard,
-        key,
-        Arc::clone(&cached),
-        rect.width,
-        rect.height,
+    cache_guard.clock = cache_guard.clock.saturating_add(1);
+    let clock = cache_guard.clock;
+    if let Some(texture) = cache_guard.sources.get(&key) {
+        let texture = Arc::clone(texture);
+        *cache_guard.source_pins.entry(key.clone()).or_insert(0) += 1;
+        drop(cache_guard);
+        return Ok((
+            texture,
+            GpuSourceTextureLease {
+                cache,
+                key,
+                active: true,
+            },
+            layout,
+            true,
+        ));
+    }
+    drop(cache_guard);
+
+    let first_payload = source_texture_payload_clamped_rect(
+        domain,
+        source.channel_role,
+        source_rect,
+        PixelRect {
+            x: source_rect
+                .x
+                .saturating_add(layout.source_page_table[0].x.saturating_mul(interior_width))
+                .saturating_sub(halo)
+                .max(source_rect.x),
+            y: source_rect
+                .y
+                .saturating_add(
+                    layout.source_page_table[0]
+                        .y
+                        .saturating_mul(interior_height),
+                )
+                .saturating_sub(halo)
+                .max(source_rect.y),
+            width: page_width,
+            height: page_height,
+        },
     )?;
-    Ok((cached, false))
+    let layer_bytes = first_payload.bytes.len() as u64;
+    let byte_len = layer_bytes
+        .checked_mul(u64::from(layer_count))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page array bytes overflow".into()))?;
+    let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
+    if byte_len > budget {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "source page array {}x{}x{} exceeds the declared GPU source residency budget",
+            page_width, page_height, layer_count
+        )));
+    }
+    let reservation = reserve_source_texture_cache_space(
+        cache,
+        key.clone(),
+        byte_len,
+        page_width,
+        page_height.saturating_mul(layer_count),
+    )?;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hot-trimmer-source-page-array-texture"),
+        size: wgpu::Extent3d {
+            width: page_width,
+            height: page_height,
+            depth_or_array_layers: layer_count,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: first_payload.format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer_index, page) in layout.source_page_table.iter().enumerate() {
+        let layer = u32::try_from(layer_index).map_err(|_| {
+            AtlasRenderExecutionError::Gpu("source page layer count overflow".into())
+        })?;
+        let interior_origin_x = source_rect
+            .x
+            .saturating_add(page.x.saturating_mul(interior_width));
+        let interior_origin_y = source_rect
+            .y
+            .saturating_add(page.y.saturating_mul(interior_height));
+        let page_origin = PixelRect {
+            x: interior_origin_x.saturating_sub(halo).max(source_rect.x),
+            y: interior_origin_y.saturating_sub(halo).max(source_rect.y),
+            width: page_width,
+            height: page_height,
+        };
+        let payload = if layer == 0 {
+            GpuSourceTexturePayload {
+                bytes: first_payload.bytes.clone(),
+                format: first_payload.format,
+                bytes_per_pixel: first_payload.bytes_per_pixel,
+            }
+        } else {
+            source_texture_payload_clamped_rect(
+                domain,
+                source.channel_role,
+                source_rect,
+                page_origin,
+            )?
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &payload.bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(page_width * payload.bytes_per_pixel),
+                rows_per_image: Some(page_height),
+            },
+            wgpu::Extent3d {
+                width: page_width,
+                height: page_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-source-page-array-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(layer_count),
+        ..Default::default()
+    });
+    let cached = Arc::new(GpuCachedSourceTexture {
+        _texture: texture,
+        view,
+        byte_len,
+        layer_count,
+        last_used: clock,
+    });
+    let (cached, lease) = reservation.commit(key, cached)?;
+    Ok((cached, lease, layout, false))
 }
 
 struct GpuSourceTexturePayload {
@@ -5294,6 +6322,43 @@ fn source_texture_payload_rect(
             "source texture tile exceeds prepared source bounds".into(),
         ));
     }
+    source_texture_payload_mapped(domain, role, rect.width, rect.height, |local_x, local_y| {
+        (rect.x + local_x, rect.y + local_y)
+    })
+}
+
+fn source_texture_payload_clamped_rect(
+    domain: &PreparedMaterialDomain,
+    role: MaterialChannelRole,
+    source_rect: PixelRect,
+    rect: PixelRect,
+) -> Result<GpuSourceTexturePayload, AtlasRenderExecutionError> {
+    if source_rect.x.saturating_add(source_rect.width) > domain.width
+        || source_rect.y.saturating_add(source_rect.height) > domain.height
+        || source_rect.width == 0
+        || source_rect.height == 0
+    {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "source page array exceeds prepared source bounds".into(),
+        ));
+    }
+    let max_x = source_rect.x + source_rect.width - 1;
+    let max_y = source_rect.y + source_rect.height - 1;
+    source_texture_payload_mapped(domain, role, rect.width, rect.height, |local_x, local_y| {
+        (
+            rect.x.saturating_add(local_x).clamp(source_rect.x, max_x),
+            rect.y.saturating_add(local_y).clamp(source_rect.y, max_y),
+        )
+    })
+}
+
+fn source_texture_payload_mapped(
+    domain: &PreparedMaterialDomain,
+    role: MaterialChannelRole,
+    width: u32,
+    height: u32,
+    mut source_xy: impl FnMut(u32, u32) -> (u32, u32),
+) -> Result<GpuSourceTexturePayload, AtlasRenderExecutionError> {
     let channel = domain
         .registered_channels()
         .iter()
@@ -5303,10 +6368,10 @@ fn source_texture_payload_rect(
         })?;
     match channel {
         PreparedExemplarChannel::BaseColor { plane, .. } => {
-            let mut rgba =
-                Vec::with_capacity((u64::from(rect.width) * u64::from(rect.height) * 4) as usize);
-            for y in rect.y..rect.y + rect.height {
-                for x in rect.x..rect.x + rect.width {
+            let mut rgba = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
+            for local_y in 0..height {
+                for local_x in 0..width {
+                    let (x, y) = source_xy(local_x, local_y);
                     let value = plane.pixel(x, y);
                     rgba.push(linear_to_srgb(value.rgb[0]));
                     rgba.push(linear_to_srgb(value.rgb[1]));
@@ -5321,10 +6386,10 @@ fn source_texture_payload_rect(
             })
         }
         PreparedExemplarChannel::Scalar { plane, .. } => {
-            let mut r32 =
-                Vec::with_capacity((u64::from(rect.width) * u64::from(rect.height) * 4) as usize);
-            for y in rect.y..rect.y + rect.height {
-                for x in rect.x..rect.x + rect.width {
+            let mut r32 = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
+            for local_y in 0..height {
+                for local_x in 0..width {
+                    let (x, y) = source_xy(local_x, local_y);
                     r32.extend_from_slice(&plane.pixel(x, y).0.clamp(0.0, 1.0).to_le_bytes());
                 }
             }
@@ -5335,10 +6400,10 @@ fn source_texture_payload_rect(
             })
         }
         PreparedExemplarChannel::Mask { plane, .. } => {
-            let mut r32 =
-                Vec::with_capacity((u64::from(rect.width) * u64::from(rect.height) * 4) as usize);
-            for y in rect.y..rect.y + rect.height {
-                for x in rect.x..rect.x + rect.width {
+            let mut r32 = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
+            for local_y in 0..height {
+                for local_x in 0..width {
+                    let (x, y) = source_xy(local_x, local_y);
                     r32.extend_from_slice(&plane.pixel(x, y).0.clamp(0.0, 1.0).to_le_bytes());
                 }
             }
@@ -5349,10 +6414,10 @@ fn source_texture_payload_rect(
             })
         }
         PreparedExemplarChannel::Normal { plane, .. } => {
-            let mut rgba =
-                Vec::with_capacity((u64::from(rect.width) * u64::from(rect.height) * 4) as usize);
-            for y in rect.y..rect.y + rect.height {
-                for x in rect.x..rect.x + rect.width {
+            let mut rgba = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
+            for local_y in 0..height {
+                for local_x in 0..width {
+                    let (x, y) = source_xy(local_x, local_y);
                     let value = plane.pixel(x, y);
                     rgba.extend_from_slice(&[
                         signed_unit(value.xyz[0]),
@@ -5369,10 +6434,10 @@ fn source_texture_payload_rect(
             })
         }
         PreparedExemplarChannel::MaterialId { plane } => {
-            let mut rgba =
-                Vec::with_capacity((u64::from(rect.width) * u64::from(rect.height) * 4) as usize);
-            for y in rect.y..rect.y + rect.height {
-                for x in rect.x..rect.x + rect.width {
+            let mut rgba = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
+            for local_y in 0..height {
+                for local_x in 0..width {
+                    let (x, y) = source_xy(local_x, local_y);
                     let bytes = plane.pixel(x, y).0.to_le_bytes();
                     rgba.extend_from_slice(&[bytes[0], bytes[1], bytes[2], 255]);
                 }
@@ -5681,6 +6746,14 @@ fn encode_header(header: GpuAtlasHeader) -> [u8; GPU_HEADER_BYTES] {
         header.map_kind,
         header.normal_convention,
         header.source_role,
+        header.source_page_width,
+        header.source_page_height,
+        header.source_page_interior_width,
+        header.source_page_interior_height,
+        header.source_page_count_x,
+        header.source_page_count_y,
+        header.source_page_halo,
+        header.source_page_mode,
     ];
     for (index, value) in values.into_iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
@@ -6415,5 +7488,382 @@ mod tests {
                 .iter()
                 .any(|rect| rect.width >= 1024 && rect.height >= 1024)
         );
+    }
+
+    #[test]
+    fn gpu_execution_radial_footprint_is_bounded_to_output_subtile() {
+        let radial_plan = gpu_tiled_export_polar_radial_plan();
+        let mut command =
+            pack_command(&radial_plan.ordered_regions[0]).expect("radial command should pack");
+        command.crop_x = 0;
+        command.crop_y = 0;
+        command.crop_width = 4096;
+        command.crop_height = 4096;
+        command.dst_x = 0;
+        command.dst_y = 0;
+        command.dst_width = 4096;
+        command.dst_height = 4096;
+        command.semantic_x = 0;
+        command.semantic_y = 0;
+        command.semantic_width = 4096;
+        command.semantic_height = 4096;
+        command.slot_width = 4096.0;
+        command.slot_height = 4096.0;
+
+        let rects = command_source_footprint_rects(
+            &command,
+            PixelRect {
+                x: 3968,
+                y: 2016,
+                width: 64,
+                height: 64,
+            },
+            4096,
+            4096,
+        );
+
+        assert!(
+            !rects.is_empty(),
+            "radial subtile should produce at least one resident source footprint"
+        );
+        assert!(
+            rects
+                .iter()
+                .all(|rect| rect.width < command.crop_width && rect.height < command.crop_height),
+            "radial execution footprint must stay bounded to the output subtile instead of the whole crop: {rects:?}"
+        );
+        let plan = resident_source_page_plan_for_commands(
+            std::slice::from_ref(&command),
+            PixelRect {
+                x: 3968,
+                y: 2016,
+                width: 64,
+                height: 64,
+            },
+            4096,
+            4096,
+            512,
+            256,
+            4,
+            ExportMemoryBudgets::default().gpu_source_residency_bytes,
+        )
+        .expect("sparse radial resident plan");
+        let dense_page_count = plan
+            .source_rect
+            .width
+            .div_ceil(plan.interior_width)
+            .saturating_mul(plan.source_rect.height.div_ceil(plan.interior_height));
+        assert!(
+            plan.layer_count() < dense_page_count,
+            "radial seam resident plan must preserve sparse pages instead of densifying the bounding rect; layers={}, dense_page_count={}, plan={plan:?}",
+            plan.layer_count(),
+            dense_page_count
+        );
+    }
+
+    #[test]
+    fn resident_source_page_plan_rejects_byte_over_budget_footprint() {
+        let error = resident_source_page_plan(
+            &[PixelRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            }],
+            32,
+            32,
+            64,
+            16,
+            1 << 30,
+            ExportMemoryBudgets::default().gpu_source_residency_bytes,
+            1,
+        )
+        .expect_err("resident page plan must reject a byte-over-budget footprint");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot fit resident source pages"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resident_source_pages_are_row_major_for_dense_shader_layers() {
+        let pages = required_resident_pages(
+            &[PixelRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 20,
+            }],
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 20,
+            },
+            10,
+            10,
+        );
+        assert_eq!(
+            pages,
+            vec![
+                GpuResidentSourcePage { x: 0, y: 0 },
+                GpuResidentSourcePage { x: 1, y: 0 },
+                GpuResidentSourcePage { x: 0, y: 1 },
+                GpuResidentSourcePage { x: 1, y: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn source_texture_reservations_count_against_budget_until_dropped() {
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let budget = ExportMemoryBudgets::default().gpu_source_residency_bytes;
+        let key = GpuSourceTextureKey {
+            source_set_id: SourceSetId::from_bytes([1; 16]),
+            source_id: ContentDigest::sha256(b"reservation-source"),
+            digest: ContentDigest::sha256(b"reservation-digest"),
+            origin_x: 0,
+            origin_y: 0,
+            width: 1,
+            height: 1,
+            decoded_format: "rgba8".into(),
+            decoder_version: "test".into(),
+            color_version: "test".into(),
+            channel_role: MaterialChannelRole::BaseColor,
+            page_interior_width: 1,
+            page_interior_height: 1,
+            page_halo: 0,
+            page_mode: 0,
+            page_table_hash: 0,
+        };
+        let reservation = reserve_source_texture_cache_space(
+            &cache,
+            key.clone(),
+            budget,
+            1,
+            u32::try_from(budget).unwrap_or(u32::MAX),
+        )
+        .expect("first reservation should consume the source budget");
+        assert_eq!(cache.lock().unwrap().source_reserved_bytes(), budget);
+        let second = match reserve_source_texture_cache_space(&cache, key, 1, 1, 1) {
+            Ok(_) => panic!("second reservation must see in-flight reserved bytes"),
+            Err(error) => error,
+        };
+        assert!(
+            second.to_string().contains("cannot reserve"),
+            "unexpected error: {second}"
+        );
+        drop(reservation);
+        assert_eq!(cache.lock().unwrap().source_reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn source_texture_pinned_lease_blocks_eviction_until_drop() {
+        let gpu = hot_trimmer_preview::GpuCapabilityService::default();
+        let handle = gpu
+            .initialize()
+            .expect("GPU service should initialize for source cache pin test");
+        let device = handle.device();
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let budget = ExportMemoryBudgets::default().gpu_source_residency_bytes;
+        let key_a = test_source_texture_key(b"pinned-source-a");
+        let mut key_b = test_source_texture_key(b"pinned-source-b");
+        key_b.digest = ContentDigest::sha256(b"pinned-digest-b");
+
+        let reservation_a = reserve_source_texture_cache_space(
+            &cache,
+            key_a.clone(),
+            budget,
+            1,
+            u32::try_from(budget).unwrap_or(u32::MAX),
+        )
+        .expect("source A should reserve the whole source budget");
+        let (_cached_a, lease_a) = reservation_a
+            .commit(
+                key_a,
+                test_cached_source_texture(device, budget, "pinned-source-a"),
+            )
+            .expect("source A reservation should commit into a pinned lease");
+
+        {
+            let guard = cache.lock().unwrap();
+            assert_eq!(guard.source_reserved_bytes(), 0);
+            assert_eq!(guard.source_resident_bytes(), budget);
+            assert_eq!(guard.source_pinned_count(), 1);
+        }
+
+        let blocked = match reserve_source_texture_cache_space(&cache, key_b.clone(), 1, 1, 1) {
+            Ok(_) => panic!("source B must not evict checked-out source A"),
+            Err(error) => error,
+        };
+        assert!(
+            blocked.to_string().contains("cannot reserve"),
+            "unexpected error: {blocked}"
+        );
+        {
+            let guard = cache.lock().unwrap();
+            assert_eq!(
+                guard
+                    .source_resident_bytes()
+                    .saturating_add(guard.source_reserved_bytes()),
+                budget
+            );
+            assert_eq!(guard.source_pinned_count(), 1);
+        }
+
+        drop(lease_a);
+        let reservation_b = reserve_source_texture_cache_space(&cache, key_b, 1, 1, 1)
+            .expect("source B should reserve after source A's lease drops");
+        {
+            let guard = cache.lock().unwrap();
+            assert_eq!(guard.source_reserved_bytes(), 1);
+            assert_eq!(guard.source_resident_bytes(), 0);
+            assert_eq!(guard.source_pinned_count(), 0);
+        }
+        drop(reservation_b);
+        assert_eq!(cache.lock().unwrap().source_reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn same_key_commits_share_canonical_texture_before_third_reservation() {
+        let gpu = hot_trimmer_preview::GpuCapabilityService::default();
+        let handle = gpu
+            .initialize()
+            .expect("GPU service should initialize for source cache canonicalization test");
+        let device = handle.device();
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let budget = ExportMemoryBudgets::default().gpu_source_residency_bytes;
+        let texture_bytes = budget / 2;
+        let key = test_source_texture_key(b"same-key-source");
+        let key_c = test_source_texture_key(b"third-source");
+
+        let reservation_a = reserve_source_texture_cache_space(
+            &cache,
+            key.clone(),
+            texture_bytes,
+            1,
+            u32::try_from(texture_bytes).unwrap_or(u32::MAX),
+        )
+        .expect("first same-key reservation should fit");
+        let reservation_b = reserve_source_texture_cache_space(
+            &cache,
+            key.clone(),
+            texture_bytes,
+            1,
+            u32::try_from(texture_bytes).unwrap_or(u32::MAX),
+        )
+        .expect("second same-key reservation should fit while both uploads are in flight");
+
+        let (cached_a, lease_a) = reservation_a
+            .commit(
+                key.clone(),
+                test_cached_source_texture(device, texture_bytes, "same-key-source-a"),
+            )
+            .expect("first same-key commit should publish the source texture");
+        let duplicate = test_cached_source_texture(device, texture_bytes, "same-key-source-b");
+        let duplicate_weak = Arc::downgrade(&duplicate);
+        let (cached_b, lease_b) = reservation_b
+            .commit(key.clone(), duplicate)
+            .expect("second same-key commit should lease the canonical source texture");
+
+        assert!(
+            Arc::ptr_eq(&cached_a, &cached_b),
+            "same-key commits must share the canonical cached texture"
+        );
+        assert!(
+            duplicate_weak.upgrade().is_none(),
+            "duplicate same-key upload must be dropped instead of becoming unaccounted live residency"
+        );
+        {
+            let guard = cache.lock().unwrap();
+            assert_eq!(guard.source_reserved_bytes(), 0);
+            assert_eq!(guard.source_resident_bytes(), texture_bytes);
+            assert_eq!(guard.source_pins.get(&key).copied(), Some(2));
+        }
+
+        let reservation_c = reserve_source_texture_cache_space(
+            &cache,
+            key_c,
+            texture_bytes,
+            1,
+            u32::try_from(texture_bytes).unwrap_or(u32::MAX),
+        )
+        .expect("third reservation should fit because duplicate same-key texture was dropped");
+        {
+            let guard = cache.lock().unwrap();
+            assert_eq!(
+                guard
+                    .source_resident_bytes()
+                    .saturating_add(guard.source_reserved_bytes()),
+                budget
+            );
+            assert_eq!(guard.source_pins.get(&key).copied(), Some(2));
+        }
+
+        drop(reservation_c);
+        drop(lease_a);
+        assert_eq!(
+            cache.lock().unwrap().source_pins.get(&key).copied(),
+            Some(1)
+        );
+        drop(lease_b);
+        assert_eq!(cache.lock().unwrap().source_pinned_count(), 0);
+    }
+
+    fn test_source_texture_key(name: &[u8]) -> GpuSourceTextureKey {
+        GpuSourceTextureKey {
+            source_set_id: SourceSetId::from_bytes([1; 16]),
+            source_id: ContentDigest::sha256(name),
+            digest: ContentDigest::sha256(b"pinned-digest"),
+            origin_x: 0,
+            origin_y: 0,
+            width: 1,
+            height: 1,
+            decoded_format: "rgba8".into(),
+            decoder_version: "test".into(),
+            color_version: "test".into(),
+            channel_role: MaterialChannelRole::BaseColor,
+            page_interior_width: 1,
+            page_interior_height: 1,
+            page_halo: 0,
+            page_mode: 0,
+            page_table_hash: 0,
+        }
+    }
+
+    fn test_cached_source_texture(
+        device: &wgpu::Device,
+        byte_len: u64,
+        label: &'static str,
+    ) -> Arc<GpuCachedSourceTexture> {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("pinned-source-view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        Arc::new(GpuCachedSourceTexture {
+            _texture: texture,
+            view,
+            byte_len,
+            layer_count: 1,
+            last_used: 0,
+        })
     }
 }
