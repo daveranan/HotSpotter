@@ -760,7 +760,11 @@ fn mapping_modes(
             SamplingMode::TextureSynthesis,
         ],
         TemplateSlotRole::UniqueDetail => {
-            vec![SamplingMode::UniqueContain, SamplingMode::UniqueCover]
+            vec![
+                SamplingMode::UniqueContain,
+                SamplingMode::UniqueCover,
+                SamplingMode::TextureSynthesis,
+            ]
         }
         TemplateSlotRole::TrimCap => vec![SamplingMode::ThreeSliceCap, SamplingMode::DirectCrop],
         TemplateSlotRole::Radial => vec![SamplingMode::PlanarRadial, SamplingMode::PolarRadial],

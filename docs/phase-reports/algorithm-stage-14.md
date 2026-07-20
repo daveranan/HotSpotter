@@ -59,6 +59,34 @@ executes a varying seam phase and rejects wrong-axis/short/over-threshold seams,
 authorized nine-slice center stretch, observes mid-raster cancellation, enforces resource limits, rejects malformed
 crop/period/slice/seam geometry, and rejects implicit Stretch.
 
+## GPU lowering readiness correction
+
+The production GPU executor consumes an explicit `SamplingBasis`: ordinary candidates reference their selected
+crop, while a crop-less TextureSynthesis candidate references a bounded window in the immutable Stage 8 prepared
+domain. Before dispatch it validates synthesis candidate family/route, prepared-domain identity and route,
+dimensions, window bounds, physical coverage, and the registered validity plane. Correspondence remains QA/debug
+provenance; production rendering samples the already materialized registered channels.
+
+Compact commands retain distinct opcodes for TextureSynthesis, NineSlicePanel, UniqueContain, and UniqueCover.
+Three- and nine-slice commands also carry exact cap/corner sizes and center policy. These commands use the existing
+source footprint scheduler and sparse page arrays. A page-aligned GPU validity texture accompanies each registered
+channel page, participates in the prepared-channel/cache digest, and suppresses invalid samples without a CPU
+readback or a production CPU raster pass. Texture algorithms themselves are not implemented in WGSL.
+
+Gate 1 retains NineSlicePanel for planar slots and both planar and polar radial routes for radial slots; unique-detail
+demands include TextureSynthesis. Synthesis candidates are retained only when their family agrees with the prepared
+Stage 8 route. Slice commands are rejected before packing when their mode and geometry disagree, caps overlap or
+remove the physical destination center, or ExplicitStretch lacks authored override provenance. Focused GPU tests
+compare contain, cover, and nine-slice pixels exactly with the bounded CPU oracle and exercise the rejection cases.
+
+Stage 13 now carries the authored prepared-domain window independently from candidate crops, and TextureSynthesis
+plans preserve its exact nonzero origin and extent. Synthesized slice centers require a synthesis-capable prepared
+domain and enough materialized center coverage on every sliced axis before GPU dispatch. Parity fixtures use a
+non-square source/destination relationship to distinguish contain from cover, apply the CPU validity plane to
+publication pixels, and cover synthesized plus explicitly authorized stretch centers.
+Synthesized centers also bind the candidate domain ID, prepared-source digest, prepared dimensions, and
+correspondence reference to the exact prepared-domain cache identity, rejecting stale domains before dispatch.
+
 ## Deferred work
 
 Stage 15 consumes these allocation/hotspot-local material channels when evaluating structural profiles. Sheet-wide

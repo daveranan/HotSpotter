@@ -582,13 +582,17 @@ fn compile_persisted(
             &|| !active(),
         )
         .map_err(|error| format!("Stage 11 failed for {}: {error:?}", slot.slot_key))?;
-        let generated = apply_authored_mapping(
+        let mut generated = apply_authored_mapping(
             generated,
             &binding.mapping,
             artifacts.patch_id.is_some(),
             artifacts.domain.width,
             artifacts.domain.height,
         )?;
+        generated.candidates.retain(|candidate| {
+            candidate.mapping_mode != SamplingMode::TextureSynthesis
+                || synthesis_family_matches_domain_route(candidate.family, artifacts.domain.route)
+        });
         let measurements = generated
             .candidates
             .iter()
@@ -646,6 +650,7 @@ fn compile_persisted(
             required: true,
             prepared_domain_id: artifacts.domain.cache_key.clone(),
             prepared_domain_dimensions: [artifacts.domain.width, artifacts.domain.height],
+            prepared_domain_sampling_window: window,
             registered_correspondence_reference: artifacts.domain.cache_key.clone(),
             slot_physical_size: [demand.world_width_m, demand.world_height_m],
             base_source_pixels_per_physical_unit: base_scale,
@@ -1330,6 +1335,7 @@ fn compile_source_frame(
             variation_group: region.material_group.clone(),
             prepared_domain_dimensions: [domain.width, domain.height],
             candidate,
+            sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
             slot_physical_size,
             source_pixels_per_physical_unit,
             sampling_policy: SamplingPolicy {
@@ -1654,6 +1660,7 @@ fn compile_source_frame(
             variation_group: region.material_group.clone(),
             prepared_domain_dimensions: [domain.width, domain.height],
             candidate,
+            sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
             slot_physical_size,
             source_pixels_per_physical_unit,
             sampling_policy: SamplingPolicy {
@@ -2034,14 +2041,24 @@ fn fixed_template_compiled_atlas_plan(
             .region_bindings
             .get(&region.id)
             .ok_or_else(|| format!("region {} has no persisted content binding", region.id))?;
-        let crop = plan.candidate.crop.unwrap_or(SourceCrop {
-            x: 0,
-            y: 0,
-            width: artifacts.domain.width,
-            height: artifacts.domain.height,
-        });
+        let crop = match plan.sampling_basis {
+            hot_trimmer_placement_solver::SamplingBasis::PreparedDomain { window } => window,
+            hot_trimmer_placement_solver::SamplingBasis::SelectedCrop => {
+                plan.candidate.crop.unwrap_or(SourceCrop {
+                    x: 0,
+                    y: 0,
+                    width: artifacts.domain.width,
+                    height: artifacts.domain.height,
+                })
+            }
+        };
         let mut sampling_plan = (*plan).clone();
-        if sampling_plan.candidate.crop.is_none() {
+        if sampling_plan.candidate.crop.is_none()
+            && matches!(
+                sampling_plan.sampling_basis,
+                hot_trimmer_placement_solver::SamplingBasis::SelectedCrop
+            )
+        {
             sampling_plan.candidate.crop = Some(crop);
         }
         let padding_px = slot
@@ -2564,16 +2581,25 @@ fn prepared_channel_digest(
     domain: &hot_trimmer_material_synthesis::PreparedMaterialDomain,
     role: MaterialChannelRole,
 ) -> ContentDigest {
-    let Some(channel) = domain
+    let channel = domain
         .registered_channels()
         .iter()
-        .find(|channel| channel.role() == role)
-    else {
-        return domain.prepared_source_digest.clone();
-    };
+        .find(|channel| channel.role() == role);
     let mut hash = Sha256::new();
-    hash.update(b"stage-14-prepared-channel-v1");
+    hash.update(b"stage-14-prepared-channel-v2-validity");
     hash.update([role as u8]);
+    hash.update(domain.cache_key.0.as_bytes());
+    hash.update(format!("{:?}", domain.route).as_bytes());
+    hash.update(domain.width.to_le_bytes());
+    hash.update(domain.height.to_le_bytes());
+    for tile in domain.validity.tiles() {
+        for value in &tile.pixels {
+            hash.update(value.0.to_le_bytes());
+        }
+    }
+    let Some(channel) = channel else {
+        return ContentDigest(format!("{:x}", hash.finalize()));
+    };
     let (width, height) = channel.dimensions();
     hash.update(width.to_le_bytes());
     hash.update(height.to_le_bytes());
@@ -3471,18 +3497,25 @@ fn legal_gate1_mode(
         TemplateSlotRole::Planar => {
             matches!(mode, SamplingMode::DirectCrop)
                 || (mode == SamplingMode::PeriodicTile && has_declared_period)
+                || mode == SamplingMode::TextureSynthesis
+                || mode == SamplingMode::NineSlicePanel
         }
         TemplateSlotRole::RepeatingStrip => {
             matches!(mode, SamplingMode::DirectCrop)
                 || (matches!(mode, SamplingMode::RepeatX | SamplingMode::RepeatY)
                     && has_declared_period)
+                || mode == SamplingMode::TextureSynthesis
         }
         TemplateSlotRole::UniqueDetail => matches!(
             mode,
-            SamplingMode::UniqueContain | SamplingMode::UniqueCover
+            SamplingMode::UniqueContain
+                | SamplingMode::UniqueCover
+                | SamplingMode::TextureSynthesis
         ),
         TemplateSlotRole::TrimCap => mode == SamplingMode::ThreeSliceCap,
-        TemplateSlotRole::Radial => matches!(mode, SamplingMode::PolarRadial),
+        TemplateSlotRole::Radial => {
+            matches!(mode, SamplingMode::PlanarRadial | SamplingMode::PolarRadial)
+        }
     }
 }
 
@@ -3838,10 +3871,46 @@ fn slice_geometry(
             trailing_cap_pixels: 1,
             center: SliceCenterPolicy::Repeat,
         },
+        hot_trimmer_domain::TemplateSlotRole::Planar if width >= 3 && height >= 3 => {
+            SliceGeometry::Nine {
+                left_pixels: 1,
+                right_pixels: 1,
+                top_pixels: 1,
+                bottom_pixels: 1,
+                center: SliceCenterPolicy::Repeat,
+            }
+        }
         _ => {
             let _ = height;
             SliceGeometry::None
         }
+    }
+}
+
+fn synthesis_family_matches_domain_route(
+    family: CandidateFamily,
+    route: DomainRoute,
+) -> bool {
+    match family {
+        CandidateFamily::PanelQuiltedExpansion
+        | CandidateFamily::RepeatXQuilted
+        | CandidateFamily::RepeatYQuilted => route == DomainRoute::TextureQuilting,
+        CandidateFamily::PanelPatchMatchExpansion => route == DomainRoute::PatchMatch,
+        CandidateFamily::PanelProceduralResynthesis => matches!(
+            route,
+            DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ),
+        CandidateFamily::UniqueSynthesisExtension => matches!(
+            route,
+            DomainRoute::TextureQuilting
+                | DomainRoute::PatchMatch
+                | DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ),
+        _ => false,
     }
 }
 
@@ -3859,4 +3928,39 @@ fn algorithm_versions<const N: usize>(
         .into_iter()
         .filter_map(|(stage, algorithm)| algorithm.map(|algorithm| (stage, algorithm)))
         .collect()
+}
+
+#[cfg(test)]
+mod gpu_stage_14_base_color_reachability_tests {
+    use super::{legal_gate1_mode, synthesis_family_matches_domain_route};
+    use hot_trimmer_domain::{SamplingMode, TemplateSlotRole};
+    use hot_trimmer_material_synthesis::DomainRoute;
+    use hot_trimmer_placement_solver::CandidateFamily;
+
+    #[test]
+    fn gpu_stage_14_base_color_required_modes_are_reachable_and_route_exact() {
+        assert!(legal_gate1_mode(
+            SamplingMode::NineSlicePanel,
+            TemplateSlotRole::Planar,
+            false,
+        ));
+        assert!(legal_gate1_mode(
+            SamplingMode::PlanarRadial,
+            TemplateSlotRole::Radial,
+            false,
+        ));
+        assert!(legal_gate1_mode(
+            SamplingMode::TextureSynthesis,
+            TemplateSlotRole::UniqueDetail,
+            false,
+        ));
+        assert!(synthesis_family_matches_domain_route(
+            CandidateFamily::PanelPatchMatchExpansion,
+            DomainRoute::PatchMatch,
+        ));
+        assert!(!synthesis_family_matches_domain_route(
+            CandidateFamily::PanelPatchMatchExpansion,
+            DomainRoute::TextureQuilting,
+        ));
+    }
 }

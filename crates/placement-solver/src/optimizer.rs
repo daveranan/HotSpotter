@@ -49,6 +49,9 @@ pub struct PlacementSlotInput {
     pub required: bool,
     pub prepared_domain_id: ContentDigest,
     pub prepared_domain_dimensions: [u32; 2],
+    /// Bounded prepared-domain window selected by the authored mapping. TextureSynthesis
+    /// samples this window directly instead of fabricating a full-domain crop.
+    pub prepared_domain_sampling_window: SourceCrop,
     pub registered_correspondence_reference: ContentDigest,
     /// Authoritative Stage 10 physical extent in meters (or the declared relative physical unit).
     pub slot_physical_size: [f64; 2],
@@ -95,6 +98,21 @@ pub enum SliceGeometry {
 pub enum StretchOverrideProvenance {
     NotAuthorized,
     UserOverride { settings_revision: u64 },
+}
+
+/// Authoritative source-coordinate basis for Stage 14. A prepared domain is not an
+/// authored crop even when its executable window spans the complete domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SamplingBasis {
+    SelectedCrop,
+    PreparedDomain { window: SourceCrop },
+}
+
+impl Default for SamplingBasis {
+    fn default() -> Self {
+        Self::SelectedCrop
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -180,6 +198,8 @@ pub struct SamplingPlan {
     pub variation_group: String,
     pub prepared_domain_dimensions: [u32; 2],
     pub candidate: CropCandidate,
+    #[serde(default)]
+    pub sampling_basis: SamplingBasis,
     pub slot_physical_size: [f64; 2],
     /// Complete physical-to-domain coefficient. This is not the Stage 11 scale-ladder value.
     pub source_pixels_per_physical_unit: f64,
@@ -464,6 +484,18 @@ fn validate_inputs(
                 || !candidate.eligibility.isotropic_scale
                 || candidate.domain_id != slot.prepared_domain_id
                 || candidate.correspondence_reference != slot.registered_correspondence_reference
+                || slot.prepared_domain_sampling_window.width == 0
+                || slot.prepared_domain_sampling_window.height == 0
+                || slot
+                    .prepared_domain_sampling_window
+                    .x
+                    .saturating_add(slot.prepared_domain_sampling_window.width)
+                    > slot.prepared_domain_dimensions[0]
+                || slot
+                    .prepared_domain_sampling_window
+                    .y
+                    .saturating_add(slot.prepared_domain_sampling_window.height)
+                    > slot.prepared_domain_dimensions[1]
                 || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::ExplicitStretch
                     && !matches!(
                         slot.stretch_override,
@@ -1034,6 +1066,15 @@ fn build_plan(
                 variation_group: context.slots[slot].variation_group.clone(),
                 prepared_domain_dimensions: context.slots[slot].prepared_domain_dimensions,
                 candidate: scored.candidate.clone(),
+                sampling_basis: if scored.candidate.mapping_mode
+                    == hot_trimmer_domain::SamplingMode::TextureSynthesis
+                {
+                    SamplingBasis::PreparedDomain {
+                        window: context.slots[slot].prepared_domain_sampling_window,
+                    }
+                } else {
+                    SamplingBasis::SelectedCrop
+                },
                 slot_physical_size: context.slots[slot].slot_physical_size,
                 source_pixels_per_physical_unit: context.slots[slot]
                     .base_source_pixels_per_physical_unit
@@ -1041,7 +1082,13 @@ fn build_plan(
                 sampling_policy: context.slots[slot].sampling_policy,
                 radial_mapping: context.slots[slot].radial_mapping,
                 stretch_override: context.slots[slot].stretch_override,
-                slice_geometry: context.slots[slot].slice_geometry,
+                slice_geometry: match scored.candidate.mapping_mode {
+                    hot_trimmer_domain::SamplingMode::ThreeSliceCap
+                    | hot_trimmer_domain::SamplingMode::NineSlicePanel => {
+                        context.slots[slot].slice_geometry
+                    }
+                    _ => SliceGeometry::None,
+                },
                 maximum_seam_cost_milli: context.slots[slot].maximum_seam_cost_milli,
                 unary_cost: scored.breakdown.total_cost,
             }
@@ -1323,6 +1370,12 @@ mod tests {
             required: true,
             prepared_domain_id: ContentDigest::sha256(b"registered-domain"),
             prepared_domain_dimensions: [500, 500],
+            prepared_domain_sampling_window: SourceCrop {
+                x: 0,
+                y: 0,
+                width: 500,
+                height: 500,
+            },
             registered_correspondence_reference: ContentDigest::sha256(b"registered-domain"),
             slot_physical_size: [2.0, 2.0],
             base_source_pixels_per_physical_unit: 50.0,
@@ -1645,5 +1698,44 @@ mod tests {
             ),
             Err(PlacementError::InsufficientAssignment { .. })
         ));
+    }
+
+    #[test]
+    fn texture_synthesis_preserves_authored_prepared_domain_window() {
+        let slot_id = RegionId::from_bytes([31; 16]);
+        let mut synthesis = candidate(slot_id, b"windowed-synthesis", 0, 0, 0.0);
+        synthesis.candidate.crop = None;
+        synthesis.candidate.mapping_mode = SamplingMode::TextureSynthesis;
+        synthesis.candidate.family = CandidateFamily::PanelQuiltedExpansion;
+        synthesis.candidate.route = CandidateRoute::Synthesis;
+        let mut input = slot(
+            31,
+            MaterialBehaviorClass::StochasticIsotropic,
+            vec![synthesis],
+        );
+        input.prepared_domain_sampling_window = SourceCrop {
+            x: 73,
+            y: 41,
+            width: 211,
+            height: 173,
+        };
+        let plan = optimize_placements(
+            &[input],
+            &PlacementOptimizerSettings::default(),
+            99,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.placements[0].sampling_basis,
+            SamplingBasis::PreparedDomain {
+                window: SourceCrop {
+                    x: 73,
+                    y: 41,
+                    width: 211,
+                    height: 173,
+                },
+            }
+        );
     }
 }

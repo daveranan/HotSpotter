@@ -1,5 +1,8 @@
 # GPU render migration queue
 
+Status: Completed through Prompt 005 on 2026-07-20. The render migration queue is closed; subsequent work resumes at
+Prompt 15 in [`../hot-trimmer-v1-full-algorithm-stack-prompt-pack.md`](../hot-trimmer-v1-full-algorithm-stack-prompt-pack.md).
+
 Run these prompts directly in normal Codex tasks, one at a time. Do not use an orchestrator prompt, Spark worker,
 subagent, or parallel implementation. Each prompt is self-contained and is the only task document the implementation
 task should read.
@@ -13,10 +16,10 @@ task should not read that review guide; it is for the human reviewer after the p
 | --- | --- | --- |
 | [`prompt-001.md`](prompt-001.md) | Completed | Real 8K baseline, `CompiledAtlasPlanV1`, CPU synthesis executor, GPU capability skeleton |
 | [`prompt-001.5.md`](prompt-001.5.md) | Completed | Executor-owned complete CPU Base Color composition |
-| [`prompt-002.md`](prompt-002.md) | Next | GPU compact region commands, sampling, and direct Base Color atlas writes |
-| [`prompt-003.md`](prompt-003.md) | Blocked by 002 | GPU tiles, padding, compact Region ID, exact preview, binary IPC |
-| [`prompt-004.md`](prompt-004.md) | Blocked by 003 | Requested GPU material-map pass graph |
-| [`prompt-005.md`](prompt-005.md) | Blocked by 004 | 16K/24K source/output tiling, streaming export, hardening |
+| [`prompt-002.md`](prompt-002.md) | Completed | GPU compact region commands, sampling, and direct Base Color atlas writes |
+| [`prompt-003.md`](prompt-003.md) | Completed | GPU tiles, padding, compact Region ID, exact preview, binary IPC |
+| [`prompt-004.md`](prompt-004.md) | Completed | Requested GPU material-map pass graph |
+| [`prompt-005.md`](prompt-005.md) | Completed | 16K/24K source/output tiling, streaming export, hardening |
 
 ## Execution rules
 

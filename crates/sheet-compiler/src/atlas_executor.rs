@@ -20,8 +20,11 @@ use hot_trimmer_export::{
     choose_bounded_tile_edge,
 };
 use hot_trimmer_image_io::{ImagePlane, LinearColor, MaskValue};
-use hot_trimmer_material_synthesis::PreparedMaterialDomain;
-use hot_trimmer_placement_solver::{MirrorTransform, SamplingPlan, SliceGeometry};
+use hot_trimmer_material_synthesis::{DomainRoute, PreparedMaterialDomain};
+use hot_trimmer_placement_solver::{
+    CandidateFamily, CandidateRoute, MirrorTransform, SamplingBasis, SamplingPlan,
+    SliceCenterPolicy, SliceGeometry, StretchOverrideProvenance,
+};
 use hot_trimmer_render_core::PreparedExemplarChannel;
 use wgpu::util::DeviceExt;
 
@@ -674,6 +677,8 @@ fn single_layer_source_page_layout(source_rect: PixelRect) -> GpuSourcePageLayou
 struct GpuCachedSourceTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
+    _validity_texture: wgpu::Texture,
+    validity_view: wgpu::TextureView,
     byte_len: u64,
     layer_count: u32,
     last_used: u64,
@@ -1254,6 +1259,11 @@ struct GpuRegionCommand {
     transform_mirror_x: u32,
     transform_mirror_y: u32,
     structural_profile: u32,
+    slice_left: u32,
+    slice_right: u32,
+    slice_top: u32,
+    slice_bottom: u32,
+    slice_center: u32,
     slot_width: f32,
     slot_height: f32,
     pixels_per_unit: f32,
@@ -1274,8 +1284,8 @@ struct GpuRegionCommand {
 }
 
 const GPU_HEADER_BYTES: usize = 88;
-const GPU_COMMAND_BYTES: usize = 156;
-const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v13-sparse-source-pages";
+const GPU_COMMAND_BYTES: usize = 176;
+const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v14-complete-lowering";
 
 fn requested_material_maps(
     plan: &CompiledAtlasPlanV1,
@@ -2223,16 +2233,47 @@ fn source_position_for_command(cmd: &GpuRegionCommand, pixel: [u32; 2]) -> Plann
         }
         7 => {
             p = [
-                slice_axis_repeat_cpu(
+                slice_axis_cpu(
                     m[0],
                     source_size[0],
                     crop_origin[0],
                     crop_size[0],
-                    cmd.period_x,
-                    cmd.period_y,
+                    cmd.slice_left,
+                    cmd.slice_right,
                     scale,
+                    cmd.slice_center,
                 ),
                 crop_origin[1] + (m[1] - source_size[1] * 0.5) * scale + crop_size[1] * 0.5,
+            ];
+        }
+        8 | 9 => {
+            let base_pixels_per_unit = if cmd.mode == 8 {
+                (crop_size[0] / source_size[0]).max(crop_size[1] / source_size[1])
+            } else {
+                (crop_size[0] / source_size[0]).min(crop_size[1] / source_size[1])
+            };
+            let fit_scale = base_pixels_per_unit * cmd.sampling_scale;
+            let extent = [crop_size[0] / fit_scale, crop_size[1] / fit_scale];
+            let origin = [
+                (source_size[0] - extent[0]) * 0.5,
+                (source_size[1] - extent[1]) * 0.5,
+            ];
+            p = [
+                crop_origin[0] + (m[0] - origin[0]) * fit_scale,
+                crop_origin[1] + (m[1] - origin[1]) * fit_scale,
+            ];
+        }
+        10 => {}
+        11 => {
+            p = [
+                slice_axis_cpu(
+                    m[0], source_size[0], crop_origin[0], crop_size[0], cmd.slice_left,
+                    cmd.slice_right, scale, cmd.slice_center,
+                ),
+                slice_axis_cpu(
+                    m[1], source_size[1], crop_origin[1], crop_size[1], cmd.slice_top,
+                    cmd.slice_bottom, scale, cmd.slice_center,
+                ),
             ];
         }
         _ => {}
@@ -2240,7 +2281,7 @@ fn source_position_for_command(cmd: &GpuRegionCommand, pixel: [u32; 2]) -> Plann
     PlannedSourcePosition { primary: p, seam }
 }
 
-fn slice_axis_repeat_cpu(
+fn slice_axis_cpu(
     value: f32,
     destination: f32,
     origin: f32,
@@ -2248,6 +2289,7 @@ fn slice_axis_repeat_cpu(
     leading: u32,
     trailing: u32,
     scale: f32,
+    center: u32,
 ) -> f32 {
     let leading_px = leading as f32;
     let trailing_px = trailing as f32;
@@ -2261,7 +2303,22 @@ fn slice_axis_repeat_cpu(
     }
     let center_pixels = (extent - leading_px - trailing_px).max(1.0);
     let offset = (value - leading_world) * scale;
-    origin + leading_px + positive_mod(offset, center_pixels)
+    if center == 0 {
+        origin + leading_px + positive_mod(offset, center_pixels)
+    } else if center == 1 {
+        origin + leading_px + offset
+    } else {
+        let destination_center = (destination - leading_world - trailing_world).max(0.000_001);
+        origin + leading_px + (value - leading_world) / destination_center * center_pixels
+    }
+}
+
+fn slice_center_code(center: SliceCenterPolicy) -> u32 {
+    match center {
+        SliceCenterPolicy::Repeat => 0,
+        SliceCenterPolicy::Synthesize => 1,
+        SliceCenterPolicy::ExplicitStretch => 2,
+    }
 }
 
 fn source_bounds_rects(
@@ -2445,6 +2502,225 @@ fn validate_gpu_material_map(map: MaterialMapKind) -> Result<(), AtlasRenderExec
     }
 }
 
+fn validate_gpu_prepared_domain_sampling(
+    plan: &CompiledAtlasPlanV1,
+    input: &AtlasRenderExecutionInput<'_>,
+) -> Result<(), AtlasRenderExecutionError> {
+    for command in &plan.ordered_regions {
+        if command.sampling_plan.candidate.mapping_mode
+            != hot_trimmer_domain::SamplingMode::TextureSynthesis
+        {
+            continue;
+        }
+        let SamplingBasis::PreparedDomain { window } = command.sampling_plan.sampling_basis else {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} synthesis is missing a prepared-domain sampling basis",
+                command.region_id
+            )));
+        };
+        let candidate = &command.sampling_plan.candidate;
+        if candidate.crop.is_some()
+            || candidate.route != CandidateRoute::Synthesis
+        {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} has incompatible prepared synthesis provenance",
+                command.region_id
+            )));
+        }
+        let source = input
+            .prepared_sources
+            .iter()
+            .find(|source| {
+                source.source_set_id == command.source_set_id
+                    && source.source_id == command.source_id
+            })
+            .ok_or_else(|| {
+                AtlasRenderExecutionError::InvalidInput(format!(
+                    "region {} has no prepared GPU source",
+                    command.region_id
+                ))
+            })?;
+        let domain = source.domain.as_ref();
+        if domain.cache_key != candidate.domain_id
+            || [domain.width, domain.height] != command.sampling_plan.prepared_domain_dimensions
+            || domain.validity.width() != domain.width
+            || domain.validity.height() != domain.height
+            || !synthesis_family_matches_domain_route(candidate.family, domain.route)
+        {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} prepared synthesis domain identity, route, dimensions, or validity is incompatible",
+                command.region_id
+            )));
+        }
+        if window.width == 0
+            || window.height == 0
+            || window.x.saturating_add(window.width) > domain.width
+            || window.y.saturating_add(window.height) > domain.height
+        {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} prepared synthesis window exceeds its domain",
+                command.region_id
+            )));
+        }
+        let rotated = matches!(
+            candidate.transform.rotation,
+            hot_trimmer_domain::QuarterTurn::Ninety
+                | hot_trimmer_domain::QuarterTurn::TwoSeventy
+        );
+        let slot = command.sampling_plan.slot_physical_size;
+        let required = if rotated { [slot[1], slot[0]] } else { slot };
+        let pixels_per_unit = command.sampling_plan.source_pixels_per_physical_unit
+            * command.sampling_plan.sampling_policy.scale;
+        if required[0] * pixels_per_unit > f64::from(window.width) + 1.0e-9
+            || required[1] * pixels_per_unit > f64::from(window.height) + 1.0e-9
+        {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} prepared synthesis window lacks required physical coverage",
+                command.region_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_gpu_synthesized_slice_centers(
+    plan: &CompiledAtlasPlanV1,
+    input: &AtlasRenderExecutionInput<'_>,
+) -> Result<(), AtlasRenderExecutionError> {
+    for command in &plan.ordered_regions {
+        let synthesized_center = matches!(
+            command.sampling_plan.slice_geometry,
+            SliceGeometry::Three {
+                center: SliceCenterPolicy::Synthesize,
+                ..
+            } | SliceGeometry::Nine {
+                center: SliceCenterPolicy::Synthesize,
+                ..
+            }
+        );
+        if !synthesized_center {
+            continue;
+        }
+        let source = input
+            .prepared_sources
+            .iter()
+            .find(|source| {
+                source.source_set_id == command.source_set_id
+                    && source.source_id == command.source_id
+            })
+            .ok_or_else(|| {
+                AtlasRenderExecutionError::InvalidInput(format!(
+                    "region {} synthesized slice center has no prepared GPU source",
+                    command.region_id
+                ))
+            })?;
+        let candidate = &command.sampling_plan.candidate;
+        if candidate.domain_id != source.domain.cache_key
+            || candidate.source_id != source.domain.prepared_source_digest
+            || command.sampling_plan.prepared_domain_dimensions
+                != [source.domain.width, source.domain.height]
+            || candidate.correspondence_reference != source.domain.cache_key
+        {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} synthesized slice center prepared-domain identity is incompatible",
+                command.region_id
+            )));
+        }
+        if !matches!(
+            source.domain.route,
+            DomainRoute::TextureQuilting
+                | DomainRoute::PatchMatch
+                | DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ) {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} synthesized slice center requires a synthesis-capable prepared domain",
+                command.region_id
+            )));
+        }
+        let plan = &command.sampling_plan;
+        let crop = command.source_crop.0;
+        let rotated = matches!(
+            plan.candidate.transform.rotation,
+            hot_trimmer_domain::QuarterTurn::Ninety
+                | hot_trimmer_domain::QuarterTurn::TwoSeventy
+        );
+        let size = if rotated {
+            [plan.slot_physical_size[1], plan.slot_physical_size[0]]
+        } else {
+            plan.slot_physical_size
+        };
+        let scale = plan.source_pixels_per_physical_unit * plan.sampling_policy.scale;
+        let enough = match plan.slice_geometry {
+            SliceGeometry::Three {
+                leading_cap_pixels,
+                trailing_cap_pixels,
+                ..
+            } => {
+                let cap_pixels = leading_cap_pixels.saturating_add(trailing_cap_pixels);
+                let requested = size[0] - f64::from(cap_pixels) / scale;
+                requested >= 0.0
+                    && requested * scale
+                        <= f64::from(crop.width.saturating_sub(cap_pixels)) + 1.0e-9
+            }
+            SliceGeometry::Nine {
+                left_pixels,
+                right_pixels,
+                top_pixels,
+                bottom_pixels,
+                ..
+            } => {
+                let horizontal = left_pixels.saturating_add(right_pixels);
+                let vertical = top_pixels.saturating_add(bottom_pixels);
+                let requested_x = size[0] - f64::from(horizontal) / scale;
+                let requested_y = size[1] - f64::from(vertical) / scale;
+                requested_x >= 0.0
+                    && requested_y >= 0.0
+                    && requested_x * scale
+                        <= f64::from(crop.width.saturating_sub(horizontal)) + 1.0e-9
+                    && requested_y * scale
+                        <= f64::from(crop.height.saturating_sub(vertical)) + 1.0e-9
+            }
+            SliceGeometry::None => false,
+        };
+        if !enough {
+            return Err(AtlasRenderExecutionError::InvalidInput(format!(
+                "region {} synthesized slice center exceeds prepared center coverage",
+                command.region_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn synthesis_family_matches_domain_route(
+    family: CandidateFamily,
+    route: DomainRoute,
+) -> bool {
+    match family {
+        CandidateFamily::PanelQuiltedExpansion
+        | CandidateFamily::RepeatXQuilted
+        | CandidateFamily::RepeatYQuilted => route == DomainRoute::TextureQuilting,
+        CandidateFamily::PanelPatchMatchExpansion => route == DomainRoute::PatchMatch,
+        CandidateFamily::PanelProceduralResynthesis => matches!(
+            route,
+            DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ),
+        CandidateFamily::UniqueSynthesisExtension => matches!(
+            route,
+            DomainRoute::TextureQuilting
+                | DomainRoute::PatchMatch
+                | DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ),
+        _ => false,
+    }
+}
+
 fn logical_passes_for_map(map: MaterialMapKind) -> &'static str {
     match map {
         MaterialMapKind::BaseColor => "registered-source,publish",
@@ -2477,6 +2753,8 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
     ) -> Result<AtlasRenderExecutorOutput, AtlasRenderExecutionError> {
         plan.validate()
             .map_err(|error| AtlasRenderExecutionError::InvalidInput(error.to_string()))?;
+        validate_gpu_prepared_domain_sampling(plan, input)?;
+        validate_gpu_synthesized_slice_centers(plan, input)?;
         if cancellation.is_cancelled() {
             return Err(AtlasRenderExecutionError::Cancelled);
         }
@@ -3134,6 +3412,7 @@ fn pipeline(
             texture_array_layout_entry(2),
             storage_texture_layout_entry(3, wgpu::TextureFormat::Rgba8Unorm),
             source_page_table_layout_entry(4),
+            texture_array_layout_entry(5),
         ],
         GpuAtlasPipelineKind::NormalFromHeight => vec![
             header_layout_entry(0),
@@ -3148,6 +3427,7 @@ fn pipeline(
             texture_array_layout_entry(2),
             storage_texture_layout_entry(3, wgpu::TextureFormat::R32Float),
             source_page_table_layout_entry(4),
+            texture_array_layout_entry(5),
         ],
         GpuAtlasPipelineKind::FillR32Float => vec![storage_texture_layout_entry(
             0,
@@ -5098,6 +5378,10 @@ fn encode_material_source_dispatch(
                 binding: 4,
                 resource: source_page_table_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&cached.validity_view),
+            },
         ],
     });
     let timestamp_writes = timing.and_then(|recorder| {
@@ -5833,7 +6117,13 @@ fn source_texture<'cache>(
     }
     drop(cache_guard);
     let payload = source_texture_payload(domain, source.channel_role)?;
-    let byte_len = payload.bytes.len() as u64;
+    let validity_byte_len = u64::from(source.oriented_dimensions.width)
+        .checked_mul(u64::from(source.oriented_dimensions.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("validity texture bytes overflow".into()))?;
+    let byte_len = (payload.bytes.len() as u64)
+        .checked_add(validity_byte_len)
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source texture bytes overflow".into()))?;
     let reservation = reserve_source_texture_cache_space(
         cache,
         key.clone(),
@@ -5880,9 +6170,19 @@ fn source_texture<'cache>(
         array_layer_count: Some(1),
         ..Default::default()
     });
+    let validity_layout = single_layer_source_page_layout(PixelRect {
+        x: 0,
+        y: 0,
+        width: source.oriented_dimensions.width,
+        height: source.oriented_dimensions.height,
+    });
+    let (validity_texture, validity_view) =
+        create_validity_texture_array(device, queue, domain, &validity_layout)?;
     let cached = Arc::new(GpuCachedSourceTexture {
         _texture: texture,
         view,
+        _validity_texture: validity_texture,
+        validity_view,
         byte_len,
         layer_count: 1,
         last_used: clock,
@@ -5995,7 +6295,13 @@ fn source_texture_tile<'cache>(
     }
     drop(cache_guard);
     let payload = source_texture_payload_rect(domain, source.channel_role, rect)?;
-    let byte_len = payload.bytes.len() as u64;
+    let validity_byte_len = u64::from(rect.width)
+        .checked_mul(u64::from(rect.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("validity texture bytes overflow".into()))?;
+    let byte_len = (payload.bytes.len() as u64)
+        .checked_add(validity_byte_len)
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source tile bytes overflow".into()))?;
     let reservation =
         reserve_source_texture_cache_space(cache, key.clone(), byte_len, rect.width, rect.height)?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -6037,9 +6343,14 @@ fn source_texture_tile<'cache>(
         array_layer_count: Some(1),
         ..Default::default()
     });
+    let validity_layout = single_layer_source_page_layout(rect);
+    let (validity_texture, validity_view) =
+        create_validity_texture_array(device, queue, domain, &validity_layout)?;
     let cached = Arc::new(GpuCachedSourceTexture {
         _texture: texture,
         view,
+        _validity_texture: validity_texture,
+        validity_view,
         byte_len,
         layer_count: 1,
         last_used: clock,
@@ -6186,8 +6497,16 @@ fn source_texture_page_array<'cache>(
         },
     )?;
     let layer_bytes = first_payload.bytes.len() as u64;
-    let byte_len = layer_bytes
+    let source_byte_len = layer_bytes
         .checked_mul(u64::from(layer_count))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page array bytes overflow".into()))?;
+    let validity_byte_len = u64::from(page_width)
+        .checked_mul(u64::from(page_height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(layer_count)))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| AtlasRenderExecutionError::Gpu("validity page array bytes overflow".into()))?;
+    let byte_len = source_byte_len
+        .checked_add(validity_byte_len)
         .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page array bytes overflow".into()))?;
     let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
     if byte_len > budget {
@@ -6277,9 +6596,13 @@ fn source_texture_page_array<'cache>(
         array_layer_count: Some(layer_count),
         ..Default::default()
     });
+    let (validity_texture, validity_view) =
+        create_validity_texture_array(device, queue, domain, &layout)?;
     let cached = Arc::new(GpuCachedSourceTexture {
         _texture: texture,
         view,
+        _validity_texture: validity_texture,
+        validity_view,
         byte_len,
         layer_count,
         last_used: clock,
@@ -6292,6 +6615,94 @@ struct GpuSourceTexturePayload {
     bytes: Vec<u8>,
     format: wgpu::TextureFormat,
     bytes_per_pixel: u32,
+}
+
+fn create_validity_texture_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    domain: &PreparedMaterialDomain,
+    layout: &GpuSourcePageLayout,
+) -> Result<(wgpu::Texture, wgpu::TextureView), AtlasRenderExecutionError> {
+    let layer_count = u32::try_from(layout.source_page_table.len())
+        .map_err(|_| AtlasRenderExecutionError::Gpu("validity layer count overflow".into()))?;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hot-trimmer-source-validity-array"),
+        size: wgpu::Extent3d {
+            width: layout.source_page_width,
+            height: layout.source_page_height,
+            depth_or_array_layers: layer_count,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer_index, page) in layout.source_page_table.iter().enumerate() {
+        let interior_x = layout.source_rect.x.saturating_add(
+            page.x.saturating_mul(layout.source_page_interior_width),
+        );
+        let interior_y = layout.source_rect.y.saturating_add(
+            page.y.saturating_mul(layout.source_page_interior_height),
+        );
+        let page_x = interior_x
+            .saturating_sub(layout.source_page_halo)
+            .max(layout.source_rect.x);
+        let page_y = interior_y
+            .saturating_sub(layout.source_page_halo)
+            .max(layout.source_rect.y);
+        let mut bytes = Vec::with_capacity(
+            layout.source_page_width as usize * layout.source_page_height as usize * 4,
+        );
+        let max_x = layout
+            .source_rect
+            .x
+            .saturating_add(layout.source_rect.width)
+            .saturating_sub(1);
+        let max_y = layout
+            .source_rect
+            .y
+            .saturating_add(layout.source_rect.height)
+            .saturating_sub(1);
+        for y in 0..layout.source_page_height {
+            for x in 0..layout.source_page_width {
+                let source_x = page_x.saturating_add(x).min(max_x);
+                let source_y = page_y.saturating_add(y).min(max_y);
+                bytes.extend_from_slice(&domain.validity.pixel(source_x, source_y).0.to_le_bytes());
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer_index as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(layout.source_page_width * 4),
+                rows_per_image: Some(layout.source_page_height),
+            },
+            wgpu::Extent3d {
+                width: layout.source_page_width,
+                height: layout.source_page_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-source-validity-array-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(layer_count),
+        ..Default::default()
+    });
+    Ok((texture, view))
 }
 
 fn source_texture_payload(
@@ -6580,6 +6991,7 @@ fn payload_counts(bytes: &[u8], format: crate::CompiledTilePixelFormat) -> (usiz
 fn pack_command(
     command: &CompiledRegionCommandV1,
 ) -> Result<GpuRegionCommand, AtlasRenderExecutionError> {
+    validate_gpu_slice_contract(command)?;
     let destination = command.destination_rect.0;
     let semantic = semantic_rect_for_padding(
         hot_trimmer_domain::CanonicalRect {
@@ -6592,9 +7004,7 @@ fn pack_command(
         command.edge_eligibility,
     );
     let mode = match command.sampling_plan.candidate.mapping_mode {
-        hot_trimmer_domain::SamplingMode::DirectCrop
-        | hot_trimmer_domain::SamplingMode::UniqueContain
-        | hot_trimmer_domain::SamplingMode::UniqueCover => 0,
+        hot_trimmer_domain::SamplingMode::DirectCrop => 0,
         hot_trimmer_domain::SamplingMode::PeriodicTile => 1,
         hot_trimmer_domain::SamplingMode::RepeatX => 2,
         hot_trimmer_domain::SamplingMode::RepeatY => 3,
@@ -6602,37 +7012,45 @@ fn pack_command(
         hot_trimmer_domain::SamplingMode::PolarRadial => 5,
         hot_trimmer_domain::SamplingMode::ExplicitStretch => 6,
         hot_trimmer_domain::SamplingMode::ThreeSliceCap => 7,
-        unsupported => {
-            return Err(AtlasRenderExecutionError::InvalidInput(format!(
-                "region {} has unsupported GPU sampling mode {unsupported:?}",
-                command.region_id
-            )));
-        }
+        hot_trimmer_domain::SamplingMode::UniqueContain => 8,
+        hot_trimmer_domain::SamplingMode::UniqueCover => 9,
+        hot_trimmer_domain::SamplingMode::TextureSynthesis => 10,
+        hot_trimmer_domain::SamplingMode::NineSlicePanel => 11,
     };
     let crop = command.source_crop.0;
-    let period = if command.sampling_plan.candidate.mapping_mode
-        == hot_trimmer_domain::SamplingMode::ThreeSliceCap
-    {
+    let period = command
+        .sampling_plan
+        .candidate
+        .period_pixels
+        .unwrap_or([crop.width.max(1), crop.height.max(1)]);
+    let (slice_left, slice_right, slice_top, slice_bottom, slice_center) =
         match command.sampling_plan.slice_geometry {
+            SliceGeometry::None => (0, 0, 0, 0, 0),
             SliceGeometry::Three {
                 leading_cap_pixels,
                 trailing_cap_pixels,
-                ..
-            } => [leading_cap_pixels.max(1), trailing_cap_pixels.max(1)],
-            _ => {
-                return Err(AtlasRenderExecutionError::InvalidInput(format!(
-                    "region {} has ThreeSliceCap without three-slice geometry",
-                    command.region_id
-                )));
-            }
-        }
-    } else {
-        command
-            .sampling_plan
-            .candidate
-            .period_pixels
-            .unwrap_or([crop.width.max(1), crop.height.max(1)])
-    };
+                center,
+            } => (
+                leading_cap_pixels,
+                trailing_cap_pixels,
+                0,
+                0,
+                slice_center_code(center),
+            ),
+            SliceGeometry::Nine {
+                left_pixels,
+                right_pixels,
+                top_pixels,
+                bottom_pixels,
+                center,
+            } => (
+                left_pixels,
+                right_pixels,
+                top_pixels,
+                bottom_pixels,
+                slice_center_code(center),
+            ),
+        };
     let radial = command
         .radial_parameters
         .unwrap_or(hot_trimmer_domain::RadialMappingSettings {
@@ -6678,6 +7096,11 @@ fn pack_command(
         transform_mirror_x: u32::from(command.source_to_region_transform.mirror_x),
         transform_mirror_y: u32::from(command.source_to_region_transform.mirror_y),
         structural_profile: structural_profile_code(command.structural_profile),
+        slice_left,
+        slice_right,
+        slice_top,
+        slice_bottom,
+        slice_center,
         slot_width: command.sampling_plan.slot_physical_size[0] as f32,
         slot_height: command.sampling_plan.slot_physical_size[1] as f32,
         pixels_per_unit: command.sampling_plan.source_pixels_per_physical_unit as f32,
@@ -6704,6 +7127,109 @@ fn pack_command(
             .to_radians())
         .cos() as f32,
     })
+}
+
+fn validate_gpu_slice_contract(
+    command: &CompiledRegionCommandV1,
+) -> Result<(), AtlasRenderExecutionError> {
+    let plan = &command.sampling_plan;
+    let mode = plan.candidate.mapping_mode;
+    let crop = command.source_crop.0;
+    let authorized_stretch = matches!(
+        plan.stretch_override,
+        StretchOverrideProvenance::UserOverride { .. }
+    );
+    if mode == hot_trimmer_domain::SamplingMode::ExplicitStretch && !authorized_stretch {
+        return Err(AtlasRenderExecutionError::InvalidInput(format!(
+            "region {} has unauthorized ExplicitStretch",
+            command.region_id
+        )));
+    }
+    let geometry_valid = match (mode, plan.slice_geometry) {
+        (
+            hot_trimmer_domain::SamplingMode::ThreeSliceCap,
+            SliceGeometry::Three {
+                leading_cap_pixels,
+                trailing_cap_pixels,
+                center,
+            },
+        ) => {
+            leading_cap_pixels > 0
+                && trailing_cap_pixels > 0
+                && leading_cap_pixels
+                    .checked_add(trailing_cap_pixels)
+                    .is_some_and(|sum| sum < crop.width)
+                && center != SliceCenterPolicy::ExplicitStretch
+        }
+        (
+            hot_trimmer_domain::SamplingMode::NineSlicePanel,
+            SliceGeometry::Nine {
+                left_pixels,
+                right_pixels,
+                top_pixels,
+                bottom_pixels,
+                center,
+            },
+        ) => {
+            left_pixels > 0
+                && right_pixels > 0
+                && top_pixels > 0
+                && bottom_pixels > 0
+                && left_pixels
+                    .checked_add(right_pixels)
+                    .is_some_and(|sum| sum < crop.width)
+                && top_pixels
+                    .checked_add(bottom_pixels)
+                    .is_some_and(|sum| sum < crop.height)
+                && (center != SliceCenterPolicy::ExplicitStretch || authorized_stretch)
+        }
+        (
+            hot_trimmer_domain::SamplingMode::ThreeSliceCap
+            | hot_trimmer_domain::SamplingMode::NineSlicePanel,
+            _,
+        ) => false,
+        (_, SliceGeometry::None) => true,
+        _ => false,
+    };
+    let rotated = matches!(
+        plan.candidate.transform.rotation,
+        hot_trimmer_domain::QuarterTurn::Ninety
+            | hot_trimmer_domain::QuarterTurn::TwoSeventy
+    );
+    let size = if rotated {
+        [plan.slot_physical_size[1], plan.slot_physical_size[0]]
+    } else {
+        plan.slot_physical_size
+    };
+    let scale = plan.source_pixels_per_physical_unit * plan.sampling_policy.scale;
+    let destination_valid = match plan.slice_geometry {
+        SliceGeometry::Three {
+            leading_cap_pixels,
+            trailing_cap_pixels,
+            ..
+        } => {
+            size[0]
+                > f64::from(leading_cap_pixels.saturating_add(trailing_cap_pixels)) / scale
+        }
+        SliceGeometry::Nine {
+            left_pixels,
+            right_pixels,
+            top_pixels,
+            bottom_pixels,
+            ..
+        } => {
+            size[0] > f64::from(left_pixels.saturating_add(right_pixels)) / scale
+                && size[1] > f64::from(top_pixels.saturating_add(bottom_pixels)) / scale
+        }
+        SliceGeometry::None => true,
+    };
+    if !geometry_valid || !destination_valid {
+        return Err(AtlasRenderExecutionError::InvalidInput(format!(
+            "region {} has an illegal GPU slice mode, geometry, center policy, or destination",
+            command.region_id
+        )));
+    }
+    Ok(())
 }
 
 fn final_atlas_metadata(
@@ -6787,6 +7313,11 @@ fn encode_commands(commands: &[GpuRegionCommand]) -> Vec<u8> {
             command.transform_mirror_x,
             command.transform_mirror_y,
             command.structural_profile,
+            command.slice_left,
+            command.slice_right,
+            command.slice_top,
+            command.slice_bottom,
+            command.slice_center,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -6953,6 +7484,7 @@ mod tests {
                     reasons: vec!["gpu tiled export scheduler fixture".into()],
                 },
             },
+            sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
             slot_physical_size: [f64::from(crop.width), f64::from(crop.height)],
             source_pixels_per_physical_unit: 1.0,
             sampling_policy: SamplingPolicy::default(),
@@ -7858,9 +8390,31 @@ mod tests {
             array_layer_count: Some(1),
             ..Default::default()
         });
+        let validity_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pinned-source-validity"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let validity_view = validity_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("pinned-source-validity-view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
         Arc::new(GpuCachedSourceTexture {
             _texture: texture,
             view,
+            _validity_texture: validity_texture,
+            validity_view,
             byte_len,
             layer_count: 1,
             last_used: 0,

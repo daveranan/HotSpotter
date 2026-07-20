@@ -2,7 +2,10 @@
 
 Captured: 2026-07-19
 
-## Status
+> Historical review snapshot: this report records an intermediate Prompt 003 review and was superseded by the later
+> accepted Prompt 003-005 implementation. Current queue state is maintained in [`README.md`](README.md).
+
+## Status at capture time (superseded)
 
 Prompt 003 is materially improved, but not fully accepted yet.
 
@@ -256,10 +259,11 @@ These are no longer listed as runtime blockers:
 - Native publication generation still comes from frontend draft ID.
 - Original edit-boundary objections superseded by user-approved radial and diagnostic-profile changes.
 
-## Decision for Prompt 004
+## Decision for Prompt 004 at capture time (superseded)
 
-Prompt 004 depends on Prompt 003 having an exact, capability-bounded, trustworthy preview path. The current state is
-good enough to debug visually and gather telemetry, but not good enough to accept Prompt 003 as complete.
+At the time of this review, Prompt 004 depended on Prompt 003 having an exact, capability-bounded, trustworthy preview
+path. That state was good enough to debug visually and gather telemetry, but was not then good enough to accept Prompt
+003 as complete.
 
-Prompt 004 remains blocked until the real gaps above pass. Do not treat the diagnostic 2K/4K/8K complete single-tile
-modes or the 512 MiB cache bridge as final Prompt 003 architecture.
+Prompt 004 therefore remained blocked at capture time until the gaps above passed. This decision is historical and has
+been superseded by the completed Prompt 003-005 implementation recorded in the queue ledger.

@@ -16,11 +16,11 @@ use hot_trimmer_domain::{
 use hot_trimmer_image_io::{
     ImagePlane, LinearColor, LinearScalar, NormalAlphaPolicy, ResolvedAlphaMode, TangentNormal,
 };
-use hot_trimmer_material_synthesis::PreparedMaterialDomain;
+use hot_trimmer_material_synthesis::{DomainRoute, PreparedMaterialDomain};
 use hot_trimmer_placement_solver::{
     CandidateDescriptors, CandidateFamily, CandidateRoute, CandidateTransform, CropCandidate,
-    EligibilityEvidence, MirrorTransform, PositionStrategy, SamplingPlan, SliceGeometry,
-    SourceCrop, StretchOverrideProvenance,
+    EligibilityEvidence, MirrorTransform, PositionStrategy, SamplingBasis, SamplingPlan,
+    SliceCenterPolicy, SliceGeometry, SourceCrop, StretchOverrideProvenance,
 };
 use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
 use hot_trimmer_render_core::PreparedExemplarChannel;
@@ -221,6 +221,33 @@ fn domain_with_size(
     )
 }
 
+fn synthesis_domain() -> Arc<PreparedMaterialDomain> {
+    let width = 4;
+    let height = 4;
+    let pixels = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| LinearColor {
+                rgb: [x as f32 / 3.0, y as f32 / 3.0, (x + y) as f32 / 6.0],
+                alpha: 1.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    let plane = ImagePlane::from_row_major(width, height, 4, &pixels).unwrap();
+    Arc::new(
+        PreparedMaterialDomain::from_registered_channels_with_route_and_seams(
+            ContentDigest::sha256(b"stage-14-synthesis-domain"),
+            ContentDigest::sha256(b"stage-14-synthesis-source"),
+            vec![PreparedExemplarChannel::BaseColor {
+                plane,
+                alpha_mode: ResolvedAlphaMode::Opaque,
+            }],
+            DomainRoute::TextureQuilting,
+            Vec::new(),
+        )
+        .unwrap(),
+    )
+}
+
 fn solid_domain(seed: &[u8], rgba: [u8; 4]) -> Arc<PreparedMaterialDomain> {
     let color = LinearColor {
         rgb: [
@@ -298,6 +325,7 @@ fn sampling_plan(
                 reasons: Vec::new(),
             },
         },
+        sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
         slot_physical_size: [crop.width as f64, crop.height as f64],
         source_pixels_per_physical_unit: 1.0,
         sampling_policy: SamplingPolicy {
@@ -1547,13 +1575,18 @@ fn cpu_expected_base_color(
     plane
         .to_row_major()
         .iter()
-        .flat_map(|pixel| {
-            [
-                linear_to_srgb(pixel.rgb[0]),
-                linear_to_srgb(pixel.rgb[1]),
-                linear_to_srgb(pixel.rgb[2]),
-                (pixel.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ]
+        .zip(synthesized.validity.to_row_major())
+        .flat_map(|(pixel, valid)| {
+            if valid.0 < 0.5 {
+                [0, 0, 0, 0]
+            } else {
+                [
+                    linear_to_srgb(pixel.rgb[0]),
+                    linear_to_srgb(pixel.rgb[1]),
+                    linear_to_srgb(pixel.rgb[2]),
+                    (pixel.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+                ]
+            }
         })
         .collect()
 }
@@ -1646,7 +1679,7 @@ fn gpu_stage_14_base_color() {
         panic!("supported GPU route must not return CPU region buffers");
     };
     assert_eq!(first.command_count, 2);
-    assert_eq!(first.upload_bytes, 4 * 4 * 4);
+    assert_eq!(first.upload_bytes, 4 * 4 * 8);
     assert_eq!(first.base_color_rgba8.len(), 4 * 2 * 4);
     assert_eq!(
         output_pixel(&first.base_color_rgba8, 4, 0, 0),
@@ -2774,24 +2807,378 @@ fn gpu_stage_14_base_color_source_frame_authored_crop_and_radial_preview_metadat
 }
 
 #[test]
-fn gpu_stage_14_base_color_rejects_unsupported_mode() {
-    let domain = domain();
-    let mut plan = plan(&domain);
-    plan.ordered_regions[0].sampling_plan.candidate.mapping_mode = SamplingMode::TextureSynthesis;
+fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_modes() {
+    let prepared_domain = synthesis_domain();
+    let mut plan = material_map_plan(&prepared_domain, MaterialMapKind::BaseColor);
+    let region = &mut plan.ordered_regions[0];
+    region.sampling_plan.candidate.mapping_mode = SamplingMode::TextureSynthesis;
+    region.sampling_plan.candidate.family = CandidateFamily::PanelQuiltedExpansion;
+    region.sampling_plan.candidate.route = CandidateRoute::Synthesis;
+    region.sampling_plan.candidate.crop = None;
+    region.sampling_plan.sampling_basis = SamplingBasis::PreparedDomain {
+        window: SourceCrop {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        },
+    };
+    plan.final_plan_hash = ContentDigest(String::new());
     let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
-    let input = AtlasRenderExecutionInput {
-        prepared_sources: vec![AtlasPreparedSource {
-            source_set_id: plan.ordered_sources[0].source_set_id,
-            source_id: plan.ordered_sources[0].source_id.clone(),
-            channel_role: MaterialChannelRole::BaseColor,
-            domain,
-        }],
+    let synthesis = with_gpu_executor(&cache, |executor| {
+        let input = AtlasRenderExecutionInput {
+            prepared_sources: prepared_sources_for_plan(&plan, Arc::clone(&prepared_domain)),
+            source_frame_cache: None,
+        };
+        let output = executor
+            .execute(&plan, &input, &CancellationToken::new(), &|| true)
+            .expect("prepared synthesis GPU lowering");
+        let AtlasRenderExecutorOutput::FinalAtlas(output) = output else {
+            panic!("prepared synthesis must remain on the GPU production route")
+        };
+        output
+    });
+    assert_eq!(
+        output_pixel(&synthesis.base_color_rgba8, 4, 0, 0),
+        expected_domain_pixel(0, 0)
+    );
+    let warm = execute_final_atlas_with_cache(
+        &plan,
+        prepared_sources_for_plan(&plan, Arc::clone(&prepared_domain)),
+        &cache,
+    );
+    assert_eq!(warm.upload_bytes, 0);
+    let cancelled_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(&plan, Arc::clone(&prepared_domain)),
+        source_frame_cache: None,
+    };
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(&plan, &cancelled_input, &cancelled, &|| true)
+            .expect_err("cancelled prepared synthesis must not publish")
+    });
+    assert!(matches!(
+        error,
+        hot_trimmer_sheet_compiler::AtlasRenderExecutionError::Cancelled
+    ));
+
+    let mut invalid_coverage = plan.clone();
+    invalid_coverage.ordered_regions[0]
+        .sampling_plan
+        .slot_physical_size = [5.0, 4.0];
+    invalid_coverage.final_plan_hash = ContentDigest(String::new());
+    let invalid_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(
+            &invalid_coverage,
+            Arc::clone(&prepared_domain),
+        ),
         source_frame_cache: None,
     };
     let error = with_gpu_executor(&cache, |executor| {
         executor
-            .execute(&plan, &input, &CancellationToken::new(), &|| true)
-            .expect_err("unsupported GPU sampling mode must fail before dispatch")
+            .execute(
+                &invalid_coverage,
+                &invalid_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("insufficient prepared synthesis coverage must fail before dispatch")
     });
-    assert!(error.to_string().contains("unsupported GPU sampling mode"));
+    assert!(error.to_string().contains("lacks required physical coverage"));
+
+    let mut mismatched_family = plan.clone();
+    mismatched_family.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .family = CandidateFamily::PanelPatchMatchExpansion;
+    mismatched_family.final_plan_hash = ContentDigest(String::new());
+    let mismatch_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(
+            &mismatched_family,
+            Arc::clone(&prepared_domain),
+        ),
+        source_frame_cache: None,
+    };
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(
+                &mismatched_family,
+                &mismatch_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("PatchMatch family must reject a quilting prepared domain")
+    });
+    assert!(error
+        .to_string()
+        .contains("prepared synthesis domain identity, route, dimensions, or validity is incompatible"));
+
+    let direct_domain = domain_with_size(
+        b"gpu-stage-14-fit-domain",
+        b"gpu-stage-14-fit-source",
+        6,
+        4,
+        255,
+    );
+    for mode in [
+        SamplingMode::UniqueContain,
+        SamplingMode::UniqueCover,
+        SamplingMode::NineSlicePanel,
+    ] {
+        let mut exact = material_map_plan(&direct_domain, MaterialMapKind::BaseColor);
+        exact.ordered_regions[0].source_crop = SourcePixelRect(PixelBounds {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 4,
+        });
+        exact.ordered_regions[0].sampling_plan.candidate.crop = Some(SourceCrop {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 4,
+        });
+        exact.ordered_regions[0].sampling_plan.candidate.mapping_mode = mode;
+        exact.ordered_regions[0].sampling_plan.candidate.family = match mode {
+            SamplingMode::UniqueContain => CandidateFamily::UniqueContain,
+            SamplingMode::UniqueCover => CandidateFamily::UniqueCover,
+            SamplingMode::NineSlicePanel => CandidateFamily::NineSlicePanel,
+            _ => unreachable!(),
+        };
+        exact.ordered_regions[0].sampling_plan.candidate.route = match mode {
+            SamplingMode::NineSlicePanel => CandidateRoute::Cap,
+            _ => CandidateRoute::Unique,
+        };
+        if mode == SamplingMode::NineSlicePanel {
+            exact.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+                left_pixels: 1,
+                right_pixels: 1,
+                top_pixels: 1,
+                bottom_pixels: 1,
+                center: SliceCenterPolicy::Repeat,
+            };
+        }
+        exact.final_plan_hash = ContentDigest(String::new());
+        let output = execute_final_atlas(
+            &exact,
+            prepared_sources_for_plan(&exact, Arc::clone(&direct_domain)),
+        );
+        let oracle = cpu_expected_base_color(
+            &exact.ordered_regions[0].sampling_plan,
+            &direct_domain,
+            [4, 4],
+        );
+        assert_eq!(output.base_color_rgba8.as_ref(), oracle.as_slice(), "{mode:?}");
+    }
+
+    for (center_domain, center, stretch_override) in [
+        (
+            Arc::clone(&prepared_domain),
+            SliceCenterPolicy::Synthesize,
+            StretchOverrideProvenance::NotAuthorized,
+        ),
+        (
+            Arc::clone(&direct_domain),
+            SliceCenterPolicy::ExplicitStretch,
+            StretchOverrideProvenance::UserOverride {
+                settings_revision: 17,
+            },
+        ),
+    ] {
+        let mut exact = material_map_plan(&center_domain, MaterialMapKind::BaseColor);
+        exact.ordered_regions[0].sampling_plan.candidate.mapping_mode =
+            SamplingMode::NineSlicePanel;
+        exact.ordered_regions[0].sampling_plan.candidate.family =
+            CandidateFamily::NineSlicePanel;
+        exact.ordered_regions[0].sampling_plan.candidate.route = CandidateRoute::Cap;
+        exact.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+            left_pixels: 1,
+            right_pixels: 1,
+            top_pixels: 1,
+            bottom_pixels: 1,
+            center,
+        };
+        exact.ordered_regions[0].sampling_plan.stretch_override = stretch_override;
+        exact.final_plan_hash = ContentDigest(String::new());
+        let output = execute_final_atlas(
+            &exact,
+            prepared_sources_for_plan(&exact, Arc::clone(&center_domain)),
+        );
+        let oracle = cpu_expected_base_color(
+            &exact.ordered_regions[0].sampling_plan,
+            &center_domain,
+            [4, 4],
+        );
+        assert_eq!(output.base_color_rgba8.as_ref(), oracle.as_slice(), "{center:?}");
+    }
+
+    let mut unsynthesized_center = material_map_plan(&direct_domain, MaterialMapKind::BaseColor);
+    unsynthesized_center.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .mapping_mode = SamplingMode::NineSlicePanel;
+    unsynthesized_center.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .family = CandidateFamily::NineSlicePanel;
+    unsynthesized_center.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .route = CandidateRoute::Cap;
+    unsynthesized_center.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+        left_pixels: 1,
+        right_pixels: 1,
+        top_pixels: 1,
+        bottom_pixels: 1,
+        center: SliceCenterPolicy::Synthesize,
+    };
+    unsynthesized_center.final_plan_hash = ContentDigest(String::new());
+    let unsynthesized_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(
+            &unsynthesized_center,
+            Arc::clone(&direct_domain),
+        ),
+        source_frame_cache: None,
+    };
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(
+                &unsynthesized_center,
+                &unsynthesized_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("synthesized center on a direct domain must fail")
+    });
+    assert!(error
+        .to_string()
+        .contains("requires a synthesis-capable prepared domain"));
+
+    let mut insufficient_center = material_map_plan(&prepared_domain, MaterialMapKind::BaseColor);
+    insufficient_center.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .mapping_mode = SamplingMode::NineSlicePanel;
+    insufficient_center.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .family = CandidateFamily::NineSlicePanel;
+    insufficient_center.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .route = CandidateRoute::Cap;
+    insufficient_center.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+        left_pixels: 1,
+        right_pixels: 1,
+        top_pixels: 1,
+        bottom_pixels: 1,
+        center: SliceCenterPolicy::Synthesize,
+    };
+    insufficient_center.ordered_regions[0]
+        .sampling_plan
+        .slot_physical_size = [5.0, 4.0];
+    insufficient_center.final_plan_hash = ContentDigest(String::new());
+    let insufficient_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(
+            &insufficient_center,
+            Arc::clone(&prepared_domain),
+        ),
+        source_frame_cache: None,
+    };
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(
+                &insufficient_center,
+                &insufficient_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("synthesized center beyond prepared coverage must fail")
+    });
+    assert!(error
+        .to_string()
+        .contains("exceeds prepared center coverage"));
+
+    let mut mismatched_center = insufficient_center.clone();
+    mismatched_center.ordered_regions[0]
+        .sampling_plan
+        .slot_physical_size = [4.0, 4.0];
+    mismatched_center.final_plan_hash = ContentDigest(String::new());
+    let mut stale_domain = (*prepared_domain).clone();
+    stale_domain.cache_key = ContentDigest::sha256(b"stale-synthesized-center-domain");
+    let stale_domain = Arc::new(stale_domain);
+    let mismatched_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(&mismatched_center, stale_domain),
+        source_frame_cache: None,
+    };
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(
+                &mismatched_center,
+                &mismatched_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("stale synthesized-center domain identity must fail")
+    });
+    assert!(error
+        .to_string()
+        .contains("synthesized slice center prepared-domain identity is incompatible"));
+
+    let mut illegal_slice = material_map_plan(&direct_domain, MaterialMapKind::BaseColor);
+    illegal_slice.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .mapping_mode = SamplingMode::NineSlicePanel;
+    illegal_slice.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .family = CandidateFamily::NineSlicePanel;
+    illegal_slice.ordered_regions[0]
+        .sampling_plan
+        .candidate
+        .route = CandidateRoute::Cap;
+    illegal_slice.final_plan_hash = ContentDigest(String::new());
+    let illegal_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(&illegal_slice, Arc::clone(&direct_domain)),
+        source_frame_cache: None,
+    };
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(
+                &illegal_slice,
+                &illegal_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("nine-slice without nine-slice geometry must fail")
+    });
+    assert!(error.to_string().contains("illegal GPU slice"));
+
+    let mut unauthorized = illegal_slice.clone();
+    unauthorized.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+        left_pixels: 1,
+        right_pixels: 1,
+        top_pixels: 1,
+        bottom_pixels: 1,
+        center: SliceCenterPolicy::ExplicitStretch,
+    };
+    unauthorized.final_plan_hash = ContentDigest(String::new());
+    let unauthorized_input = AtlasRenderExecutionInput {
+        prepared_sources: prepared_sources_for_plan(&unauthorized, Arc::clone(&direct_domain)),
+        source_frame_cache: None,
+    };
+    let error = with_gpu_executor(&cache, |executor| {
+        executor
+            .execute(
+                &unauthorized,
+                &unauthorized_input,
+                &CancellationToken::new(),
+                &|| true,
+            )
+            .expect_err("unauthorized nine-slice center stretch must fail")
+    });
+    assert!(error.to_string().contains("illegal GPU slice"));
 }

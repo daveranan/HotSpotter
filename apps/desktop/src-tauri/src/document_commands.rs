@@ -2131,6 +2131,7 @@ fn removed_preview_specific_fabrication(
             variation_group: region.material_group.clone(),
             prepared_domain_dimensions: [domain.width, domain.height],
             candidate,
+            sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
             slot_physical_size: [
                 f64::from(slot.allocation.width),
                 f64::from(slot.allocation.height),
@@ -4793,6 +4794,7 @@ mod algorithm_stage_14_preview_a_tests {
                     reasons: Vec::new(),
                 },
             },
+            sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
             slot_physical_size: [1.0, 1.0],
             source_pixels_per_physical_unit: 4.0,
             sampling_policy: SamplingPolicy {

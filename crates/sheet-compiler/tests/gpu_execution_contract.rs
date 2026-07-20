@@ -104,6 +104,7 @@ fn test_sampling_plan(
                 reasons: vec!["executor contract fixture".into()],
             },
         },
+        sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
         slot_physical_size: [f64::from(crop.width), f64::from(crop.height)],
         source_pixels_per_physical_unit: 1.0,
         sampling_policy: SamplingPolicy::default(),

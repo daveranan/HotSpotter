@@ -723,17 +723,27 @@ fn validate_region(
         });
     }
     let crop = region.source_crop.0;
-    if region.sampling_plan.candidate.crop
-        != Some(hot_trimmer_placement_solver::SourceCrop {
-            x: crop.x,
-            y: crop.y,
-            width: crop.width,
-            height: crop.height,
-        })
-    {
+    let compiled_crop = hot_trimmer_placement_solver::SourceCrop {
+        x: crop.x,
+        y: crop.y,
+        width: crop.width,
+        height: crop.height,
+    };
+    let basis_matches = match region.sampling_plan.sampling_basis {
+        hot_trimmer_placement_solver::SamplingBasis::SelectedCrop => {
+            region.sampling_plan.candidate.crop == Some(compiled_crop)
+        }
+        hot_trimmer_placement_solver::SamplingBasis::PreparedDomain { window } => {
+            region.sampling_plan.candidate.crop.is_none()
+                && window == compiled_crop
+                && region.sampling_plan.candidate.mapping_mode
+                    == hot_trimmer_domain::SamplingMode::TextureSynthesis
+        }
+    };
+    if !basis_matches {
         return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
             region_id: region.region_id,
-            reason: "sampling plan crop differs from the compiled source crop",
+            reason: "sampling basis/window differs from the compiled source region",
         });
     }
     if region.sampling_plan.radial_mapping != region.radial_parameters {

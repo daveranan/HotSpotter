@@ -286,6 +286,7 @@ fn sampling_plan(
                 reasons: Vec::new(),
             },
         },
+        sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
         slot_physical_size: [f64::from(destination.width), f64::from(destination.height)],
         source_pixels_per_physical_unit: 1.0,
         sampling_policy: SamplingPolicy {

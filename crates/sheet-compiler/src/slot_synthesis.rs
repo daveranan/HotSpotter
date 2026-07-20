@@ -9,8 +9,8 @@ use hot_trimmer_domain::{
 use hot_trimmer_image_io::{ImagePlane, LinearColor, LinearScalar, MaskValue, TangentNormal};
 use hot_trimmer_material_synthesis::{DomainRoute, PreparedMaterialDomain, SeamAxis};
 use hot_trimmer_placement_solver::{
-    MirrorTransform, SamplingPlan, SliceCenterPolicy, SliceGeometry, SourceCrop,
-    StretchOverrideProvenance,
+    CandidateFamily, CandidateRoute, MirrorTransform, SamplingBasis, SamplingPlan,
+    SliceCenterPolicy, SliceGeometry, SourceCrop, StretchOverrideProvenance,
 };
 use hot_trimmer_render_core::{PreparedExemplarChannel, RenderCancellationToken};
 use thiserror::Error;
@@ -311,13 +311,12 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
     {
         return Err(SlotSynthesisError::InvalidPlan);
     }
-    // Stage 14 has no registered TextureSynthesis executor. Reject it instead
-    // of allowing the generic physical branch to become centered full-source
-    // sampling. Authored radial plans may intentionally omit a selected crop;
-    // their full-domain basis is internal and must not be published as a Gate 1
-    // crop selection.
-    if p.candidate.mapping_mode == SamplingMode::TextureSynthesis
-        || (p.candidate.crop.is_none() && !radial_without_crop(p))
+    let prepared_synthesis = p.candidate.mapping_mode == SamplingMode::TextureSynthesis;
+    if (p.candidate.crop.is_none() && !radial_without_crop(p) && !prepared_synthesis)
+        || (prepared_synthesis
+            && !matches!(p.sampling_basis, SamplingBasis::PreparedDomain { .. }))
+        || (!prepared_synthesis
+            && matches!(p.sampling_basis, SamplingBasis::PreparedDomain { .. }))
     {
         return Err(SlotSynthesisError::InvalidPlan);
     }
@@ -335,6 +334,9 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
         || p.candidate.correspondence_reference != r.domain.cache_key
     {
         return Err(SlotSynthesisError::DomainMismatch);
+    }
+    if prepared_synthesis {
+        validate_prepared_synthesis(r)?;
     }
     let c = crop(r);
     if c.width == 0
@@ -574,12 +576,74 @@ fn validate_synthesized_center(
 }
 
 fn crop(r: &SlotSynthesisRequest<'_>) -> SourceCrop {
-    r.plan.candidate.crop.unwrap_or(SourceCrop {
-        x: 0,
-        y: 0,
-        width: r.domain.width,
-        height: r.domain.height,
-    })
+    match r.plan.sampling_basis {
+        SamplingBasis::PreparedDomain { window } => window,
+        SamplingBasis::SelectedCrop => r.plan.candidate.crop.unwrap_or(SourceCrop {
+            x: 0,
+            y: 0,
+            width: r.domain.width,
+            height: r.domain.height,
+        }),
+    }
+}
+
+fn validate_prepared_synthesis(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
+    let p = r.plan;
+    let SamplingBasis::PreparedDomain { window } = p.sampling_basis else {
+        return Err(SlotSynthesisError::InvalidPlan);
+    };
+    if !synthesis_family_matches_domain_route(p.candidate.family, r.domain.route)
+        || p.candidate.route != CandidateRoute::Synthesis
+        || window.width == 0
+        || window.height == 0
+        || window.x.saturating_add(window.width) > r.domain.width
+        || window.y.saturating_add(window.height) > r.domain.height
+    {
+        return Err(SlotSynthesisError::InvalidPlan);
+    }
+    let rotated = matches!(
+        p.candidate.transform.rotation,
+        QuarterTurn::Ninety | QuarterTurn::TwoSeventy
+    );
+    let physical = if rotated {
+        [p.slot_physical_size[1], p.slot_physical_size[0]]
+    } else {
+        p.slot_physical_size
+    };
+    let scale = p.source_pixels_per_physical_unit * p.sampling_policy.scale;
+    if physical[0] * scale > f64::from(window.width) + 1.0e-9
+        || physical[1] * scale > f64::from(window.height) + 1.0e-9
+    {
+        return Err(SlotSynthesisError::InvalidPlan);
+    }
+    Ok(())
+}
+
+fn synthesis_family_matches_domain_route(
+    family: CandidateFamily,
+    route: DomainRoute,
+) -> bool {
+    match family {
+        CandidateFamily::PanelQuiltedExpansion
+        | CandidateFamily::RepeatXQuilted
+        | CandidateFamily::RepeatYQuilted => route == DomainRoute::TextureQuilting,
+        CandidateFamily::PanelPatchMatchExpansion => route == DomainRoute::PatchMatch,
+        CandidateFamily::PanelProceduralResynthesis => matches!(
+            route,
+            DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ),
+        CandidateFamily::UniqueSynthesisExtension => matches!(
+            route,
+            DomainRoute::TextureQuilting
+                | DomainRoute::PatchMatch
+                | DomainRoute::StatisticalSynthesis
+                | DomainRoute::ProceduralReconstruction
+                | DomainRoute::LearnedProvider
+        ),
+        _ => false,
+    }
 }
 
 fn radial_without_crop(plan: &SamplingPlan) -> bool {
@@ -1411,6 +1475,7 @@ mod tests {
                     reasons: Vec::new(),
                 },
             },
+            sampling_basis: hot_trimmer_placement_solver::SamplingBasis::SelectedCrop,
             slot_physical_size: [1.0, 1.0],
             source_pixels_per_physical_unit: 8.0,
             sampling_policy: SamplingPolicy {
