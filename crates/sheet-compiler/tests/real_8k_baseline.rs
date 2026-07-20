@@ -366,7 +366,9 @@ fn real_8k_cpu_baseline() {
     runs.push(match switch_result {
         Ok(artifact) => {
             assert!(
-                artifact.rendered_tiles.contains_key(&MaterialMapKind::Normal),
+                artifact
+                    .rendered_tiles
+                    .contains_key(&MaterialMapKind::Normal),
                 "cached single-map switch must publish Normal"
             );
             assert!(

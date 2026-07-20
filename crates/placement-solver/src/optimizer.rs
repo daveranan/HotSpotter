@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use hot_trimmer_domain::{
     AlgorithmProvenance, CancellationToken, CompilationDiagnostic, ContentDigest, DiagnosticCode,
-    MaterialBehaviorClass, RadialMappingSettings, RecoveryChoice, RegionId, SamplingPolicy, StageResult,
-    TemplateSlotRole,
+    MaterialBehaviorClass, RadialMappingSettings, RecoveryChoice, RegionId, SamplingPolicy,
+    StageResult, TemplateSlotRole,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,14 +66,28 @@ pub struct PlacementSlotInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SliceCenterPolicy { Repeat, Synthesize, ExplicitStretch }
+pub enum SliceCenterPolicy {
+    Repeat,
+    Synthesize,
+    ExplicitStretch,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SliceGeometry {
     None,
-    Three { leading_cap_pixels: u32, trailing_cap_pixels: u32, center: SliceCenterPolicy },
-    Nine { left_pixels: u32, right_pixels: u32, top_pixels: u32, bottom_pixels: u32, center: SliceCenterPolicy },
+    Three {
+        leading_cap_pixels: u32,
+        trailing_cap_pixels: u32,
+        center: SliceCenterPolicy,
+    },
+    Nine {
+        left_pixels: u32,
+        right_pixels: u32,
+        top_pixels: u32,
+        bottom_pixels: u32,
+        center: SliceCenterPolicy,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -305,22 +319,34 @@ pub fn optimize_placements(
         pair_evaluations: 0,
     };
     let order = slot_order(slots);
-    let mut beam = vec![BeamState { selected: vec![None; slots.len()], cost: 0.0 }];
+    let mut beam = vec![BeamState {
+        selected: vec![None; slots.len()],
+        cost: 0.0,
+    }];
     for slot_index in order {
         let candidate_order = candidate_order(&slots[slot_index].candidates.top_candidates, seed);
         if candidate_order.is_empty() {
-            return Err(insufficient(slots[slot_index].slot_id, "Stage 12 produced no legal top-K candidate"));
+            return Err(insufficient(
+                slots[slot_index].slot_id,
+                "Stage 12 produced no legal top-K candidate",
+            ));
         }
         let mut next = Vec::new();
         for state in &beam {
             for &candidate_index in &candidate_order {
                 check_cancel(cancellation)?;
                 let mut added = slots[slot_index].candidates.top_candidates[candidate_index]
-                    .breakdown.total_cost;
+                    .breakdown
+                    .total_cost;
                 let mut permitted = true;
                 for (other_slot, selected) in state.selected.iter().enumerate() {
                     if let Some(other_candidate) = selected {
-                        let pair = context.pair(slot_index, candidate_index, other_slot, *other_candidate)?;
+                        let pair = context.pair(
+                            slot_index,
+                            candidate_index,
+                            other_slot,
+                            *other_candidate,
+                        )?;
                         if !pair.accepted {
                             permitted = false;
                             break;
@@ -331,7 +357,10 @@ pub fn optimize_placements(
                 if permitted {
                     let mut selected = state.selected.clone();
                     selected[slot_index] = Some(candidate_index);
-                    next.push(BeamState { selected, cost: state.cost + added });
+                    next.push(BeamState {
+                        selected,
+                        cost: state.cost + added,
+                    });
                 }
             }
         }
@@ -343,8 +372,11 @@ pub fn optimize_placements(
         }
         next.sort_by(|a, b| {
             a.cost.total_cmp(&b.cost).then_with(|| {
-                assignment_tie_key(&a.selected, slots, seed)
-                    .cmp(&assignment_tie_key(&b.selected, slots, seed))
+                assignment_tie_key(&a.selected, slots, seed).cmp(&assignment_tie_key(
+                    &b.selected,
+                    slots,
+                    seed,
+                ))
             })
         });
         next.truncate(settings.beam_width);
@@ -374,7 +406,9 @@ fn validate_inputs(
         return Err(PlacementError::InvalidSettings);
     }
     if slots.is_empty() {
-        return Err(PlacementError::MalformedInput("placement request has no slots".into()));
+        return Err(PlacementError::MalformedInput(
+            "placement request has no slots".into(),
+        ));
     }
     let mut ids = slots.iter().map(|slot| slot.slot_id).collect::<Vec<_>>();
     ids.sort();
@@ -389,7 +423,10 @@ fn validate_inputs(
             || slot.prepared_domain_dimensions[0] == 0
             || slot.prepared_domain_dimensions[1] == 0
             || slot.maximum_seam_cost_milli > 1000
-            || slot.slot_physical_size.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            || slot
+                .slot_physical_size
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
             || !slot.base_source_pixels_per_physical_unit.is_finite()
             || slot.base_source_pixels_per_physical_unit <= 0.0
             || !slot.sampling_policy.scale.is_finite()
@@ -401,7 +438,10 @@ fn validate_inputs(
             )));
         }
         if domain_dimensions
-            .insert(slot.prepared_domain_id.clone(), slot.prepared_domain_dimensions)
+            .insert(
+                slot.prepared_domain_id.clone(),
+                slot.prepared_domain_dimensions,
+            )
             .is_some_and(|dimensions| dimensions != slot.prepared_domain_dimensions)
         {
             return Err(PlacementError::MalformedInput(
@@ -409,7 +449,10 @@ fn validate_inputs(
             ));
         }
         if slot.required && slot.candidates.top_candidates.is_empty() {
-            return Err(insufficient(slot.slot_id, "required slot has no Stage 12 candidate"));
+            return Err(insufficient(
+                slot.slot_id,
+                "required slot has no Stage 12 candidate",
+            ));
         }
         for scored in &slot.candidates.top_candidates {
             let candidate = &scored.candidate;
@@ -422,7 +465,10 @@ fn validate_inputs(
                 || candidate.domain_id != slot.prepared_domain_id
                 || candidate.correspondence_reference != slot.registered_correspondence_reference
                 || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::ExplicitStretch
-                    && !matches!(slot.stretch_override, StretchOverrideProvenance::UserOverride { .. }))
+                    && !matches!(
+                        slot.stretch_override,
+                        StretchOverrideProvenance::UserOverride { .. }
+                    ))
                 || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::ThreeSliceCap
                     && !matches!(slot.slice_geometry, SliceGeometry::Three { .. }))
                 || (candidate.mapping_mode == hot_trimmer_domain::SamplingMode::NineSlicePanel
@@ -450,7 +496,11 @@ fn slot_order(slots: &[PlacementSlotInput]) -> Vec<usize> {
         slots[b]
             .visual_importance_milli
             .cmp(&slots[a].visual_importance_milli)
-            .then(slots[b].constraint_tightness_milli.cmp(&slots[a].constraint_tightness_milli))
+            .then(
+                slots[b]
+                    .constraint_tightness_milli
+                    .cmp(&slots[a].constraint_tightness_milli),
+            )
             .then(
                 slots[a]
                     .candidates
@@ -470,9 +520,16 @@ fn candidate_order(candidates: &[ScoredCandidate], seed: u64) -> Vec<usize> {
             .breakdown
             .total_cost
             .total_cmp(&candidates[b].breakdown.total_cost)
-            .then(seed_tie(seed, &candidates[a].candidate.candidate_id)
-                .cmp(&seed_tie(seed, &candidates[b].candidate.candidate_id)))
-            .then(candidates[a].candidate.candidate_id.cmp(&candidates[b].candidate.candidate_id))
+            .then(
+                seed_tie(seed, &candidates[a].candidate.candidate_id)
+                    .cmp(&seed_tie(seed, &candidates[b].candidate.candidate_id)),
+            )
+            .then(
+                candidates[a]
+                    .candidate
+                    .candidate_id
+                    .cmp(&candidates[b].candidate.candidate_id),
+            )
     });
     order
 }
@@ -485,13 +542,12 @@ impl SolverContext<'_> {
         slot_b: usize,
         candidate_b: usize,
     ) -> Result<PairEvaluation, PlacementError> {
-        let (first_slot, first_candidate, second_slot, second_candidate) = if self.slots[slot_a].slot_id
-            < self.slots[slot_b].slot_id
-        {
-            (slot_a, candidate_a, slot_b, candidate_b)
-        } else {
-            (slot_b, candidate_b, slot_a, candidate_a)
-        };
+        let (first_slot, first_candidate, second_slot, second_candidate) =
+            if self.slots[slot_a].slot_id < self.slots[slot_b].slot_id {
+                (slot_a, candidate_a, slot_b, candidate_b)
+            } else {
+                (slot_b, candidate_b, slot_a, candidate_a)
+            };
         let first = &self.slots[first_slot].candidates.top_candidates[first_candidate].candidate;
         let second = &self.slots[second_slot].candidates.top_candidates[second_candidate].candidate;
         let key = PairKey {
@@ -536,9 +592,17 @@ fn evaluate_pair(
         0.0
     };
     let descriptor_similarity = descriptor_similarity(first, second);
-    let salient = unit(first.descriptors.saliency_milli.min(second.descriptors.saliency_milli))
-        * unit(first.descriptors.feature_strength_milli.min(second.descriptors.feature_strength_milli))
-        * overlap;
+    let salient = unit(
+        first
+            .descriptors
+            .saliency_milli
+            .min(second.descriptors.saliency_milli),
+    ) * unit(
+        first
+            .descriptors
+            .feature_strength_milli
+            .min(second.descriptors.feature_strength_milli),
+    ) * overlap;
     let identical = if same_coordinate_domain && first.transform == second.transform {
         overlap
     } else {
@@ -550,8 +614,13 @@ fn evaluate_pair(
         && first_slot.reuse_permissions.stochastic_overlap
         && second_slot.reuse_permissions.stochastic_overlap
         && first.transform != second.transform;
-    let unique_behavior = matches!(first_slot.material_behavior, MaterialBehaviorClass::UniqueDetail)
-        || matches!(second_slot.material_behavior, MaterialBehaviorClass::UniqueDetail);
+    let unique_behavior = matches!(
+        first_slot.material_behavior,
+        MaterialBehaviorClass::UniqueDetail
+    ) || matches!(
+        second_slot.material_behavior,
+        MaterialBehaviorClass::UniqueDetail
+    );
     let large_slots = first_slot.visual_importance_milli >= settings.large_slot_importance_milli
         && second_slot.visual_importance_milli >= settings.large_slot_importance_milli;
     let salient_duplicate = same_coordinate_domain
@@ -566,8 +635,12 @@ fn evaluate_pair(
         && second_slot.reuse_permissions.manufactured_periodic_reuse;
     let identical_crop_reuse_penalized = same_coordinate_domain
         && !periodic_permitted
-        && (first_slot.reuse_permissions.require_spatially_distinct_crops
-            || second_slot.reuse_permissions.require_spatially_distinct_crops)
+        && (first_slot
+            .reuse_permissions
+            .require_spatially_distinct_crops
+            || second_slot
+                .reuse_permissions
+                .require_spatially_distinct_crops)
         && first.crop.is_some()
         && first.crop == second.crop;
     let accepted = !salient_duplicate || salient_reuse_permitted || periodic_permitted;
@@ -591,27 +664,55 @@ fn evaluate_pair(
     } else {
         3.0
     };
-    let transform_multiplier = if periodic_permitted { 0.0 } else if stochastic { 0.35 } else { 1.25 };
-    let variation_multiplier = if same_variation && !periodic_permitted { 0.8 } else { 0.0 };
+    let transform_multiplier = if periodic_permitted {
+        0.0
+    } else if stochastic {
+        0.35
+    } else {
+        1.25
+    };
+    let variation_multiplier = if same_variation && !periodic_permitted {
+        0.8
+    } else {
+        0.0
+    };
     let values = [
         (PairwiseCostTerm::SourceOverlap, overlap, overlap_multiplier),
-        (PairwiseCostTerm::DescriptorSimilarity, descriptor_similarity, descriptor_multiplier),
-        (PairwiseCostTerm::RepeatedSalientFeature, salient, salient_multiplier),
-        (PairwiseCostTerm::IdenticalTransform, identical, transform_multiplier),
+        (
+            PairwiseCostTerm::DescriptorSimilarity,
+            descriptor_similarity,
+            descriptor_multiplier,
+        ),
+        (
+            PairwiseCostTerm::RepeatedSalientFeature,
+            salient,
+            salient_multiplier,
+        ),
+        (
+            PairwiseCostTerm::IdenticalTransform,
+            identical,
+            transform_multiplier,
+        ),
         (
             PairwiseCostTerm::VariationGroup,
-            if same_variation { descriptor_similarity * (0.5 + 0.5 * overlap) } else { 0.0 },
+            if same_variation {
+                descriptor_similarity * (0.5 + 0.5 * overlap)
+            } else {
+                0.0
+            },
             variation_multiplier,
         ),
     ];
     let terms = values
         .into_iter()
-        .map(|(term, normalized_cost, policy_multiplier)| PairwiseTermBreakdown {
-            term,
-            normalized_cost,
-            policy_multiplier,
-            weighted_cost: normalized_cost * policy_multiplier,
-        })
+        .map(
+            |(term, normalized_cost, policy_multiplier)| PairwiseTermBreakdown {
+                term,
+                normalized_cost,
+                policy_multiplier,
+                weighted_cost: normalized_cost * policy_multiplier,
+            },
+        )
         .collect::<Vec<_>>();
     let total_cost = terms.iter().map(|term| term.weighted_cost).sum();
     PairEvaluation {
@@ -625,7 +726,8 @@ fn evaluate_pair(
                 "accepted by material-class reuse policy".into()
             }
         } else {
-            "rejected: a unique salient source feature would repeat across large visible slots".into()
+            "rejected: a unique salient source feature would repeat across large visible slots"
+                .into()
         },
         breakdown: PairwiseCostBreakdown {
             terms,
@@ -637,18 +739,26 @@ fn evaluate_pair(
 }
 
 fn crop_overlap(first: Option<SourceCrop>, second: Option<SourceCrop>) -> f64 {
-    let (Some(a), Some(b)) = (first, second) else { return 0.0 };
+    let (Some(a), Some(b)) = (first, second) else {
+        return 0.0;
+    };
     let x0 = a.x.max(b.x);
     let y0 = a.y.max(b.y);
     let x1 = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
-    let y1 = a.y.saturating_add(a.height).min(b.y.saturating_add(b.height));
+    let y1 =
+        a.y.saturating_add(a.height)
+            .min(b.y.saturating_add(b.height));
     if x1 <= x0 || y1 <= y0 {
         return 0.0;
     }
     let intersection = u64::from(x1 - x0) * u64::from(y1 - y0);
-    let smaller = (u64::from(a.width) * u64::from(a.height))
-        .min(u64::from(b.width) * u64::from(b.height));
-    if smaller == 0 { 0.0 } else { intersection as f64 / smaller as f64 }
+    let smaller =
+        (u64::from(a.width) * u64::from(a.height)).min(u64::from(b.width) * u64::from(b.height));
+    if smaller == 0 {
+        0.0
+    } else {
+        intersection as f64 / smaller as f64
+    }
 }
 
 fn descriptor_similarity(first: &CropCandidate, second: &CropCandidate) -> f64 {
@@ -688,7 +798,8 @@ fn stochastic_overlap(first: &PlacementSlotInput, second: &PlacementSlotInput) -
     let stochastic = |behavior| {
         matches!(
             behavior,
-            MaterialBehaviorClass::StochasticIsotropic | MaterialBehaviorClass::StochasticDirectional
+            MaterialBehaviorClass::StochasticIsotropic
+                | MaterialBehaviorClass::StochasticDirectional
         )
     };
     stochastic(first.material_behavior) && stochastic(second.material_behavior)
@@ -706,7 +817,9 @@ fn local_improvement(
         let mut best: Option<(f64, Vec<Option<usize>>)> = None;
         for &slot in &stable_slots {
             for candidate in candidate_order(&context.slots[slot].candidates.top_candidates, seed) {
-                if selected[slot] == Some(candidate) || local_work >= context.settings.max_local_evaluations {
+                if selected[slot] == Some(candidate)
+                    || local_work >= context.settings.max_local_evaluations
+                {
                     continue;
                 }
                 check_cancel(context.cancellation)?;
@@ -725,14 +838,12 @@ fn local_improvement(
             for second_position in first_position + 1..stable_slots.len() {
                 let first = stable_slots[first_position];
                 let second = stable_slots[second_position];
-                for first_candidate in candidate_order(
-                    &context.slots[first].candidates.top_candidates,
-                    seed,
-                ) {
-                    for second_candidate in candidate_order(
-                        &context.slots[second].candidates.top_candidates,
-                        seed,
-                    ) {
+                for first_candidate in
+                    candidate_order(&context.slots[first].candidates.top_candidates, seed)
+                {
+                    for second_candidate in
+                        candidate_order(&context.slots[second].candidates.top_candidates, seed)
+                    {
                         if local_work >= context.settings.max_local_evaluations {
                             break 'pairs;
                         }
@@ -747,7 +858,14 @@ fn local_improvement(
                         proposal[first] = Some(first_candidate);
                         proposal[second] = Some(second_candidate);
                         if let Some(cost) = legal_assignment_cost(context, &proposal)? {
-                            consider_improvement(&mut best, cost, proposal, baseline, context.slots, seed);
+                            consider_improvement(
+                                &mut best,
+                                cost,
+                                proposal,
+                                baseline,
+                                context.slots,
+                                seed,
+                            );
                         }
                     }
                 }
@@ -776,7 +894,8 @@ fn consider_improvement(
     let replace = best.as_ref().is_none_or(|(old_cost, old)| {
         cost < *old_cost - 1.0e-12
             || ((cost - *old_cost).abs() <= 1.0e-12
-                && assignment_tie_key(&proposal, slots, seed) < assignment_tie_key(old, slots, seed))
+                && assignment_tie_key(&proposal, slots, seed)
+                    < assignment_tie_key(old, slots, seed))
     });
     if replace {
         *best = Some((cost, proposal));
@@ -799,14 +918,23 @@ fn legal_assignment_cost(
     let mut total = 0.0;
     let stable_slots = slot_order(context.slots);
     for &slot in &stable_slots {
-        let Some(candidate) = selected[slot] else { return Ok(None) };
-        total += context.slots[slot].candidates.top_candidates[candidate].breakdown.total_cost;
+        let Some(candidate) = selected[slot] else {
+            return Ok(None);
+        };
+        total += context.slots[slot].candidates.top_candidates[candidate]
+            .breakdown
+            .total_cost;
     }
     for first_position in 0..stable_slots.len() {
         for second_position in first_position + 1..stable_slots.len() {
             let first = stable_slots[first_position];
             let second = stable_slots[second_position];
-            let pair = context.pair(first, selected[first].unwrap(), second, selected[second].unwrap())?;
+            let pair = context.pair(
+                first,
+                selected[first].unwrap(),
+                second,
+                selected[second].unwrap(),
+            )?;
             if !pair.accepted {
                 return Ok(None);
             }
@@ -828,14 +956,20 @@ fn build_plan(
     for &slot in &stable_slots {
         let candidate = selected[slot];
         unary_cost += context.slots[slot].candidates.top_candidates[candidate.unwrap()]
-            .breakdown.total_cost;
+            .breakdown
+            .total_cost;
     }
     for first_position in 0..stable_slots.len() {
         for second_position in first_position + 1..stable_slots.len() {
             let first = stable_slots[first_position];
             let second = stable_slots[second_position];
             pairwise_cost += context
-                .pair(first, selected[first].unwrap(), second, selected[second].unwrap())?
+                .pair(
+                    first,
+                    selected[first].unwrap(),
+                    second,
+                    selected[second].unwrap(),
+                )?
                 .breakdown
                 .total_cost;
         }
@@ -873,7 +1007,8 @@ fn build_plan(
                     PairwiseDecisionOutcome::RejectedByObjective
                 },
                 reason: if evaluation.accepted && !chosen {
-                    "rejected by the bounded global objective in favor of a lower-cost assignment".into()
+                    "rejected by the bounded global objective in favor of a lower-cost assignment"
+                        .into()
                 } else {
                     evaluation.reason.clone()
                 },
@@ -900,7 +1035,8 @@ fn build_plan(
                 prepared_domain_dimensions: context.slots[slot].prepared_domain_dimensions,
                 candidate: scored.candidate.clone(),
                 slot_physical_size: context.slots[slot].slot_physical_size,
-                source_pixels_per_physical_unit: context.slots[slot].base_source_pixels_per_physical_unit
+                source_pixels_per_physical_unit: context.slots[slot]
+                    .base_source_pixels_per_physical_unit
                     * scored.candidate.isotropic_scale,
                 sampling_policy: context.slots[slot].sampling_policy,
                 radial_mapping: context.slots[slot].radial_mapping,
@@ -955,19 +1091,24 @@ fn validate_complete_plan(
     placements: &[SamplingPlan],
 ) -> Result<PlacementValidationSummary, PlacementError> {
     let complete = placements.len() == slots.len();
-    let required = slots
-        .iter()
-        .filter(|slot| slot.required)
-        .all(|slot| placements.iter().any(|placement| placement.slot_id == slot.slot_id));
+    let required = slots.iter().filter(|slot| slot.required).all(|slot| {
+        placements
+            .iter()
+            .any(|placement| placement.slot_id == slot.slot_id)
+    });
     let isotropic = placements.iter().all(|placement| {
         placement.candidate.eligibility.isotropic_scale
             && placement.candidate.isotropic_scale.is_finite()
             && placement.candidate.isotropic_scale > 0.0
     });
     let registered = placements.iter().all(|placement| {
-        slots.iter().find(|slot| slot.slot_id == placement.slot_id).is_some_and(|slot| {
-            placement.candidate.correspondence_reference == slot.registered_correspondence_reference
-        })
+        slots
+            .iter()
+            .find(|slot| slot.slot_id == placement.slot_id)
+            .is_some_and(|slot| {
+                placement.candidate.correspondence_reference
+                    == slot.registered_correspondence_reference
+            })
     });
     if !complete || !required || !isotropic || !registered {
         return Err(PlacementError::MalformedInput(
@@ -986,15 +1127,23 @@ fn validate_complete_plan(
 fn heatmap(placements: &[SamplingPlan], edge: u8) -> Vec<CropReuseHeatmapCell> {
     let mut counts = BTreeMap::<(ContentDigest, ContentDigest, u8, u8), u16>::new();
     for placement in placements {
-        let Some(crop) = placement.candidate.crop else { continue };
+        let Some(crop) = placement.candidate.crop else {
+            continue;
+        };
         let [width, height] = placement.prepared_domain_dimensions;
         let grid = u32::from(edge);
         let x0 = (u64::from(crop.x) * u64::from(grid) / u64::from(width)).min(u64::from(edge - 1));
         let y0 = (u64::from(crop.y) * u64::from(grid) / u64::from(height)).min(u64::from(edge - 1));
         let x1 = ((u64::from(crop.x.saturating_add(crop.width)) * u64::from(grid)
-            + u64::from(width) - 1) / u64::from(width)).min(u64::from(edge));
+            + u64::from(width)
+            - 1)
+            / u64::from(width))
+        .min(u64::from(edge));
         let y1 = ((u64::from(crop.y.saturating_add(crop.height)) * u64::from(grid)
-            + u64::from(height) - 1) / u64::from(height)).min(u64::from(edge));
+            + u64::from(height)
+            - 1)
+            / u64::from(height))
+        .min(u64::from(edge));
         for y in y0..y1 {
             for x in x0..x1 {
                 let key = (
@@ -1010,19 +1159,23 @@ fn heatmap(placements: &[SamplingPlan], edge: u8) -> Vec<CropReuseHeatmapCell> {
     }
     counts
         .into_iter()
-        .map(|((source_id, domain_id, x, y), reuse_count)| CropReuseHeatmapCell {
-            source_id,
-            domain_id,
-            x,
-            y,
-            reuse_count,
-            repetition_milli: if reuse_count <= 1 {
-                0
-            } else {
-                u16::try_from((u32::from(reuse_count - 1) * 1000 / u32::from(reuse_count)).min(1000))
+        .map(
+            |((source_id, domain_id, x, y), reuse_count)| CropReuseHeatmapCell {
+                source_id,
+                domain_id,
+                x,
+                y,
+                reuse_count,
+                repetition_milli: if reuse_count <= 1 {
+                    0
+                } else {
+                    u16::try_from(
+                        (u32::from(reuse_count - 1) * 1000 / u32::from(reuse_count)).min(1000),
+                    )
                     .unwrap_or(1000)
+                },
             },
-        })
+        )
         .collect()
 }
 
@@ -1036,7 +1189,9 @@ fn assignment_tie_key(
         .enumerate()
         .filter_map(|(slot, candidate)| {
             candidate.map(|candidate| {
-                let id = &slots[slot].candidates.top_candidates[candidate].candidate.candidate_id;
+                let id = &slots[slot].candidates.top_candidates[candidate]
+                    .candidate
+                    .candidate_id;
                 (slots[slot].slot_id, seed_tie(seed, id), id.0.clone())
             })
         })
@@ -1046,13 +1201,19 @@ fn assignment_tie_key(
 }
 
 fn seed_tie(seed: u64, id: &ContentDigest) -> u64 {
-    id.0.as_bytes().iter().fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    id.0.as_bytes()
+        .iter()
+        .fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 fn check_cancel(cancellation: &CancellationToken) -> Result<(), PlacementError> {
-    if cancellation.is_cancelled() { Err(PlacementError::Cancelled) } else { Ok(()) }
+    if cancellation.is_cancelled() {
+        Err(PlacementError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn insufficient(slot_id: RegionId, message: &str) -> PlacementError {
@@ -1072,7 +1233,9 @@ fn insufficient(slot_id: RegionId, message: &str) -> PlacementError {
     }
 }
 
-fn unit(value: u16) -> f64 { f64::from(value.min(1000)) / 1000.0 }
+fn unit(value: u16) -> f64 {
+    f64::from(value.min(1000)) / 1000.0
+}
 
 #[cfg(test)]
 mod tests {
@@ -1085,7 +1248,13 @@ mod tests {
         SourceCrop, UnaryWeights,
     };
 
-    fn candidate(slot_id: RegionId, name: &[u8], x: u32, saliency: u16, cost: f64) -> ScoredCandidate {
+    fn candidate(
+        slot_id: RegionId,
+        name: &[u8],
+        x: u32,
+        saliency: u16,
+        cost: f64,
+    ) -> ScoredCandidate {
         let reference = ContentDigest::sha256(b"registered-domain");
         ScoredCandidate {
             rank: 1,
@@ -1094,8 +1263,16 @@ mod tests {
                 source_id: ContentDigest::sha256(b"shared-source"),
                 domain_id: reference.clone(),
                 slot_id,
-                crop: Some(SourceCrop { x, y: 0, width: 100, height: 100 }),
-                transform: CandidateTransform { rotation: QuarterTurn::Zero, mirror: MirrorTransform::None },
+                crop: Some(SourceCrop {
+                    x,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                }),
+                transform: CandidateTransform {
+                    rotation: QuarterTurn::Zero,
+                    mirror: MirrorTransform::None,
+                },
                 isotropic_scale: 1.0,
                 mapping_mode: SamplingMode::DirectCrop,
                 family: CandidateFamily::PanelDirect,
@@ -1124,11 +1301,18 @@ mod tests {
                     reasons: Vec::new(),
                 },
             },
-            breakdown: CandidateCostBreakdown { terms: Vec::new(), total_cost: cost },
+            breakdown: CandidateCostBreakdown {
+                terms: Vec::new(),
+                total_cost: cost,
+            },
         }
     }
 
-    fn slot(id: u8, behavior: MaterialBehaviorClass, candidates: Vec<ScoredCandidate>) -> PlacementSlotInput {
+    fn slot(
+        id: u8,
+        behavior: MaterialBehaviorClass,
+        candidates: Vec<ScoredCandidate>,
+    ) -> PlacementSlotInput {
         PlacementSlotInput {
             slot_id: RegionId::from_bytes([id; 16]),
             role: TemplateSlotRole::Planar,
@@ -1142,7 +1326,11 @@ mod tests {
             registered_correspondence_reference: ContentDigest::sha256(b"registered-domain"),
             slot_physical_size: [2.0, 2.0],
             base_source_pixels_per_physical_unit: 50.0,
-            sampling_policy: SamplingPolicy { filter: SourceSamplingMode::Nearest, scale: 1.25, correct_tangent_normals: false },
+            sampling_policy: SamplingPolicy {
+                filter: SourceSamplingMode::Nearest,
+                scale: 1.25,
+                correct_tangent_normals: false,
+            },
             radial_mapping: None,
             stretch_override: StretchOverrideProvenance::NotAuthorized,
             slice_geometry: SliceGeometry::None,
@@ -1150,7 +1338,10 @@ mod tests {
             reuse_permissions: ReusePermissions::default(),
             candidates: ScoredCandidateSet {
                 stage_result: StageResult::Executed {
-                    algorithm: AlgorithmProvenance { algorithm_id: "stage-12".into(), version: "1".into() },
+                    algorithm: AlgorithmProvenance {
+                        algorithm_id: "stage-12".into(),
+                        version: "1".into(),
+                    },
                     settings_hash: ContentDigest::sha256(b"stage-12-settings"),
                     diagnostics: Vec::new(),
                 },
@@ -1169,124 +1360,273 @@ mod tests {
         let first_id = RegionId::from_bytes([1; 16]);
         let second_id = RegionId::from_bytes([2; 16]);
         let slots = vec![
-            slot(1, MaterialBehaviorClass::UniqueDetail, vec![
-                candidate(first_id, b"first-cheapest-mark", 0, 900, 0.0),
-                candidate(first_id, b"first-diverse", 220, 100, 0.4),
-            ]),
-            slot(2, MaterialBehaviorClass::UniqueDetail, vec![
-                candidate(second_id, b"second-cheapest-mark", 0, 900, 0.0),
-                candidate(second_id, b"second-diverse", 220, 100, 0.4),
-            ]),
+            slot(
+                1,
+                MaterialBehaviorClass::UniqueDetail,
+                vec![
+                    candidate(first_id, b"first-cheapest-mark", 0, 900, 0.0),
+                    candidate(first_id, b"first-diverse", 220, 100, 0.4),
+                ],
+            ),
+            slot(
+                2,
+                MaterialBehaviorClass::UniqueDetail,
+                vec![
+                    candidate(second_id, b"second-cheapest-mark", 0, 900, 0.0),
+                    candidate(second_id, b"second-diverse", 220, 100, 0.4),
+                ],
+            ),
         ];
         let settings = PlacementOptimizerSettings::default();
         let first = optimize_placements(&slots, &settings, 99, &CancellationToken::new()).unwrap();
         let second = optimize_placements(&slots, &settings, 99, &CancellationToken::new()).unwrap();
         let mut permuted_slots = slots.clone();
         permuted_slots.reverse();
-        let permuted = optimize_placements(
-            &permuted_slots,
-            &settings,
-            99,
-            &CancellationToken::new(),
-        ).unwrap();
-        assert_eq!(first.deterministic_bytes().unwrap(), second.deterministic_bytes().unwrap());
-        assert_eq!(first.deterministic_bytes().unwrap(), permuted.deterministic_bytes().unwrap());
-        assert_eq!(first.objective_report_bytes().unwrap(), second.objective_report_bytes().unwrap());
+        let permuted =
+            optimize_placements(&permuted_slots, &settings, 99, &CancellationToken::new()).unwrap();
+        assert_eq!(
+            first.deterministic_bytes().unwrap(),
+            second.deterministic_bytes().unwrap()
+        );
+        assert_eq!(
+            first.deterministic_bytes().unwrap(),
+            permuted.deterministic_bytes().unwrap()
+        );
+        assert_eq!(
+            first.objective_report_bytes().unwrap(),
+            second.objective_report_bytes().unwrap()
+        );
         assert!(first.validation.complete_assignment);
         assert!(first.validation.isotropic_scale_only);
         assert!(first.validation.registered_mapping_only);
-        assert_ne!(first.placements[0].candidate.crop, first.placements[1].candidate.crop);
-        assert_eq!(first.placements[0].sampling_policy, slots[0].sampling_policy);
+        assert_ne!(
+            first.placements[0].candidate.crop,
+            first.placements[1].candidate.crop
+        );
+        assert_eq!(
+            first.placements[0].sampling_policy,
+            slots[0].sampling_policy
+        );
         assert_eq!(first.placements[0].source_pixels_per_physical_unit, 50.0);
-        assert_eq!(first.placements[0].stretch_override, StretchOverrideProvenance::NotAuthorized);
+        assert_eq!(
+            first.placements[0].stretch_override,
+            StretchOverrideProvenance::NotAuthorized
+        );
         assert!(first.pairwise_decisions.iter().any(|decision| {
             decision.outcome == PairwiseDecisionOutcome::RejectedByPolicy
                 && decision.reason.contains("unique salient")
         }));
-        assert!(first.qa_views.contains(&PlacementPlanQaView::CropReuseHeatmap));
-        assert!(first.pairwise_decisions.iter().all(|decision| {
-            decision.first_slot_id < decision.second_slot_id
-        }));
+        assert!(
+            first
+                .qa_views
+                .contains(&PlacementPlanQaView::CropReuseHeatmap)
+        );
+        assert!(
+            first
+                .pairwise_decisions
+                .iter()
+                .all(|decision| { decision.first_slot_id < decision.second_slot_id })
+        );
 
         let same_transform = optimize_placements(
             &[
-                slot(7, MaterialBehaviorClass::StochasticIsotropic, vec![
-                    candidate(RegionId::from_bytes([7; 16]), b"same-transform-a", 0, 300, 0.0),
-                ]),
-                slot(8, MaterialBehaviorClass::StochasticIsotropic, vec![
-                    candidate(RegionId::from_bytes([8; 16]), b"same-transform-b", 20, 300, 0.0),
-                ]),
+                slot(
+                    7,
+                    MaterialBehaviorClass::StochasticIsotropic,
+                    vec![candidate(
+                        RegionId::from_bytes([7; 16]),
+                        b"same-transform-a",
+                        0,
+                        300,
+                        0.0,
+                    )],
+                ),
+                slot(
+                    8,
+                    MaterialBehaviorClass::StochasticIsotropic,
+                    vec![candidate(
+                        RegionId::from_bytes([8; 16]),
+                        b"same-transform-b",
+                        20,
+                        300,
+                        0.0,
+                    )],
+                ),
             ],
             &settings,
             99,
             &CancellationToken::new(),
-        ).unwrap();
-        let same_transform_pair = same_transform.pairwise_decisions.iter()
-            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted).unwrap();
+        )
+        .unwrap();
+        let same_transform_pair = same_transform
+            .pairwise_decisions
+            .iter()
+            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted)
+            .unwrap();
         assert!(!same_transform_pair.breakdown.stochastic_overlap_permitted);
-        assert!(same_transform_pair.breakdown.terms.iter()
-            .find(|term| term.term == PairwiseCostTerm::IdenticalTransform).unwrap().weighted_cost > 0.0);
+        assert!(
+            same_transform_pair
+                .breakdown
+                .terms
+                .iter()
+                .find(|term| term.term == PairwiseCostTerm::IdenticalTransform)
+                .unwrap()
+                .weighted_cost
+                > 0.0
+        );
 
-        let stochastic_a = slot(3, MaterialBehaviorClass::StochasticIsotropic, vec![
-            candidate(RegionId::from_bytes([3; 16]), b"stochastic-a", 0, 300, 0.0),
-        ]);
-        let mut stochastic_b = slot(4, MaterialBehaviorClass::StochasticIsotropic, vec![
-            candidate(RegionId::from_bytes([4; 16]), b"stochastic-b", 20, 300, 0.0),
-        ]);
-        stochastic_b.candidates.top_candidates[0].candidate.transform.rotation = QuarterTurn::OneEighty;
+        let stochastic_a = slot(
+            3,
+            MaterialBehaviorClass::StochasticIsotropic,
+            vec![candidate(
+                RegionId::from_bytes([3; 16]),
+                b"stochastic-a",
+                0,
+                300,
+                0.0,
+            )],
+        );
+        let mut stochastic_b = slot(
+            4,
+            MaterialBehaviorClass::StochasticIsotropic,
+            vec![candidate(
+                RegionId::from_bytes([4; 16]),
+                b"stochastic-b",
+                20,
+                300,
+                0.0,
+            )],
+        );
+        stochastic_b.candidates.top_candidates[0]
+            .candidate
+            .transform
+            .rotation = QuarterTurn::OneEighty;
         let stochastic = optimize_placements(
             &[stochastic_a, stochastic_b],
             &settings,
             99,
             &CancellationToken::new(),
-        ).unwrap();
-        let stochastic_pair = stochastic.pairwise_decisions.iter()
-            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted).unwrap();
+        )
+        .unwrap();
+        let stochastic_pair = stochastic
+            .pairwise_decisions
+            .iter()
+            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted)
+            .unwrap();
         assert!(stochastic_pair.breakdown.stochastic_overlap_permitted);
         assert!(!stochastic_pair.breakdown.intentional_periodic_reuse);
 
-        let cross_domain_a = slot(9, MaterialBehaviorClass::UniqueDetail, vec![
-            candidate(RegionId::from_bytes([9; 16]), b"cross-domain-a", 0, 900, 0.0),
-        ]);
-        let mut cross_domain_b = slot(10, MaterialBehaviorClass::UniqueDetail, vec![
-            candidate(RegionId::from_bytes([10; 16]), b"cross-domain-b", 0, 900, 0.0),
-        ]);
+        let cross_domain_a = slot(
+            9,
+            MaterialBehaviorClass::UniqueDetail,
+            vec![candidate(
+                RegionId::from_bytes([9; 16]),
+                b"cross-domain-a",
+                0,
+                900,
+                0.0,
+            )],
+        );
+        let mut cross_domain_b = slot(
+            10,
+            MaterialBehaviorClass::UniqueDetail,
+            vec![candidate(
+                RegionId::from_bytes([10; 16]),
+                b"cross-domain-b",
+                0,
+                900,
+                0.0,
+            )],
+        );
         let other_domain = ContentDigest::sha256(b"other-domain");
         cross_domain_b.prepared_domain_id = other_domain.clone();
         cross_domain_b.registered_correspondence_reference = other_domain.clone();
-        cross_domain_b.candidates.top_candidates[0].candidate.domain_id = other_domain.clone();
-        cross_domain_b.candidates.top_candidates[0].candidate.correspondence_reference = other_domain;
+        cross_domain_b.candidates.top_candidates[0]
+            .candidate
+            .domain_id = other_domain.clone();
+        cross_domain_b.candidates.top_candidates[0]
+            .candidate
+            .correspondence_reference = other_domain;
         let cross_domain = optimize_placements(
             &[cross_domain_a, cross_domain_b],
             &settings,
             99,
             &CancellationToken::new(),
-        ).unwrap();
-        let cross_domain_pair = cross_domain.pairwise_decisions.iter()
-            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted).unwrap();
-        assert_eq!(cross_domain_pair.breakdown.terms.iter()
-            .find(|term| term.term == PairwiseCostTerm::SourceOverlap).unwrap().normalized_cost, 0.0);
-        assert!(cross_domain.crop_reuse_heatmap.iter().all(|cell| cell.reuse_count == 1));
+        )
+        .unwrap();
+        let cross_domain_pair = cross_domain
+            .pairwise_decisions
+            .iter()
+            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted)
+            .unwrap();
+        assert_eq!(
+            cross_domain_pair
+                .breakdown
+                .terms
+                .iter()
+                .find(|term| term.term == PairwiseCostTerm::SourceOverlap)
+                .unwrap()
+                .normalized_cost,
+            0.0
+        );
+        assert!(
+            cross_domain
+                .crop_reuse_heatmap
+                .iter()
+                .all(|cell| cell.reuse_count == 1)
+        );
 
-        let mut periodic_a = slot(5, MaterialBehaviorClass::ManufacturedPattern, vec![
-            candidate(RegionId::from_bytes([5; 16]), b"periodic-a", 0, 900, 0.0),
-        ]);
-        let mut periodic_b = slot(6, MaterialBehaviorClass::ManufacturedPattern, vec![
-            candidate(RegionId::from_bytes([6; 16]), b"periodic-b", 0, 900, 0.0),
-        ]);
-        periodic_a.candidates.top_candidates[0].candidate.period_pixels = Some([16, 16]);
-        periodic_b.candidates.top_candidates[0].candidate.period_pixels = Some([16, 16]);
+        let mut periodic_a = slot(
+            5,
+            MaterialBehaviorClass::ManufacturedPattern,
+            vec![candidate(
+                RegionId::from_bytes([5; 16]),
+                b"periodic-a",
+                0,
+                900,
+                0.0,
+            )],
+        );
+        let mut periodic_b = slot(
+            6,
+            MaterialBehaviorClass::ManufacturedPattern,
+            vec![candidate(
+                RegionId::from_bytes([6; 16]),
+                b"periodic-b",
+                0,
+                900,
+                0.0,
+            )],
+        );
+        periodic_a.candidates.top_candidates[0]
+            .candidate
+            .period_pixels = Some([16, 16]);
+        periodic_b.candidates.top_candidates[0]
+            .candidate
+            .period_pixels = Some([16, 16]);
         let periodic = optimize_placements(
             &[periodic_a, periodic_b],
             &settings,
             99,
             &CancellationToken::new(),
-        ).unwrap();
-        let periodic_pair = periodic.pairwise_decisions.iter()
-            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted).unwrap();
+        )
+        .unwrap();
+        let periodic_pair = periodic
+            .pairwise_decisions
+            .iter()
+            .find(|decision| decision.outcome == PairwiseDecisionOutcome::Accepted)
+            .unwrap();
         assert!(periodic_pair.breakdown.intentional_periodic_reuse);
-        assert_eq!(periodic_pair.breakdown.terms.iter()
-            .find(|term| term.term == PairwiseCostTerm::SourceOverlap).unwrap().weighted_cost, 0.0);
+        assert_eq!(
+            periodic_pair
+                .breakdown
+                .terms
+                .iter()
+                .find(|term| term.term == PairwiseCostTerm::SourceOverlap)
+                .unwrap()
+                .weighted_cost,
+            0.0
+        );
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
@@ -1297,7 +1637,12 @@ mod tests {
         let mut insufficient_slots = slots.clone();
         insufficient_slots[0].candidates.top_candidates.clear();
         assert!(matches!(
-            optimize_placements(&insufficient_slots, &settings, 99, &CancellationToken::new()),
+            optimize_placements(
+                &insufficient_slots,
+                &settings,
+                99,
+                &CancellationToken::new()
+            ),
             Err(PlacementError::InsufficientAssignment { .. })
         ));
     }

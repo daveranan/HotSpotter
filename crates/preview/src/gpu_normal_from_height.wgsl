@@ -8,6 +8,8 @@ struct AtlasHeader {
     command_count: u32,
     source_width: u32,
     source_height: u32,
+    source_origin_x: u32,
+    source_origin_y: u32,
     map_kind: u32,
     normal_convention: u32,
     source_role: u32,

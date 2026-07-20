@@ -8,6 +8,8 @@ struct AtlasHeader {
     command_count: u32,
     source_width: u32,
     source_height: u32,
+    source_origin_x: u32,
+    source_origin_y: u32,
     map_kind: u32,
     normal_convention: u32,
     source_role: u32,
@@ -123,8 +125,9 @@ fn transform_tangent_normal(normal: vec3<f32>, rotation: u32, mirror: u32) -> ve
 }
 
 fn load_linear(p: vec2<f32>) -> vec4<f32> {
-    let sx = i32(clamp(floor(p.x), 0.0, f32(header.source_width - 1u)));
-    let sy = i32(clamp(floor(p.y), 0.0, f32(header.source_height - 1u)));
+    let local = p - vec2<f32>(f32(header.source_origin_x), f32(header.source_origin_y));
+    let sx = i32(clamp(floor(local.x), 0.0, f32(header.source_width - 1u)));
+    let sy = i32(clamp(floor(local.y), 0.0, f32(header.source_height - 1u)));
     let c = textureLoad(source_tex, vec2<i32>(sx, sy), 0);
     if (header.source_role != 0u) {
         return c;
@@ -209,7 +212,9 @@ fn material_height_sample(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
     }
     let position = source_position(cmd, pixel);
     let p = position.primary;
-    if (!position.valid || p.x < 0.0 || p.x >= f32(header.source_width) || p.y < 0.0 || p.y >= f32(header.source_height)) {
+    let source_origin = vec2<f32>(f32(header.source_origin_x), f32(header.source_origin_y));
+    let source_limit = source_origin + vec2<f32>(f32(header.source_width), f32(header.source_height));
+    if (!position.valid || p.x < source_origin.x || p.x >= source_limit.x || p.y < source_origin.y || p.y >= source_limit.y) {
         return 0.0;
     }
     let linear = sample_linear(p, cmd.sampling_filter != 0u);
@@ -223,6 +228,22 @@ fn material_height_sample(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
 
 fn final_height_at(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
     return clamp(0.5 + material_height_sample(cmd, pixel) + structural_height_at(cmd, pixel), 0.0, 1.0);
+}
+
+fn slice_axis_repeat(value: f32, destination: f32, origin: f32, extent: f32, leading: u32, trailing: u32, scale: f32) -> f32 {
+    let leading_px = f32(leading);
+    let trailing_px = f32(trailing);
+    let leading_world = leading_px / scale;
+    let trailing_world = trailing_px / scale;
+    if (value < leading_world) {
+        return origin + value * scale;
+    }
+    if (value >= destination - trailing_world) {
+        return origin + extent - trailing_px + (value - (destination - trailing_world)) * scale;
+    }
+    let center_pixels = max(extent - leading_px - trailing_px, 1.0);
+    let offset = (value - leading_world) * scale;
+    return origin + leading_px + ((offset % center_pixels) + center_pixels) % center_pixels;
 }
 
 fn source_position(cmd: RegionCommand, pixel: vec2<u32>) -> SourcePosition {
@@ -316,6 +337,11 @@ fn source_position(cmd: RegionCommand, pixel: vec2<u32>) -> SourcePosition {
         }
     } else if (cmd.mode == 6u) {
         p = crop_origin + vec2<f32>(m.x / source_size.x * crop_size.x, m.y / source_size.y * crop_size.y);
+    } else if (cmd.mode == 7u) {
+        p = vec2<f32>(
+            slice_axis_repeat(m.x, source_size.x, crop_origin.x, crop_size.x, cmd.period_x, cmd.period_y, scale),
+            crop_origin.y + (m.y - source_size.y * 0.5) * scale + crop_size.y * 0.5,
+        );
     }
     return SourcePosition(p, p, 0.0, valid);
 }
@@ -337,8 +363,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let position = source_position(cmd, pixel);
             let p = position.primary;
             if (position.valid &&
-                p.x >= 0.0 && p.x < f32(header.source_width) &&
-                p.y >= 0.0 && p.y < f32(header.source_height)) {
+                p.x >= f32(header.source_origin_x) && p.x < f32(header.source_origin_x + header.source_width) &&
+                p.y >= f32(header.source_origin_y) && p.y < f32(header.source_origin_y + header.source_height)) {
                 let linear = sample_linear(p, cmd.sampling_filter != 0u);
                 var blended = linear;
                 if (position.seam_blend > 0.0) {

@@ -139,9 +139,17 @@ pub struct CompiledTemplateTopology {
 /// Recursive authored split grammar. Released templates persist the resulting integer rectangles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WeightedTemplateGrammar {
-    Slot { slot_key: String },
-    Horizontal { weights: Vec<u32>, children: Vec<Self> },
-    Vertical { weights: Vec<u32>, children: Vec<Self> },
+    Slot {
+        slot_key: String,
+    },
+    Horizontal {
+        weights: Vec<u32>,
+        children: Vec<Self>,
+    },
+    Vertical {
+        weights: Vec<u32>,
+        children: Vec<Self>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -350,14 +358,25 @@ impl TemplateDefinition {
             let fit_matches_role = matches!(
                 (slot.role, slot.fit),
                 (TemplateSlotRole::Planar, TemplateFitSemantics::Planar)
-                    | (TemplateSlotRole::RepeatingStrip, TemplateFitSemantics::HorizontalStrip)
-                    | (TemplateSlotRole::RepeatingStrip, TemplateFitSemantics::VerticalStrip)
-                    | (TemplateSlotRole::UniqueDetail, TemplateFitSemantics::UniqueContain)
+                    | (
+                        TemplateSlotRole::RepeatingStrip,
+                        TemplateFitSemantics::HorizontalStrip
+                    )
+                    | (
+                        TemplateSlotRole::RepeatingStrip,
+                        TemplateFitSemantics::VerticalStrip
+                    )
+                    | (
+                        TemplateSlotRole::UniqueDetail,
+                        TemplateFitSemantics::UniqueContain
+                    )
                     | (TemplateSlotRole::TrimCap, TemplateFitSemantics::TrimCap)
                     | (TemplateSlotRole::Radial, TemplateFitSemantics::Radial)
             );
             if !fit_matches_role {
-                return Err(TemplateRegistryError::InvalidFitSemantics(slot.slot_key.clone()));
+                return Err(TemplateRegistryError::InvalidFitSemantics(
+                    slot.slot_key.clone(),
+                ));
             }
             match (slot.role, slot.radial_parameters) {
                 (TemplateSlotRole::Radial, Some(radial)) => {
@@ -501,8 +520,14 @@ impl TemplateRegistry {
         if from.stable_order != to.stable_order {
             reasons.push("stable_slot_order_changed".into());
         }
-        if from.slots.iter().map(|slot| (&slot.slot_key, slot.allocation, slot.hotspot))
-            .ne(to.slots.iter().map(|slot| (&slot.slot_key, slot.allocation, slot.hotspot)))
+        if from
+            .slots
+            .iter()
+            .map(|slot| (&slot.slot_key, slot.allocation, slot.hotspot))
+            .ne(to
+                .slots
+                .iter()
+                .map(|slot| (&slot.slot_key, slot.allocation, slot.hotspot)))
         {
             reasons.push("pinned_geometry_changed".into());
         }
@@ -579,7 +604,12 @@ pub fn compile_weighted_grammar(
     let mut output = BTreeMap::new();
     compile_grammar_node(
         grammar,
-        CanonicalRect { x: 0, y: 0, width: CANONICAL_TEMPLATE_EDGE, height: CANONICAL_TEMPLATE_EDGE },
+        CanonicalRect {
+            x: 0,
+            y: 0,
+            width: CANONICAL_TEMPLATE_EDGE,
+            height: CANONICAL_TEMPLATE_EDGE,
+        },
         0,
         &mut output,
     )?;
@@ -607,13 +637,22 @@ fn compile_grammar_node(
                 return Err(TemplateRegistryError::InvalidWeightedGrammar);
             }
             let horizontal = matches!(grammar, WeightedTemplateGrammar::Horizontal { .. });
-            let lengths = largest_remainder(if horizontal { rect.width } else { rect.height }, weights)?;
+            let lengths =
+                largest_remainder(if horizontal { rect.width } else { rect.height }, weights)?;
             let mut cursor = if horizontal { rect.x } else { rect.y };
             for (child, length) in children.iter().zip(lengths) {
                 let child_rect = if horizontal {
-                    CanonicalRect { x: cursor, width: length, ..rect }
+                    CanonicalRect {
+                        x: cursor,
+                        width: length,
+                        ..rect
+                    }
                 } else {
-                    CanonicalRect { y: cursor, height: length, ..rect }
+                    CanonicalRect {
+                        y: cursor,
+                        height: length,
+                        ..rect
+                    }
                 };
                 cursor = cursor.saturating_add(length);
                 compile_grammar_node(child, child_rect, depth + 1, output)?;
@@ -676,8 +715,7 @@ fn insert_rect_boundaries(
 
 fn scale_boundary(boundary: u32, output_edge: u32) -> u32 {
     u32::try_from(
-        (u64::from(boundary) * u64::from(output_edge)
-            + u64::from(CANONICAL_TEMPLATE_EDGE / 2))
+        (u64::from(boundary) * u64::from(output_edge) + u64::from(CANONICAL_TEMPLATE_EDGE / 2))
             / u64::from(CANONICAL_TEMPLATE_EDGE),
     )
     .expect("scaled u32 boundary remains u32")
@@ -692,7 +730,12 @@ fn scale_rect(
     let right = x_boundaries[&(rect.x + rect.width)];
     let top = y_boundaries[&rect.y];
     let bottom = y_boundaries[&(rect.y + rect.height)];
-    CanonicalRect { x: left, y: top, width: right - left, height: bottom - top }
+    CanonicalRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
 }
 
 fn rect_contains(outer: CanonicalRect, inner: CanonicalRect) -> bool {

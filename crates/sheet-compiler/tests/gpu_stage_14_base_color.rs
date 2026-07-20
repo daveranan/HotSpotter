@@ -7,11 +7,11 @@ use std::{
 
 use hot_trimmer_domain::{
     CancellationToken, ContentDigest, DocumentHash, EdgeEligibility, MaterialChannelRole,
-    MaterialMapKind, NormalConvention, NormalizedBounds, NormalizedPoint, NormalizedScalar, OrientedPixelSize,
-    PixelBounds, PixelSize, Projection, QuarterTurn, RadialMappingSettings, RegionBehavior,
-    RegionContinuity, RegionId, RegionSampling, SamplingMode, SamplingPolicy, SourceCropIntent,
-    SourceId, SourceSamplingMode, SourceSetId, StructuralProfile, TemplateSlotRole,
-    TrimSheetDocumentCommand,
+    MaterialMapKind, NormalConvention, NormalizedBounds, NormalizedPoint, NormalizedScalar,
+    OrientedPixelSize, PixelBounds, PixelSize, Projection, QuarterTurn, RadialMappingSettings,
+    RegionBehavior, RegionContinuity, RegionId, RegionSampling, SamplingMode, SamplingPolicy,
+    SourceCropIntent, SourceId, SourceSamplingMode, SourceSetId, StructuralProfile,
+    TemplateSlotRole, TrimSheetDocumentCommand,
 };
 use hot_trimmer_image_io::{
     ImagePlane, LinearColor, LinearScalar, NormalAlphaPolicy, ResolvedAlphaMode, TangentNormal,
@@ -725,11 +725,11 @@ fn material_map_plan(domain: &PreparedMaterialDomain, map: MaterialMapKind) -> C
         },
         requested_maps: vec![map],
         ordered_sources: domain
-        .registered_channels()
-        .iter()
-        .map(PreparedExemplarChannel::role)
-        .map(|role| material_source_record(domain, source_set_id, role))
-        .collect(),
+            .registered_channels()
+            .iter()
+            .map(PreparedExemplarChannel::role)
+            .map(|role| material_source_record(domain, source_set_id, role))
+            .collect(),
         ordered_regions: vec![region],
         final_plan_hash: ContentDigest(String::new()),
     }
@@ -867,11 +867,11 @@ fn material_map_modes_plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlan
             MaterialMapKind::RegionId,
         ],
         ordered_sources: domain
-        .registered_channels()
-        .iter()
-        .map(PreparedExemplarChannel::role)
-        .map(|role| material_source_record(domain, source_set_id, role))
-        .collect(),
+            .registered_channels()
+            .iter()
+            .map(PreparedExemplarChannel::role)
+            .map(|role| material_source_record(domain, source_set_id, role))
+            .collect(),
         ordered_regions,
         final_plan_hash: ContentDigest(String::new()),
     }
@@ -1032,7 +1032,9 @@ fn gpu_material_map_pipeline() {
     );
     assert!(normal_from_cached_height.telemetry.iter().any(|line| {
         line.contains("requested_map=Normal")
-            && line.contains("executed_gpu_passes=height-r32float-gpu-resource-cache,normal-from-final-height")
+            && line.contains(
+                "executed_gpu_passes=height-r32float-gpu-resource-cache,normal-from-final-height",
+            )
             && line.contains("intermediate_cache=final-height:persistent-gpu-resource-hit")
     }));
 
@@ -1225,7 +1227,9 @@ fn gpu_material_map_imported_normal_landmark_and_cache_scope() {
         "flat Height must preserve the unmistakable imported Normal landmark, got {open_gl_landmark:?}"
     );
     assert!(normal.telemetry.iter().any(|line| {
-        line.contains("executed_gpu_passes=height-r32float,authored-normal-sample,normal-from-final-height")
+        line.contains(
+            "executed_gpu_passes=height-r32float,authored-normal-sample,normal-from-final-height",
+        )
     }));
 
     let mut direct_x_plan = normal_plan.clone();
@@ -1267,9 +1271,15 @@ fn gpu_material_map_imported_normal_landmark_and_cache_scope() {
         );
     }
 
-    let base_hash = normal_plan.pixel_plan_hash(MaterialMapKind::BaseColor).unwrap();
-    let height_hash = normal_plan.pixel_plan_hash(MaterialMapKind::Height).unwrap();
-    let normal_hash = normal_plan.pixel_plan_hash(MaterialMapKind::Normal).unwrap();
+    let base_hash = normal_plan
+        .pixel_plan_hash(MaterialMapKind::BaseColor)
+        .unwrap();
+    let height_hash = normal_plan
+        .pixel_plan_hash(MaterialMapKind::Height)
+        .unwrap();
+    let normal_hash = normal_plan
+        .pixel_plan_hash(MaterialMapKind::Normal)
+        .unwrap();
     let mut replaced_normal = normal_plan.clone();
     replaced_normal
         .ordered_sources
@@ -1278,17 +1288,23 @@ fn gpu_material_map_imported_normal_landmark_and_cache_scope() {
         .expect("Normal source record")
         .digest = ContentDigest::sha256(b"replacement-normal-only");
     assert_eq!(
-        replaced_normal.pixel_plan_hash(MaterialMapKind::BaseColor).unwrap(),
+        replaced_normal
+            .pixel_plan_hash(MaterialMapKind::BaseColor)
+            .unwrap(),
         base_hash,
         "replacing Normal must not invalidate Base Color pixels"
     );
     assert_eq!(
-        replaced_normal.pixel_plan_hash(MaterialMapKind::Height).unwrap(),
+        replaced_normal
+            .pixel_plan_hash(MaterialMapKind::Height)
+            .unwrap(),
         height_hash,
         "replacing Normal must not invalidate final Height pixels"
     );
     assert_ne!(
-        replaced_normal.pixel_plan_hash(MaterialMapKind::Normal).unwrap(),
+        replaced_normal
+            .pixel_plan_hash(MaterialMapKind::Normal)
+            .unwrap(),
         normal_hash,
         "replacing Normal must invalidate Normal pixels"
     );
@@ -1298,10 +1314,7 @@ fn gpu_material_map_imported_normal_landmark_and_cache_scope() {
 fn gpu_material_maps_cover_direct_loop_and_radial_modes() {
     let domain = material_domain();
     let plan = material_map_modes_plan(&domain);
-    let output = execute_final_atlas(
-        &plan,
-        prepared_sources_for_plan(&plan, Arc::clone(&domain)),
-    );
+    let output = execute_final_atlas(&plan, prepared_sources_for_plan(&plan, Arc::clone(&domain)));
     for map in [
         MaterialMapKind::Height,
         MaterialMapKind::Normal,
@@ -1387,10 +1400,8 @@ fn gpu_material_maps_cover_direct_loop_and_radial_modes() {
     assert_eq!(lookup[3].continuity, RegionContinuity::Xy);
     assert_eq!(lookup[4].role, hot_trimmer_domain::ManualRegionRole::Radial);
     assert_ne!(
-        hot_trimmer_sheet_compiler::CompiledRegionClassification::Horizontal
-            .display_rgba8(0),
-        hot_trimmer_sheet_compiler::CompiledRegionClassification::Horizontal
-            .display_rgba8(1),
+        hot_trimmer_sheet_compiler::CompiledRegionClassification::Horizontal.display_rgba8(0),
+        hot_trimmer_sheet_compiler::CompiledRegionClassification::Horizontal.display_rgba8(1),
         "different regions in the same semantic class need distinct display shades"
     );
 }
@@ -1399,10 +1410,7 @@ fn gpu_material_maps_cover_direct_loop_and_radial_modes() {
 fn gpu_material_map_radial_extension_uses_opaque_interior_pixels() {
     let domain = material_domain_with_transparent_outer_row();
     let plan = radial_base_color_plan(&domain);
-    let output = execute_final_atlas(
-        &plan,
-        prepared_sources_for_plan(&plan, Arc::clone(&domain)),
-    );
+    let output = execute_final_atlas(&plan, prepared_sources_for_plan(&plan, Arc::clone(&domain)));
     let base_color = output
         .display_tiles
         .get(&MaterialMapKind::BaseColor)
@@ -2558,9 +2566,10 @@ fn gpu_stage_14_base_color_compile_persisted_route_counters_and_transform_parity
         .get(&MaterialMapKind::Normal)
         .expect("production Normal tile");
     assert!(
-        production_normal.pixels().chunks_exact(4).any(|pixel| {
-            pixel[3] > 0 && pixel[0] > 180 && pixel[1] > 180 && pixel[2] < 230
-        }),
+        production_normal
+            .pixels()
+            .chunks_exact(4)
+            .any(|pixel| { pixel[3] > 0 && pixel[0] > 180 && pixel[1] > 180 && pixel[2] < 230 }),
         "production Source Frame route must sample the imported tangent-space Normal landmark"
     );
     for (map, low, high) in [

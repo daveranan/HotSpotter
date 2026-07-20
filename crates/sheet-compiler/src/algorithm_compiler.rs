@@ -4,7 +4,10 @@ use hot_trimmer_domain::{
 };
 use thiserror::Error;
 
-use crate::{IntermediateAtlasArtifact, IntermediateAtlasError, IntermediateAtlasRequest, compose_intermediate_atlas};
+use crate::{
+    IntermediateAtlasArtifact, IntermediateAtlasError, IntermediateAtlasRequest,
+    compose_intermediate_atlas,
+};
 
 pub const COMPILER_FACADE_ALGORITHM_ID: &str = "hot-trimmer.algorithm-stack";
 pub const COMPILER_FACADE_VERSION: &str = "14.1.0-intermediate";
@@ -33,7 +36,10 @@ pub enum CompilerFacadeError {
     #[error("compilation was cancelled before a complete artifact existed")]
     Cancelled { report: CompilationReport },
     #[error("algorithm stage {stage} is unsupported")]
-    UnsupportedStage { stage: u8, report: CompilationReport },
+    UnsupportedStage {
+        stage: u8,
+        report: CompilationReport,
+    },
     #[error(transparent)]
     Intermediate(#[from] IntermediateAtlasError),
     #[error("persisted Stage 1-14 pipeline failed: {0}")]
@@ -42,7 +48,9 @@ pub enum CompilerFacadeError {
 
 impl AlgorithmCompiler {
     #[must_use]
-    pub const fn new() -> Self { Self }
+    pub const fn new() -> Self {
+        Self
+    }
 
     /// Refuses the first uninstalled stage. It cannot return pixels from a placeholder or legacy path.
     pub fn compile(
@@ -93,10 +101,13 @@ fn report(
 ) -> CompilationReport {
     let mut stages = std::collections::BTreeMap::new();
     if let Some(stage) = stage {
-        stages.insert(stage, StageResult::FailedWithRecovery {
-            reason: diagnostic.clone(),
-            recovery_choices: vec![RecoveryChoice::ChooseAnotherSource],
-        });
+        stages.insert(
+            stage,
+            StageResult::FailedWithRecovery {
+                reason: diagnostic.clone(),
+                recovery_choices: vec![RecoveryChoice::ChooseAnotherSource],
+            },
+        );
     }
     CompilationReport {
         header: CompilationReportHeader {

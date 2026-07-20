@@ -119,6 +119,7 @@ pub struct IntermediateAtlasArtifact {
     /// All bounded raw GPU material-map tiles returned by the persisted Stage 14
     /// compile. CPU artifacts leave this empty.
     pub rendered_tiles: BTreeMap<MaterialMapKind, Arc<crate::GpuAtlasRenderedTile>>,
+    pub rendered_tile_timings: BTreeMap<MaterialMapKind, crate::GpuAtlasTileTiming>,
     /// Paintable GPU display publications for material maps. Typed working
     /// resources remain in `rendered_tiles`.
     pub rendered_display_tiles: BTreeMap<MaterialMapKind, Arc<crate::GpuAtlasRenderedTile>>,
@@ -441,6 +442,7 @@ pub(crate) fn compose_intermediate_atlas(
         telemetry: Vec::new(),
         rendered_tile: None,
         rendered_tiles: BTreeMap::new(),
+        rendered_tile_timings: BTreeMap::new(),
         rendered_display_tiles: BTreeMap::new(),
         pending: vec![
             "profiles",
@@ -619,9 +621,7 @@ fn placement_plan_has_complete_required_assignments(
         .iter()
         .map(|placement| placement.slot_id)
         .collect::<BTreeSet<_>>();
-    slots
-        .iter()
-        .all(|slot| assigned.contains(&slot.region_id))
+    slots.iter().all(|slot| assigned.contains(&slot.region_id))
 }
 
 fn fill_unowned_transparent_pixels(

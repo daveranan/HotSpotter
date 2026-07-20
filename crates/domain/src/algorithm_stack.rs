@@ -128,7 +128,11 @@ impl SyntheticFixtureSpec {
                     SyntheticGenerator::Structure => {
                         let line_x = self.expected_properties.get("lineX").copied().unwrap_or(16);
                         let line_y = self.expected_properties.get("lineY").copied().unwrap_or(24);
-                        if i64::from(x) == line_x || i64::from(y) == line_y { 65_535 } else { 4_096 }
+                        if i64::from(x) == line_x || i64::from(y) == line_y {
+                            65_535
+                        } else {
+                            4_096
+                        }
                     }
                     SyntheticGenerator::Orientation => {
                         let rise = self.expected_properties.get("rise").copied().unwrap_or(1);
@@ -137,16 +141,42 @@ impl SyntheticFixtureSpec {
                         u16::try_from(phase * 4_096).unwrap_or(u16::MAX)
                     }
                     SyntheticGenerator::Periodicity => {
-                        let px = self.expected_properties.get("periodX").copied().unwrap_or(8).max(1);
-                        let py = self.expected_properties.get("periodY").copied().unwrap_or(8).max(1);
-                        if i64::from(x) % px == 0 || i64::from(y) % py == 0 { 57_344 } else { 8_192 }
+                        let px = self
+                            .expected_properties
+                            .get("periodX")
+                            .copied()
+                            .unwrap_or(8)
+                            .max(1);
+                        let py = self
+                            .expected_properties
+                            .get("periodY")
+                            .copied()
+                            .unwrap_or(8)
+                            .max(1);
+                        if i64::from(x) % px == 0 || i64::from(y) % py == 0 {
+                            57_344
+                        } else {
+                            8_192
+                        }
                     }
                     SyntheticGenerator::Saliency => {
-                        let cx = self.expected_properties.get("centerX").copied().unwrap_or(32);
-                        let cy = self.expected_properties.get("centerY").copied().unwrap_or(32);
+                        let cx = self
+                            .expected_properties
+                            .get("centerX")
+                            .copied()
+                            .unwrap_or(32);
+                        let cy = self
+                            .expected_properties
+                            .get("centerY")
+                            .copied()
+                            .unwrap_or(32);
                         let dx = i64::from(x) - cx;
                         let dy = i64::from(y) - cy;
-                        if dx * dx + dy * dy <= 25 { 65_535 } else { stable_noise(self.seed, x, y) }
+                        if dx * dx + dy * dy <= 25 {
+                            65_535
+                        } else {
+                            stable_noise(self.seed, x, y)
+                        }
                     }
                     SyntheticGenerator::Registration => stable_noise(self.seed, x, y),
                 };
@@ -159,7 +189,10 @@ impl SyntheticFixtureSpec {
             planes.insert(String::from("normal"), base.clone());
             planes.insert(String::from("roughness"), base);
         }
-        SyntheticFixture { spec: self.clone(), planes }
+        SyntheticFixture {
+            spec: self.clone(),
+            planes,
+        }
     }
 }
 
@@ -180,8 +213,12 @@ pub enum StageResult {
         settings_hash: ContentDigest,
         diagnostics: Vec<CompilationDiagnostic>,
     },
-    PassThrough { reason: String },
-    SkippedBecauseUnused { reason: String },
+    PassThrough {
+        reason: String,
+    },
+    SkippedBecauseUnused {
+        reason: String,
+    },
     FailedWithRecovery {
         reason: CompilationDiagnostic,
         recovery_choices: Vec<RecoveryChoice>,
@@ -305,7 +342,11 @@ pub struct CachedArtifact {
 }
 
 pub trait ContentAddressedCache: Send + Sync {
-    fn load(&self, key: &CacheKey, kind: CacheArtifactKind) -> Result<Option<CachedArtifact>, CacheError>;
+    fn load(
+        &self,
+        key: &CacheKey,
+        kind: CacheArtifactKind,
+    ) -> Result<Option<CachedArtifact>, CacheError>;
     /// Implementations must publish atomically only after the complete digest-verified payload is written.
     fn publish_complete(&self, artifact: CachedArtifact) -> Result<(), CacheError>;
 }
@@ -441,9 +482,12 @@ impl SeedPolicy {
             Self::Fixed { seed } => seed,
             Self::DerivedFromRequest => {
                 let bytes = request_key.0.0.as_bytes();
-                bytes.iter().take(16).fold(0xcbf2_9ce4_8422_2325, |acc, byte| {
-                    (acc ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-                })
+                bytes
+                    .iter()
+                    .take(16)
+                    .fold(0xcbf2_9ce4_8422_2325, |acc, byte| {
+                        (acc ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    })
             }
         }
     }
@@ -460,10 +504,16 @@ pub struct CancellationToken(Arc<AtomicBool>);
 
 impl CancellationToken {
     #[must_use]
-    pub fn new() -> Self { Self::default() }
-    pub fn cancel(&self) { self.0.store(true, Ordering::Release); }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
     #[must_use]
-    pub fn is_cancelled(&self) -> bool { self.0.load(Ordering::Acquire) }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -471,10 +521,16 @@ pub struct RevisionAuthority(Arc<AtomicU64>);
 
 impl RevisionAuthority {
     #[must_use]
-    pub fn new(revision: u64) -> Self { Self(Arc::new(AtomicU64::new(revision))) }
-    pub fn supersede_with(&self, revision: u64) { self.0.store(revision, Ordering::Release); }
+    pub fn new(revision: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(revision)))
+    }
+    pub fn supersede_with(&self, revision: u64) {
+        self.0.store(revision, Ordering::Release);
+    }
     #[must_use]
-    pub fn current(&self) -> u64 { self.0.load(Ordering::Acquire) }
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -486,8 +542,16 @@ pub struct PublicationGuard {
 
 impl PublicationGuard {
     #[must_use]
-    pub fn new(expected_revision: u64, cancellation: CancellationToken, revisions: RevisionAuthority) -> Self {
-        Self { expected_revision, cancellation, revisions }
+    pub fn new(
+        expected_revision: u64,
+        cancellation: CancellationToken,
+        revisions: RevisionAuthority,
+    ) -> Self {
+        Self {
+            expected_revision,
+            cancellation,
+            revisions,
+        }
     }
 
     pub fn authorize_complete_publish(&self) -> Result<(), CompilationDiagnostic> {
@@ -554,11 +618,19 @@ mod tests {
             contract_version: ALGORITHM_STACK_CONTRACT_VERSION,
             source_digests: vec![ContentDigest::sha256(b"source-a")],
             settings_hash: ContentDigest::sha256(b"settings"),
-            algorithm_versions: BTreeMap::from([(1, AlgorithmProvenance {
-                algorithm_id: String::from("source-ingestion"), version: String::from("0.0.0-unsupported"),
-            })]),
+            algorithm_versions: BTreeMap::from([(
+                1,
+                AlgorithmProvenance {
+                    algorithm_id: String::from("source-ingestion"),
+                    version: String::from("0.0.0-unsupported"),
+                },
+            )]),
             template_topology_hash: ContentDigest::sha256(b"fixed-template"),
-            output: OutputSpecHeader { width: 2048, height: 2048, mip_count: 4 },
+            output: OutputSpecHeader {
+                width: 2048,
+                height: 2048,
+                mip_count: 4,
+            },
             seed: 7,
             revision: 3,
         }
@@ -577,39 +649,66 @@ mod tests {
         }
 
         let traceability = TraceabilityMatrix::bundled().expect("valid traceability");
-        let stages: Vec<_> = traceability.stages.iter().map(|entry| entry.stage).collect();
+        let stages: Vec<_> = traceability
+            .stages
+            .iter()
+            .map(|entry| entry.stage)
+            .collect();
         assert_eq!(stages, (1..=20).collect::<Vec<_>>());
         assert!(traceability.acceptance_invariants.len() >= 30);
-        assert!(traceability.stages.iter().all(|entry| !entry.planned_test.is_empty()));
+        assert!(
+            traceability
+                .stages
+                .iter()
+                .all(|entry| !entry.planned_test.is_empty())
+        );
 
         let first = request();
         let second = request();
-        assert_eq!(first.canonical_bytes().unwrap(), second.canonical_bytes().unwrap());
+        assert_eq!(
+            first.canonical_bytes().unwrap(),
+            second.canonical_bytes().unwrap()
+        );
         assert_eq!(first.cache_key().unwrap(), second.cache_key().unwrap());
         let key = first.cache_key().unwrap();
         let report = CompilationReport {
             header: CompilationReportHeader {
                 contract_version: 1,
                 request_key: key,
-                compiler: AlgorithmProvenance { algorithm_id: String::from("hot-trimmer"), version: String::from("0.1.0") },
+                compiler: AlgorithmProvenance {
+                    algorithm_id: String::from("hot-trimmer"),
+                    version: String::from("0.1.0"),
+                },
                 seed: 7,
                 revision: 3,
             },
-            stages: BTreeMap::from([(1, StageResult::FailedWithRecovery {
-                reason: CompilationDiagnostic::unsupported_stage(1),
-                recovery_choices: vec![RecoveryChoice::ChooseAnotherSource],
-            })]),
+            stages: BTreeMap::from([(
+                1,
+                StageResult::FailedWithRecovery {
+                    reason: CompilationDiagnostic::unsupported_stage(1),
+                    recovery_choices: vec![RecoveryChoice::ChooseAnotherSource],
+                },
+            )]),
             diagnostics: vec![CompilationDiagnostic::unsupported_stage(1)],
         };
-        assert_eq!(report.deterministic_bytes().unwrap(), report.deterministic_bytes().unwrap());
+        assert_eq!(
+            report.deterministic_bytes().unwrap(),
+            report.deterministic_bytes().unwrap()
+        );
 
         let cancellation = CancellationToken::new();
         let revisions = RevisionAuthority::new(3);
         let guard = PublicationGuard::new(3, cancellation.clone(), revisions.clone());
         cancellation.cancel();
-        assert_eq!(guard.authorize_complete_publish().unwrap_err().code, DiagnosticCode::Cancelled);
+        assert_eq!(
+            guard.authorize_complete_publish().unwrap_err().code,
+            DiagnosticCode::Cancelled
+        );
         let guard = PublicationGuard::new(3, CancellationToken::new(), revisions.clone());
         revisions.supersede_with(4);
-        assert_eq!(guard.authorize_complete_publish().unwrap_err().code, DiagnosticCode::RevisionSuperseded);
+        assert_eq!(
+            guard.authorize_complete_publish().unwrap_err().code,
+            DiagnosticCode::RevisionSuperseded
+        );
     }
 }

@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use hot_trimmer_domain::{
-    ContentDigest, DocumentHash, EdgeEligibility, ManualRegionRole, MappingTransform, MaterialChannelRole,
-    OrientedPixelSize, PatchId, PixelBounds, PixelSize, RadialMappingSettings, RegionContinuity,
-    RegionId, RegionSampling, SourceSetId, StructuralProfile,
+    ContentDigest, DocumentHash, EdgeEligibility, ManualRegionRole, MappingTransform,
+    MaterialChannelRole, OrientedPixelSize, PatchId, PixelBounds, PixelSize, RadialMappingSettings,
+    RegionContinuity, RegionId, RegionSampling, SourceSetId, StructuralProfile,
 };
 use hot_trimmer_placement_solver::SamplingPlan;
 
@@ -142,16 +142,12 @@ struct CanonicalAtlasPixelTileRequest {
     valid_rect: OutputPixelRect,
 }
 
-fn pixel_source_roles(
-    map: hot_trimmer_domain::MaterialMapKind,
-) -> &'static [MaterialChannelRole] {
+fn pixel_source_roles(map: hot_trimmer_domain::MaterialMapKind) -> &'static [MaterialChannelRole] {
     use hot_trimmer_domain::MaterialMapKind;
     match map {
         MaterialMapKind::BaseColor => &[MaterialChannelRole::BaseColor],
         MaterialMapKind::Height => &[MaterialChannelRole::Height],
-        MaterialMapKind::Normal => {
-            &[MaterialChannelRole::Height, MaterialChannelRole::Normal]
-        }
+        MaterialMapKind::Normal => &[MaterialChannelRole::Height, MaterialChannelRole::Normal],
         MaterialMapKind::Roughness => &[MaterialChannelRole::Roughness],
         MaterialMapKind::Metallic => &[MaterialChannelRole::Metallic],
         MaterialMapKind::AmbientOcclusion => &[MaterialChannelRole::AmbientOcclusion],

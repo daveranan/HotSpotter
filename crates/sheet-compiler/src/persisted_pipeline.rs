@@ -51,7 +51,9 @@ use sha2::{Digest as ShaDigest, Sha256};
 
 #[derive(Clone)]
 struct DomainArtifacts {
+    source_set_id: hot_trimmer_domain::SourceSetId,
     patch_id: Option<String>,
+    patch_id_raw: Option<hot_trimmer_domain::PatchId>,
     domain: hot_trimmer_material_synthesis::PreparedMaterialDomain,
     stage5: hot_trimmer_material_analysis::SourceAnalysisReport,
     stage6: hot_trimmer_material_analysis::ScaleOrientationReport,
@@ -684,19 +686,114 @@ fn compile_persisted(
     }
 
     let mut ordered_plans = Vec::with_capacity(placement.placements.len());
+    for (slot, region) in topology.slots.iter().zip(&document.topology.regions) {
+        let plan = placement
+            .placements
+            .iter()
+            .find(|plan| plan.slot_id == region.id)
+            .ok_or_else(|| format!("Stage 13 omitted required slot {}", slot.slot_key))?;
+        ordered_plans.push(plan);
+    }
+
+    if let Some(executor) = executor_override {
+        let compiled_plan = fixed_template_compiled_atlas_plan(
+            &request,
+            document,
+            &topology,
+            &ordered_plans,
+            &domains,
+            &region_domains,
+        )?;
+        let mut prepared_sources = BTreeMap::new();
+        for artifacts in &domains {
+            for channel_role in compiled_source_roles_for_domain(&artifacts.domain) {
+                let source_id = artifacts.domain.prepared_source_digest.clone();
+                prepared_sources
+                    .entry((artifacts.source_set_id, source_id.clone(), channel_role))
+                    .or_insert_with(|| AtlasPreparedSource {
+                        source_set_id: artifacts.source_set_id,
+                        source_id,
+                        channel_role,
+                        domain: Arc::new(artifacts.domain.clone()),
+                    });
+            }
+        }
+        let execution = executor
+            .execute(
+                &compiled_plan,
+                &AtlasRenderExecutionInput {
+                    prepared_sources: prepared_sources.into_values().collect(),
+                    source_frame_cache,
+                },
+                cancellation,
+                is_current,
+            )
+            .map_err(|error| error.to_string())?;
+        if let AtlasRenderExecutorOutput::FinalAtlas(output) = execution {
+            let region_sources = document
+                .topology
+                .regions
+                .iter()
+                .enumerate()
+                .map(|(index, _region)| {
+                    let artifacts = &domains[region_domains[index]];
+                    (
+                        artifacts.source_set_id,
+                        artifacts.patch_id_raw,
+                        artifacts.domain.prepared_source_digest.clone(),
+                        Arc::new(artifacts.domain.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut artifact = final_atlas_artifact_from_gpu(
+                request.revision,
+                topology.clone(),
+                &placement,
+                fixed_template_algorithm_versions(
+                    first_domain,
+                    snapshot,
+                    &stage10.stage_result,
+                    &placement,
+                    Some(AlgorithmProvenance {
+                        algorithm_id: "hot-trimmer.stage-14.gpu-final-atlas".into(),
+                        version: COMPILED_ATLAS_ALGORITHM_VERSION.into(),
+                    }),
+                ),
+                Vec::new(),
+                document,
+                &region_sources,
+                &compiled_plan,
+                &output,
+            )?;
+            artifact.pending.retain(|pending| *pending != "profiles");
+            artifact.telemetry.push(format!(
+                "profile={:?}; output={}x{}; regions={}; maps={}; executor=gpu; plan_hash={}; render_ms={}; cpu_stage14_calls=0; cpu_atlas_composition_calls=0",
+                request.profile,
+                topology.output_size.width,
+                topology.output_size.height,
+                document.topology.regions.len(),
+                compiled_plan
+                    .requested_maps
+                    .iter()
+                    .map(|map| format!("{map:?}"))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                compiled_plan.final_plan_hash.0,
+                output.render_ms
+            ));
+            return Ok(artifact);
+        }
+    }
+
     let mut results = Vec::with_capacity(placement.placements.len());
-    for (index, (slot, region)) in topology
+    for (index, (slot, _region)) in topology
         .slots
         .iter()
         .zip(&document.topology.regions)
         .enumerate()
     {
         let artifacts = &domains[region_domains[index]];
-        let plan = placement
-            .placements
-            .iter()
-            .find(|plan| plan.slot_id == region.id)
-            .ok_or_else(|| format!("Stage 13 omitted required slot {}", slot.slot_key))?;
+        let plan = ordered_plans[index];
         results.push(
             synthesize_slot_material_with_guard(
                 SlotSynthesisRequest {
@@ -709,7 +806,6 @@ fn compile_persisted(
             )
             .map_err(|error| format!("Stage 14 failed for {}: {error}", slot.slot_key))?,
         );
-        ordered_plans.push(plan);
     }
     let slots = topology
         .slots
@@ -736,57 +832,15 @@ fn compile_persisted(
             }
         })
         .collect::<Vec<_>>();
-    let versions = algorithm_versions([
-        (
-            1,
-            Some(AlgorithmProvenance {
-                algorithm_id: "hot_trimmer.persisted_registered_source".into(),
-                version: "1.0.0".into(),
-            }),
-        ),
-        (
-            2,
-            Some(AlgorithmProvenance {
-                algorithm_id: hot_trimmer_image_io::STAGE_02_ALGORITHM_ID.into(),
-                version: hot_trimmer_image_io::STAGE_02_ALGORITHM_VERSION.into(),
-            }),
-        ),
-        (3, executed_algorithm(&first_domain.stage3_result)),
-        (4, executed_algorithm(&first_domain.stage4_result)),
-        (5, executed_algorithm(&first_domain.stage5.stage_result)),
-        (6, executed_algorithm(&first_domain.stage6.stage_result)),
-        (7, executed_algorithm(&first_domain.stage7.stage_result)),
-        (8, executed_algorithm(&first_domain.stage8_result)),
-        (
-            9,
-            Some(AlgorithmProvenance {
-                algorithm_id: "hot_trimmer.fixed_template_topology".into(),
-                version: snapshot.identity.template_version.clone(),
-            }),
-        ),
-        (10, executed_algorithm(&stage10.stage_result)),
-        (
-            11,
-            Some(AlgorithmProvenance {
-                algorithm_id: hot_trimmer_placement_solver::STAGE_11_ALGORITHM_ID.into(),
-                version: hot_trimmer_placement_solver::STAGE_11_ALGORITHM_VERSION.into(),
-            }),
-        ),
-        (
-            12,
-            Some(AlgorithmProvenance {
-                algorithm_id: hot_trimmer_placement_solver::STAGE_12_ALGORITHM_ID.into(),
-                version: hot_trimmer_placement_solver::STAGE_12_ALGORITHM_VERSION.into(),
-            }),
-        ),
-        (13, executed_algorithm(&placement.stage_result)),
-        (
-            14,
-            results
-                .first()
-                .and_then(|result| executed_algorithm(&result.stage_result)),
-        ),
-    ]);
+    let versions = fixed_template_algorithm_versions(
+        first_domain,
+        snapshot,
+        &stage10.stage_result,
+        &placement,
+        results
+            .first()
+            .and_then(|result| executed_algorithm(&result.stage_result)),
+    );
     AlgorithmCompiler::new()
         .compile_intermediate_atlas(
             &IntermediateAtlasRequest {
@@ -1932,6 +1986,203 @@ fn compiled_tile_request_for(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fixed_template_compiled_atlas_plan(
+    request: &PersistedStage14PreviewRequest<'_>,
+    document: &hot_trimmer_domain::TrimSheetDocument,
+    topology: &hot_trimmer_domain::CompiledTemplateTopology,
+    ordered_plans: &[&SamplingPlan],
+    domains: &[DomainArtifacts],
+    region_domains: &[usize],
+) -> Result<CompiledAtlasPlanV1, String> {
+    let mut source_records = Vec::new();
+    let mut source_index = BTreeMap::new();
+    for artifacts in domains {
+        for channel_role in compiled_source_roles_for_domain(&artifacts.domain) {
+            let source_id = artifacts.domain.prepared_source_digest.clone();
+            let key = (artifacts.source_set_id, source_id.clone(), channel_role);
+            if source_index.contains_key(&key) {
+                continue;
+            }
+            source_records.push(CompiledSourceCommandV1 {
+                source_set_id: artifacts.source_set_id,
+                source_id: source_id.clone(),
+                digest: prepared_channel_digest(&artifacts.domain, channel_role),
+                oriented_dimensions: OrientedPixelSize {
+                    width: artifacts.domain.width,
+                    height: artifacts.domain.height,
+                },
+                decoder_version: DIRECT_SOURCE_FRAME_DECODER_VERSION.to_string(),
+                decoded_format: "rgba8".to_string(),
+                color_version: DIRECT_SOURCE_FRAME_DECODER_VERSION.to_string(),
+                channel_role,
+            });
+            source_index.insert(key, source_records.len());
+        }
+    }
+
+    let mut region_records = Vec::with_capacity(document.topology.regions.len());
+    for (index, ((slot, region), plan)) in topology
+        .slots
+        .iter()
+        .zip(document.topology.regions.iter())
+        .zip(ordered_plans.iter())
+        .enumerate()
+    {
+        let artifacts = &domains[region_domains[index]];
+        let binding = document
+            .region_bindings
+            .get(&region.id)
+            .ok_or_else(|| format!("region {} has no persisted content binding", region.id))?;
+        let crop = plan.candidate.crop.unwrap_or(SourceCrop {
+            x: 0,
+            y: 0,
+            width: artifacts.domain.width,
+            height: artifacts.domain.height,
+        });
+        let mut sampling_plan = (*plan).clone();
+        if sampling_plan.candidate.crop.is_none() {
+            sampling_plan.candidate.crop = Some(crop);
+        }
+        let padding_px = slot
+            .hotspot
+            .x
+            .saturating_sub(slot.allocation.x)
+            .max(slot.hotspot.y.saturating_sub(slot.allocation.y))
+            .max(
+                (slot.allocation.x + slot.allocation.width)
+                    .saturating_sub(slot.hotspot.x + slot.hotspot.width),
+            )
+            .max(
+                (slot.allocation.y + slot.allocation.height)
+                    .saturating_sub(slot.hotspot.y + slot.hotspot.height),
+            );
+        let render_cache_key = ContentDigest::sha256(
+            format!(
+                "fixed-template|{}|{}|{}|{}|{}|{}|{}|{}",
+                request.profile as u8,
+                region.id,
+                plan.candidate.candidate_id.0,
+                artifacts.domain.cache_key.0,
+                slot.allocation.x,
+                slot.allocation.y,
+                slot.allocation.width,
+                slot.allocation.height
+            )
+            .as_bytes(),
+        );
+        region_records.push(CompiledRegionCommandV1 {
+            region_id: region.id,
+            compact_index: u32::try_from(index)
+                .map_err(|_| format!("fixed-template compact index {index} overflows u32"))?,
+            region_role: binding.mapping.behavior.role,
+            source_set_id: artifacts.source_set_id,
+            source_id: artifacts.domain.prepared_source_digest.clone(),
+            patch_id: artifacts.patch_id_raw,
+            source_crop: SourcePixelRect(hot_trimmer_domain::PixelBounds {
+                x: crop.x,
+                y: crop.y,
+                width: crop.width,
+                height: crop.height,
+            }),
+            destination_rect: OutputPixelRect(hot_trimmer_domain::PixelBounds {
+                x: slot.allocation.x,
+                y: slot.allocation.y,
+                width: slot.allocation.width,
+                height: slot.allocation.height,
+            }),
+            sampling: binding.mapping.behavior.sampling,
+            source_to_region_transform: binding.mapping.transform,
+            radial_parameters: binding.mapping.behavior.radial,
+            structural_profile: region.structural_profile,
+            continuity: binding.mapping.behavior.continuity,
+            padding_px,
+            edge_eligibility: binding.mapping.behavior.edge_eligibility,
+            sampling_plan,
+            render_cache_key,
+        });
+    }
+
+    let mut plan = compiled_atlas_plan_from_persisted(
+        request.revision,
+        request.draft_id,
+        document.topology.topology_hash,
+        document
+            .appearance_hash()
+            .map_err(|error| error.to_string())?,
+        topology.output_size,
+        request.profile,
+        material_maps_for_view_intent(request.view_intent.as_ref()),
+        source_records,
+        region_records,
+    )
+    .map_err(|error| error.to_string())?;
+    plan.tile_request = compiled_tile_request_for(
+        request.profile,
+        request.view_intent.as_ref(),
+        topology.output_size,
+        request.draft_id.unwrap_or_default(),
+        &plan.ordered_regions,
+    )?;
+    plan.final_plan_hash = ContentDigest(String::new());
+    plan.finalize().map_err(|error| error.to_string())
+}
+
+fn fixed_template_algorithm_versions(
+    first_domain: &DomainArtifacts,
+    snapshot: &hot_trimmer_domain::TemplateSnapshot,
+    stage10_result: &StageResult,
+    placement: &PlacementPlan,
+    stage14: Option<AlgorithmProvenance>,
+) -> BTreeMap<u8, AlgorithmProvenance> {
+    algorithm_versions([
+        (
+            1,
+            Some(AlgorithmProvenance {
+                algorithm_id: "hot_trimmer.persisted_registered_source".into(),
+                version: "1.0.0".into(),
+            }),
+        ),
+        (
+            2,
+            Some(AlgorithmProvenance {
+                algorithm_id: hot_trimmer_image_io::STAGE_02_ALGORITHM_ID.into(),
+                version: hot_trimmer_image_io::STAGE_02_ALGORITHM_VERSION.into(),
+            }),
+        ),
+        (3, executed_algorithm(&first_domain.stage3_result)),
+        (4, executed_algorithm(&first_domain.stage4_result)),
+        (5, executed_algorithm(&first_domain.stage5.stage_result)),
+        (6, executed_algorithm(&first_domain.stage6.stage_result)),
+        (7, executed_algorithm(&first_domain.stage7.stage_result)),
+        (8, executed_algorithm(&first_domain.stage8_result)),
+        (
+            9,
+            Some(AlgorithmProvenance {
+                algorithm_id: "hot_trimmer.fixed_template_topology".into(),
+                version: snapshot.identity.template_version.clone(),
+            }),
+        ),
+        (10, executed_algorithm(stage10_result)),
+        (
+            11,
+            Some(AlgorithmProvenance {
+                algorithm_id: hot_trimmer_placement_solver::STAGE_11_ALGORITHM_ID.into(),
+                version: hot_trimmer_placement_solver::STAGE_11_ALGORITHM_VERSION.into(),
+            }),
+        ),
+        (
+            12,
+            Some(AlgorithmProvenance {
+                algorithm_id: hot_trimmer_placement_solver::STAGE_12_ALGORITHM_ID.into(),
+                version: hot_trimmer_placement_solver::STAGE_12_ALGORITHM_VERSION.into(),
+            }),
+        ),
+        (13, executed_algorithm(&placement.stage_result)),
+        (14, stage14),
+    ])
+}
+
 fn material_maps_for_view_intent(
     intent: Option<&SourceFramePreviewViewIntent>,
 ) -> Vec<hot_trimmer_domain::MaterialMapKind> {
@@ -2259,6 +2510,7 @@ fn final_atlas_artifact_from_gpu(
         telemetry: output.telemetry.clone(),
         rendered_tile: Some(Arc::clone(&output.interactive_tile)),
         rendered_tiles: output.map_tiles.clone(),
+        rendered_tile_timings: output.tile_timings.clone(),
         rendered_display_tiles: output.display_tiles.clone(),
         pending: vec![
             "profiles",
@@ -3042,7 +3294,9 @@ fn build_domain(
     )
     .map_err(|error| format!("Stage 8 failed: {error}"))?;
     Ok(DomainArtifacts {
+        source_set_id,
         patch_id: patch.map(|value| value.id.to_string()),
+        patch_id_raw: patch.map(|value| value.id),
         domain: stage8.domain,
         stage5,
         stage6,

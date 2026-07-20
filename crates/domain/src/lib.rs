@@ -14,19 +14,20 @@ mod units;
 pub use algorithm_stack::*;
 pub use channel::{Channel, ChannelDataKind};
 pub use document::{
-    AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION, REGION_BEHAVIOR_VERSION, AcceptedTopology, AddressMode, AppearanceHashInputs,
+    AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION, AcceptedTopology, AddressMode, AppearanceHashInputs,
     AuthoredLayoutPreset, AuthoredLayoutPresetRegion, BlendPolicy, ChangeClassification,
-    ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, FitAxis,
-    GeneratorProvenance, MAX_MAPPING_MAGNITUDE, MappingTransform, MaterialMapContent,
-    MaterialMapKind, MaterialSourceSet, PartitionAxis, ProceduralMaterial, Projection, QuarterTurn,
-    EdgeEligibility, ManualRegionRole, RadialMappingSettings, RegionAppearanceHashInput,
-    RegionBehavior, RegionBinding, RegionContinuity, RegionDefinition, RegionMapping,
-    RegionOrientation, RegionSampling, RegionTopologyHashInput, RenderSettings, SamplingPolicy,
-    SheetFraming, SolidChannelValues, SourceCropIntent, TRIM_SHEET_DOCUMENT_SCHEMA_VERSION,
-    TopologyHashInputs, TopologyKind, TopologySnapshot, TreatmentLayer, TreatmentParameter,
-    TrimSheetChange, TrimSheetDocument, TrimSheetDocumentCommand, TrimSheetDocumentError,
-    TrimSheetId, UvFitKind, UvFitPolicy, WARP_OPERATION_VERSION, WarpOperation,
-    diagonal_cascade_authored_preset, new_blank_authored_preset, validate_authored_layout_preset,
+    ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, EdgeEligibility, FitAxis,
+    GeneratorProvenance, MAX_MAPPING_MAGNITUDE, ManualRegionRole, MappingTransform,
+    MaterialMapContent, MaterialMapKind, MaterialSourceSet, PartitionAxis, ProceduralMaterial,
+    Projection, QuarterTurn, REGION_BEHAVIOR_VERSION, RadialMappingSettings,
+    RegionAppearanceHashInput, RegionBehavior, RegionBinding, RegionContinuity, RegionDefinition,
+    RegionMapping, RegionOrientation, RegionSampling, RegionTopologyHashInput, RenderSettings,
+    SamplingPolicy, SheetFraming, SolidChannelValues, SourceCropIntent,
+    TRIM_SHEET_DOCUMENT_SCHEMA_VERSION, TopologyHashInputs, TopologyKind, TopologySnapshot,
+    TreatmentLayer, TreatmentParameter, TrimSheetChange, TrimSheetDocument,
+    TrimSheetDocumentCommand, TrimSheetDocumentError, TrimSheetId, UvFitKind, UvFitPolicy,
+    WARP_OPERATION_VERSION, WarpOperation, diagonal_cascade_authored_preset,
+    new_blank_authored_preset, validate_authored_layout_preset,
 };
 pub use error::{DomainError, ErrorCode, UserFacingError};
 pub use id::{LayerId, LayoutId, MapId, PatchId, ProjectId, RegionId, SourceId, SourceSetId};

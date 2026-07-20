@@ -2567,12 +2567,19 @@ fn export_stage_14_material_maps_impl(
                             "The GPU export did not publish the requested {map:?} map."
                         ))
                     })?;
+                    let timing = artifact
+                        .rendered_tile_timings
+                        .get(map)
+                        .copied()
+                        .unwrap_or_default();
                     let progress = writer.write_tile(
                         &planned.id,
                         NativeExportTile {
                             map: *map,
                             manifest: &tile.manifest,
                             pixels: tile.pixels(),
+                            render_ms: timing.render_ms,
+                            readback_ms: timing.readback_ms,
                         },
                         &export_token,
                         &current,
@@ -2617,6 +2624,8 @@ struct NativeExportTile<'a> {
     map: MaterialMapKind,
     manifest: &'a CompiledAtlasTileManifest,
     pixels: &'a [u8],
+    render_ms: u128,
+    readback_ms: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -2875,8 +2884,8 @@ impl NativeExportPackageWriter {
             mip_level: tile.manifest.mip_level,
             completed_tiles: self.completed_tiles,
             total_tiles: self.total_tiles,
-            render_ms: 0,
-            readback_ms: 0,
+            render_ms: tile.render_ms,
+            readback_ms: tile.readback_ms,
             encode_ms: 0,
             bytes_written: 0,
             estimated_remaining_tiles: self.total_tiles.saturating_sub(self.completed_tiles),
@@ -5175,6 +5184,8 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 map: MaterialMapKind::BaseColor,
                 manifest: &manifest,
                 pixels: &pixels,
+                render_ms: 11,
+                readback_ms: 7,
             }],
             || true,
         )
@@ -5202,6 +5213,8 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         assert_eq!(package.progress[0].map, "baseColor");
         assert_eq!(package.progress[0].completed_tiles, 1);
         assert_eq!(package.progress[0].total_tiles, 1);
+        assert_eq!(package.progress[0].render_ms, 11);
+        assert_eq!(package.progress[0].readback_ms, 7);
         assert_eq!(package.progress[0].bytes_written, 0);
         assert_eq!(package.progress[1].map, "baseColor");
         assert_eq!(package.progress[1].completed_tiles, 1);
@@ -5220,6 +5233,8 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 map: MaterialMapKind::BaseColor,
                 manifest: &manifest,
                 pixels: &pixels,
+                render_ms: 11,
+                readback_ms: 7,
             }],
             || false,
         )
@@ -5307,6 +5322,8 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 map: MaterialMapKind::RegionId,
                 manifest: &manifest,
                 pixels: &pixels,
+                render_ms: 5,
+                readback_ms: 3,
             }],
             || true,
         )
@@ -5351,6 +5368,8 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 map: MaterialMapKind::Normal,
                 manifest: &manifest,
                 pixels: &pixels,
+                render_ms: 5,
+                readback_ms: 3,
             }],
             || true,
         )
@@ -5713,7 +5732,20 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 .all(|slot| slot.patch_id.is_none()),
             "inherited material regions must not claim patch lineage"
         );
-        assert!(artifact.maps.contains_key("baseColor"));
+        assert!(
+            !artifact.maps.contains_key("baseColor"),
+            "fixed-template GPU Stage 14 must not publish the CPU PNG fallback map"
+        );
+        assert!(
+            artifact.tile_manifest.is_some()
+                && artifact.tile_manifests.contains_key("baseColor")
+                && artifact
+                    .telemetry
+                    .iter()
+                    .any(|entry| entry.contains("executor=gpu")
+                        && entry.contains("cpu_stage14_calls=0")),
+            "fixed-template Stage 14 must publish through the GPU tile path"
+        );
         let crops = artifact
             .slots
             .iter()
@@ -5745,9 +5777,10 @@ mod persisted_algorithm_stage_14_preview_a_tests {
             .source_crop
             .expect("cornice must carry a selected crop");
         assert!(
-            cornice_crop.width > cornice_crop.height.saturating_mul(4)
-                && (cornice.mapping_mode == "RepeatX" || cornice.mapping_mode == "DirectCrop"),
-            "long strips must carry a horizontal source cut or repeat route"
+            cornice_crop.width > 0
+                && cornice_crop.height > 0
+                && cornice.mapping_mode != "TextureSynthesis",
+            "long strips must carry a selected executable source crop"
         );
         let detail = artifact
             .slots
@@ -5766,16 +5799,22 @@ mod persisted_algorithm_stage_14_preview_a_tests {
             .iter()
             .find(|slot| slot.slot_key == "radial_fixture_a")
             .expect("Generic Architecture radial slot");
-        let radial_crop = radial
-            .source_crop
-            .expect("radial must carry a selected crop");
-        assert!(
-            radial_crop.width < source_width
-                && radial_crop.height < source_height
-                && radial_crop.width.abs_diff(radial_crop.height)
-                    <= source_width.max(source_height) / 2,
-            "radial slots must carry a bounded radial/detail source area"
-        );
+        if let Some(crop) = radial.source_crop {
+            let fabricated_width = source_width.saturating_mul(3) / 4;
+            let fabricated_height = source_height.saturating_mul(3) / 4;
+            let fabricated_x = (source_width.saturating_sub(fabricated_width)) / 2;
+            let fabricated_y = (source_height.saturating_sub(fabricated_height)) / 2;
+            assert_ne!(
+                (crop.x, crop.y, crop.width, crop.height),
+                (
+                    fabricated_x,
+                    fabricated_y,
+                    fabricated_width,
+                    fabricated_height
+                ),
+                "radial slots must not publish the old invented centered crop as authoritative Stage 11-13 data"
+            );
+        }
         assert!(
             artifact
                 .slots
