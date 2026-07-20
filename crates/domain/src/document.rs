@@ -727,7 +727,10 @@ impl Default for RenderSettings {
                     enabled: true,
                     bit_depth: if matches!(
                         channel,
-                        Channel::BaseColor | Channel::RegionId | Channel::MaterialId
+                        Channel::BaseColor
+                            | Channel::Normal
+                            | Channel::RegionId
+                            | Channel::MaterialId
                     ) {
                         ChannelBitDepth::Eight
                     } else {
@@ -1855,6 +1858,9 @@ impl TrimSheetDocument {
             TrimSheetDocumentCommand::SetAtlasPadding { padding_px } => {
                 next.render_settings.atlas_padding_px = *padding_px;
             }
+            TrimSheetDocumentCommand::SetChannelRenderPolicy { channel, policy } => {
+                next.render_settings.channels.insert(*channel, *policy);
+            }
         }
         next.document_revision = next.document_revision.saturating_add(1);
         next.appearance_revision = next.document_revision;
@@ -2714,6 +2720,10 @@ pub enum TrimSheetDocumentCommand {
     },
     SetAtlasPadding {
         padding_px: u32,
+    },
+    SetChannelRenderPolicy {
+        channel: Channel,
+        policy: ChannelRenderPolicy,
     },
     SetSourceFrame {
         bounds: NormalizedBounds,

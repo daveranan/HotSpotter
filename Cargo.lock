@@ -1697,6 +1697,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hot-trimmer-domain",
+ "hot-trimmer-export",
  "hot-trimmer-geometry",
  "hot-trimmer-image-io",
  "hot-trimmer-material-analysis",
@@ -1707,6 +1708,7 @@ dependencies = [
  "hot-trimmer-render-core",
  "hot-trimmer-sheet-compiler",
  "image",
+ "png 0.18.1",
  "serde",
  "serde_json",
  "sha2",
@@ -1858,6 +1860,7 @@ dependencies = [
  "base64 0.22.1",
  "hot-trimmer-domain",
  "hot-trimmer-effect-compiler",
+ "hot-trimmer-export",
  "hot-trimmer-geometry",
  "hot-trimmer-image-io",
  "hot-trimmer-material-analysis",

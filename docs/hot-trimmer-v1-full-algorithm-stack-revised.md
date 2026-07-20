@@ -1337,14 +1337,54 @@ source-usage, mapping, correspondence, validity, and failure views. It is cancel
 failed required slot, cancellation, or superseded revision publishes no partial atlas. The compositor may not use
 a whole-sheet source cover, the removed legacy renderer, implicit Stretch, or center-cover recovery.
 
-Stage 20 still owns production preview fixtures, complete QA, atomic export, and Blender synchronization. It
-extends this feedback path; it does not introduce the first visual access to compiled material.
+Stage 20 still owns production preview fixtures, complete QA, package publication, and Blender synchronization on the
+accepted GPU preview/streaming-export infrastructure. It extends this feedback path; it does not introduce the first
+visual access to compiled material or another exporter.
+
+---
+
+# GPU execution authority for Stages 15–21
+
+Stages 15–21 use the accepted GPU processing/rendering architecture. `TrimSheetDocument` and `compile_persisted`
+remain the single live document/orchestration authority. The algorithm compiler is the low-volume planning component
+beneath that entry point: it resolves physical legality, role compatibility, LOD, fallback, dependencies, deterministic
+seeds, cache identities, diagnostics, and immutable compact commands. It is not a second renderer or public pipeline.
+
+The application-owned GPU service performs production pixel-parallel work:
+
+```text
+Stage 14 registered sampling
+-> Stage 15 profile SDF/occupancy/Height
+-> Stage 16 detail/stamp contributions
+-> Stage 18 compiled masks/weathering/material-state contributions
+-> Stage 17 requested-map PBR composition
+-> Stage 19 padding/filtering/mips/exact IDs/validation reductions
+-> tiled preview or bounded streaming export
+```
+
+Intermediates remain GPU-resident and tile-local. Each operation declares its halo, format, dependencies, and cache
+identity. Only requested final maps/QA tiles or bounded validation summaries are read back. A 16K/24K output never
+becomes a monolithic CPU atlas or an all-map GPU allocation, and no GPU intermediate is read back merely so the CPU can
+perform the next pixel pass.
+
+The CPU remains responsible for document commands, branch-heavy bounded analysis/solvers/plan compilation, validation,
+scheduling policy, cache keys, small reductions, diagnostics, final encoding, manifest/filesystem I/O, and explicitly
+test-only parity fixtures. It does not rasterize production slots, profiles, details, effects, PBR channels, QA views,
+padding, IDs, or mips. Unsupported GPU work fails with a typed product diagnostic; it never silently selects a CPU
+production renderer.
+
+`CompiledSheet` is the immutable completed lineage/manifest over compact plans and tiled GPU results. It is not a
+container requiring every full-resolution map to be resident in CPU memory. Preview, QA, export, packages, and Blender
+consume this lineage and the same shader semantics.
 
 ---
 
 # 20. Stage 15: scale-constrained structural profile synthesis
 
 Structural trim edges are generated mathematically from signed-distance fields, but a profile is evaluated only after a constraint solver resolves a legal representation for the slot.
+The CPU emits a compact `CompiledProfile`; the existing tiled GPU executor evaluates its SDF, occupancy, physical
+Height, derivatives, filtering, and supersampling. Published pixel fields are GPU-resident tile resources or requested
+QA tiles, never unconditional full-atlas CPU arrays.
 
 The pipeline is:
 
@@ -1541,6 +1581,10 @@ After Stage 20 completes an atomic export, its exact manifest/checksum-pinned re
 
 # 21. Stage 16: scale-constrained detail and pattern synthesis
 
+Stage 16 compiles authoring intent and immutable library references into compact deterministic `CompiledDetail`
+operations on the CPU. Registered mask/SDF conversion, stamp/motif sampling, relief, repetition, scatter, clipping, and
+channel contributions execute as requested GPU tile passes and remain GPU-resident for Stages 18, 17, and 19.
+
 Details are semantic overlays, not new topology by default. Every detail compiles through the same physical-size, applicability, feature-LOD, and supersampling rules as structural profiles.
 
 ## 16.1 Detail types
@@ -1690,6 +1734,9 @@ visible provenance; it is never introduced as an automatic fisheye effect to mak
 # 22. Stage 17: PBR estimation and composition from compiled effects
 
 Stage 17 does not decide whether an effect fits. It consumes already resolved `CompiledEffect` operations produced by Stage 18 and composes their channel contributions with imported or estimated material maps.
+Composition extends the one requested-map GPU dependency graph. CPU work selects/proves the route and records
+provenance; physical Height, normal derivation/vector composition, Roughness, AO, Metallic, color/alpha, and packing are
+GPU tile passes with declared halos. Unrequested channels do not execute.
 
 ## 17.1 Compiled contribution model
 
@@ -1788,6 +1835,9 @@ A local model may estimate Height, Normal, or Roughness, but imported maps and e
 # 23. Stage 18: scale-aware effect compilation and material-state synthesis
 
 Stage 18 is the authoritative router for structural effects, details, weathering, and material-state operations. Raw effect parameters are never rendered directly.
+Fit, role, scale, LOD, fallback, occupancy conflict, dependency order, and compact commands are compiled on the CPU.
+Only those commands reach GPU evaluators, which generate tile-local masks and channel contributions from global
+physical coordinates so scheduling and tile boundaries cannot move deterministic features.
 
 The compiler resolves each requested effect against:
 
@@ -2124,6 +2174,11 @@ The route and fallback decisions are deterministic and visible in diagnostics.
 
 # 24. Stage 19: atlas finishing, feature LOD, and exact metadata
 
+Stage 19 reuses the accepted GPU scheduler, padding/ownership infrastructure, compact Region ID, tile caches, and
+streaming-export boundary. Dilation, channel-aware downsampling/filtering, mips, exact ID writes, and pixel-parallel
+survival measurements are GPU passes. The CPU reads bounded statistics and tile manifests to build reports, checksums,
+metadata, and the `CompiledSheet` lineage; it never assembles a monolithic finished atlas.
+
 ## 19.1 Padding and bleed
 
 When possible, evaluate material, profiles, details, and weathering directly over the full allocation rectangle.
@@ -2225,6 +2280,10 @@ The UI may summarize this without exposing every internal parameter. Developer d
 
 
 # 25. Stage 20: preview, Blender application, and QA
+
+Stage 20 adds product controls, geometry presentation, QA navigation, package publication, and Blender synchronization
+on the accepted GPU artifact and streaming-export routes. It does not create another renderer/exporter or recompute
+material/QA pixels in the frontend or on the CPU.
 
 ## Hot Trimmer preview
 
@@ -2433,7 +2492,7 @@ fn solve_source_placements(
 # 28. Trim-sheet compilation pseudocode
 
 ```rust
-fn compile_trim_sheet(
+fn compile_trim_sheet_plan(
     template: &TemplateSnapshot,
     sources: &PreparedSources,
     placements: &PlacementPlan,
@@ -2441,9 +2500,9 @@ fn compile_trim_sheet(
     decorations: &[DecorationBinding],
     material_state: &MaterialStateRecipe,
     output: OutputSpec,
-) -> Result<CompiledMaps> {
+) -> Result<CompiledSheetPlan> {
     let geometry = scale_template_boundaries(template, output)?;
-    let mut atlas = AtlasChannels::new(output);
+    let mut commands = Vec::with_capacity(geometry.slots.len());
     let mut compilation_report = EffectCompilationReport::default();
 
     for slot in &geometry.slots {
@@ -2457,7 +2516,7 @@ fn compile_trim_sheet(
             output,
         )?;
 
-        let base = synthesize_slot_material(
+        let sampling = compile_slot_sampling(
             slot,
             binding,
             placement,
@@ -2466,7 +2525,7 @@ fn compile_trim_sheet(
 
         let effect_context = EffectContext::new(
             &demand,
-            &base,
+            &sampling,
             material_state,
             output,
         );
@@ -2482,17 +2541,11 @@ fn compile_trim_sheet(
             &effect_context,
         )?;
 
-        let preliminary_masks = generate_structural_masks(
-            slot,
-            &compiled_profiles,
-            &compiled_details,
-            &effect_context,
-        )?;
-
         let compiled_weathering = compile_weathering_effects(
             material_state,
             slot,
-            &preliminary_masks,
+            &compiled_profiles,
+            &compiled_details,
             &effect_context,
         )?;
 
@@ -2502,64 +2555,6 @@ fn compile_trim_sheet(
             &compiled_weathering,
         );
 
-        let rendered_profiles = render_compiled_effects(
-            &compiled_profiles,
-            supersample_factor,
-        )?;
-
-        let rendered_details = render_compiled_effects(
-            &compiled_details,
-            supersample_factor,
-        )?;
-
-        let rendered_weathering = render_compiled_effects(
-            &compiled_weathering,
-            supersample_factor,
-        )?;
-
-        let final_height = compose_height_fields(
-            base.height,
-            rendered_profiles.height,
-            rendered_details.height,
-            rendered_weathering.height,
-        )?;
-
-        let generated_normal = normal_from_physical_height(
-            &final_height,
-            slot.world_size,
-        );
-
-        let final_normal = compose_normals_vector_correct(
-            base.normal,
-            generated_normal,
-            rendered_profiles.normal,
-            rendered_details.normal,
-            rendered_weathering.normal,
-        );
-
-        let composed = compose_pbr_channels(
-            base,
-            final_height,
-            final_normal,
-            rendered_profiles,
-            rendered_details,
-            rendered_weathering,
-        )?;
-
-        let resolved = downsample_compiled_slot_channels(
-            composed,
-            supersample_factor,
-        )?;
-
-        validate_feature_survival(
-            slot,
-            &resolved,
-            &compiled_profiles,
-            &compiled_details,
-            &compiled_weathering,
-            output,
-        )?;
-
         compilation_report.record_slot(
             slot.id,
             &compiled_profiles,
@@ -2567,18 +2562,71 @@ fn compile_trim_sheet(
             &compiled_weathering,
         );
 
-        atlas.write_allocation(slot, resolved)?;
-        atlas.write_exact_region_id(slot)?;
-        atlas.write_exact_material_id(slot, binding.material_id)?;
+        commands.push(CompiledSlotCommand {
+            slot: compact_slot_geometry(slot),
+            sampling,
+            profiles: compiled_profiles,
+            details: compiled_details,
+            weathering: compiled_weathering,
+            supersample_factor,
+            requested_maps: output.requested_maps,
+            pass_dependencies: compile_requested_pass_dependencies(...)?,
+            halos: compile_operation_halos(...)?,
+            material_id: binding.material_id,
+        });
     }
 
-    atlas.finish_bleed_and_mips()?;
-    atlas.validate_registration()?;
-    atlas.validate_exact_ids()?;
-    atlas.validate_topology_hash(template)?;
-    atlas.attach_effect_compilation_summary(compilation_report)?;
+    Ok(CompiledSheetPlan::finalize(
+        template,
+        sources,
+        output,
+        commands,
+        compilation_report,
+    )?)
+}
 
-    Ok(atlas.finish())
+fn execute_compiled_sheet(
+    service: &GpuRenderService,
+    plan: &CompiledSheetPlan,
+    request: TileMapRequest,
+    cancellation: &CancellationToken,
+) -> Result<CompiledSheetArtifact> {
+    let schedule = service.schedule_requested_tiles(
+        plan,
+        request,
+        service.capabilities(),
+        service.memory_budgets(),
+    )?;
+
+    for tile in schedule {
+        cancellation.check()?;
+
+        // Every intermediate below remains GPU-resident and tile-local.
+        let sampled = service.sample_registered_material(plan, tile)?;
+        let profiles = service.evaluate_compiled_profiles(plan, tile, &sampled)?;
+        let details = service.evaluate_compiled_details(plan, tile, &profiles)?;
+        let effects = service.evaluate_compiled_effects(plan, tile, &profiles, &details)?;
+        let pbr = service.compose_requested_pbr_maps(
+            plan,
+            tile,
+            &sampled,
+            &profiles,
+            &details,
+            &effects,
+        )?;
+        let finished = service.finish_requested_maps_and_mips(plan, tile, &pbr)?;
+        let validation = service.reduce_feature_survival(plan, tile, &finished)?;
+
+        service.publish_current_tile_or_stream_export(
+            plan,
+            tile,
+            finished,
+            validation,
+            cancellation,
+        )?;
+    }
+
+    Ok(service.finish_compiled_artifact(plan, request)?)
 }
 ```
 

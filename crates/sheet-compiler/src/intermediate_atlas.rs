@@ -154,9 +154,8 @@ pub(crate) fn compose_intermediate_atlas(
     if current_revision() != request.revision {
         return Err(IntermediateAtlasError::RevisionSuperseded);
     }
-    if !request.placement_plan.validation.complete_assignment
-        || !request.placement_plan.validation.required_slots_present
-        || !request.placement_plan.validation.registered_mapping_only
+    if !placement_plan_has_complete_required_assignments(request.placement_plan, &request.slots)
+        || !placement_plan_uses_stage14_executable_mappings(request.placement_plan)
     {
         return Err(IntermediateAtlasError::IncompletePlacementPlan);
     }
@@ -412,6 +411,7 @@ pub(crate) fn compose_intermediate_atlas(
         MaterialChannelRole::RegionId,
         MaterialChannelRole::MaterialId,
     ];
+    fill_unowned_transparent_pixels(&mut region_ownership, request.topology, &request.slots);
     Ok(IntermediateAtlasArtifact {
         label: INTERMEDIATE_ATLAS_LABEL,
         non_exportable: true,
@@ -586,6 +586,101 @@ fn append_channel_identity(bytes: &mut Vec<u8>, channel: &PreparedExemplarChanne
             }
         }
     }
+}
+
+fn placement_plan_uses_stage14_executable_mappings(placement_plan: &PlacementPlan) -> bool {
+    placement_plan.placements.iter().all(|placement| {
+        matches!(
+            placement.candidate.mapping_mode,
+            SamplingMode::DirectCrop
+                | SamplingMode::PeriodicTile
+                | SamplingMode::RepeatX
+                | SamplingMode::RepeatY
+                | SamplingMode::UniqueContain
+                | SamplingMode::UniqueCover
+                | SamplingMode::ThreeSliceCap
+                | SamplingMode::NineSlicePanel
+                | SamplingMode::PlanarRadial
+                | SamplingMode::PolarRadial
+                | SamplingMode::ExplicitStretch
+        )
+    })
+}
+
+fn placement_plan_has_complete_required_assignments(
+    placement_plan: &PlacementPlan,
+    slots: &[IntermediateSlotInput<'_>],
+) -> bool {
+    if placement_plan.placements.len() != slots.len() {
+        return false;
+    }
+    let assigned = placement_plan
+        .placements
+        .iter()
+        .map(|placement| placement.slot_id)
+        .collect::<BTreeSet<_>>();
+    slots
+        .iter()
+        .all(|slot| assigned.contains(&slot.region_id))
+}
+
+fn fill_unowned_transparent_pixels(
+    region_ownership: &mut [Option<RegionId>],
+    topology: &CompiledTemplateTopology,
+    slots: &[IntermediateSlotInput<'_>],
+) {
+    let Some(first_slot) = slots.first() else {
+        return;
+    };
+    let width = topology.output_size.width;
+    if width == 0 {
+        return;
+    }
+    for (index, owner) in region_ownership.iter_mut().enumerate() {
+        if owner.is_some() {
+            continue;
+        }
+        let x = u32::try_from(index).unwrap_or(u32::MAX) % width;
+        let y = u32::try_from(index).unwrap_or(u32::MAX) / width;
+        let nearest = slots
+            .iter()
+            .filter_map(|slot| {
+                topology
+                    .slots
+                    .iter()
+                    .find(|topology_slot| topology_slot.slot_key == slot.slot_key)
+                    .map(|topology_slot| {
+                        (
+                            slot.region_id,
+                            rect_distance_sq(x, y, topology_slot.allocation),
+                        )
+                    })
+            })
+            .min_by_key(|(_, distance)| *distance)
+            .map(|(region_id, _)| region_id)
+            .unwrap_or(first_slot.region_id);
+        *owner = Some(nearest);
+    }
+}
+
+fn rect_distance_sq(x: u32, y: u32, rect: hot_trimmer_domain::CanonicalRect) -> u64 {
+    let right = rect.x.saturating_add(rect.width).saturating_sub(1);
+    let bottom = rect.y.saturating_add(rect.height).saturating_sub(1);
+    let dx = if x < rect.x {
+        rect.x - x
+    } else if x > right {
+        x - right
+    } else {
+        0
+    };
+    let dy = if y < rect.y {
+        rect.y - y
+    } else if y > bottom {
+        y - bottom
+    } else {
+        0
+    };
+    u64::from(dx) * u64::from(dx) + u64::from(dy) * u64::from(dy)
 }
 
 fn write_rgba(

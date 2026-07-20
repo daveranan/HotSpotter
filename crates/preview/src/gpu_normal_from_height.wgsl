@@ -77,12 +77,6 @@ fn valid_height(candidate: f32, fallback: f32) -> f32 {
     return select(fallback, candidate, candidate >= 0.0);
 }
 
-fn compose_reoriented_normal(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
-    let t = base + vec3<f32>(0.0, 0.0, 1.0);
-    let u = detail * vec3<f32>(-1.0, -1.0, 1.0);
-    return normalize(t * dot(t, u) - u * t.z);
-}
-
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= header.tile_width || id.y >= header.tile_height) {
@@ -119,7 +113,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let authored_decoded = authored_sample.xyz * 2.0 - vec3<f32>(1.0);
                 var n = height_normal;
                 if (header.source_role == 2u && authored_sample.a > 0.0 && dot(authored_decoded, authored_decoded) > 0.0001) {
-                    n = compose_reoriented_normal(normalize(authored_decoded), height_normal);
+                    n = normalize(authored_decoded);
                 }
                 if (header.normal_convention == 1u) {
                     n.y = -n.y;

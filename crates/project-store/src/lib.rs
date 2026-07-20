@@ -9,14 +9,14 @@ use std::{
 
 use hot_trimmer_domain::{
     AssignmentProvenance, AuthoredLayoutPreset, AuthoredLayoutPresetRegion, ChannelInterpretation,
-    ChannelRegistration, ContentDigest, DelightingIntent, LayoutId, LogicalGridSpec,
-    MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole,
-    MaterialClassificationCommand, MaterialClassificationIntent, MaterialMapContent,
-    MaterialMapKind, MaterialSourceSet, NormalConvention, NormalizedBounds, NormalizedPoint,
-    NormalizedScalar, OrientedPixelSize, PartitionRecipe, Patch, PatchCommand, PatchCommandError,
-    PatchEditOutcome, PatchSet, ProjectId, Projection, RegionSourceOverride,
-    RegistrationDiagnostic, RegistrationDiagnosticCode, RegistrationRecoveryChoice, SourceFrame,
-    SourceId, SourceSetId, TemplateRegistry, TrimSheetDocument, TrimSheetDocumentCommand,
+    ChannelRegistration, ContentDigest, DelightingIntent, LayoutId, MaterialCalibrationCommand,
+    MaterialCalibrationIntent, MaterialChannelRole, MaterialClassificationCommand,
+    MaterialClassificationIntent, MaterialMapContent, MaterialMapKind, MaterialSourceSet,
+    NormalConvention, NormalizedBounds, NormalizedPoint, NormalizedScalar, OrientedPixelSize,
+    Patch, PatchCommand, PatchCommandError, PatchEditOutcome, PatchSet, ProjectId, Projection,
+    RegionSourceOverride, RegistrationDiagnostic, RegistrationDiagnosticCode,
+    RegistrationRecoveryChoice, SourceFrame, SourceId, SourceSetId, TemplateRegistry,
+    TrimSheetDocument, TrimSheetDocumentCommand,
 };
 use hot_trimmer_geometry::Quadrilateral;
 use hot_trimmer_image_io::{ColorPolicy, DecodeLimits, inspect_path_with_policy};
@@ -1189,19 +1189,67 @@ impl ProjectStore {
         Ok(self.document.as_ref().unwrap())
     }
 
-    pub fn refresh_document_assets(&mut self) -> Result<(), StoreError> {
+    pub fn refresh_document_assets(&mut self) -> Result<bool, StoreError> {
         let Some(current) = self.document.clone() else {
-            return Ok(());
+            return Ok(false);
         };
-        let next = current
-            .with_assets(
-                load_material_catalog(&self.connection)?,
-                self.patch_set.patches().to_vec(),
-            )
-            .map_err(|error| StoreError::Document(error.to_string()))?;
+        let materials = load_material_catalog(&self.connection)?;
+        let source_sets = load_source_sets(&self.connection)?;
+        let sources = load_sources(&self.connection)?;
+        let patches = self.patch_set.patches().to_vec();
+        let mut next = current.clone();
+        let mut changed = false;
+        if next.materials != materials {
+            next.materials = materials;
+            changed = true;
+        }
+        if next.patches != patches {
+            next.patches = patches;
+            changed = true;
+        }
+        if let Some(frame) = next.source_frame.as_ref() {
+            let owner = source_sets
+                .iter()
+                .find(|source_set| source_set.id == frame.source_set_id)
+                .ok_or_else(|| {
+                    StoreError::Document(format!(
+                        "SourceFrame owner {} is missing",
+                        frame.source_set_id
+                    ))
+                })?;
+            if owner.source_revision != frame.source_revision {
+                let source_set_id = Uuid::from_bytes(frame.source_set_id.to_bytes());
+                let source = sources
+                    .iter()
+                    .find(|source| {
+                        source.source_set_id == source_set_id
+                            && source.channel == SourceChannel::BaseColor
+                    })
+                    .ok_or(StoreError::BaseColorRequired)?;
+                let (rebound, _) = rebind_source_frame(
+                    &next,
+                    OrientedPixelSize {
+                        width: source.input.width,
+                        height: source.input.height,
+                    },
+                    owner.source_revision,
+                )?;
+                next = rebound;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+        if next.document_revision == current.document_revision {
+            next.document_revision = current.document_revision.saturating_add(1);
+            next.appearance_revision = next.document_revision;
+            next.validate()
+                .map_err(|error| StoreError::Document(error.to_string()))?;
+        }
         persist_document_state(&mut self.connection, Some(&next), "refresh_document_assets")?;
         self.document = Some(next);
-        Ok(())
+        Ok(true)
     }
 
     pub fn undo_document_command(&mut self) -> Result<&TrimSheetDocument, StoreError> {
@@ -2139,6 +2187,7 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::SetRegionRadial { .. } => "set_region_radial",
         TrimSheetDocumentCommand::SetOutputResolution { .. } => "set_output_resolution",
         TrimSheetDocumentCommand::SetAtlasPadding { .. } => "set_atlas_padding",
+        TrimSheetDocumentCommand::SetChannelRenderPolicy { .. } => "set_channel_render_policy",
         TrimSheetDocumentCommand::SetSourceFrame { .. } => "set_source_frame",
         TrimSheetDocumentCommand::DetachSourceCell { .. } => "detach_source_cell",
         TrimSheetDocumentCommand::ResetSourceCell { .. } => "reset_source_cell",
@@ -4388,7 +4437,10 @@ mod algorithm_stage_01_tests {
     };
     use uuid::Uuid;
 
-    use super::{ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError};
+    use super::{
+        ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError,
+        persist_document_state,
+    };
     use hot_trimmer_domain::TrimSheetDocumentCommand;
 
     fn input(label: u8, width: u32, height: u32, orientation: u16) -> SourceInput {
@@ -4792,6 +4844,76 @@ mod algorithm_stage_01_tests {
         assert!((frame_width_px - frame_height_px).abs() < 0.001);
         assert!(frame.bounds.x.get() > 0.0);
         assert_eq!(frame.bounds.y.get(), 0.0);
+        drop(store);
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn refreshing_assets_advances_source_frame_revision_after_companion_map_import() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-source-frame-refresh-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("refresh.hottrimmer");
+        let mut store =
+            ProjectStore::create(&path, "SourceFrame companion refresh").expect("create project");
+        let primary = Uuid::from_bytes(
+            store.summary().expect("empty summary").source_sets[0]
+                .id
+                .to_bytes(),
+        );
+        store
+            .replace_source_in_set(primary, SourceChannel::BaseColor, &input(80, 2048, 1024, 1))
+            .expect("base color");
+        store
+            .create_source_frame_document()
+            .expect("create source frame");
+        let before = store
+            .summary()
+            .expect("before summary")
+            .document
+            .expect("document");
+        let before_frame = before.source_frame.clone().expect("source frame");
+        assert_eq!(before_frame.source_revision, 1);
+
+        store
+            .replace_source_in_set(primary, SourceChannel::Roughness, &input(81, 2048, 1024, 1))
+            .expect("companion map bumps source set revision");
+        let stale = store
+            .summary()
+            .expect("stale summary")
+            .document
+            .expect("document");
+        assert_eq!(
+            stale
+                .source_frame
+                .as_ref()
+                .expect("source frame")
+                .source_revision,
+            1
+        );
+        assert!(store.refresh_document_assets().expect("refresh assets"));
+        let refreshed = store
+            .summary()
+            .expect("refreshed summary")
+            .document
+            .expect("document");
+        let refreshed_frame = refreshed.source_frame.expect("refreshed source frame");
+        assert_eq!(refreshed_frame.source_revision, 2);
+        assert_eq!(refreshed_frame.bounds, before_frame.bounds);
+        assert_eq!(
+            refreshed_frame.oriented_dimensions,
+            before_frame.oriented_dimensions
+        );
+        assert_eq!(refreshed_frame.identity, refreshed_frame.compute_identity());
+        assert!(refreshed.document_revision > before.document_revision);
+        assert!(
+            !store
+                .refresh_document_assets()
+                .expect("second refresh is idempotent")
+        );
+
         drop(store);
         fs::remove_dir_all(root).expect("remove fixture directory");
     }

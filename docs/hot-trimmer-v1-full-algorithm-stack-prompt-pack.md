@@ -9,13 +9,18 @@ This pack implements the complete twenty-stage architecture in
 Run one prompt per Codex task, in the order listed here. Do not combine prompts. A prompt is complete only when
 its stage is implemented, connected to the authoritative pipeline, and its focused verification passes.
 
-This is a quality-first clean engine replacement:
+This is a quality-first algorithm replacement on the accepted GPU execution architecture:
 
 - Preserve the useful source-first desktop workbench and authoring workflow.
-- Do not preserve old project/schema compatibility, the legacy sheet compiler, runtime semantic repacking, or
-  old renderer behavior.
+- Preserve `TrimSheetDocument`, `compile_persisted`, the immutable compiled-plan boundary, the application-owned GPU
+  service, tiled artifacts, and streaming export as the single production orchestration/execution lineage.
+- Treat `AlgorithmCompiler` as internal low-volume plan compilation beneath `compile_persisted`, never as a second live
+  facade. `CompiledSheet` is a manifest/lineage over tiled GPU results, not a monolithic CPU map container.
+- Do not preserve old project/schema compatibility, runtime semantic repacking, normalized profile/effect behavior,
+  or the CPU production pixel executor.
 - Do not create dual authorities, adapters that become permanent, or silent legacy fallbacks.
-- Delete a replaced path in the same prompt that establishes its replacement as authoritative.
+- Delete a replaced algorithm or CPU pixel path only after its compact-plan/GPU replacement is authoritative and its
+  focused gate passes. Keep the smallest explicitly test-only CPU parity oracles.
 - Never hard-code behavior for brick, wood, metal, a fixture filename, or one supplied screenshot.
 
 ## What “all materials” means
@@ -75,7 +80,8 @@ Every prompt preserves these invariants:
 7. Physical feature scale is stable across slot aspect ratios and output resolutions.
 8. Fixed inputs, versions, settings, template, output, and seed produce deterministic plans and output.
 9. Unsupported or insufficient input produces a typed diagnostic and recovery choices, not plausible fake output.
-10. Preview, final render, QA views, export, and Blender consume one `CompiledSheet` lineage.
+10. Preview, final render, QA views, export, and Blender consume one `compile_persisted`/`CompiledSheet` lineage and the
+    same tiled GPU executor semantics.
 
 ## Required result state for every stage
 
@@ -106,6 +112,14 @@ renderer, or an unrelated synthesis engine.
 - Make deterministic iteration, tie-breaking, reductions, and pseudo-random streams part of the tests.
 - Add success, pass-through, insufficiency, cancellation, and malformed-input evidence.
 - Add no enabled UI control unless it invokes a typed native command and changes an authoritative artifact.
+- CPU work is limited to document/algorithm planning, validation, branch-heavy bounded solvers, cache identities,
+  scheduling policy, diagnostics, small reductions, final encoding, filesystem I/O, and explicit test oracles. The
+  production CPU route must not rasterize slots, effects, atlas maps, QA images, padding, or mips.
+- Production pixel-parallel work uses the existing application-owned GPU service and compact immutable commands. Keep
+  intermediates GPU-resident, generate only requested maps/QA outputs, operate in bounded tiles with declared halos,
+  and read back only final tiles or bounded summaries.
+- Do not add a second renderer, GPU owner, preview-only shader, exporter, or silent CPU fallback. A GPU failure is a
+  typed failure under the supported-hardware policy.
 - Run exactly the one verification command named by the prompt. If it fails, make at most one focused correction
   and rerun the same command. Do not substitute a broad workspace sweep.
 - Write or update the named stage report with delivered routes, evidence, measurements, and remaining later-stage
@@ -123,14 +137,14 @@ renderer, or an unrelated synthesis engine.
 | 10-14 | One prompt per demand, placement, and synthesis stage | 10-14 |
 | 14P-A | First visible authoritative atlas integration | Through Stage 14 |
 | 14P-B | Intermediate-preview QA and cache hardening | Through Stage 14 |
-| 15 | Structural profiles and semantic occupancy | 15 |
+| 15 | Compact structural-profile compilation and tiled GPU occupancy/Height | 15 |
 | LIB | Reusable source/patch/stamp/profile library and management window | Cross-cutting before Stage 16 |
-| 16 | Semantic details, stamps, and patterns | 16 |
-| 18 | Effect compilation | 18 |
-| 17 | PBR composition from compiled effects | 17 |
-| 19 | Finishing and metadata | 19 |
-| 20 | Preview, QA, export, and Blender | 20 |
-| 21 | Full qualification and old-engine deletion | Final V1 gate |
+| 16 | Compact semantic-detail plans and tiled GPU evaluation | 16 |
+| 18 | Effect compilation and tiled GPU effect evaluation | 18 |
+| 17 | Requested-map GPU PBR composition from compiled effects | 17 |
+| 19 | Tiled GPU finishing, reduced validation, and metadata | 19 |
+| 20 | Product workflow, QA, package publication, and Blender on the accepted GPU path | 20 |
+| 21 | Full GPU V1 qualification and remaining obsolete-path removal | Final V1 gate |
 
 Stage 18 precedes Stage 17 in implementation because Stage 17 consumes `CompiledEffect` operations produced by
 Stage 18. The product-stage numbers remain unchanged.
@@ -1121,7 +1135,8 @@ Scope:
 - Enforce cancellation, revision supersession, and required-slot atomicity. No failure publishes a partial atlas.
 - Keep final compile, export, and Blender actions disabled. Do not add the full invalidation matrix, heatmaps, rich
   decision explorer, broad corpus qualification, or cache/performance hardening; Prompt 14P-B owns those.
-- Keep Stage 20 responsible for production preview fixtures, complete QA, atomic export, and Blender synchronization.
+- Keep Stage 20 responsible for production preview fixtures, complete QA, package publication, and Blender
+  synchronization on the accepted GPU preview/streaming-export infrastructure.
 - Add docs/phase-reports/algorithm-stage-14-preview-a.md.
 
 Acceptance:
@@ -1191,19 +1206,48 @@ Stop conditions:
 
 ---
 
-## Prompt 15 — Stage 15: scale-constrained structural profile synthesis
+## GPU readiness gate before Prompt 15
+
+Prompt 15 may start only after Render Prompt 005 has accepted the single `compile_persisted` GPU executor, bounded
+source/output tiling, requested-map pass graph, binary preview, streaming export, and the supported-GPU failure policy.
+The accepted GPU route must also lower every Stage 14 `SamplingPlan` used by the full algorithm stack into exact compact
+GPU commands or a prepared registered source domain. `TextureSynthesis`, `ThreeSliceCap`, `NineSlicePanel`, contain/
+cover, and radial variants may not be rejected, collapsed into ordinary direct sampling, or sent to the CPU production
+rasterizer. If that lowering is incomplete, stop and complete it as a Stage 14 GPU integration correction before
+starting Stage 15.
+
+For Prompts 15–21, the standing execution split is:
+
+```text
+CPU: validate intent -> resolve physical legality/LOD/dependencies -> compile immutable compact commands
+GPU: schedule bounded tiles -> evaluate pixels/intermediates -> cache GPU resources -> publish requested final tiles
+CPU: consume bounded summaries/readbacks -> encode/write metadata/files -> publish atomically
+```
+
+Do not read a GPU intermediate back merely so the CPU can perform the next pixel pass.
+
+---
+
+## Prompt 15 — Stage 15: compiled structural profiles and tiled GPU synthesis
 
 ```text
 Implement Prompt 15 / Stage 15 from the full algorithm-stack prompt pack.
 
 Read the common rules and revised Stage 15. Consume Stage 10 capacities and Stage 14 slot-local material. No subagents.
 
+Prerequisite:
+- The GPU readiness gate above is green, including exact full-Stage-14 sampling-plan lowering.
+
 Objective:
-Compile and render physically legal structural trim profiles instead of normalized rectangle effects.
+Compile physically legal structural profiles on the CPU and evaluate their occupancy, physical Height, and derivatives
+as bounded GPU tile passes instead of normalized CPU or shader shortcuts.
 
 Scope:
-- Replace the current normalized profile API with requested and CompiledProfile plans expressed in physical/relative
-  units, pixel scale, occupancy, LOD, supersampling, evaluator, and fallback reason.
+- Replace the current normalized profile API with requested and `CompiledProfile` plans expressed in physical/relative
+  units, resolved pixel scale, occupancy semantics, LOD, supersampling, evaluator, fallback reason, algorithm version,
+  compact resource references, required halo, and deterministic cache identity.
+- Keep profile constraint solving, opposing-edge legality, fallback selection, and compact command compilation on the
+  CPU. These are bounded branch-heavy decisions and must not become per-pixel GPU policy.
 - Implement rectangle/disc/annulus signed-distance fields and the complete required programs: Flat, convex bevel,
   concave groove, rounded bevel, double bevel, raised lip, recessed seam, panel frame, fully rounded strip, merged
   opposing bevel, radial disc, annulus, and bounded custom profile curve.
@@ -1211,16 +1255,24 @@ Scope:
   disabled, and incompatibility outcomes selected by declared policy.
 - Implement FullHeight, SimplifiedHeight, NormalOnly, RoughnessOnly, and Disabled profile LODs without changing
   physical profile dimensions or seed.
-- Generate physical Height and analytic/compiled normal contributions; use analytic filtering or selected 1x/2x/4x/8x
-  supersampling. Do not widen sub-pixel geometry in final pixels.
-- Publish typed structural occupancy rather than only flattened pixels: signed distance, inside/outside, flat-center,
-  raised, recessed, cap, groove, and profile-exclusion fields plus physical Height and derivative contributions.
+- Add compact profile commands to the immutable atlas plan and execute SDF, occupancy, physical Height, analytic
+  derivatives, filtering, and compiled 1x/2x/4x/8x supersampling on the application-owned GPU service. Do not widen
+  sub-pixel geometry in final pixels.
+- Represent structural occupancy authoritatively as compiled semantics plus GPU-resident tile-local fields: signed
+  distance, inside/outside, flat-center, raised, recessed, cap, groove, and profile-exclusion, with physical Height and
+  derivative contributions. Do not allocate or persist unconditional full-atlas CPU occupancy arrays.
+- Cache compiled plans by exact upstream identity and GPU outputs by plan/map/tile/halo/format/shader identity. Keep
+  occupancy and Height GPU-resident for Stages 16–19; read back only requested QA tiles or bounded validation summaries.
+- Use the existing requested-map graph: Base Color-only work runs no profile pass; a Height/Normal/effect request runs
+  only its required profile dependencies. Declare sufficient halos for every SDF/filter/derivative operation.
 - Treat authored profile edges as material structure. Atlas allocation borders are never bevels, seams, or wear edges
   merely because two rectangles touch. Preserve enough semantic occupancy for later stamps to conform above, below,
   inside, outside, or across a profile without reverse-engineering pixels.
 - Keep physical Height authoritative until Stage 17 derives and composes normals. An imported normal may coexist with
   the profile plan, but Stage 15 must not flatten the two into an opaque replacement map.
 - Add profile occupancy/LOD/fallback QA views and docs/phase-reports/algorithm-stage-15.md.
+- Remove the normalized profile CPU production path and the current hard-coded normalized GPU profile evaluator after
+  GPU parity passes. Retain only minimal CPU formula fixtures as an explicitly test-only oracle.
 
 Acceptance:
 - Required broad panel, extreme strips, radial, cap, sub-pixel, and opposing-bevel fixtures pass at 1K/2K/4K/8K.
@@ -1228,15 +1280,23 @@ Acceptance:
 - Physical slope/width remain stable across slot aspect and resolution.
 - Allocation boundaries with no requested profile remain flat, while requested radial/linear profile occupancy can
   be queried consistently by Stage 16 and Stage 18.
-- Every fallback is deterministic and present in EffectPlan diagnostics.
+- Every fallback is deterministic and present in the `CompiledProfile` diagnostics that Stage 18 later incorporates
+  into `EffectPlan`.
+- GPU tile output matches the compact CPU oracle within declared float/packing tolerances, adjacent tiles agree at
+  valid interiors, unrequested profile passes dispatch zero work, and production CPU profile raster counters remain
+  zero.
+- Profile intermediates remain within declared GPU tile/residency budgets at 1K/2K/4K/8K and survive cancellation and
+  revision supersession without stale publication.
 
 Verification — run exactly:
-cargo test -p hot-trimmer-effect-compiler algorithm_stage_15_profiles
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_15_gpu_profiles
 
 Stop conditions:
 - Stop if lengths remain fractions of the hotspot minor edge while reported as meters.
 - Stop if supersampling is used to make an illegal profile fit.
 - Stop if generated normals overwrite imported normals before Stage 17 composition.
+- Stop if the production route constructs full-frame CPU SDF/occupancy/Height planes, reads profile intermediates back
+  for another pixel pass, or adds another GPU service/shader authority.
 ```
 
 ---
@@ -1253,6 +1313,15 @@ Objective:
 Give Hot Trimmer a durable, searchable, dependency-safe library for material source sets, authored patches, masks,
 registered stamp channels, profile presets, and effect recipes, with a real management window feeding typed references
 to source preparation, Stage 15, and Stage 16.
+
+Execution split:
+- Keep hashing, versioning, dependency checks, metadata/database transactions, path resolution, import validation, and
+  command handling on the CPU; these are low-volume correctness work and gain nothing from GPU dispatch.
+- Use the existing GPU service for pixel-parallel registered-channel preview, mask/SDF preview, thumbnail resampling,
+  and atlas-sheet preview where it is materially beneficial. These previews consume the same channel interpretation
+  and compact asset identity later used by compilation; they do not create renderer authority.
+- Do not upload an entire library eagerly. Decode/upload/cache only visible or requested assets under the existing
+  CPU/GPU memory budgets, and never read GPU previews back as authoritative library source pixels.
 
 Scope — library contracts and storage:
 - Define versioned LibraryAssetId, LibraryAssetVersion, content digest, LibraryAssetKind, StampAssetRef, provenance,
@@ -1288,6 +1357,8 @@ Scope — Hot Trimmer management window:
 - Let layout selection, source selection, Stage 15 profile selection, and Stage 16 detail authoring browse/select
   items by compatible kind, but do
   not implement brush strokes, scattering, final PBR composition, export packaging, cloud sync, or marketplace work.
+- Reuse the application-owned GPU device, source cache, cancellation generations, and raw tile publication for library
+  pixel previews. Do not add a library-specific GPU service, shader authority, or Base64 pixel path.
 
 Acceptance:
 - Registered material-set, authored-patch, folder, single-mask, registered-stamp-channel, and atlas-sheet fixtures
@@ -1298,6 +1369,8 @@ Acceptance:
 - Referenced assets cannot be destructively deleted or silently mutated, and editing creates deterministic versions.
 - The Library window can author every initial asset kind through command-backed controls; no thumbnail or filename is
   used as compiler authority.
+- Large/registered preview generation is bounded and GPU-backed when selected by policy; CPU work remains limited to
+  decode/validation/metadata, and preview cache eviction cannot mutate pinned library identities.
 
 Verification — run exactly:
 cargo test -p hot-trimmer-desktop reusable_asset_library
@@ -1311,7 +1384,7 @@ Stop conditions:
 
 ---
 
-## Prompt 16 — Stage 16: scale-constrained semantic details and patterns
+## Prompt 16 — Stage 16: compiled semantic details and tiled GPU evaluation
 
 ```text
 Implement Prompt 16 / Stage 16 from the full algorithm-stack prompt pack.
@@ -1320,20 +1393,26 @@ Read the common rules and revised Stage 16. Consume Stage 10 capacities, Stage 1
 asset references. No subagents.
 
 Objective:
-Compile material-independent semantic detail overlays that remain physically valid across panels, strips, caps, and
-radial slots.
+Compile material-independent semantic detail operations that remain physically valid across panels, strips, caps, and
+radial slots, then evaluate reusable-atlas contributions as bounded GPU tile passes.
 
 Scope:
 - Define typed DetailDefinition/CompiledDetail contracts with physical range, scale space, compatible roles,
   orientation, aspect limits, minimum pixels, repeat period, contain/cover policy, channel contributions, fallback,
-  provenance, and seed.
+  provenance, seed, required source resources, required halo, operation dependencies, and deterministic GPU/cache
+  identity.
 - Define non-destructive StampOperation and StampStroke contracts: immutable asset/version reference, reusable-atlas
   versus asset-specific-deferred scope, target slot/region, physical transform, pivot, rotation, mirror, opacity,
   blend policy, clipping, seed, spacing/scatter/jitter, layer order, occupancy relation, and per-channel contributions.
   Store deterministic operation parameters or stroke samples, never pasted display pixels.
 - Implement repeating strip, unique detail, radial detail, trim cap, bolt group, vent, panel stamp, groove, decal,
   procedural motif, and user-patch detail families.
-- Implement registered mask-to-SDF conversion and coherent bevel/groove/lip/stamp Height/Normal contributions.
+- Keep role/fit/LOD/fallback selection, immutable asset resolution, layer intent, and compact deterministic operation/
+  scatter compilation on the CPU. Do not run branch-heavy authoring policy independently in shaders.
+- Upload immutable registered stamp/mask/channel assets through the existing digest-keyed GPU source cache. Implement
+  registered mask-to-SDF conversion, stamp sampling, coherent bevel/groove/lip relief, procedural motifs, clipping,
+  repetition, deterministic scatter evaluation, and Height/normal-input/scalar/color/ID contributions as tiled GPU
+  passes. Keep their intermediates GPU-resident for Stages 18–19.
 - Support planar and explicitly polar radial stamps without fisheye distortion by default. Preserve the stamp's
   physical aspect under rotation; any conformal/polar warp is an authored mapping mode with visible provenance.
 - Implement physical motif periods and role-specific Surface/HorizontalStrip/VerticalStrip/Radial/TrimCap/Unique
@@ -1342,8 +1421,14 @@ Scope:
   variant/fallback selection and occupancy interaction.
 - Distinguish source material-domain structure from semantic details supplied by template/user/procedural intent.
 - Emit registered masks, physical Height, vector-normal inputs, scalar/color/ID contributions, and operation lineage;
-  do not flatten them into final PBR pixels. Material-ID contributions remain exact categorical writes, Metallic is
-  legal only through explicit intent, and imported normal stamps retain their declared convention.
+  represent pixel fields as GPU-resident tile resources rather than CPU images, and do not flatten them into final PBR
+  pixels. Material-ID contributions remain exact categorical writes, Metallic is legal only through explicit intent,
+  and imported normal stamps retain their declared convention.
+- Generate only dependencies needed by the requested final map or QA view. Declare halos for SDF, filtering, relief,
+  scatter footprint, and derivatives; valid interiors must match across tile boundaries.
+- Cache compilation separately from GPU evaluation. Changing selection or viewport does not recompile operations;
+  changing an asset digest, physical transform, seed, algorithm/shader version, map, tile, or halo invalidates the exact
+  affected descendants.
 - Add detail route/occupancy QA views and docs/phase-reports/algorithm-stage-16.md.
 
 Acceptance:
@@ -1355,9 +1440,13 @@ Acceptance:
 - A material-reusable stamp may compile into the atlas, while an asset-specific deferred stamp remains an operation
   for Stage 20/Blender and is not accidentally baked into every asset using that material.
 - An empty detail list produces a valid SkippedBecauseUnused stage result.
+- GPU tile goldens cover every detail family, registered channel alignment, deterministic scatter across tile edges,
+  physical scale at 1K/2K/4K/8K, and declared float/packed tolerances. Exact IDs and plan identities remain exact.
+- Production CPU detail/mask/SDF/stamp raster counters remain zero, no full-atlas CPU detail planes exist, and
+  unrequested contribution passes dispatch zero work.
 
 Verification — run exactly:
-cargo test -p hot-trimmer-effect-compiler algorithm_stage_16_details
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_16_gpu_details
 
 Stop conditions:
 - Stop if one square mask is resized into all slot roles.
@@ -1365,11 +1454,13 @@ Stop conditions:
 - Stop if a user patch loses registered PBR correspondence.
 - Stop if display-space brush coordinates become placement authority.
 - Stop if asset-specific damage is baked into a reusable trim material without explicit scope.
+- Stop if an intermediate is read back for CPU composition, a detail shader resolves raw user intent, or a second GPU
+  asset/render cache is created.
 ```
 
 ---
 
-## Prompt 18 — Stage 18: scale-aware effect compilation and material-state synthesis
+## Prompt 18 — Stage 18: scale-aware effect compilation and tiled GPU evaluation
 
 ```text
 Implement Prompt 18 / Stage 18 from the full algorithm-stack prompt pack before Prompt 17.
@@ -1379,21 +1470,29 @@ No subagents.
 
 Objective:
 Make one authoritative compiler resolve raw profiles, details, weathering, and material-state recipes into legal
-role-specific CompiledEffect operations before PBR rendering/composition.
+role-specific `CompiledEffect` operations, then evaluate their pixel contributions through the existing tiled GPU pass
+graph before Stage 17 PBR composition.
 
 Scope:
 - Implement EffectDefinition, EffectApplicability, EffectScale/ScaleSpace, EffectFallback, EffectOccupancy,
   EffectRoute, CompiledEffect, EffectPlan, and typed fallback reasons from the revised contracts.
+- Keep scale conversion, physical fit, role compatibility, occupancy conflict resolution, feature-LOD selection,
+  supersampling selection, dependency ordering, fallback choice, and compact command construction on the CPU. The
+  compiler produces immutable WGSL-ready commands/resource tables; shaders never interpret raw recipes or decide fit.
 - Enforce compilation order: scale space -> physical dimensions -> role compatibility -> physical fit/occupancy ->
   pixel dimensions -> feature LOD -> role evaluator -> supersampling -> compiled operation/failure.
 - Generate registered region, exposed edge, distance, cavity, raised/recessed, direction, radial inner/outer,
-  decoration, and material-group masks in physical units where practical.
+  decoration, and material-group masks in physical units as bounded GPU tile passes. Reuse Stage 15/16 GPU-resident
+  occupancy and contribution tiles; do not reconstruct them from readback pixels.
 - Implement Grunge and EdgeWear variants for surface, horizontal strip, vertical strip, radial inner/outer, unique,
   and trim cap; implement strip anisotropy, radial coordinates, cap transitions, and world-direction influence.
 - Implement Micro/Meso/Macro/Structural material state and user recipes Clean, Used, Heavy, Wet, Dusty, Chipped Paint,
   Rusting, and Mossy as typed bundles compiled separately per slot.
 - Implement effect-family LOD ladders, deterministic placement, occupancy conflict resolution, 1x/2x/4x/8x
   supersampling, complete fallback diagnostics, and Clean/empty valid plans.
+- Implement the compiled surface/strip/radial/cap weathering evaluators, masks, seeded noise/features, and channel
+  contribution generation in the application-owned GPU service. Deterministic feature coordinates are derived from
+  global slot/atlas physical coordinates so tile boundaries and scheduling order cannot move them.
 - Compile profile, procedural detail, stamp, and decal operations into one deterministic dependency/layer plan. Resolve
   above/below/conform/clip/accumulate relationships against Stage 15 occupancy before rendering and record every
   conflict, suppressed contribution, library version, mask dependency, and fallback.
@@ -1401,6 +1500,12 @@ Scope:
   operations remain referenced in the manifest for Stage 20/Blender and must not be rendered into the shared atlas.
 - Validate channel legality and blend semantics during compilation, including exact IDs, bounded scalar channels,
   physical Height units, imported vector normals, alpha, and exposed-metal-only Metallic changes.
+- Add effect operations and their dependencies to the existing requested-map graph. A requested map dispatches only
+  effect operations that can contribute to it and their real prerequisites. Keep GPU intermediates resident for Stage
+  17, use compact single-channel/vector formats, and read back only requested QA tiles or bounded route/occupancy
+  summaries.
+- Key CPU plans by exact intent/scale/library/version/seed inputs and GPU resources by plan/operation/map/tile/halo/
+  format/shader identity. Declare operation-specific halos and prove seamless valid interiors.
 - Remove any raw-effect direct render path or universal normalized grunge texture.
 - Add effect-route/occupancy/LOD/supersampling QA views and docs/phase-reports/algorithm-stage-18.md.
 
@@ -1416,20 +1521,27 @@ Acceptance:
 - Clean compiles to a valid empty effect plan; incompatible effects are reported, never hidden.
 - Layer-order fixtures prove that a stamp below a lip, a decal above a flat panel, and dirt conforming to a groove
   resolve differently but deterministically; deferred operations never appear in the reusable atlas.
+- GPU/CPU-oracle fixtures prove compact-command parity, deterministic seeded placement across tile boundaries, exact
+  operation/ID identity, declared numeric tolerances, zero unrequested dispatches, and zero production CPU effect
+  raster calls.
+- Effect evaluation stays within declared tile/halo/residency budgets and cancellation/revision checks prevent stale
+  contribution tiles from entering Stage 17.
 
 Verification — run exactly:
-cargo test -p hot-trimmer-effect-compiler algorithm_stage_18_effect_compilation
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_18_gpu_effects
 
 Stop conditions:
 - Stop if one universal weathering evaluator handles all roles.
 - Stop if raw recipe parameters can reach render-core without CompiledEffect.
 - Stop if a fallback changes topology or silently changes physical scale.
 - Stop if painter's-order pixels replace the typed operation/dependency plan.
+- Stop if production weathering/mask/contribution pixels are generated on the CPU, GPU kernels choose applicability or
+  fallback policy, or a contribution is read back for CPU PBR composition.
 ```
 
 ---
 
-## Prompt 17 — Stage 17: PBR estimation and composition from compiled effects
+## Prompt 17 — Stage 17: requested-map GPU PBR estimation and composition
 
 ```text
 Implement Prompt 17 / Stage 17 from the full algorithm-stack prompt pack after Prompt 18.
@@ -1439,25 +1551,41 @@ operations; do not decide effect applicability here. No subagents.
 
 Objective:
 Render and compose imported, estimated, structural, detail, and weathering contributions into physically coherent
-PBR channels with explicit provenance.
+PBR channels with explicit provenance through the existing dependency-driven tiled GPU pass graph.
 
 Scope:
+- Compile material-class ranges, clamps, imported/estimated precedence, learned-provider choice, contribution order,
+  normal convention, requested-map dependencies, formats, and provenance on the CPU into compact immutable PBR pass
+  commands. CPU planning must not allocate or rasterize final/intermediate map planes.
 - Implement physical Height composition with explicit amplitudes, material-class ranges, clamps, and contribution
-  provenance. Do not add unrestricted normalized maps.
+  provenance as a float GPU tile pass. Do not add unrestricted normalized maps.
 - Compose in declared semantic layer order. Structural profiles, SDF details, stamp relief, decals, and weathering may
   mask or conform to one another only through the Stage 18 plan; Stage 17 does not infer order from pixels.
-- Generate normals from physical Height using Scharr derivatives divided by meters-per-pixel X/Y.
+- Generate normals on the GPU from final physical Height using Scharr derivatives divided by meters-per-pixel X/Y;
+  declare and schedule the derivative halo so valid interiors match across tiles.
 - Decode imported normals, combine them with generated/compiled contributions through reoriented or equivalent
   vector-correct normal mapping, renormalize, and re-encode in selected convention.
 - Derive normals after all physical Height contributions are resolved, then vector-compose explicitly imported normal
   details. Never alpha-blend encoded normal RGB. Respect premultiplied/unpremultiplied color decal policy separately
   from linear scalar, exact ID, and vector channels.
 - Prefer imported Roughness; otherwise estimate from class/base/contrast/high-frequency evidence and compiled effects
-  with Estimated provenance and bounded ranges.
+  with Estimated provenance and bounded ranges. Execute sampling/estimation/composition on GPU tiles while the CPU
+  records the chosen route and provenance.
 - Keep Metallic zero unless imported, explicitly labeled metal/material-ID-driven, or changed by exposed-metal effect.
-- Implement multi-radius physical Height AO/cavity and compose compiled contributions.
+- Implement multi-radius physical Height AO/cavity and compose compiled contributions as GPU passes with declared
+  radius/halo and bounded multi-scale intermediates.
 - Define a versioned local learned-map provider boundary; imported maps and explicit procedural structure take
-  precedence. Unavailable provider routes explicitly to classical estimates/pass-through.
+  precedence. A provider may use the shared GPU when beneficial but returns a registered GPU resource/tiled source
+  whenever possible so later stages do not require a round-trip. Unavailable routes explicitly use the compiled
+  classical estimate/pass-through policy.
+- Extend, rather than replace, the accepted requested-map graph. Deduplicate prerequisites and keep Stage 14 sampling,
+  Stage 15 occupancy/Height, Stage 16 details, Stage 18 effects, final Height, Normal, Roughness, AO, and Metallic
+  intermediates GPU-resident. Base Color alone runs none of these passes; Normal runs Height dependencies but not
+  unrelated Roughness/AO/Metallic work.
+- Use qualified float/single-channel/vector formats internally and pack only requested publication/export tiles.
+  Cache every pass by exact dependency identity and record requested/executed/cache-hit/skipped/readback telemetry.
+- Retain minimal CPU calculations only as small deterministic parity fixtures. Remove CPU production PBR raster and
+  composition paths after GPU parity passes.
 - Produce per-channel contribution/provenance QA views and docs/phase-reports/algorithm-stage-17.md.
 
 Acceptance:
@@ -1467,19 +1595,27 @@ Acceptance:
 - Base-Color-only outputs label estimated channels and remain deterministic.
 - Stamp/decal fixtures preserve registration, physical size, layer order, mask polarity, exact IDs, and normal-vector
   length across output resolutions.
+- Requested-map telemetry proves no unrelated pass or readback ran. GPU tile seams pass for Height, Normal, Roughness,
+  AO, Metallic, alpha, and imported/generated contribution boundaries at every required halo.
+- Exact/categorical values and plan identities are exact; float/filtered cross-backend comparisons use declared fixed
+  tolerances. Same hardware/backend and complete input tuple produce stable output hashes.
+- Production CPU PBR pixel counters remain zero and 8K requested-map performance remains within the accepted GPU
+  budget after the new algorithms are enabled.
 
 Verification — run exactly:
-cargo test -p hot-trimmer-sheet-compiler algorithm_stage_17_pbr_composition
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_17_gpu_pbr_composition
 
 Stop conditions:
 - Stop if Stage 17 changes an effect route or fit decision.
 - Stop if generated structure overwrites imported normals instead of composing.
 - Stop if inferred channels lose Estimated provenance.
+- Stop if an intermediate GPU map is read back for CPU composition, a frontend/preview shader computes material math,
+  or all maps are generated when only one was requested.
 ```
 
 ---
 
-## Prompt 19 — Stage 19: atlas finishing, feature LOD validation, exact IDs, and metadata
+## Prompt 19 — Stage 19: tiled GPU finishing, reduced validation, exact IDs, and metadata
 
 ```text
 Implement Prompt 19 / Stage 19 from the full algorithm-stack prompt pack.
@@ -1488,20 +1624,33 @@ Read the common rules and revised Stage 19. Consume fully composed slot channels
 
 Objective:
 Finish a registered atlas with correct bleed/filtering/mips, exact categorical maps, survival evidence, and complete
-runtime metadata.
+runtime metadata without materializing full-resolution CPU maps.
 
 Scope:
-- Evaluate material/effects over allocation rectangles where possible; implement nearest-valid-pixel/jump-flood
-  dilation for finite unique content. IDs never bleed.
-- Downsample compiled supersampled slots by channel: color-managed area Base Color, linear scalar filtering,
-  decoded-vector normal filtering/renormalization, validated Roughness/Metallic, nearest categorical IDs.
-- Implement channel-specific atlas filtering/mips. Region ID fills hotspot rectangles only with exact colors and no
-  AA/dither/bleed/color transform; Material ID uses exact shared labels.
-- Implement mip-survival validation at mip 0/1/2 and configured target range for bevel coherence, strip collapse,
-  seams/bleed, simplified-effect strength, and ID exactness at mip 0.
+- Extend the accepted GPU tile/halo/compact-ID infrastructure; do not create a second finishing path. Evaluate
+  material/effects over allocation rectangles where possible and implement nearest-valid-pixel/jump-flood dilation for
+  finite unique content as bounded GPU passes. IDs never bleed.
+- Downsample compiled supersampled GPU tiles by channel: color-managed area Base Color, linear scalar filtering,
+  decoded-vector normal filtering/renormalization, validated Roughness/Metallic, and nearest categorical IDs. Keep
+  intermediates resident and publish/read back only requested final tiles or export batches.
+- Implement channel-specific GPU filtering and mip generation. Region ID fills hotspot rectangles only using compact
+  `R32Uint` indices plus the stable table, with no AA/dither/bleed/color transform; Material ID uses exact shared labels.
+- Implement mip-survival measurement using GPU reductions/compares over requested tiles at mip 0/1/2 and the configured
+  target range for bevel coherence, strip collapse, seams/bleed, simplified-effect strength, and ID exactness at mip
+  0. Read back only bounded statistics/diagnostics, not the analyzed full maps.
+- Compile finishing policy, requested mip ranges, exact ID tables, validation thresholds, manifest lineage, and tile/
+  map scheduling on the CPU. Execute all pixel filtering, dilation, downsampling, mip generation, ID writes, and
+  pixel-parallel survival analysis on the existing GPU service.
+- Reuse Prompt 005 budgets, source/output tiling, staging pools, streaming encoder boundary, progress, cancellation,
+  device-loss policy, and atomic finalization. Operation-specific halos and valid interiors must remain seamless at
+  8K/16K/24K; no monolithic fallback is permitted even on permissive adapters.
 - Produce complete manifest data: template/version/compatibility/topology hash, material revision, slot/allocation/
   hotspot/role/fit/world/radial data, map paths/colorspaces/checksums, and effect/LOD/supersampling summaries.
-- Produce deterministic detailed and concise compilation reports plus all Stage 19 QA views.
+- Build the manifest/reports on the CPU from immutable plan identities, GPU tile manifests, bounded reduction results,
+  and streaming output checksums. `CompiledSheet` references this lineage and tiled results; it does not own duplicate
+  monolithic CPU pixel buffers.
+- Produce deterministic detailed and concise compilation reports plus all Stage 19 QA views. QA pixels are requested
+  GPU tiles through the same artifact route, never UI-side or CPU recomputation.
 - Add docs/phase-reports/algorithm-stage-19.md.
 
 Acceptance:
@@ -1510,40 +1659,50 @@ Acceptance:
 - Supersampling changes raster quality but never physical dimensions.
 - Survival validation catches disappearing and over-strengthened fixtures.
 - Same inputs produce byte-identical maps, checksums, manifest payload, and report.
+- Tile/monolithic-within-limit references agree at valid interiors for all maps/mips, bounded GPU reductions match small
+  CPU oracle statistics, and exact IDs remain exact across tiles and mip-0 publication.
+- Production CPU finishing/ID/mip/QA pixel counters remain zero; memory telemetry proves bounded CPU/GPU residency and
+  unrequested maps/mips/QA passes dispatch no work.
 
 Verification — run exactly:
-cargo test -p hot-trimmer-sheet-compiler algorithm_stage_19_atlas_finishing
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_19_gpu_atlas_finishing
 
 Stop conditions:
 - Stop if normal downsampling treats encoded RGB as color.
 - Stop if IDs are antialiased, bled, or mip-filtered at mip 0.
 - Stop if a survival warning is computed from UI approximations rather than authoritative channels/plans.
+- Stop if finishing allocates a full 16K/24K CPU map, duplicates the Prompt 005 scheduler/exporter, or reads GPU maps
+  back for CPU dilation/filtering/mip/QA work.
 ```
 
 ---
 
-## Prompt 20 — Stage 20: preview, QA workflow, atomic export, and Blender application
+## Prompt 20 — Stage 20: GPU-backed product workflow, QA, package publication, and Blender
 
 ```text
 Implement Prompt 20 / Stage 20 from the full algorithm-stack prompt pack.
 
-Read the common rules and revised Stage 20. Consume the Stage 19 CompiledSheet lineage and manifest only.
+Read the common rules and revised Stage 20. Consume the Stage 19 `CompiledSheet` lineage/tile manifest through the
+single `compile_persisted` GPU artifact and accepted streaming-export routes only.
 No subagents.
 
 Objective:
 Expose the complete material compiler through the existing source-first UI, prove it on representative geometry,
-publish it atomically, and apply semantic slots correctly in Blender.
+publish it through the already-atomic GPU streaming exporter, and apply semantic slots correctly in Blender without
+creating another renderer, map compositor, QA rasterizer, or exporter.
 
 Scope — desktop workflow:
 - Keep the established source library/canvas/sheet/inspector shell. Add typed controls for material-class override,
   physical-scale measurement, orientation, de-lighting, domain-route policy, seed, source sufficiency, placement pin/
   override, legal transforms, ExplicitStretch warning, material-state recipe, and effect fallback.
 - Add staged cancellable analysis/domain/placement/compile/export jobs with revision guards, progress, cache reuse,
-  bounded preview refinement, and no partial authoritative publication.
+  bounded GPU tile preview refinement, and no partial authoritative publication. Scheduling commands remain CPU work;
+  every pixel result comes from the existing GPU service and current compiled generation.
 - Add all QA views from revised Stage 20: channels, IDs, crop usage, repetition heatmap, seam energy, texel density,
   effect route/occupancy/LOD/supersampling, mip warnings, plan/provenance, and Blender status.
 - Every slot inspector shows selected source/domain/crop/transform/mode/cost, confidence, route, and fallback. UI does
-  not recompute compiler truth.
+  not recompute compiler truth. Pixel QA views request only visible GPU tiles; scalar summaries consume bounded GPU
+  reductions or plan metadata.
 - Integrate the Prompt LIB management window and browser into profile/detail/effect authoring. Provide stamp/splat
   tools that create typed Stage 16 operations with undo/redo, physical size, pivot, rotate/mirror, opacity, spacing,
   deterministic scatter/jitter, channel contribution preview, and explicit reusable-atlas versus asset-specific scope.
@@ -1555,9 +1714,14 @@ Scope — desktop workflow:
 
 Scope — preview/export:
 - Preview Plane, Cube, Cylinder, Beveled Block, Wall Module, Archway, Radial Disc, and Mechanical Prop, including
-  several authored hotspot-UV fixtures. Preview consumes exported-equivalent map handles and conventions.
-- Implement snapshot-based cancellable atomic package export with complete maps, manifest, checksums, colorspaces,
-  overwrite policy, staging validation, flush, and publish. Failure/cancellation never exposes partial success.
+  several authored hotspot-UV fixtures. Preview consumes exported-equivalent GPU tile/map handles and conventions.
+  Display geometry may sample compiled maps, but it never resolves crop/effect/material semantics or becomes a second
+  production material renderer.
+- Reuse the accepted Prompt 005 snapshot-based cancellable streaming export exactly. Stage 20 supplies the completed
+  Stage 19 manifest/package metadata, map request set, overwrite intent, and publication destination; it does not
+  implement another encoder, staging directory, atomic finalizer, or full-frame buffer.
+- Keep requested QA/preview maps GPU-resident and publish through the binary tile manifest. Do not restore PNG/Base64,
+  full-atlas preview readback, frontend material math, or CPU geometry-preview baking.
 
 Scope — Blender companion:
 - Load/validate manifest, create/update full Principled material, color spaces, normal, Height/displacement policy,
@@ -1573,6 +1737,8 @@ Scope — Blender companion:
 - Add docs/phase-reports/algorithm-stage-20.md and user-facing workflow/diagnostic documentation.
 - Add `CompiledTrimPackage` publishing to the library only after atomic Stage 20 export succeeds. Published packages
   pin the complete manifest/checksums and source recipe lineage; they never alias a mutable build directory.
+- Remove any remaining product call edge to CPU slot/effect/PBR/finishing rasterization. UI, Blender coordination,
+  metadata validation, encoding, and filesystem operations remain CPU work; material pixels remain GPU work.
 
 Acceptance:
 - The universal corpus can be compiled through the UI without material-specific workflows.
@@ -1585,6 +1751,11 @@ Acceptance:
   asset-specific scopes remain visibly distinct throughout.
 - A successfully exported trim package can be published, searched, reopened, and applied from the Library without
   changing its pinned manifest or source asset versions.
+- QA/map/geometry-preview requests prove requested-tile execution, revision safety, bounded payloads, zero frontend
+  material math, and zero production CPU pixel counters. Cached map/QA switching does not recompile plans or read back
+  unrelated maps.
+- Atomic package export is demonstrably the Prompt 005 streaming route with Stage 19 data, and 16K/24K package creation
+  retains its accepted bounded-memory/failure behavior.
 
 Verification — run exactly:
 npm run check:algorithm-stage-20
@@ -1594,15 +1765,17 @@ Stop conditions:
 - Stop if preview has a shortcut renderer different from final/export.
 - Stop if Blender only calculates fit values without authoring and validating UV/material state.
 - Stop if interactive splats are stored as flattened preview pixels or if screen coordinates become authoritative.
+- Stop if Stage 20 creates another exporter/GPU service, computes QA or material pixels on the CPU/frontend, or turns
+  `CompiledSheet` into a monolithic in-memory map bundle.
 ```
 
 ---
 
-## Prompt 21 — Full V1 qualification and old-engine removal
+## Prompt 21 — Full GPU V1 qualification and remaining obsolete-path removal
 
 ```text
-Implement Prompt 21: qualify the complete twenty-stage Hot Trimmer V1 algorithm stack and remove every replaced
-legacy authority.
+Implement Prompt 21: qualify the complete twenty-stage Hot Trimmer V1 algorithm stack on the accepted tiled GPU
+production path and remove every remaining replaced algorithm, duplicate authority, and CPU production pixel route.
 
 Read AGENTS.md, both governing algorithm documents, every algorithm stage report, the corpus manifest, and the
 traceability matrix. Inspect current git status. No subagents.
@@ -1611,18 +1784,38 @@ Objective:
 Prove the full product promise across behavior classes, source conditions, slot roles, output sizes, QA views,
 export, and Blender. This prompt implements no new algorithm and creates no new acceptance criteria.
 
+Preserve explicitly:
+- `TrimSheetDocument`, `compile_persisted`, the immutable compiled-plan/compiler-executor boundary, the application-owned
+  GPU service, compact command/source caches, requested-map pass graph, tiled artifacts, binary preview transport,
+  streaming export, and Stage 20 package/Blender consumers.
+- The smallest clearly test-only CPU parity fixtures needed to validate GPU math. They are never selectable at runtime.
+
 Scope:
 - Execute every revised section-30 acceptance criterion against the universal corpus and required geometry/effect
-  fixtures at 1K, 2K, 4K, and 8K where specified.
+  fixtures at 1K, 2K, 4K, and 8K where specified, plus representative/full-product 16K and 24K tiled preview/export
+  workloads from Prompt 005 after the Stage 15–19 algorithms are enabled.
 - Close every traceability row with unit/property/plan/image/failure/performance evidence. A pass-through result is
   accepted only where the stage contract allows it and its reason is asserted.
-- Measure named 8K analysis/domain/placement/compile memory and time, preview latency, cancellation latency, cache
-  reuse, save/reopen, export, and Blender update on documented hardware.
+- Measure named CPU planning phases separately from GPU upload/dispatch/cache/readback/publication/encode phases.
+  Record 8K analysis/domain/placement/compile time, requested-map latency, cancellation latency, cache reuse,
+  save/reopen, export, and Blender update, plus 16K/24K first-tile/total time and peak CPU/GPU residency on documented
+  discrete and integrated hardware when actually available.
 - Exercise malformed/bounded inputs, cache loss, low disk, cancellation, revision supersession, deterministic
   reruns, project crash recovery, atomic package publication, and offline operation.
-- Delete the legacy sheet compiler, normalized profile renderer, runtime semantic repacking, obsolete mappings,
-  duplicated IPC/React authority, old schema/migrations, unused fixtures, temporary adapters, and dead dependencies.
-- Confirm one source document, one staged algorithm pipeline, one CompiledSheet lineage, and one manifest authority.
+- Delete only concretely identified obsolete paths: CPU production slot/atlas/profile/detail/effect/PBR/finishing/QA
+  rasterizers, normalized-profile and universal-weathering evaluators, runtime semantic repacking, obsolete mappings,
+  duplicated IPC/React material authority, superseded schema/migrations, temporary adapters, and dead dependencies.
+  Do not delete or rename the accepted `sheet-compiler`/`compile_persisted` GPU orchestration merely because an older
+  document called a prior implementation the legacy sheet compiler.
+- Confirm one source document, one `compile_persisted` staged planning pipeline, one immutable plan lineage, one
+  production GPU executor, one tiled `CompiledSheet`/manifest lineage, one binary preview path, and one streaming
+  exporter.
+- Add route counters/assertions proving every production pixel class—Stage 14 sampling, Stage 15 profiles, Stage 16
+  details, Stage 18 effects, Stage 17 PBR, Stage 19 finishing/IDs/mips/QA—executes on GPU. CPU counters must remain zero
+  outside explicit parity fixtures, encoding, and bounded summary/metadata work.
+- Re-run tile-boundary, halo, deterministic seed, exact-ID, requested-map, device-loss, cancellation, cache-eviction,
+  disk-failure, and atomic-publication evidence after the final algorithms are installed. Prompt 005 evidence produced
+  before Stages 15–19 does not alone qualify their new passes.
 - Update README, technical spec, architecture decisions, support diagnostics, algorithm version registry, Blender
   guide, known limitations, and docs/phase-reports/algorithm-stack-v1-qualification.md.
 
@@ -1633,6 +1826,10 @@ Acceptance:
 - Source insufficiency and invalid effects are actionable and never silently distorted.
 - Preview/export/Blender agree and locked geometry assignments survive material/effect/resolution updates.
 - No live code can publish through the old engine or alter standard topology from appearance.
+- 8K/16K/24K workloads stay within declared CPU/GPU budgets, generate only requested maps, publish no stale/partial
+  artifacts, and contain no monolithic all-map allocation or GPU-to-CPU-to-GPU intermediate round-trip.
+- Supported GPU failures are typed; unsupported hardware never invokes a CPU production renderer. Exact identities/
+  categorical outputs are exact and float/filtered parity uses the fixed declared tolerances.
 
 Verification — run exactly:
 npm run check
@@ -1641,6 +1838,8 @@ Stop conditions:
 - Stop rather than waive a failed revised acceptance criterion.
 - Stop if a deleted legacy path still has a runtime caller.
 - Stop if broad green tests conceal missing corpus/visual/Blender evidence.
+- Stop if cleanup targets `compile_persisted`, the production GPU executor, tiled artifact/export infrastructure, or the
+  test-only CPU oracle, or if qualification hides CPU pixel work behind a helper with a non-rendering name.
 ```
 
 ---

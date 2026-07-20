@@ -21,6 +21,9 @@ export type AlgorithmJobEvent =
 export type SourceChannel =
   | "base_color" | "normal" | "height" | "roughness" | "metallic"
   | "ambient_occlusion" | "specular" | "opacity" | "edge_mask" | "material_id";
+export type RenderOutputChannel = SourceChannel | "region_id";
+export type ChannelBitDepth = "eight" | "sixteen" | "thirty_two_float";
+export interface ChannelRenderPolicy { enabled: boolean; bitDepth: ChannelBitDepth }
 export type ChannelInterpretation = "color_managed_base_color" | "tangent_space_normal" | "linear_scalar"
   | "linear_opacity" | "binary_mask" | "categorical_id";
 export type NormalConvention = "not_applicable" | "open_gl" | "direct_x" | "unspecified";
@@ -227,7 +230,12 @@ export interface TrimSheetDocument {
   primaryMaterial: string | null;
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
   regionBindings: Record<string, RegionBinding>;
-  renderSettings: { outputSize: PixelSize; atlasPaddingPx?: number; rendererVersion: string };
+  renderSettings: {
+    outputSize: PixelSize;
+    atlasPaddingPx?: number;
+    rendererVersion: string;
+    channels: Partial<Record<RenderOutputChannel, ChannelRenderPolicy>>;
+  };
   sourceFrame?: SourceFrame;
   logicalGrid?: { schemaVersion: number; width: number; height: number };
   partitionProvenance?: unknown;
@@ -483,7 +491,7 @@ export interface IntermediateAtlasProjection {
   topology: unknown;
   placementPlanId: string;
   maps: Partial<Record<CompiledMapView, string>>;
-  tileManifest: GpuTiledPreviewPublication;
+  tileManifest?: GpuTiledPreviewPublication;
   tileManifests?: Partial<Record<CompiledMapView, GpuTiledPreviewPublication>>;
   regionIdLookup: readonly RegionIdLookupEntry[];
   regions: readonly ResolvedRegion[];
@@ -495,6 +503,7 @@ export interface IntermediateAtlasProjection {
   exportAvailable: false;
   blenderAvailable: false;
   sourceFrame?: SourceFrame;
+  project?: ProjectProjection;
 }
 
 export interface RegionIdLookupEntry {
@@ -560,6 +569,51 @@ export interface Stage14PreviewRequest {
   requestedMaps?: readonly SourceFramePreviewMaterialMap[];
   /** Exact output-atlas coordinates, used only by `exactViewport`. */
   viewportRect?: PixelBounds;
+}
+
+export interface NativeStage14ExportRequest {
+  protocolVersion: number;
+  revision: number;
+  path: string;
+  requestedMaps?: readonly SourceFramePreviewMaterialMap[];
+}
+
+export interface NativeStage14ExportOutput {
+  id: string;
+  map: CompiledMapView;
+  fileName: string;
+  checksum: string;
+  bytes: number;
+  width: number;
+  height: number;
+  pixelFormat: string;
+}
+
+export interface NativeStage14ExportProgress {
+  map: string;
+  mipLevel: number;
+  completedTiles: number;
+  totalTiles: number;
+  renderMs: number;
+  readbackMs: number;
+  encodeMs: number;
+  bytesWritten: number;
+  estimatedRemainingTiles: number;
+}
+
+export interface NativeStage14ExportProjection {
+  path: string;
+  revision: number;
+  bytesWritten: number;
+  outputs: readonly NativeStage14ExportOutput[];
+  progress: readonly NativeStage14ExportProgress[];
+  telemetry: readonly string[];
+  project?: ProjectProjection;
+}
+
+export interface NativeStage14ExportProgressEvent {
+  revision: number;
+  progress: NativeStage14ExportProgress;
 }
 
 export interface PreviewSheetProjection {
@@ -633,6 +687,7 @@ export type TrimSheetDocumentCommand =
   | { type: "set_region_radial"; regionId: string; radial: NonNullable<RegionMapping["radial"]> }
   | { type: "set_output_resolution"; outputSize: PixelSize }
   | { type: "set_atlas_padding"; paddingPx: number }
+  | { type: "set_channel_render_policy"; channel: RenderOutputChannel; policy: ChannelRenderPolicy }
   | { type: "set_source_frame"; bounds: NormalizedBounds }
   | { type: "detach_source_cell"; regionId: string }
   | { type: "reset_source_cell"; regionId: string };

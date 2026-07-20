@@ -189,8 +189,12 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
     }
     // Stage 14 has no registered TextureSynthesis executor. Reject it instead
     // of allowing the generic physical branch to become centered full-source
-    // sampling, and require every executable plan to carry its selected crop.
-    if p.candidate.mapping_mode == SamplingMode::TextureSynthesis || p.candidate.crop.is_none() {
+    // sampling. Authored radial plans may intentionally omit a selected crop;
+    // their full-domain basis is internal and must not be published as a Gate 1
+    // crop selection.
+    if p.candidate.mapping_mode == SamplingMode::TextureSynthesis
+        || (p.candidate.crop.is_none() && !radial_without_crop(p))
+    {
         return Err(SlotSynthesisError::InvalidPlan);
     }
     if p.candidate.mapping_mode == SamplingMode::ExplicitStretch
@@ -308,7 +312,20 @@ fn validate_synthesized_center(r: &SlotSynthesisRequest<'_>, c: SourceCrop) -> R
 }
 
 fn crop(r: &SlotSynthesisRequest<'_>) -> SourceCrop {
-    r.plan.candidate.crop.expect("validated Stage 14 plan must carry a source crop")
+    r.plan.candidate.crop.unwrap_or(SourceCrop {
+        x: 0,
+        y: 0,
+        width: r.domain.width,
+        height: r.domain.height,
+    })
+}
+
+fn radial_without_crop(plan: &SamplingPlan) -> bool {
+    plan.candidate.crop.is_none()
+        && matches!(
+            plan.candidate.mapping_mode,
+            SamplingMode::PlanarRadial | SamplingMode::PolarRadial
+        )
 }
 
 fn map_position(r: &SlotSynthesisRequest<'_>, q: [f64; 2]) -> Position {

@@ -1,7 +1,7 @@
 //! Immutable atlas render-execution boundary introduced by GPU migration Prompt 1.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
     sync::{
         Arc, Mutex, OnceLock,
@@ -11,8 +11,12 @@ use std::{
 };
 
 use hot_trimmer_domain::{
-    CancellationToken, ContentDigest, MaterialChannelRole, MaterialMapKind, RegionId,
+    CancellationToken, ContentDigest, MaterialChannelRole, MaterialMapKind, PixelBounds, RegionId,
     SourceSamplingMode, SourceSetId,
+};
+use hot_trimmer_export::{
+    ExportMemoryBudgets, ExportPixelFormat, PixelRect, TiledExportError, bounded_tile_byte_len,
+    choose_bounded_tile_edge,
 };
 use hot_trimmer_image_io::{ImagePlane, LinearColor, MaskValue};
 use hot_trimmer_material_synthesis::PreparedMaterialDomain;
@@ -23,7 +27,10 @@ use wgpu::util::DeviceExt;
 use crate::{
     AlgorithmCompiler, IntermediateAtlasArtifact, IntermediateAtlasRequest, SlotSynthesisLimits,
     SlotSynthesisRequest, SynthesizedSlotMaterial,
-    compiled_atlas_plan::{CompiledAtlasPlanV1, CompiledRegionCommandV1, CompiledSourceCommandV1},
+    compiled_atlas_plan::{
+        CompiledAtlasPlanV1, CompiledAtlasTileIdentity, CompiledRegionCommandV1,
+        CompiledSourceCommandV1, CompiledTilePixelFormat, OutputPixelRect,
+    },
     persisted_pipeline::{SourceFramePreviewCache, semantic_rect_for_padding},
     synthesize_slot_material_with_guard,
 };
@@ -619,9 +626,37 @@ pub struct GpuAtlasSourceTextureCache {
 }
 
 impl GpuAtlasSourceTextureCache {
+    fn budgets() -> ExportMemoryBudgets {
+        ExportMemoryBudgets::default()
+    }
+
     #[must_use]
     pub fn source_count(&self) -> usize {
         self.sources.len()
+    }
+
+    #[must_use]
+    pub fn source_resident_bytes(&self) -> u64 {
+        self.sources
+            .values()
+            .map(|texture| texture.byte_len)
+            .sum::<u64>()
+    }
+
+    #[must_use]
+    pub fn rendered_tile_bytes(&self) -> u64 {
+        self.rendered_tiles
+            .iter()
+            .map(|tile| tile.pixels.len() as u64)
+            .sum::<u64>()
+    }
+
+    #[must_use]
+    pub fn rendered_texture_bytes(&self) -> u64 {
+        self.rendered_textures
+            .iter()
+            .map(|texture| texture.byte_len)
+            .sum::<u64>()
     }
 
     fn cached_tile(
@@ -642,7 +677,10 @@ impl GpuAtlasSourceTextureCache {
         self.rendered_tiles
             .retain(|existing| existing.manifest.identity.pixel_identity() != pixel_identity);
         self.rendered_tiles.push(Arc::clone(&tile));
-        while self.rendered_tiles.len() > 32 {
+        let budget = Self::budgets().staging_buffers_bytes;
+        while self.rendered_tiles.len() > 1
+            && (self.rendered_tiles.len() > 32 || self.rendered_tile_bytes() > budget)
+        {
             self.rendered_tiles.remove(0);
         }
     }
@@ -666,19 +704,25 @@ impl GpuAtlasSourceTextureCache {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
+        byte_len: u64,
     ) {
         let pixel_identity = identity.pixel_identity();
         self.rendered_textures
             .retain(|existing| existing.pixel_identity != pixel_identity);
-        self.rendered_textures.push(Arc::new(GpuCachedRenderedTexture {
-            pixel_identity,
-            _texture: texture,
-            view,
-            width,
-            height,
-            format,
-        }));
-        while self.rendered_textures.len() > 16 {
+        self.rendered_textures
+            .push(Arc::new(GpuCachedRenderedTexture {
+                pixel_identity,
+                _texture: texture,
+                view,
+                width,
+                height,
+                format,
+                byte_len,
+            }));
+        let budget = Self::budgets().gpu_output_intermediate_residency_bytes;
+        while self.rendered_textures.len() > 1
+            && (self.rendered_textures.len() > 16 || self.rendered_texture_bytes() > budget)
+        {
             self.rendered_textures.remove(0);
         }
     }
@@ -691,6 +735,7 @@ pub struct GpuCachedRenderedTexture {
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    byte_len: u64,
 }
 
 pub struct GpuAtlasRenderExecutor<'a> {
@@ -821,13 +866,56 @@ impl Default for GpuAtlasTileCache {
 #[derive(Debug)]
 pub struct GpuAtlasReadbackPool {
     maximum_buffers: usize,
+    byte_capacity: u64,
+    checked_out_bytes: u64,
     available: Vec<GpuAtlasStagingBuffer>,
 }
 
 #[derive(Debug)]
-struct GpuAtlasStagingBuffer {
+pub struct GpuAtlasStagingBuffer {
     byte_len: u64,
     buffer: wgpu::Buffer,
+}
+
+struct GpuAtlasStagingLease<'a> {
+    cache: &'a Mutex<GpuAtlasSourceTextureCache>,
+    staging: Option<GpuAtlasStagingBuffer>,
+}
+
+impl GpuAtlasStagingLease<'_> {
+    fn buffer(&self) -> &wgpu::Buffer {
+        &self
+            .staging
+            .as_ref()
+            .expect("staging lease must own a buffer until drop")
+            .buffer
+    }
+}
+
+impl Drop for GpuAtlasStagingLease<'_> {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take()
+            && let Ok(mut cache) = self.cache.lock()
+        {
+            cache.readback_pool.release_staging(staging);
+        }
+    }
+}
+
+fn acquire_staging_lease<'a>(
+    device: &wgpu::Device,
+    cache: &'a Mutex<GpuAtlasSourceTextureCache>,
+    byte_len: u64,
+) -> Result<GpuAtlasStagingLease<'a>, AtlasRenderExecutionError> {
+    let staging = cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .readback_pool
+        .acquire_staging(device, byte_len)?;
+    Ok(GpuAtlasStagingLease {
+        cache,
+        staging: Some(staging),
+    })
 }
 
 impl GpuAtlasReadbackPool {
@@ -835,30 +923,84 @@ impl GpuAtlasReadbackPool {
     pub fn new(maximum_buffers: usize) -> Self {
         Self {
             maximum_buffers,
+            byte_capacity: ExportMemoryBudgets::default().staging_buffers_bytes,
+            checked_out_bytes: 0,
             available: Vec::new(),
         }
     }
 
-    pub fn acquire_staging(&mut self, device: &wgpu::Device, byte_len: u64) -> wgpu::Buffer {
+    fn available_bytes(&self) -> u64 {
+        self.available
+            .iter()
+            .map(|buffer| buffer.byte_len)
+            .sum::<u64>()
+    }
+
+    fn reserve_staging_bytes(&mut self, byte_len: u64) -> Result<(), AtlasRenderExecutionError> {
+        if byte_len > self.byte_capacity {
+            return Err(AtlasRenderExecutionError::Gpu(format!(
+                "readback staging request {byte_len} exceeds the declared staging budget"
+            )));
+        }
+        if self.checked_out_bytes.saturating_add(byte_len) > self.byte_capacity {
+            return Err(AtlasRenderExecutionError::Gpu(format!(
+                "readback staging request {byte_len} would exceed the declared in-flight staging budget"
+            )));
+        }
+        self.checked_out_bytes = self.checked_out_bytes.saturating_add(byte_len);
+        Ok(())
+    }
+
+    fn release_staging_bytes(&mut self, byte_len: u64) {
+        self.checked_out_bytes = self.checked_out_bytes.saturating_sub(byte_len);
+    }
+
+    pub fn acquire_staging(
+        &mut self,
+        device: &wgpu::Device,
+        byte_len: u64,
+    ) -> Result<GpuAtlasStagingBuffer, AtlasRenderExecutionError> {
         if let Some(index) = self
             .available
             .iter()
             .position(|buffer| buffer.byte_len >= byte_len)
         {
-            return self.available.swap_remove(index).buffer;
+            let staging = self.available.swap_remove(index);
+            self.reserve_staging_bytes(staging.byte_len)?;
+            return Ok(staging);
         }
-        device.create_buffer(&wgpu::BufferDescriptor {
+        while self
+            .checked_out_bytes
+            .saturating_add(self.available_bytes())
+            .saturating_add(byte_len)
+            > self.byte_capacity
+            && !self.available.is_empty()
+        {
+            self.available.remove(0);
+        }
+        self.reserve_staging_bytes(byte_len)?;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hot-trimmer-base-color-readback"),
             size: byte_len,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        })
+        });
+        Ok(GpuAtlasStagingBuffer { byte_len, buffer })
     }
 
-    pub fn release_staging(&mut self, buffer: wgpu::Buffer, byte_len: u64) {
+    pub fn release_staging(&mut self, staging: GpuAtlasStagingBuffer) {
+        self.release_staging_bytes(staging.byte_len);
+        while self
+            .checked_out_bytes
+            .saturating_add(self.available_bytes())
+            .saturating_add(staging.byte_len)
+            > self.byte_capacity
+            && !self.available.is_empty()
+        {
+            self.available.remove(0);
+        }
         if self.available.len() < self.maximum_buffers {
-            self.available
-                .push(GpuAtlasStagingBuffer { byte_len, buffer });
+            self.available.push(staging);
         }
     }
 }
@@ -932,7 +1074,7 @@ struct GpuRegionCommand {
 
 const GPU_HEADER_BYTES: usize = 48;
 const GPU_COMMAND_BYTES: usize = 156;
-const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v8-radial-interior-extension";
+const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v10-authored-normal-height-fallback";
 
 fn requested_material_maps(
     plan: &CompiledAtlasPlanV1,
@@ -950,6 +1092,969 @@ fn requested_material_maps(
         }
     }
     Ok(unique_maps)
+}
+
+#[derive(Clone, Debug)]
+struct CompiledExportSchedule {
+    adapter_max_texture_dimension_2d: u32,
+    output_width: u32,
+    output_height: u32,
+    output_monolithic_bytes: u64,
+    output_monolithic_budget_bytes: u64,
+    source_monolithic_bytes: Vec<u64>,
+    source_monolithic_budget_bytes: u64,
+    output_tile_edge: u32,
+    source_tile_edge: u32,
+    output_tiles: Vec<CompiledExportOutputTile>,
+    source_tiles: Vec<CompiledExportSourceTile>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledExportOutputTile {
+    identity: CompiledAtlasTileIdentity,
+    output_rect: OutputPixelRect,
+    valid_rect: OutputPixelRect,
+    bit_depth: u8,
+    color_space: &'static str,
+    staging_bytes: u64,
+    footprints: Vec<CompiledExportSourceFootprint>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledExportSourceTile {
+    source_index: usize,
+    source: CompiledSourceCommandV1,
+    rect: PixelRect,
+    halo_rect: PixelRect,
+    halo_px: u32,
+    byte_len: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledExportSourceFootprint {
+    region_id: RegionId,
+    source_index: usize,
+    source_rect: PixelRect,
+    required_source_tiles: Vec<usize>,
+}
+
+fn preflight_tiled_export_plan(
+    executor: &GpuAtlasRenderExecutor<'_>,
+    plan: &CompiledAtlasPlanV1,
+    requested_maps: &[MaterialMapKind],
+) -> Result<CompiledExportSchedule, AtlasRenderExecutionError> {
+    let gpu = executor
+        .service
+        .initialize()
+        .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
+    let schedule = schedule_compiled_export_tiles(plan, requested_maps, gpu.capabilities())
+        .map_err(|error| {
+            AtlasRenderExecutionError::Gpu(format!("tiled compiled-plan preflight failed: {error}"))
+        })?;
+    if schedule.output_tiles.is_empty() {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "tiled compiled-plan preflight produced no output tiles".into(),
+        ));
+    }
+    if schedule.output_tile_edge == 0 || schedule.source_tile_edge == 0 {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "tiled compiled-plan preflight selected a zero tile edge".into(),
+        ));
+    }
+    let total_staging_bytes = schedule
+        .output_tiles
+        .iter()
+        .map(|tile| {
+            let _identity = &tile.identity;
+            let _output_rect = tile.output_rect;
+            let _valid_rect = tile.valid_rect;
+            let metadata_bytes =
+                u64::from(tile.bit_depth).saturating_add(tile.color_space.len() as u64);
+            tile.staging_bytes
+                .saturating_add(metadata_bytes)
+                .saturating_add(
+                    tile.footprints
+                        .iter()
+                        .map(|footprint| {
+                            let _region_id = footprint.region_id;
+                            let _source_rect = footprint.source_rect;
+                            u64::try_from(footprint.required_source_tiles.len())
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(
+                                    u64::try_from(footprint.source_index).unwrap_or(0).min(1),
+                                )
+                        })
+                        .sum::<u64>(),
+                )
+        })
+        .sum::<u64>();
+    let total_source_bytes = schedule
+        .source_tiles
+        .iter()
+        .map(|tile| {
+            let _source = &tile.source;
+            let _rect = tile.rect;
+            tile.byte_len.saturating_add(u64::from(tile.halo_px))
+        })
+        .sum::<u64>();
+    if total_staging_bytes == 0 || total_source_bytes == 0 {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "tiled compiled-plan preflight produced empty residency accounting".into(),
+        ));
+    }
+    Ok(schedule)
+}
+
+fn ensure_schedule_publishable_by_current_executor(
+    plan: &CompiledAtlasPlanV1,
+    schedule: &CompiledExportSchedule,
+    requested_maps: &[MaterialMapKind],
+) -> Result<(), AtlasRenderExecutionError> {
+    let current_tile = plan.tile_request.output_rect.0;
+    let current_tile_bytes = current_executor_tile_residency_bytes(plan, requested_maps)
+        .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
+    let current_tile_fits_renderer = current_tile.width
+        <= schedule.adapter_max_texture_dimension_2d
+        && current_tile.height <= schedule.adapter_max_texture_dimension_2d
+        && current_tile_bytes <= schedule.output_monolithic_budget_bytes;
+    let output_fits_current_renderer = schedule.output_width
+        <= schedule.adapter_max_texture_dimension_2d
+        && schedule.output_height <= schedule.adapter_max_texture_dimension_2d
+        && schedule.output_monolithic_bytes <= schedule.output_monolithic_budget_bytes;
+    let source_fits_current_renderer = schedule.source_tiles.iter().all(|tile| {
+        tile.source.oriented_dimensions.width <= schedule.adapter_max_texture_dimension_2d
+            && tile.source.oriented_dimensions.height <= schedule.adapter_max_texture_dimension_2d
+    }) && schedule
+        .source_monolithic_bytes
+        .iter()
+        .copied()
+        .sum::<u64>()
+        <= schedule.source_monolithic_budget_bytes;
+
+    if (output_fits_current_renderer || current_tile_fits_renderer) && source_fits_current_renderer
+    {
+        return Ok(());
+    }
+
+    let output_tile_limit = requested_maps.len().max(1);
+    if !output_fits_current_renderer
+        && !current_tile_fits_renderer
+        && schedule.output_tiles.len() > output_tile_limit
+    {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "compiled export schedule requires multi-output-tile streaming; the current GPU executor cannot publish that as a single interactive tile".into(),
+        ));
+    }
+    let tiled_sources = schedule
+        .source_tiles
+        .iter()
+        .filter(|tile| {
+            tile.rect.width < tile.source.oriented_dimensions.width
+                || tile.rect.height < tile.source.oriented_dimensions.height
+        })
+        .count();
+    if !source_fits_current_renderer && tiled_sources > 0 {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "compiled export schedule requires source-tile uploads; the current GPU executor still binds complete source textures".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_executor_tile_residency_bytes(
+    plan: &CompiledAtlasPlanV1,
+    requested_maps: &[MaterialMapKind],
+) -> Result<u64, TiledExportError> {
+    let tile = plan.tile_request.output_rect.0;
+    let mut bytes = 0_u64;
+    for map in requested_maps {
+        let format =
+            export_format_from_compiled(plan.tile_identity(*map, GPU_SHADER_VERSION).pixel_format);
+        bytes = bytes.saturating_add(bounded_tile_byte_len(
+            tile.width,
+            tile.height,
+            format.bytes_per_pixel(),
+            plan.tile_request.halo_px,
+            256,
+        )?);
+        if material_map_requires_display_tile(*map) {
+            bytes = bytes.saturating_add(bounded_tile_byte_len(
+                tile.width,
+                tile.height,
+                4,
+                plan.tile_request.halo_px,
+                256,
+            )?);
+        }
+    }
+    if requested_maps.contains(&MaterialMapKind::Normal)
+        && !requested_maps.contains(&MaterialMapKind::Height)
+    {
+        bytes = bytes.saturating_add(bounded_tile_byte_len(
+            tile.width,
+            tile.height,
+            4,
+            plan.tile_request.halo_px,
+            256,
+        )?);
+    }
+    Ok(bytes)
+}
+
+fn material_map_requires_display_tile(map: MaterialMapKind) -> bool {
+    matches!(
+        map,
+        MaterialMapKind::Height
+            | MaterialMapKind::Roughness
+            | MaterialMapKind::Metallic
+            | MaterialMapKind::AmbientOcclusion
+            | MaterialMapKind::RegionId
+    )
+}
+
+fn schedule_compiled_export_tiles(
+    plan: &CompiledAtlasPlanV1,
+    requested_maps: &[MaterialMapKind],
+    caps: &hot_trimmer_preview::GpuCapabilityRecord,
+) -> Result<CompiledExportSchedule, TiledExportError> {
+    let budgets = ExportMemoryBudgets::default();
+    let concurrency = budgets.total_in_flight_tiles.max(1);
+    let output_monolithic_budget = budgets
+        .gpu_output_intermediate_residency_bytes
+        .min(budgets.staging_buffers_bytes);
+    let source_monolithic_budget = budgets
+        .decoded_cpu_source_tiles_bytes
+        .min(budgets.gpu_source_residency_bytes);
+    let largest_output_bytes_per_pixel = requested_maps
+        .iter()
+        .map(|map| {
+            let identity = plan.tile_identity(*map, GPU_SHADER_VERSION);
+            ensure_compiled_pixel_format_supported(caps, identity.pixel_format)?;
+            Ok(export_format_from_compiled(identity.pixel_format).bytes_per_pixel())
+        })
+        .collect::<Result<Vec<_>, TiledExportError>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(4);
+    let output_monolithic_bytes = bounded_tile_byte_len(
+        plan.output_size.width,
+        plan.output_size.height,
+        largest_output_bytes_per_pixel,
+        0,
+        caps.copy_bytes_per_row_alignment,
+    )?;
+    let output_halo = plan.tile_request.halo_px.saturating_add(1);
+    let output_tile_edge = choose_bounded_tile_edge(
+        plan.output_size.width.max(plan.output_size.height),
+        caps.maximum_texture_dimension_2d,
+        largest_output_bytes_per_pixel,
+        output_halo,
+        budgets
+            .gpu_output_intermediate_residency_bytes
+            .min(budgets.staging_buffers_bytes)
+            / u64::from(concurrency),
+        caps.copy_bytes_per_row_alignment,
+    )?;
+    let largest_source_edge = plan
+        .ordered_sources
+        .iter()
+        .map(|source| {
+            source
+                .oriented_dimensions
+                .width
+                .max(source.oriented_dimensions.height)
+        })
+        .max()
+        .unwrap_or(1);
+    let source_tile_edge = choose_bounded_tile_edge(
+        largest_source_edge,
+        caps.maximum_texture_dimension_2d,
+        4,
+        1,
+        budgets
+            .decoded_cpu_source_tiles_bytes
+            .min(budgets.gpu_source_residency_bytes)
+            / u64::from(concurrency),
+        caps.copy_bytes_per_row_alignment,
+    )?;
+    let source_monolithic_bytes = plan
+        .ordered_sources
+        .iter()
+        .map(|source| {
+            bounded_tile_byte_len(
+                source.oriented_dimensions.width,
+                source.oriented_dimensions.height,
+                export_source_bytes_per_pixel(source.channel_role),
+                0,
+                caps.copy_bytes_per_row_alignment,
+            )
+        })
+        .collect::<Result<Vec<_>, TiledExportError>>()?;
+    let source_tiles = schedule_compiled_source_tiles(plan, source_tile_edge, 1, caps)?;
+    let output_tiles = schedule_compiled_output_tiles(
+        plan,
+        requested_maps,
+        output_tile_edge,
+        output_halo,
+        &source_tiles,
+        caps,
+    )?;
+    Ok(CompiledExportSchedule {
+        adapter_max_texture_dimension_2d: caps.maximum_texture_dimension_2d,
+        output_width: plan.output_size.width,
+        output_height: plan.output_size.height,
+        output_monolithic_bytes,
+        output_monolithic_budget_bytes: output_monolithic_budget,
+        source_monolithic_bytes,
+        source_monolithic_budget_bytes: source_monolithic_budget,
+        output_tile_edge,
+        source_tile_edge,
+        output_tiles,
+        source_tiles,
+    })
+}
+
+fn schedule_compiled_source_tiles(
+    plan: &CompiledAtlasPlanV1,
+    tile_edge: u32,
+    halo_px: u32,
+    caps: &hot_trimmer_preview::GpuCapabilityRecord,
+) -> Result<Vec<CompiledExportSourceTile>, TiledExportError> {
+    let mut tiles = Vec::new();
+    for (source_index, source) in plan.ordered_sources.iter().enumerate() {
+        let width = source.oriented_dimensions.width;
+        let height = source.oriented_dimensions.height;
+        for y in (0..height).step_by(tile_edge as usize) {
+            for x in (0..width).step_by(tile_edge as usize) {
+                let rect = PixelRect {
+                    x,
+                    y,
+                    width: tile_edge.min(width - x),
+                    height: tile_edge.min(height - y),
+                };
+                let halo_rect = inflate_rect(rect, halo_px, width, height);
+                let byte_len = bounded_tile_byte_len(
+                    halo_rect.width,
+                    halo_rect.height,
+                    export_source_bytes_per_pixel(source.channel_role),
+                    0,
+                    caps.copy_bytes_per_row_alignment,
+                )?;
+                tiles.push(CompiledExportSourceTile {
+                    source_index,
+                    source: source.clone(),
+                    rect,
+                    halo_rect,
+                    halo_px,
+                    byte_len,
+                });
+            }
+        }
+    }
+    Ok(tiles)
+}
+
+fn schedule_compiled_output_tiles(
+    plan: &CompiledAtlasPlanV1,
+    requested_maps: &[MaterialMapKind],
+    tile_edge: u32,
+    halo_px: u32,
+    source_tiles: &[CompiledExportSourceTile],
+    caps: &hot_trimmer_preview::GpuCapabilityRecord,
+) -> Result<Vec<CompiledExportOutputTile>, TiledExportError> {
+    let mut tiles = Vec::new();
+    for map in requested_maps {
+        let base_identity = plan.tile_identity(*map, GPU_SHADER_VERSION);
+        let format = export_format_from_compiled(base_identity.pixel_format);
+        for y in (0..plan.output_size.height).step_by(tile_edge as usize) {
+            for x in (0..plan.output_size.width).step_by(tile_edge as usize) {
+                let valid = PixelRect {
+                    x,
+                    y,
+                    width: tile_edge.min(plan.output_size.width - x),
+                    height: tile_edge.min(plan.output_size.height - y),
+                };
+                let output = inflate_rect(
+                    valid,
+                    halo_px,
+                    plan.output_size.width,
+                    plan.output_size.height,
+                );
+                let output_rect = compiled_output_rect(output);
+                let valid_rect = compiled_output_rect(valid);
+                let identity =
+                    compiled_tile_identity_for(plan, *map, output_rect, valid_rect, halo_px);
+                let staging_bytes = bounded_tile_byte_len(
+                    output.width,
+                    output.height,
+                    format.bytes_per_pixel(),
+                    0,
+                    caps.copy_bytes_per_row_alignment,
+                )?;
+                let bit_depth = compiled_bit_depth(base_identity.pixel_format);
+                let color_space = compiled_color_space(*map, base_identity.pixel_format);
+                tiles.push(CompiledExportOutputTile {
+                    identity,
+                    output_rect,
+                    valid_rect,
+                    bit_depth,
+                    color_space,
+                    staging_bytes,
+                    footprints: compiled_source_footprints_for_tile(plan, output, source_tiles)?,
+                });
+            }
+        }
+    }
+    Ok(tiles)
+}
+
+fn compiled_tile_identity_for(
+    plan: &CompiledAtlasPlanV1,
+    map: MaterialMapKind,
+    output_rect: OutputPixelRect,
+    valid_rect: OutputPixelRect,
+    halo_px: u32,
+) -> CompiledAtlasTileIdentity {
+    let mut tile_plan = plan.clone();
+    tile_plan.requested_maps = vec![map];
+    tile_plan.tile_request.output_rect = output_rect;
+    tile_plan.tile_request.valid_rect = valid_rect;
+    tile_plan.tile_request.halo_px = halo_px;
+    tile_plan.tile_identity(map, GPU_SHADER_VERSION)
+}
+
+fn compiled_source_footprints_for_tile(
+    plan: &CompiledAtlasPlanV1,
+    output_rect: PixelRect,
+    source_tiles: &[CompiledExportSourceTile],
+) -> Result<Vec<CompiledExportSourceFootprint>, TiledExportError> {
+    let mut footprints = Vec::new();
+    for region in &plan.ordered_regions {
+        let region_output = pixel_rect(region.destination_rect.0);
+        let Some(intersection) = intersect_rect(output_rect, region_output) else {
+            continue;
+        };
+        let source_index = plan.ordered_sources.iter().position(|source| {
+            source.source_set_id == region.source_set_id && source.source_id == region.source_id
+        });
+        let Some(source_index) = source_index else {
+            continue;
+        };
+        let source = &plan.ordered_sources[source_index];
+        for source_rect in compiled_region_source_footprints(
+            region,
+            intersection,
+            source.oriented_dimensions.width,
+            source.oriented_dimensions.height,
+        )? {
+            let required_source_tiles = source_tiles
+                .iter()
+                .enumerate()
+                .filter(|(_, tile)| {
+                    tile.source_index == source_index
+                        && intersect_rect(tile.halo_rect, source_rect).is_some()
+                })
+                .map(|(index, _)| index)
+                .collect();
+            footprints.push(CompiledExportSourceFootprint {
+                region_id: region.region_id,
+                source_index,
+                source_rect,
+                required_source_tiles,
+            });
+        }
+    }
+    Ok(footprints)
+}
+
+fn compiled_region_source_footprints(
+    region: &CompiledRegionCommandV1,
+    intersection: PixelRect,
+    source_width: u32,
+    source_height: u32,
+) -> Result<Vec<PixelRect>, TiledExportError> {
+    let command = pack_command(region).map_err(|error| {
+        TiledExportError::InvalidRequest(format!(
+            "compiled region {} cannot be packed for footprint planning: {error}",
+            region.region_id
+        ))
+    })?;
+    if matches!(command.mode, 4 | 5) {
+        return Ok(vec![PixelRect {
+            x: 0,
+            y: 0,
+            width: source_width,
+            height: source_height,
+        }]);
+    }
+    let points = footprint_sample_points(intersection, &command);
+    let mut primary = Vec::new();
+    let mut seam = Vec::new();
+    for point in points {
+        let position = source_position_for_command(&command, point);
+        primary.push(position.primary);
+        if let Some(other) = position.seam {
+            seam.push(other);
+        }
+    }
+    add_wrapped_axis_extrema(&command, &mut primary);
+    add_wrapped_axis_extrema(&command, &mut seam);
+    let mut rects = source_bounds_rects(&primary, source_width, source_height);
+    rects.extend(source_bounds_rects(&seam, source_width, source_height));
+    if rects.is_empty() {
+        rects.push(pixel_rect(region.source_crop.0));
+    }
+    Ok(rects)
+}
+
+fn ensure_compiled_pixel_format_supported(
+    caps: &hot_trimmer_preview::GpuCapabilityRecord,
+    format: CompiledTilePixelFormat,
+) -> Result<(), TiledExportError> {
+    let supported = caps.candidate_formats.iter().any(|candidate| {
+        (candidate.sampled || candidate.storage)
+            && match format {
+                CompiledTilePixelFormat::Rgba8UnormSrgb => candidate.format == "Rgba8UnormSrgb",
+                CompiledTilePixelFormat::Rgba8UnormLinear => candidate.format == "Rgba8Unorm",
+                CompiledTilePixelFormat::R32Float => candidate.format == "R32Float",
+                CompiledTilePixelFormat::R32Uint => candidate.format == "R32Uint",
+            }
+    });
+    if supported {
+        Ok(())
+    } else {
+        Err(TiledExportError::UnsupportedFeatureOrFormat(format!(
+            "adapter does not support compiled tile format {format:?}"
+        )))
+    }
+}
+
+fn export_format_from_compiled(format: CompiledTilePixelFormat) -> ExportPixelFormat {
+    match format {
+        CompiledTilePixelFormat::Rgba8UnormSrgb => ExportPixelFormat::Rgba8UnormSrgb,
+        CompiledTilePixelFormat::Rgba8UnormLinear => ExportPixelFormat::Rgba8UnormLinear,
+        CompiledTilePixelFormat::R32Float => ExportPixelFormat::R32Float,
+        CompiledTilePixelFormat::R32Uint => ExportPixelFormat::R32Uint,
+    }
+}
+
+fn compiled_bit_depth(format: CompiledTilePixelFormat) -> u8 {
+    match format {
+        CompiledTilePixelFormat::Rgba8UnormSrgb | CompiledTilePixelFormat::Rgba8UnormLinear => 8,
+        CompiledTilePixelFormat::R32Float | CompiledTilePixelFormat::R32Uint => 32,
+    }
+}
+
+fn compiled_color_space(map: MaterialMapKind, format: CompiledTilePixelFormat) -> &'static str {
+    match (map, format) {
+        (MaterialMapKind::BaseColor, CompiledTilePixelFormat::Rgba8UnormSrgb) => "sRGB",
+        _ => "linear",
+    }
+}
+
+fn export_source_bytes_per_pixel(_role: MaterialChannelRole) -> u64 {
+    4
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlannedSourcePosition {
+    primary: [f32; 2],
+    seam: Option<[f32; 2]>,
+}
+
+fn footprint_sample_points(rect: PixelRect, command: &GpuRegionCommand) -> Vec<[u32; 2]> {
+    let right = rect.x.saturating_add(rect.width.saturating_sub(1));
+    let bottom = rect.y.saturating_add(rect.height.saturating_sub(1));
+    let center_x = rect.x.saturating_add(rect.width / 2).min(right);
+    let center_y = rect.y.saturating_add(rect.height / 2).min(bottom);
+    let step = footprint_sample_step(command);
+    let mut points = BTreeSet::<[u32; 2]>::new();
+    let mut x = rect.x;
+    loop {
+        push_footprint_point(&mut points, x, rect.y, right, bottom);
+        push_footprint_point(&mut points, x, bottom, right, bottom);
+        push_footprint_point(&mut points, x, center_y, right, bottom);
+        if x == right {
+            break;
+        }
+        x = x.saturating_add(step).min(right);
+    }
+    let mut y = rect.y;
+    loop {
+        push_footprint_point(&mut points, rect.x, y, right, bottom);
+        push_footprint_point(&mut points, right, y, right, bottom);
+        push_footprint_point(&mut points, center_x, y, right, bottom);
+        if y == bottom {
+            break;
+        }
+        y = y.saturating_add(step).min(bottom);
+    }
+    push_footprint_point(&mut points, center_x, center_y, right, bottom);
+    if matches!(command.mode, 4 | 5) {
+        let samples = rect.width.max(rect.height).div_ceil(step).max(1);
+        for index in 0..=samples {
+            let t = index as f32 / samples as f32;
+            let left_to_right = rect.x as f32 + (right.saturating_sub(rect.x)) as f32 * t;
+            let top_to_bottom = rect.y as f32 + (bottom.saturating_sub(rect.y)) as f32 * t;
+            let right_to_left = right as f32 - (right.saturating_sub(rect.x)) as f32 * t;
+            push_footprint_point(
+                &mut points,
+                left_to_right.round() as u32,
+                top_to_bottom.round() as u32,
+                right,
+                bottom,
+            );
+            push_footprint_point(
+                &mut points,
+                right_to_left.round() as u32,
+                top_to_bottom.round() as u32,
+                right,
+                bottom,
+            );
+        }
+    }
+    points.into_iter().collect()
+}
+
+fn footprint_sample_step(command: &GpuRegionCommand) -> u32 {
+    let repeat_step = |period: u32| period.max(1).div_ceil(2).clamp(1, 64);
+    match command.mode {
+        1 => repeat_step(command.period_x.min(command.period_y)),
+        2 => repeat_step(command.period_x),
+        3 => repeat_step(command.period_y),
+        4 | 5 => 16,
+        _ => 64,
+    }
+}
+
+fn push_footprint_point(points: &mut BTreeSet<[u32; 2]>, x: u32, y: u32, right: u32, bottom: u32) {
+    points.insert([x.min(right), y.min(bottom)]);
+}
+
+fn add_wrapped_axis_extrema(command: &GpuRegionCommand, points: &mut Vec<[f32; 2]>) {
+    if points.is_empty() {
+        return;
+    }
+    let crop_size = [
+        command.crop_width.max(1) as f32,
+        command.crop_height.max(1) as f32,
+    ];
+    let crop_origin = [
+        command.crop_x as f32 + command.transform_offset_x * crop_size[0],
+        command.crop_y as f32 + command.transform_offset_y * crop_size[1],
+    ];
+    let wraps_x = matches!(command.mode, 1 | 2 | 5);
+    let wraps_y = matches!(command.mode, 1 | 3);
+    if !wraps_x && !wraps_y {
+        return;
+    }
+    let x0 = crop_origin[0];
+    let x1 = crop_origin[0] + command.period_x.max(1).min(command.crop_width.max(1)) as f32 - 0.001;
+    let y0 = crop_origin[1];
+    let y1 =
+        crop_origin[1] + command.period_y.max(1).min(command.crop_height.max(1)) as f32 - 0.001;
+    let original = points.clone();
+    for point in original {
+        match (wraps_x, wraps_y) {
+            (true, true) => {
+                points.push([x0, y0]);
+                points.push([x1, y0]);
+                points.push([x0, y1]);
+                points.push([x1, y1]);
+            }
+            (true, false) => {
+                points.push([x0, point[1]]);
+                points.push([x1, point[1]]);
+            }
+            (false, true) => {
+                points.push([point[0], y0]);
+                points.push([point[0], y1]);
+            }
+            (false, false) => {}
+        }
+    }
+}
+
+fn source_position_for_command(cmd: &GpuRegionCommand, pixel: [u32; 2]) -> PlannedSourcePosition {
+    let semantic_max_x = cmd
+        .semantic_x
+        .saturating_add(cmd.semantic_width.saturating_sub(1));
+    let semantic_max_y = cmd
+        .semantic_y
+        .saturating_add(cmd.semantic_height.saturating_sub(1));
+    let sem_x = pixel[0]
+        .clamp(cmd.semantic_x, semantic_max_x)
+        .saturating_sub(cmd.semantic_x);
+    let sem_y = pixel[1]
+        .clamp(cmd.semantic_y, semantic_max_y)
+        .saturating_sub(cmd.semantic_y);
+    let q = [
+        (sem_x as f32 + 0.5) / cmd.semantic_width.max(1) as f32,
+        (sem_y as f32 + 0.5) / cmd.semantic_height.max(1) as f32,
+    ];
+    let crop_size = [cmd.crop_width.max(1) as f32, cmd.crop_height.max(1) as f32];
+    let crop_origin = [
+        cmd.crop_x as f32 + cmd.transform_offset_x * crop_size[0],
+        cmd.crop_y as f32 + cmd.transform_offset_y * crop_size[1],
+    ];
+    let destination_size = [
+        cmd.slot_width.max(0.000_001),
+        cmd.slot_height.max(0.000_001),
+    ];
+    let local = [
+        (q[0] - 0.5) * destination_size[0],
+        (q[1] - 0.5) * destination_size[1],
+    ];
+    let source_local = transform_local_cpu(local, cmd.rotation, cmd.mirror);
+    let source_size = if cmd.rotation == 1 || cmd.rotation == 3 {
+        [destination_size[1], destination_size[0]]
+    } else {
+        destination_size
+    };
+    let m = [
+        source_local[0] + source_size[0] * 0.5,
+        source_local[1] + source_size[1] * 0.5,
+    ];
+    let scale = cmd.pixels_per_unit * cmd.sampling_scale;
+    let mut p = [
+        crop_origin[0] + crop_size[0] * 0.5 + source_local[0] * scale,
+        crop_origin[1] + crop_size[1] * 0.5 + source_local[1] * scale,
+    ];
+    let mut seam = None;
+    match cmd.mode {
+        1 => {
+            p[0] = crop_origin[0] + positive_mod(p[0] - crop_origin[0], cmd.period_x.max(1) as f32);
+            p[1] = crop_origin[1] + positive_mod(p[1] - crop_origin[1], cmd.period_y.max(1) as f32);
+        }
+        2 => {
+            p[1] = p[1].clamp(crop_origin[1], crop_origin[1] + crop_size[1] - 1.0);
+            p[0] = crop_origin[0] + positive_mod(p[0] - crop_origin[0], cmd.period_x.max(1) as f32);
+        }
+        3 => {
+            p[0] = p[0].clamp(crop_origin[0], crop_origin[0] + crop_size[0] - 1.0);
+            p[1] = crop_origin[1] + positive_mod(p[1] - crop_origin[1], cmd.period_y.max(1) as f32);
+        }
+        4 => {
+            let delta = [q[0] - cmd.radial_center_x, q[1] - cmd.radial_center_y];
+            let radius = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            let span = (cmd.radial_outer_radius - cmd.radial_inner_radius).max(0.000_001);
+            let mut warped_radius = cmd.radial_inner_radius
+                + ((radius - cmd.radial_inner_radius) / span)
+                    .clamp(0.0, 1.0)
+                    .powf(cmd.radial_falloff)
+                    * span;
+            if radius >= cmd.radial_outer_radius {
+                let inset = 1.5_f32.min((crop_size[0].min(crop_size[1]) * 0.5).max(0.5));
+                let normalized_inset = inset / crop_size[0].min(crop_size[1]).max(1.0);
+                warped_radius = cmd
+                    .radial_inner_radius
+                    .max(cmd.radial_outer_radius - span * normalized_inset);
+            }
+            let radial_scale = if radius > 0.000_001 {
+                warped_radius / radius
+            } else {
+                0.0
+            };
+            let radial_local = transform_local_cpu(
+                [
+                    delta[0] * radial_scale * destination_size[0],
+                    delta[1] * radial_scale * destination_size[1],
+                ],
+                cmd.rotation,
+                cmd.mirror,
+            );
+            p = [
+                crop_origin[0] + cmd.radial_center_x * crop_size[0] + radial_local[0] * scale,
+                crop_origin[1] + cmd.radial_center_y * crop_size[1] + radial_local[1] * scale,
+            ];
+            p[0] = p[0].clamp(crop_origin[0] + 0.5, crop_origin[0] + crop_size[0] - 0.5);
+            p[1] = p[1].clamp(crop_origin[1] + 0.5, crop_origin[1] + crop_size[1] - 0.5);
+        }
+        5 => {
+            let radial_local = transform_local_cpu(
+                [q[0] - cmd.radial_center_x, q[1] - cmd.radial_center_y],
+                cmd.rotation,
+                cmd.mirror,
+            );
+            let radius =
+                (radial_local[0] * radial_local[0] + radial_local[1] * radial_local[1]).sqrt();
+            let span = (cmd.radial_outer_radius - cmd.radial_inner_radius).max(0.000_001);
+            let radial_inset = 1.5_f32.min((crop_size[1] * 0.5).max(0.5));
+            let outer_extension_radius = cmd
+                .radial_inner_radius
+                .max(cmd.radial_outer_radius - span * radial_inset / crop_size[1].max(1.0));
+            let sample_radius = if radius >= cmd.radial_outer_radius {
+                outer_extension_radius
+            } else {
+                radius.clamp(cmd.radial_inner_radius, cmd.radial_outer_radius)
+            };
+            let theta = radial_local[1].atan2(radial_local[0]) / std::f32::consts::TAU;
+            let wrapped_theta = theta - theta.floor();
+            let polar = [
+                (wrapped_theta * crop_size[0]).min(crop_size[0] - 0.000_001),
+                (((sample_radius - cmd.radial_inner_radius) / span)
+                    .clamp(0.0, 1.0)
+                    .powf(cmd.radial_falloff)
+                    * crop_size[1])
+                    .min(crop_size[1] - 0.000_001),
+            ];
+            let planar = [
+                (cmd.radial_center_x + radial_local[0]) * crop_size[0],
+                (cmd.radial_center_y + radial_local[1]) * crop_size[1],
+            ];
+            let transition = cmd.radial_blend_width.min(span);
+            let t = if transition > 0.000_001 {
+                ((radius - cmd.radial_inner_radius) / transition).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let blend = t * t * (3.0 - 2.0 * t);
+            p = [
+                crop_origin[0] + planar[0] * (1.0 - blend) + polar[0] * blend,
+                crop_origin[1] + planar[1] * (1.0 - blend) + polar[1] * blend,
+            ];
+            let seam_distance = wrapped_theta.min(1.0 - wrapped_theta);
+            if cmd.radial_seam_blend_width > 0.000_001
+                && seam_distance < cmd.radial_seam_blend_width
+            {
+                let other_polar_x =
+                    ((1.0 - wrapped_theta) * crop_size[0]).min(crop_size[0] - 0.000_001);
+                seam = Some([
+                    crop_origin[0] + planar[0] * (1.0 - blend) + other_polar_x * blend,
+                    crop_origin[1] + planar[1] * (1.0 - blend) + polar[1] * blend,
+                ]);
+            }
+        }
+        6 => {
+            p = [
+                crop_origin[0] + m[0] / source_size[0] * crop_size[0],
+                crop_origin[1] + m[1] / source_size[1] * crop_size[1],
+            ];
+        }
+        _ => {}
+    }
+    PlannedSourcePosition { primary: p, seam }
+}
+
+fn source_bounds_rects(
+    points: &[[f32; 2]],
+    source_width: u32,
+    source_height: u32,
+) -> Vec<PixelRect> {
+    let valid = points
+        .iter()
+        .filter(|point| point[0].is_finite() && point[1].is_finite())
+        .collect::<Vec<_>>();
+    if valid.is_empty() {
+        return Vec::new();
+    }
+    let min_x = valid
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i64
+        - 2;
+    let min_y = valid
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i64
+        - 2;
+    let max_x = valid
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i64
+        + 3;
+    let max_y = valid
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i64
+        + 3;
+    let x = min_x.clamp(0, i64::from(source_width.saturating_sub(1))) as u32;
+    let y = min_y.clamp(0, i64::from(source_height.saturating_sub(1))) as u32;
+    let right = max_x.clamp(i64::from(x + 1), i64::from(source_width)) as u32;
+    let bottom = max_y.clamp(i64::from(y + 1), i64::from(source_height)) as u32;
+    vec![PixelRect {
+        x,
+        y,
+        width: right.saturating_sub(x).max(1),
+        height: bottom.saturating_sub(y).max(1),
+    }]
+}
+
+fn transform_local_cpu(local: [f32; 2], rotation: u32, mirror: u32) -> [f32; 2] {
+    let mut p = local;
+    if mirror == 1 {
+        p[0] = -p[0];
+    } else if mirror == 2 {
+        p[1] = -p[1];
+    }
+    match rotation {
+        1 => [p[1], -p[0]],
+        2 => [-p[0], -p[1]],
+        3 => [-p[1], p[0]],
+        _ => p,
+    }
+}
+
+fn positive_mod(value: f32, period: f32) -> f32 {
+    ((value % period) + period) % period
+}
+
+fn inflate_rect(rect: PixelRect, halo: u32, max_width: u32, max_height: u32) -> PixelRect {
+    let x = rect.x.saturating_sub(halo);
+    let y = rect.y.saturating_sub(halo);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(halo)
+        .min(max_width);
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_add(halo)
+        .min(max_height);
+    PixelRect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+fn intersect_rect(a: PixelRect, b: PixelRect) -> Option<PixelRect> {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
+    let bottom =
+        a.y.saturating_add(a.height)
+            .min(b.y.saturating_add(b.height));
+    (right > x && bottom > y).then(|| PixelRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
+}
+
+fn pixel_rect(bounds: PixelBounds) -> PixelRect {
+    PixelRect {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+    }
+}
+
+fn compiled_output_rect(rect: PixelRect) -> OutputPixelRect {
+    OutputPixelRect(PixelBounds {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    })
 }
 
 fn validate_gpu_material_map(map: MaterialMapKind) -> Result<(), AtlasRenderExecutionError> {
@@ -1009,6 +2114,8 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             return Err(AtlasRenderExecutionError::Superseded);
         }
         let requested_maps = requested_material_maps(plan)?;
+        let export_schedule = preflight_tiled_export_plan(self, plan, &requested_maps)?;
+        ensure_schedule_publishable_by_current_executor(plan, &export_schedule, &requested_maps)?;
         if requested_maps.len() > 1 {
             let mut first_output = None::<AtlasFinalAtlasOutput>;
             let mut map_tiles = BTreeMap::<MaterialMapKind, Arc<GpuAtlasRenderedTile>>::new();
@@ -1037,22 +2144,16 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 });
                 if let Some(cached_normal) = cached_normal {
                     let cached_height =
-                        self.source_texture_cache
-                            .lock()
-                            .ok()
-                            .and_then(|mut cache| {
-                                let identity =
-                                    plan.tile_identity(MaterialMapKind::Height, GPU_SHADER_VERSION);
-                                cache.cached_tile(&identity, plan.tile_request.generation)
-                            });
+                        self.source_texture_cache.lock().ok().and_then(|mut cache| {
+                            let identity =
+                                plan.tile_identity(MaterialMapKind::Height, GPU_SHADER_VERSION);
+                            cache.cached_tile(&identity, plan.tile_request.generation)
+                        });
                     let cached_height_display =
-                        self.source_texture_cache
-                            .lock()
-                            .ok()
-                            .and_then(|mut cache| {
-                                let identity = display_tile_identity(plan, MaterialMapKind::Height);
-                                cache.cached_tile(&identity, plan.tile_request.generation)
-                            });
+                        self.source_texture_cache.lock().ok().and_then(|mut cache| {
+                            let identity = display_tile_identity(plan, MaterialMapKind::Height);
+                            cache.cached_tile(&identity, plan.tile_request.generation)
+                        });
                     map_tiles.insert(MaterialMapKind::Normal, Arc::clone(&cached_normal));
                     display_tiles.insert(MaterialMapKind::Normal, cached_normal);
                     consumed_maps.push(MaterialMapKind::Normal);
@@ -1069,10 +2170,23 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                         }
                         consumed_maps.push(MaterialMapKind::Height);
                     }
+                    let cached_has_authored_normal = plan
+                        .ordered_sources
+                        .iter()
+                        .any(|source| source.channel_role == MaterialChannelRole::Normal);
                     telemetry.push(format!(
-                        "executor=gpu; requested_map=Normal; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; dependency=Normal<-Height; intermediate_cache={}; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0",
+                        "executor=gpu; requested_map=Normal; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; dependency={}; intermediate_cache={}; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0",
                         logical_passes_for_map(MaterialMapKind::Normal),
-                        if map_tiles.contains_key(&MaterialMapKind::Height) {
+                        if cached_has_authored_normal {
+                            "Normal<-authored-Normal"
+                        } else {
+                            "Normal<-Height"
+                        },
+                        if !requested_maps.contains(&MaterialMapKind::Height)
+                            && cached_has_authored_normal
+                        {
+                            "final-height:not-used"
+                        } else if map_tiles.contains_key(&MaterialMapKind::Height) {
                             "final-height:persistent-cache-hit"
                         } else {
                             "final-height:not-requested"
@@ -1252,8 +2366,10 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             } else {
                 Arc::clone(&cached)
             };
-            let (nontransparent, nonzero_rgb) =
-                payload_counts(interactive_tile.pixels(), interactive_tile.manifest.pixel_format);
+            let (nontransparent, nonzero_rgb) = payload_counts(
+                interactive_tile.pixels(),
+                interactive_tile.manifest.pixel_format,
+            );
             let mut map_tiles = BTreeMap::new();
             map_tiles.insert(requested_map, Arc::clone(&cached));
             let mut display_tiles = BTreeMap::new();
@@ -1375,7 +2491,10 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             if !is_current() {
                 return Err(AtlasRenderExecutionError::Superseded);
             }
-            let source_role = source_channel_role_for_source(plan, source, requested_map);
+            let Some(source_role) = source_channel_role_for_source(plan, source, requested_map)
+            else {
+                continue;
+            };
             if source.channel_role != source_role {
                 continue;
             }
@@ -1414,7 +2533,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 .map(pack_command)
                 .collect::<Result<Vec<_>, _>>()?;
             if !commands.is_empty() {
-                source_groups.push((source, cached, commands));
+                source_groups.push((source, cached, commands, source_role));
             }
         }
         let upload_ms = upload_started.elapsed().as_millis();
@@ -1422,8 +2541,12 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("hot-trimmer-base-color-atlas-encoder"),
         });
-        let mut timing =
-            GpuPassTimingRecorder::new(device, queue, caps, (plan.ordered_sources.len() as u32).saturating_add(1));
+        let mut timing = GpuPassTimingRecorder::new(
+            device,
+            queue,
+            caps,
+            (plan.ordered_sources.len() as u32).saturating_add(1),
+        );
         encoder.clear_texture(
             &output_texture,
             &wgpu::ImageSubresourceRange {
@@ -1437,7 +2560,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         let dispatch_started = Instant::now();
         let mut command_count = 0_u32;
         let mut command_bytes = 0_u64;
-        for (source, cached, commands) in source_groups {
+        for (source, cached, commands, source_role) in source_groups {
             if cancellation.is_cancelled() {
                 return Err(AtlasRenderExecutionError::Cancelled);
             }
@@ -1460,7 +2583,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                     crate::CompiledNormalConvention::OpenGl => 0,
                     crate::CompiledNormalConvention::DirectX => 1,
                 },
-                source_role: gpu_channel_role_code(source.channel_role),
+                source_role: gpu_channel_role_code(source_role),
             };
             let header_bytes = encode_header(header);
             let command_buffer_bytes = encode_commands(&commands);
@@ -1520,12 +2643,12 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             .ok_or_else(|| {
                 AtlasRenderExecutionError::Gpu("readback buffer size overflow".into())
             })?;
-        let readback_buffer = self
-            .source_texture_cache
-            .lock()
-            .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
-            .readback_pool
-            .acquire_staging(device, readback_bytes);
+        let output_row_bytes = usize::try_from(u64::from(tile_width) * 4)
+            .map_err(|_| AtlasRenderExecutionError::Gpu("output row size overflow".into()))?;
+        let padded_row_bytes = usize::try_from(padded_bytes_per_row)
+            .map_err(|_| AtlasRenderExecutionError::Gpu("padded row size overflow".into()))?;
+        let readback_staging =
+            acquire_staging_lease(device, self.source_texture_cache, readback_bytes)?;
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &output_texture,
@@ -1534,7 +2657,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &readback_buffer,
+                buffer: readback_staging.buffer(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row as u32),
@@ -1557,49 +2680,18 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             timing.resolve(&mut encoder);
         }
         queue.submit(Some(encoder.finish()));
-        let readback_started = Instant::now();
-        let slice = readback_buffer.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        device.poll(wgpu::PollType::Wait).map_err(|error| {
-            AtlasRenderExecutionError::Gpu(format!("device poll failed: {error:?}"))
-        })?;
-        receiver
-            .recv()
-            .map_err(|error| {
-                AtlasRenderExecutionError::Gpu(format!("readback callback failed: {error}"))
-            })?
-            .map_err(|error| {
-                AtlasRenderExecutionError::Gpu(format!("readback map failed: {error:?}"))
-            })?;
-        let mapped = slice.get_mapped_range();
-        let output_row_bytes = usize::try_from(u64::from(tile_width) * 4)
-            .map_err(|_| AtlasRenderExecutionError::Gpu("output row size overflow".into()))?;
-        let padded_row_bytes = usize::try_from(padded_bytes_per_row)
-            .map_err(|_| AtlasRenderExecutionError::Gpu("padded row size overflow".into()))?;
-        let mut tile_rgba8 = vec![0; output_row_bytes * tile_height as usize];
-        for y in 0..tile_height as usize {
-            let src = y * padded_row_bytes;
-            let dst = y * output_row_bytes;
-            tile_rgba8[dst..dst + output_row_bytes]
-                .copy_from_slice(&mapped[src..src + output_row_bytes]);
-        }
-        drop(mapped);
-        readback_buffer.unmap();
-        self.source_texture_cache
-            .lock()
-            .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
-            .readback_pool
-            .release_staging(readback_buffer, readback_bytes);
+        let readback_pending = PendingGpuReadback {
+            staging: readback_staging,
+            output_row_bytes,
+            padded_row_bytes,
+            height: tile_height,
+        };
+        let (pixels, readback_ms) = finish_readback(device, readback_pending)?;
         if !is_current() {
             return Err(AtlasRenderExecutionError::Superseded);
         }
-        let readback_ms = readback_started.elapsed().as_millis();
         let region_valid_pixel_counts = final_atlas_metadata(plan)?;
         let render_ms = started.elapsed().as_millis();
-        let pixels: Arc<[u8]> = Arc::from(tile_rgba8);
         let (nontransparent, nonzero_rgb) = rgba_payload_counts(&pixels);
         let pixel_format = identity.pixel_format;
         let interactive_tile = Arc::new(GpuAtlasRenderedTile {
@@ -1724,7 +2816,9 @@ fn pipeline(
             GpuAtlasPipelineKind::FillR32Float => "hot-trimmer-fill-r32float-bind-layout",
             GpuAtlasPipelineKind::NormalFromHeight => "hot-trimmer-normal-from-height-bind-layout",
             GpuAtlasPipelineKind::RegionIdR32Uint => "hot-trimmer-region-id-bind-layout",
-            GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-bind-layout",
+            GpuAtlasPipelineKind::RegionIdDisplayRgba8 => {
+                "hot-trimmer-region-id-display-bind-layout"
+            }
         }),
         entries: &entries,
     });
@@ -1865,9 +2959,8 @@ fn storage_texture_layout_entry(
     }
 }
 
-struct PendingGpuReadback {
-    buffer: wgpu::Buffer,
-    byte_len: u64,
+struct PendingGpuReadback<'a> {
+    staging: GpuAtlasStagingLease<'a>,
     output_row_bytes: usize,
     padded_row_bytes: usize,
     height: u32,
@@ -1986,7 +3079,8 @@ impl GpuPassTimingRecorder {
             .filter_map(|(label, start, end)| {
                 let start = *timestamps.get(start as usize)?;
                 let end = *timestamps.get(end as usize)?;
-                let delta_ns = end.saturating_sub(start) as f64 * f64::from(self.timestamp_period_ns);
+                let delta_ns =
+                    end.saturating_sub(start) as f64 * f64::from(self.timestamp_period_ns);
                 Some(format!(
                     "executor=gpu; gpu_pass_timing={label}; gpu_ms={:.3}; timestamp_bytes={}",
                     delta_ns / 1_000_000.0,
@@ -2034,8 +3128,10 @@ fn execute_r32float_material_tile(
                 cache.cached_tile(&display_identity, plan.tile_request.generation)
             })
             .unwrap_or_else(|| Arc::clone(&cached));
-        let (nontransparent, nonzero_rgb) =
-            payload_counts(interactive_tile.pixels(), interactive_tile.manifest.pixel_format);
+        let (nontransparent, nonzero_rgb) = payload_counts(
+            interactive_tile.pixels(),
+            interactive_tile.manifest.pixel_format,
+        );
         let mut map_tiles = BTreeMap::new();
         map_tiles.insert(requested_map, Arc::clone(&cached));
         let mut display_tiles = BTreeMap::new();
@@ -2110,8 +3206,7 @@ fn execute_r32float_material_tile(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("hot-trimmer-r32float-material-encoder"),
     });
-    let mut timing =
-        GpuPassTimingRecorder::new(device, queue, state.capabilities(), 8);
+    let mut timing = GpuPassTimingRecorder::new(device, queue, state.capabilities(), 8);
     if requested_map == MaterialMapKind::Height {
         let fill_pipeline = pipeline(
             device,
@@ -2223,11 +3318,13 @@ fn execute_r32float_material_tile(
                 tile.width,
                 tile.height,
                 wgpu::TextureFormat::R32Float,
+                u64::from(tile.width)
+                    .saturating_mul(u64::from(tile.height))
+                    .saturating_mul(4),
             );
     }
-    let (pixels, readback_ms) = finish_readback(device, executor.source_texture_cache, pending)?;
-    let (display_pixels, display_readback_ms) =
-        finish_readback(device, executor.source_texture_cache, display_pending)?;
+    let (pixels, readback_ms) = finish_readback(device, pending)?;
+    let (display_pixels, display_readback_ms) = finish_readback(device, display_pending)?;
     let readback_bytes = u64::try_from(pixels.len())
         .map_err(|_| AtlasRenderExecutionError::Gpu("readback payload overflow".into()))?;
     let display_readback_bytes = u64::try_from(display_pixels.len())
@@ -2252,12 +3349,20 @@ fn execute_r32float_material_tile(
         state.capabilities().backend,
         plan.final_plan_hash.0,
         logical_passes_for_map(requested_map),
-        stats.source_cache_hits.saturating_add(display_stats.source_cache_hits),
+        stats
+            .source_cache_hits
+            .saturating_add(display_stats.source_cache_hits),
         u32::from(pipeline_cache_hit) + u32::from(display_pipeline_cache_hit),
-        stats.upload_bytes.saturating_add(display_stats.upload_bytes),
+        stats
+            .upload_bytes
+            .saturating_add(display_stats.upload_bytes),
         stats.upload_ms.saturating_add(display_stats.upload_ms),
-        stats.command_count.saturating_add(display_stats.command_count),
-        stats.command_bytes.saturating_add(display_stats.command_bytes),
+        stats
+            .command_count
+            .saturating_add(display_stats.command_count),
+        stats
+            .command_bytes
+            .saturating_add(display_stats.command_bytes),
         stats.dispatch_ms.saturating_add(display_stats.dispatch_ms),
         readback_bytes.saturating_add(display_readback_bytes),
         readback_ms.saturating_add(display_readback_ms),
@@ -2284,10 +3389,16 @@ fn execute_r32float_material_tile(
                 .saturating_add(display_stats.source_cache_hits),
             pipeline_cache_hits: u32::from(pipeline_cache_hit)
                 + u32::from(display_pipeline_cache_hit),
-            upload_bytes: stats.upload_bytes.saturating_add(display_stats.upload_bytes),
+            upload_bytes: stats
+                .upload_bytes
+                .saturating_add(display_stats.upload_bytes),
             upload_ms: stats.upload_ms.saturating_add(display_stats.upload_ms),
-            command_count: stats.command_count.saturating_add(display_stats.command_count),
-            command_bytes: stats.command_bytes.saturating_add(display_stats.command_bytes),
+            command_count: stats
+                .command_count
+                .saturating_add(display_stats.command_count),
+            command_bytes: stats
+                .command_bytes
+                .saturating_add(display_stats.command_bytes),
             dispatch_ms: stats.dispatch_ms.saturating_add(display_stats.dispatch_ms),
             readback_bytes: readback_bytes.saturating_add(display_readback_bytes),
             readback_ms: readback_ms.saturating_add(display_readback_ms),
@@ -2319,8 +3430,10 @@ fn execute_region_id_gpu_tile(
                 cache.cached_tile(&display_identity, plan.tile_request.generation)
             })
             .unwrap_or_else(|| Arc::clone(&cached));
-        let (nontransparent, nonzero_rgb) =
-            payload_counts(interactive_tile.pixels(), interactive_tile.manifest.pixel_format);
+        let (nontransparent, nonzero_rgb) = payload_counts(
+            interactive_tile.pixels(),
+            interactive_tile.manifest.pixel_format,
+        );
         let mut map_tiles = BTreeMap::new();
         map_tiles.insert(requested_map, Arc::clone(&cached));
         let mut display_tiles = BTreeMap::new();
@@ -2478,8 +3591,7 @@ fn execute_region_id_gpu_tile(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("hot-trimmer-region-id-encoder"),
     });
-    let mut timing =
-        GpuPassTimingRecorder::new(device, queue, state.capabilities(), 4);
+    let mut timing = GpuPassTimingRecorder::new(device, queue, state.capabilities(), 4);
     let dispatch_started = Instant::now();
     {
         let timestamp_writes = timing
@@ -2546,9 +3658,8 @@ fn execute_region_id_gpu_tile(
         timing.resolve(&mut encoder);
     }
     queue.submit(Some(encoder.finish()));
-    let (pixels, readback_ms) = finish_readback(device, executor.source_texture_cache, pending)?;
-    let (display_pixels, display_readback_ms) =
-        finish_readback(device, executor.source_texture_cache, display_pending)?;
+    let (pixels, readback_ms) = finish_readback(device, pending)?;
+    let (display_pixels, display_readback_ms) = finish_readback(device, display_pending)?;
     let readback_bytes = u64::try_from(pixels.len())
         .map_err(|_| AtlasRenderExecutionError::Gpu("readback payload overflow".into()))?;
     let display_readback_bytes = u64::try_from(display_pixels.len())
@@ -2636,6 +3747,10 @@ fn execute_height_normal_gpu(
     let device = state.device();
     let queue = state.queue();
     let pipeline_started = Instant::now();
+    let has_authored_normal = plan
+        .ordered_sources
+        .iter()
+        .any(|source| source.channel_role == MaterialChannelRole::Normal);
     let (fill_pipeline, fill_cache_hit) = pipeline(
         device,
         executor.source_texture_cache,
@@ -2651,10 +3766,6 @@ fn execute_height_normal_gpu(
         executor.source_texture_cache,
         GpuAtlasPipelineKind::NormalFromHeight,
     )?;
-    let has_authored_normal = plan
-        .ordered_sources
-        .iter()
-        .any(|source| source.channel_role == MaterialChannelRole::Normal);
     let authored_normal_pipeline = if has_authored_normal {
         Some(pipeline(
             device,
@@ -2700,7 +3811,9 @@ fn execute_height_normal_gpu(
         tile.width,
         tile.height,
         wgpu::TextureFormat::Rgba8Unorm,
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
     );
     let height_display = publish_height.then(|| {
         create_working_texture(
@@ -2756,8 +3869,7 @@ fn execute_height_normal_gpu(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("hot-trimmer-height-normal-encoder"),
     });
-    let mut timing =
-        GpuPassTimingRecorder::new(device, queue, state.capabilities(), 8);
+    let mut timing = GpuPassTimingRecorder::new(device, queue, state.capabilities(), 8);
     if cached_height_texture.is_none() {
         dispatch_fill_r32float_with_pipeline(
             device,
@@ -2847,108 +3959,111 @@ fn execute_height_normal_gpu(
     } else {
         None
     };
-    let authored_normal_stats = if let Some((authored_normal_pipeline, _)) =
-        &authored_normal_pipeline
-    {
-        Some(dispatch_material_map_to_view(
-            device,
-            queue,
-            executor.source_texture_cache,
-            &mut encoder,
-            timing.as_mut(),
-            "authored-normal-sample",
-            authored_normal_pipeline,
-            plan,
-            input,
-            MaterialMapKind::Normal,
-            &authored_normal_view,
-            cancellation,
-            is_current,
-        )?)
-    } else {
-        None
-    };
-    let commands = plan
-        .ordered_regions
-        .iter()
-        .map(pack_command)
-        .collect::<Result<Vec<_>, _>>()?;
-    let header = GpuAtlasHeader {
-        output_width: plan.output_size.width,
-        output_height: plan.output_size.height,
-        tile_x: tile.x,
-        tile_y: tile.y,
-        tile_width: tile.width,
-        tile_height: tile.height,
-        command_count: commands.len() as u32,
-        source_width: 0,
-        source_height: 0,
-        map_kind: gpu_map_code(MaterialMapKind::Normal),
-        normal_convention: match plan.normal_convention {
-            crate::CompiledNormalConvention::OpenGl => 0,
-            crate::CompiledNormalConvention::DirectX => 1,
-        },
-        source_role: gpu_channel_role_code(if has_authored_normal {
-            MaterialChannelRole::Normal
+    let authored_normal_stats =
+        if let Some((authored_normal_pipeline, _)) = &authored_normal_pipeline {
+            Some(dispatch_material_map_to_view(
+                device,
+                queue,
+                executor.source_texture_cache,
+                &mut encoder,
+                timing.as_mut(),
+                "authored-normal-sample",
+                authored_normal_pipeline,
+                plan,
+                input,
+                MaterialMapKind::Normal,
+                &authored_normal_view,
+                cancellation,
+                is_current,
+            )?)
         } else {
-            MaterialChannelRole::Height
-        }),
-    };
-    let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("hot-trimmer-normal-from-height-header"),
-        contents: &encode_header(header),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let command_buffer_bytes = nonempty_command_bytes(&commands);
-    let command_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("hot-trimmer-normal-from-height-commands"),
-        contents: &command_buffer_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let normal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("hot-trimmer-normal-from-height-bind-group"),
-        layout: &normal_pipeline.bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: header_buffer.as_entire_binding(),
+            None
+        };
+    let (command_count, command_buffer_bytes_len, normal_dispatch_ms) = {
+        let commands = plan
+            .ordered_regions
+            .iter()
+            .map(pack_command)
+            .collect::<Result<Vec<_>, _>>()?;
+        let header = GpuAtlasHeader {
+            output_width: plan.output_size.width,
+            output_height: plan.output_size.height,
+            tile_x: tile.x,
+            tile_y: tile.y,
+            tile_width: tile.width,
+            tile_height: tile.height,
+            command_count: commands.len() as u32,
+            source_width: 0,
+            source_height: 0,
+            map_kind: gpu_map_code(MaterialMapKind::Normal),
+            normal_convention: match plan.normal_convention {
+                crate::CompiledNormalConvention::OpenGl => 0,
+                crate::CompiledNormalConvention::DirectX => 1,
             },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: command_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(
-                    cached_height_texture
-                        .as_ref()
-                        .map_or(&height_view, |cached| &cached.view),
-                ),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::TextureView(&authored_normal_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&normal_view),
-            },
-        ],
-    });
-    let normal_dispatch_started = Instant::now();
-    {
-        let timestamp_writes = timing
-            .as_mut()
-            .and_then(|recorder| recorder.timestamp_writes("normal-from-final-height"));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("hot-trimmer-normal-from-height-dispatch"),
-            timestamp_writes,
+            source_role: gpu_channel_role_code(MaterialChannelRole::Height),
+        };
+        let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hot-trimmer-normal-from-height-header"),
+            contents: &encode_header(header),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
-        pass.set_pipeline(&normal_pipeline.pipeline);
-        pass.set_bind_group(0, &normal_bind_group, &[]);
-        pass.dispatch_workgroups(tile.width.div_ceil(16), tile.height.div_ceil(16), 1);
-    }
-    let normal_dispatch_ms = normal_dispatch_started.elapsed().as_millis();
+        let command_buffer_bytes = nonempty_command_bytes(&commands);
+        let command_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hot-trimmer-normal-from-height-commands"),
+            contents: &command_buffer_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let normal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hot-trimmer-normal-from-height-bind-group"),
+            layout: &normal_pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: header_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: command_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        cached_height_texture
+                            .as_ref()
+                            .map_or(&height_view, |cached| &cached.view),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&authored_normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+            ],
+        });
+        let normal_dispatch_started = Instant::now();
+        {
+            let timestamp_writes = timing
+                .as_mut()
+                .and_then(|recorder| recorder.timestamp_writes("normal-from-final-height"));
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hot-trimmer-normal-from-height-dispatch"),
+                timestamp_writes,
+            });
+            pass.set_pipeline(
+                &normal_pipeline.pipeline,
+            );
+            pass.set_bind_group(0, &normal_bind_group, &[]);
+            pass.dispatch_workgroups(tile.width.div_ceil(16), tile.height.div_ceil(16), 1);
+        }
+        (
+            commands.len() as u32,
+            command_buffer_bytes.len() as u64,
+            normal_dispatch_started.elapsed().as_millis(),
+        )
+    };
     let height_pending = if publish_height && cached_height.is_none() {
         if let Some(cached_height_texture) = &cached_height_texture {
             Some(schedule_readback(
@@ -2974,8 +4089,9 @@ fn execute_height_normal_gpu(
     } else {
         None
     };
-    let height_display_pending =
-        if cached_height_display.is_none() && let Some((height_display_texture, _)) = &height_display {
+    let height_display_pending = if cached_height_display.is_none()
+        && let Some((height_display_texture, _)) = &height_display
+    {
         Some(schedule_readback(
             device,
             executor.source_texture_cache,
@@ -3013,6 +4129,9 @@ fn execute_height_normal_gpu(
                 tile.width,
                 tile.height,
                 wgpu::TextureFormat::R32Float,
+                u64::from(tile.width)
+                    .saturating_mul(u64::from(tile.height))
+                    .saturating_mul(4),
             );
     }
     let mut readback_bytes = 0_u64;
@@ -3024,7 +4143,7 @@ fn execute_height_normal_gpu(
         display_tiles.insert(MaterialMapKind::Height, cached_height_display);
     } else if let Some(height_display_pending) = height_display_pending {
         let (height_display_pixels, height_display_readback_ms) =
-            finish_readback(device, executor.source_texture_cache, height_display_pending)?;
+            finish_readback(device, height_display_pending)?;
         readback_bytes = readback_bytes.saturating_add(height_display_pixels.len() as u64);
         readback_ms = readback_ms.saturating_add(height_display_readback_ms);
         let height_display_tile = remember_rendered_tile_with_identity(
@@ -3041,8 +4160,7 @@ fn execute_height_normal_gpu(
         intermediate_tiles.insert("normal.final-height".into(), Arc::clone(&cached_height));
         map_tiles.insert(MaterialMapKind::Height, cached_height);
     } else if let Some(height_pending) = height_pending {
-        let (height_pixels, height_readback_ms) =
-            finish_readback(device, executor.source_texture_cache, height_pending)?;
+        let (height_pixels, height_readback_ms) = finish_readback(device, height_pending)?;
         readback_bytes = readback_bytes.saturating_add(height_pixels.len() as u64);
         readback_ms = readback_ms.saturating_add(height_readback_ms);
         let height_tile = remember_rendered_tile(
@@ -3055,8 +4173,7 @@ fn execute_height_normal_gpu(
         intermediate_tiles.insert("normal.final-height".into(), Arc::clone(&height_tile));
         map_tiles.insert(MaterialMapKind::Height, height_tile);
     }
-    let (normal_pixels, normal_readback_ms) =
-        finish_readback(device, executor.source_texture_cache, normal_pending)?;
+    let (normal_pixels, normal_readback_ms) = finish_readback(device, normal_pending)?;
     readback_bytes = readback_bytes.saturating_add(normal_pixels.len() as u64);
     readback_ms = readback_ms.saturating_add(normal_readback_ms);
     let normal_tile = remember_rendered_tile(
@@ -3068,22 +4185,23 @@ fn execute_height_normal_gpu(
     map_tiles.insert(MaterialMapKind::Normal, Arc::clone(&normal_tile));
     display_tiles.insert(MaterialMapKind::Normal, Arc::clone(&normal_tile));
     let mut telemetry = vec![format!(
-        "executor=gpu; backend={}; plan_hash={}; requested_map=Normal; logical_passes={}; executed_gpu_passes={},{}normal-from-final-height; dependency={}; intermediate_cache={}; normal_publish={}; source_cache_hits={}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; render_ms={}",
+        "executor=gpu; backend={}; plan_hash={}; requested_map=Normal; logical_passes={}; executed_gpu_passes={}; dependency={}; intermediate_cache={}; normal_publish={}; source_cache_hits={}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; render_ms={}",
         state.capabilities().backend,
         plan.final_plan_hash.0,
         logical_passes_for_map(MaterialMapKind::Normal),
-        if cached_height_texture.is_some() {
-            "height-r32float-gpu-resource-cache"
+        if has_authored_normal {
+            if cached_height_texture.is_some() {
+                "height-r32float-gpu-resource-cache,authored-normal-sample"
+            } else {
+                "height-r32float,authored-normal-sample"
+            }
+        } else if cached_height_texture.is_some() {
+            "height-r32float-gpu-resource-cache,normal-from-final-height"
         } else {
-            "height-r32float"
+            "height-r32float,normal-from-final-height"
         },
         if has_authored_normal {
-            "authored-normal-sample,"
-        } else {
-            ""
-        },
-        if has_authored_normal {
-            "Normal<-Height+authored-Normal"
+            "Normal<-authored-Normal|HeightFallback"
         } else {
             "Normal<-Height"
         },
@@ -3093,7 +4211,7 @@ fn execute_height_normal_gpu(
             "final-height:live-gpu-hit"
         },
         if has_authored_normal {
-            "authored-plus-r32float-gpu-final-height"
+            "authored-normal-pass-through-with-height-fallback"
         } else {
             "from-r32float-gpu-final-height"
         },
@@ -3111,34 +4229,56 @@ fn execute_height_normal_gpu(
             + authored_normal_pipeline
                 .as_ref()
                 .map_or(0, |(_, hit)| u32::from(*hit)),
-        height_stats.upload_bytes.saturating_add(
-            height_display_stats
-                .as_ref()
-                .map_or(0, |stats| stats.upload_bytes),
-        ).saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.upload_bytes)),
-        height_stats.upload_ms.saturating_add(
-            height_display_stats
-                .as_ref()
-                .map_or(0, |stats| stats.upload_ms),
-        ).saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.upload_ms)),
+        height_stats
+            .upload_bytes
+            .saturating_add(
+                height_display_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_bytes),
+            )
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_bytes)
+            ),
+        height_stats
+            .upload_ms
+            .saturating_add(
+                height_display_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_ms),
+            )
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_ms)
+            ),
         height_stats
             .command_count
-            .saturating_add(commands.len() as u32)
+            .saturating_add(command_count)
             .saturating_add(
                 height_display_stats
                     .as_ref()
                     .map_or(0, |stats| stats.command_count),
             )
-            .saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.command_count)),
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.command_count)
+            ),
         height_stats
             .command_bytes
-            .saturating_add(command_buffer_bytes.len() as u64)
+            .saturating_add(command_buffer_bytes_len)
             .saturating_add(
                 height_display_stats
                     .as_ref()
                     .map_or(0, |stats| stats.command_bytes),
             )
-            .saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.command_bytes)),
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.command_bytes)
+            ),
         height_stats
             .dispatch_ms
             .saturating_add(normal_dispatch_ms)
@@ -3147,7 +4287,11 @@ fn execute_height_normal_gpu(
                     .as_ref()
                     .map_or(0, |stats| stats.dispatch_ms),
             )
-            .saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.dispatch_ms)),
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.dispatch_ms)
+            ),
         started.elapsed().as_millis()
     )];
     if publish_height {
@@ -3190,34 +4334,56 @@ fn execute_height_normal_gpu(
             + authored_normal_pipeline
                 .as_ref()
                 .map_or(0, |(_, hit)| u32::from(*hit)),
-        upload_bytes: height_stats.upload_bytes.saturating_add(
-            height_display_stats
-                .as_ref()
-                .map_or(0, |stats| stats.upload_bytes),
-        ).saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.upload_bytes)),
-        upload_ms: height_stats.upload_ms.saturating_add(
-            height_display_stats
-                .as_ref()
-                .map_or(0, |stats| stats.upload_ms),
-        ).saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.upload_ms)),
+        upload_bytes: height_stats
+            .upload_bytes
+            .saturating_add(
+                height_display_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_bytes),
+            )
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_bytes),
+            ),
+        upload_ms: height_stats
+            .upload_ms
+            .saturating_add(
+                height_display_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_ms),
+            )
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.upload_ms),
+            ),
         command_count: height_stats
             .command_count
-            .saturating_add(commands.len() as u32)
+            .saturating_add(command_count)
             .saturating_add(
                 height_display_stats
                     .as_ref()
                     .map_or(0, |stats| stats.command_count),
             )
-            .saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.command_count)),
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.command_count),
+            ),
         command_bytes: height_stats
             .command_bytes
-            .saturating_add(command_buffer_bytes.len() as u64)
+            .saturating_add(command_buffer_bytes_len)
             .saturating_add(
                 height_display_stats
                     .as_ref()
                     .map_or(0, |stats| stats.command_bytes),
             )
-            .saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.command_bytes)),
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.command_bytes),
+            ),
         dispatch_ms: height_stats
             .dispatch_ms
             .saturating_add(normal_dispatch_ms)
@@ -3226,7 +4392,11 @@ fn execute_height_normal_gpu(
                     .as_ref()
                     .map_or(0, |stats| stats.dispatch_ms),
             )
-            .saturating_add(authored_normal_stats.as_ref().map_or(0, |stats| stats.dispatch_ms)),
+            .saturating_add(
+                authored_normal_stats
+                    .as_ref()
+                    .map_or(0, |stats| stats.dispatch_ms),
+            ),
         readback_bytes,
         readback_ms,
         telemetry,
@@ -3259,7 +4429,9 @@ fn dispatch_material_map_to_view(
         if !is_current() {
             return Err(AtlasRenderExecutionError::Superseded);
         }
-        let source_role = source_channel_role_for_source(plan, source, requested_map);
+        let Some(source_role) = source_channel_role_for_source(plan, source, requested_map) else {
+            continue;
+        };
         if source.channel_role != source_role {
             continue;
         }
@@ -3292,7 +4464,7 @@ fn dispatch_material_map_to_view(
             .map(pack_command)
             .collect::<Result<Vec<_>, _>>()?;
         if !commands.is_empty() {
-            source_groups.push((source, cached, commands));
+            source_groups.push((source, cached, commands, source_role));
         }
     }
     let upload_ms = upload_started.elapsed().as_millis();
@@ -3301,7 +4473,7 @@ fn dispatch_material_map_to_view(
     let mut command_bytes = 0_u64;
     let tile = plan.tile_request.output_rect.0;
     let mut timing = timing;
-    for (source, cached, commands) in source_groups {
+    for (source, cached, commands, source_role) in source_groups {
         if cancellation.is_cancelled() {
             return Err(AtlasRenderExecutionError::Cancelled);
         }
@@ -3324,7 +4496,7 @@ fn dispatch_material_map_to_view(
                 crate::CompiledNormalConvention::OpenGl => 0,
                 crate::CompiledNormalConvention::DirectX => 1,
             },
-            source_role: gpu_channel_role_code(source.channel_role),
+            source_role: gpu_channel_role_code(source_role),
         };
         let command_buffer_bytes = encode_commands(&commands);
         command_bytes = command_bytes.saturating_add(command_buffer_bytes.len() as u64);
@@ -3400,8 +4572,7 @@ fn dispatch_fill_r32float_with_pipeline(
             resource: wgpu::BindingResource::TextureView(output_view),
         }],
     });
-    let timestamp_writes =
-        timing.and_then(|recorder| recorder.timestamp_writes("fill-r32float"));
+    let timestamp_writes = timing.and_then(|recorder| recorder.timestamp_writes("fill-r32float"));
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("hot-trimmer-fill-r32float-dispatch"),
         timestamp_writes,
@@ -3438,15 +4609,15 @@ fn create_working_texture(
     (texture, view)
 }
 
-fn schedule_readback(
+fn schedule_readback<'a>(
     device: &wgpu::Device,
-    cache: &Mutex<GpuAtlasSourceTextureCache>,
+    cache: &'a Mutex<GpuAtlasSourceTextureCache>,
     encoder: &mut wgpu::CommandEncoder,
     texture: &wgpu::Texture,
     width: u32,
     height: u32,
     bytes_per_pixel: u32,
-) -> Result<PendingGpuReadback, AtlasRenderExecutionError> {
+) -> Result<PendingGpuReadback<'a>, AtlasRenderExecutionError> {
     let output_row_bytes = u64::from(width)
         .checked_mul(u64::from(bytes_per_pixel))
         .ok_or_else(|| AtlasRenderExecutionError::Gpu("readback row size overflow".into()))?;
@@ -3457,11 +4628,7 @@ fn schedule_readback(
     let readback_bytes = padded_bytes_per_row
         .checked_mul(u64::from(height))
         .ok_or_else(|| AtlasRenderExecutionError::Gpu("readback buffer size overflow".into()))?;
-    let readback_buffer = cache
-        .lock()
-        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
-        .readback_pool
-        .acquire_staging(device, readback_bytes);
+    let readback_staging = acquire_staging_lease(device, cache, readback_bytes)?;
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -3470,7 +4637,7 @@ fn schedule_readback(
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
-            buffer: &readback_buffer,
+            buffer: readback_staging.buffer(),
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded_bytes_per_row as u32),
@@ -3484,8 +4651,7 @@ fn schedule_readback(
         },
     );
     Ok(PendingGpuReadback {
-        buffer: readback_buffer,
-        byte_len: readback_bytes,
+        staging: readback_staging,
         output_row_bytes: usize::try_from(output_row_bytes)
             .map_err(|_| AtlasRenderExecutionError::Gpu("output row size overflow".into()))?,
         padded_row_bytes: usize::try_from(padded_bytes_per_row)
@@ -3496,12 +4662,11 @@ fn schedule_readback(
 
 fn finish_readback(
     device: &wgpu::Device,
-    cache: &Mutex<GpuAtlasSourceTextureCache>,
-    pending: PendingGpuReadback,
+    pending: PendingGpuReadback<'_>,
 ) -> Result<(Arc<[u8]>, u128), AtlasRenderExecutionError> {
     let readback_started = Instant::now();
-    {
-        let slice = pending.buffer.slice(..);
+    let pixels = {
+        let slice = pending.staging.buffer().slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
@@ -3526,14 +4691,10 @@ fn finish_readback(
                 .copy_from_slice(&mapped[src..src + pending.output_row_bytes]);
         }
         drop(mapped);
-        pending.buffer.unmap();
-        cache
-            .lock()
-            .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
-            .readback_pool
-            .release_staging(pending.buffer, pending.byte_len);
-        Ok((Arc::from(pixels), readback_started.elapsed().as_millis()))
-    }
+        Ok::<Arc<[u8]>, AtlasRenderExecutionError>(Arc::from(pixels))
+    }?;
+    pending.staging.buffer().unmap();
+    Ok((pixels, readback_started.elapsed().as_millis()))
 }
 
 fn remember_rendered_tile(
@@ -3697,15 +4858,39 @@ fn source_texture(
     let mut cache_guard = cache
         .lock()
         .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
-    const MAX_GPU_SOURCES: usize = 8;
-    if cache_guard.sources.len() >= MAX_GPU_SOURCES
-        && !cache_guard.sources.contains_key(&key)
-        && let Some(oldest) = cache_guard
+    let budget = GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes;
+    if cached.byte_len > budget {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "source texture {}x{} exceeds the declared GPU source residency budget",
+            source.oriented_dimensions.width, source.oriented_dimensions.height
+        )));
+    }
+    while !cache_guard.sources.is_empty()
+        && cache_guard
+            .source_resident_bytes()
+            .saturating_add(cached.byte_len)
+            > budget
+    {
+        let Some(oldest) = cache_guard
             .sources
             .iter()
             .min_by_key(|(_, value)| value.last_used)
             .map(|(key, _)| key.clone())
-    {
+        else {
+            break;
+        };
+        cache_guard.sources.remove(&oldest);
+    }
+    const MAX_GPU_SOURCES: usize = 8;
+    while cache_guard.sources.len() >= MAX_GPU_SOURCES && !cache_guard.sources.contains_key(&key) {
+        let Some(oldest) = cache_guard
+            .sources
+            .iter()
+            .min_by_key(|(_, value)| value.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
         cache_guard.sources.remove(&oldest);
     }
     cache_guard.sources.insert(key, Arc::clone(&cached));
@@ -3823,7 +5008,7 @@ fn source_channel_role_for_source(
     plan: &CompiledAtlasPlanV1,
     source: &CompiledSourceCommandV1,
     map: hot_trimmer_domain::MaterialMapKind,
-) -> MaterialChannelRole {
+) -> Option<MaterialChannelRole> {
     use hot_trimmer_domain::MaterialMapKind;
     let preferred = match map {
         MaterialMapKind::BaseColor => MaterialChannelRole::BaseColor,
@@ -3843,9 +5028,11 @@ fn source_channel_role_for_source(
             && candidate.source_id == source.source_id
             && candidate.channel_role == preferred
     }) {
-        preferred
+        Some(preferred)
+    } else if map == MaterialMapKind::Normal {
+        None
     } else {
-        MaterialChannelRole::BaseColor
+        Some(MaterialChannelRole::BaseColor)
     }
 }
 
@@ -4172,4 +5359,655 @@ fn linear_to_srgb(value: f32) -> u8 {
     } else {
         1.055 * value.powf(1.0 / 2.4) - 0.055
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        COMPILED_ATLAS_ALGORITHM_VERSION, COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
+        CompiledAtlasPreviewProfile, CompiledColorSpacePolicy, CompiledNormalConvention,
+        CompiledTileRequest, CompiledTileRequestKind, SourcePixelRect,
+    };
+    use hot_trimmer_domain::{
+        DocumentHash, EdgeEligibility, ManualRegionRole, MappingTransform, PixelSize, QuarterTurn,
+        RadialMappingSettings, RegionContinuity, RegionSampling, SamplingMode, SamplingPolicy,
+        StructuralProfile, TemplateSlotRole,
+    };
+    use hot_trimmer_placement_solver::{
+        CandidateDescriptors, CandidateFamily, CandidateRoute, CandidateTransform, CropCandidate,
+        EligibilityEvidence, PositionStrategy, SliceGeometry, SourceCrop,
+        StretchOverrideProvenance,
+    };
+    use hot_trimmer_preview::{
+        GPU_CAPABILITY_CONTRACT_VERSION, GpuCapabilityRecord, PINNED_WGPU_VERSION,
+        TextureFormatCapability,
+    };
+
+    fn gpu_tiled_export_caps(max_texture_dimension_2d: u32) -> GpuCapabilityRecord {
+        GpuCapabilityRecord {
+            contract_version: GPU_CAPABILITY_CONTRACT_VERSION,
+            service_generation: 1,
+            wgpu_version: PINNED_WGPU_VERSION,
+            adapter_name: "bounded export fixture".into(),
+            vendor: 0,
+            device: 0,
+            backend: "test".into(),
+            driver: "test".into(),
+            driver_info: "test".into(),
+            maximum_texture_dimension_2d: max_texture_dimension_2d,
+            maximum_sampled_textures_per_stage: 16,
+            maximum_storage_textures_per_stage: 8,
+            timestamp_queries: false,
+            clear_texture: true,
+            copy_bytes_per_row_alignment: 256,
+            uniform_buffer_offset_alignment: 256,
+            storage_buffer_offset_alignment: 256,
+            recommended_tile_size: 2048,
+            candidate_formats: vec![
+                TextureFormatCapability {
+                    format: "Rgba8UnormSrgb".into(),
+                    sampled: true,
+                    storage: true,
+                },
+                TextureFormatCapability {
+                    format: "Rgba8Unorm".into(),
+                    sampled: true,
+                    storage: true,
+                },
+                TextureFormatCapability {
+                    format: "R32Float".into(),
+                    sampled: true,
+                    storage: true,
+                },
+                TextureFormatCapability {
+                    format: "R32Uint".into(),
+                    sampled: true,
+                    storage: true,
+                },
+            ],
+        }
+    }
+
+    fn gpu_tiled_export_sampling_plan(
+        region_id: RegionId,
+        source_id: ContentDigest,
+        crop: SourceCrop,
+    ) -> SamplingPlan {
+        SamplingPlan {
+            slot_id: region_id,
+            role: TemplateSlotRole::Planar,
+            variation_group: "gpu-tiled-export".into(),
+            prepared_domain_dimensions: [crop.width, crop.height],
+            candidate: CropCandidate {
+                candidate_id: ContentDigest::sha256(b"gpu-tiled-export-candidate"),
+                source_id: source_id.clone(),
+                domain_id: ContentDigest::sha256(b"gpu-tiled-export-domain"),
+                slot_id: region_id,
+                crop: Some(crop),
+                transform: CandidateTransform {
+                    rotation: QuarterTurn::Zero,
+                    mirror: MirrorTransform::None,
+                },
+                isotropic_scale: 1.0,
+                mapping_mode: SamplingMode::DirectCrop,
+                family: CandidateFamily::PanelDirect,
+                route: CandidateRoute::Direct,
+                position_strategy: PositionStrategy::DenseLowResolution,
+                period_pixels: None,
+                seam_indices: Vec::new(),
+                correspondence_reference: ContentDigest::sha256(b"gpu-tiled-export-domain"),
+                descriptors: CandidateDescriptors {
+                    saliency_milli: 0,
+                    stationarity_milli: 0,
+                    feature_strength_milli: 0,
+                    usability_milli: 1000,
+                },
+                seed: 0,
+                eligibility: EligibilityEvidence {
+                    mapping_permitted: true,
+                    transform_permitted: true,
+                    isotropic_scale: true,
+                    exact_aspect: true,
+                    entire_crop_usable: Some(true),
+                    cross_axis_preserved: Some(true),
+                    lattice_aligned: Some(true),
+                    direct_crop_applicable: true,
+                    direct_crop_rejection: None,
+                    reasons: vec!["gpu tiled export scheduler fixture".into()],
+                },
+            },
+            slot_physical_size: [f64::from(crop.width), f64::from(crop.height)],
+            source_pixels_per_physical_unit: 1.0,
+            sampling_policy: SamplingPolicy::default(),
+            radial_mapping: None,
+            stretch_override: StretchOverrideProvenance::NotAuthorized,
+            slice_geometry: SliceGeometry::None,
+            maximum_seam_cost_milli: 0,
+            unary_cost: 0.0,
+        }
+    }
+
+    fn gpu_tiled_export_plan() -> CompiledAtlasPlanV1 {
+        let source_set_id = SourceSetId::new();
+        let source_id = ContentDigest::sha256(b"gpu-tiled-export-source");
+        let region_id = RegionId::new();
+        let source_crop = PixelBounds {
+            x: 0,
+            y: 0,
+            width: 8192,
+            height: 8192,
+        };
+        CompiledAtlasPlanV1 {
+            schema_version: COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
+            algorithm_version: COMPILED_ATLAS_ALGORITHM_VERSION.into(),
+            document_revision: 42,
+            request_generation: Some(99),
+            topology_hash: DocumentHash([0x11; 32]),
+            appearance_hash: DocumentHash([0x22; 32]),
+            output_size: PixelSize {
+                width: 8192,
+                height: 8192,
+            },
+            preview_profile: CompiledAtlasPreviewProfile::Authoritative,
+            normal_convention: CompiledNormalConvention::OpenGl,
+            color_space_policy: CompiledColorSpacePolicy::SrgbColorUnassociatedAlpha,
+            tile_request: CompiledTileRequest {
+                kind: CompiledTileRequestKind::ExactViewport,
+                generation: 99,
+                output_rect: OutputPixelRect(PixelBounds {
+                    x: 0,
+                    y: 0,
+                    width: 8192,
+                    height: 8192,
+                }),
+                mip_level: 0,
+                halo_px: 0,
+                valid_rect: OutputPixelRect(PixelBounds {
+                    x: 0,
+                    y: 0,
+                    width: 8192,
+                    height: 8192,
+                }),
+            },
+            requested_maps: vec![MaterialMapKind::BaseColor, MaterialMapKind::Height],
+            ordered_sources: vec![CompiledSourceCommandV1 {
+                source_set_id,
+                source_id: source_id.clone(),
+                digest: ContentDigest::sha256(b"gpu-tiled-export-source-bytes"),
+                oriented_dimensions: hot_trimmer_domain::OrientedPixelSize {
+                    width: 8192,
+                    height: 8192,
+                },
+                decoder_version: "decoder-fixture".into(),
+                decoded_format: "rgba8".into(),
+                color_version: "color-fixture".into(),
+                channel_role: MaterialChannelRole::BaseColor,
+            }],
+            ordered_regions: vec![CompiledRegionCommandV1 {
+                region_id,
+                compact_index: 0,
+                region_role: ManualRegionRole::Panel,
+                source_set_id,
+                source_id: source_id.clone(),
+                patch_id: None,
+                source_crop: SourcePixelRect(source_crop),
+                destination_rect: OutputPixelRect(source_crop),
+                sampling: RegionSampling::OneShot,
+                source_to_region_transform: MappingTransform::default(),
+                radial_parameters: None,
+                structural_profile: StructuralProfile::Bevel,
+                continuity: RegionContinuity::None,
+                padding_px: 0,
+                edge_eligibility: EdgeEligibility::default(),
+                sampling_plan: gpu_tiled_export_sampling_plan(
+                    region_id,
+                    source_id,
+                    SourceCrop {
+                        x: source_crop.x,
+                        y: source_crop.y,
+                        width: source_crop.width,
+                        height: source_crop.height,
+                    },
+                ),
+                render_cache_key: ContentDigest::sha256(b"gpu-tiled-export-region-render"),
+            }],
+            final_plan_hash: ContentDigest(String::new()),
+        }
+        .finalize()
+        .expect("fixture plan should validate")
+    }
+
+    fn gpu_tiled_export_resized_plan(edge: u32) -> CompiledAtlasPlanV1 {
+        let mut plan = gpu_tiled_export_plan();
+        let bounds = PixelBounds {
+            x: 0,
+            y: 0,
+            width: edge,
+            height: edge,
+        };
+        plan.output_size = PixelSize {
+            width: edge,
+            height: edge,
+        };
+        plan.tile_request.output_rect = OutputPixelRect(bounds);
+        plan.tile_request.valid_rect = OutputPixelRect(bounds);
+        plan.ordered_sources[0].oriented_dimensions.width = edge;
+        plan.ordered_sources[0].oriented_dimensions.height = edge;
+        let region = &mut plan.ordered_regions[0];
+        region.source_crop = SourcePixelRect(bounds);
+        region.destination_rect = OutputPixelRect(bounds);
+        region.sampling_plan.prepared_domain_dimensions = [edge, edge];
+        region.sampling_plan.candidate.crop = Some(SourceCrop {
+            x: 0,
+            y: 0,
+            width: edge,
+            height: edge,
+        });
+        region.sampling_plan.slot_physical_size = [f64::from(edge), f64::from(edge)];
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan.finalize()
+            .expect("resized fixture plan should validate")
+    }
+
+    fn gpu_tiled_export_three_source_plan() -> CompiledAtlasPlanV1 {
+        let mut plan = gpu_tiled_export_resized_plan(8192);
+        let template = plan.ordered_sources[0].clone();
+        for index in 1..3 {
+            let mut source = template.clone();
+            source.source_set_id = SourceSetId::new();
+            source.source_id =
+                ContentDigest::sha256(format!("gpu-tiled-export-source-{index}").as_bytes());
+            source.digest =
+                ContentDigest::sha256(format!("gpu-tiled-export-source-bytes-{index}").as_bytes());
+            plan.ordered_sources.push(source);
+        }
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan.finalize()
+            .expect("multi-source fixture plan should validate")
+    }
+
+    fn gpu_tiled_export_loop_x_plan() -> CompiledAtlasPlanV1 {
+        let mut plan = gpu_tiled_export_resized_plan(257);
+        let region = &mut plan.ordered_regions[0];
+        region.sampling = RegionSampling::LoopX;
+        region.continuity = RegionContinuity::X;
+        region.sampling_plan.candidate.mapping_mode = SamplingMode::RepeatX;
+        region.sampling_plan.candidate.family = CandidateFamily::RepeatXSegment;
+        region.sampling_plan.candidate.route = CandidateRoute::Repeat;
+        region.sampling_plan.candidate.period_pixels = Some([128, 128]);
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan.finalize().expect("loop fixture plan should validate")
+    }
+
+    fn gpu_tiled_export_polar_radial_plan() -> CompiledAtlasPlanV1 {
+        let mut plan = gpu_tiled_export_resized_plan(1024);
+        let radial = RadialMappingSettings {
+            center_x: 0.5,
+            center_y: 0.5,
+            inner_radius: 0.1,
+            outer_radius: 0.5,
+            falloff: 1.0,
+            blend_width: 0.05,
+            seam_blend_width: 0.1,
+        };
+        let region = &mut plan.ordered_regions[0];
+        region.region_role = ManualRegionRole::Radial;
+        region.radial_parameters = Some(radial);
+        region.sampling_plan.radial_mapping = Some(radial);
+        region.sampling_plan.candidate.mapping_mode = SamplingMode::PolarRadial;
+        region.sampling_plan.candidate.family = CandidateFamily::PolarRadialSynthesis;
+        region.sampling_plan.candidate.route = CandidateRoute::PolarRadial;
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan.finalize()
+            .expect("polar radial fixture plan should validate")
+    }
+
+    fn gpu_tiled_export_planar_radial_plan() -> CompiledAtlasPlanV1 {
+        let mut plan = gpu_tiled_export_polar_radial_plan();
+        let region = &mut plan.ordered_regions[0];
+        region.sampling_plan.candidate.mapping_mode = SamplingMode::PlanarRadial;
+        region.sampling_plan.candidate.family = CandidateFamily::PlanarRadialSquare;
+        region.sampling_plan.candidate.route = CandidateRoute::PlanarRadial;
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan.finalize()
+            .expect("planar radial fixture plan should validate")
+    }
+
+    fn gpu_tiled_export_offset_polar_radial_plan() -> CompiledAtlasPlanV1 {
+        let mut plan = gpu_tiled_export_polar_radial_plan();
+        let region = &mut plan.ordered_regions[0];
+        region.source_crop = SourcePixelRect(PixelBounds {
+            x: 128,
+            y: 96,
+            width: 512,
+            height: 512,
+        });
+        region.sampling_plan.candidate.crop = Some(SourceCrop {
+            x: 128,
+            y: 96,
+            width: 512,
+            height: 512,
+        });
+        region.source_to_region_transform.offset = [0.6, 0.5];
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan.finalize()
+            .expect("offset polar radial fixture plan should validate")
+    }
+
+    #[test]
+    fn gpu_tiled_export_readback_pool_counts_checked_out_staging() {
+        let mut pool = GpuAtlasReadbackPool::new(4);
+        pool.byte_capacity = 12;
+
+        pool.reserve_staging_bytes(5)
+            .expect("first pending readback should fit");
+        pool.reserve_staging_bytes(4)
+            .expect("second pending readback should fit");
+        let error = pool
+            .reserve_staging_bytes(4)
+            .expect_err("third pending readback must honor aggregate checked-out budget");
+        assert!(
+            error.to_string().contains("in-flight staging budget"),
+            "{error}"
+        );
+
+        pool.release_staging_bytes(5);
+        pool.reserve_staging_bytes(3)
+            .expect("released staging budget should become available");
+    }
+
+    #[test]
+    fn gpu_tiled_export_normal_never_falls_back_to_base_color() {
+        let mut plan = gpu_tiled_export_plan();
+        let missing_normal_source = plan.ordered_sources[0].clone();
+        let mut unrelated_authored_normal = missing_normal_source.clone();
+        unrelated_authored_normal.source_set_id = SourceSetId::new();
+        unrelated_authored_normal.source_id =
+            ContentDigest::sha256(b"gpu-tiled-export-unrelated-normal-source");
+        unrelated_authored_normal.channel_role = MaterialChannelRole::Normal;
+        plan.ordered_sources.push(unrelated_authored_normal);
+
+        assert_eq!(
+            source_channel_role_for_source(&plan, &missing_normal_source, MaterialMapKind::Normal),
+            None,
+            "a mixed-source authored Normal pass must skip sources without an actual Normal channel"
+        );
+        assert_eq!(
+            source_channel_role_for_source(
+                &plan,
+                &missing_normal_source,
+                MaterialMapKind::Roughness
+            ),
+            Some(MaterialChannelRole::BaseColor),
+            "non-Normal maps may still use Base Color only as an explicit default signal"
+        );
+
+        let mut same_source_authored_normal = missing_normal_source.clone();
+        same_source_authored_normal.channel_role = MaterialChannelRole::Normal;
+        plan.ordered_sources.push(same_source_authored_normal);
+        assert_eq!(
+            source_channel_role_for_source(&plan, &missing_normal_source, MaterialMapKind::Normal),
+            Some(MaterialChannelRole::Normal)
+        );
+    }
+
+    #[test]
+    fn gpu_tiled_export_schedule_uses_compiled_plan_and_blocks_monolithic_executor() {
+        let plan = gpu_tiled_export_plan();
+        let requested_maps = requested_material_maps(&plan).expect("requested maps");
+        let schedule =
+            schedule_compiled_export_tiles(&plan, &requested_maps, &gpu_tiled_export_caps(4096))
+                .expect("compiled export schedule");
+
+        assert_eq!(requested_maps, plan.requested_maps);
+        assert!(schedule.output_tiles.len() > requested_maps.len());
+        assert!(schedule.source_tiles.iter().any(|tile| {
+            tile.rect.width < tile.source.oriented_dimensions.width
+                && tile.rect.height < tile.source.oriented_dimensions.height
+        }));
+
+        let base_color = schedule
+            .output_tiles
+            .iter()
+            .find(|tile| tile.identity.map == MaterialMapKind::BaseColor)
+            .expect("base color tile");
+        assert_eq!(
+            base_color.identity.pixel_format,
+            CompiledTilePixelFormat::Rgba8UnormSrgb
+        );
+        assert_eq!(base_color.bit_depth, 8);
+        assert_eq!(base_color.color_space, "sRGB");
+        assert_eq!(base_color.identity.output_rect, base_color.output_rect);
+        assert_eq!(base_color.identity.valid_rect, base_color.valid_rect);
+
+        let height = schedule
+            .output_tiles
+            .iter()
+            .find(|tile| tile.identity.map == MaterialMapKind::Height)
+            .expect("height tile");
+        assert_eq!(
+            height.identity.pixel_format,
+            CompiledTilePixelFormat::R32Float
+        );
+        assert_eq!(height.bit_depth, 32);
+        assert_eq!(height.color_space, "linear");
+
+        assert!(schedule.output_tiles.iter().any(|tile| {
+            tile.footprints.iter().any(|footprint| {
+                footprint.source_rect.width < plan.output_size.width
+                    && footprint.source_rect.height < plan.output_size.height
+                    && !footprint.required_source_tiles.is_empty()
+            })
+        }));
+
+        let error =
+            ensure_schedule_publishable_by_current_executor(&plan, &schedule, &requested_maps)
+                .expect_err("current executor must not silently publish a tiled export schedule");
+        assert!(error.to_string().contains("multi-output-tile streaming"));
+
+        let large_plan = gpu_tiled_export_resized_plan(24_576);
+        let large_maps = requested_material_maps(&large_plan).expect("large requested maps");
+        let large_schedule = schedule_compiled_export_tiles(
+            &large_plan,
+            &large_maps,
+            &gpu_tiled_export_caps(32_768),
+        )
+        .expect("large compiled export schedule");
+        assert!(large_schedule.output_tiles.len() > large_maps.len());
+        let error = ensure_schedule_publishable_by_current_executor(
+            &large_plan,
+            &large_schedule,
+            &large_maps,
+        )
+        .expect_err("budget-forbidden 24K schedule must not reach monolithic execution");
+        assert!(error.to_string().contains("multi-output-tile streaming"));
+
+        let mut large_viewport_plan = large_plan.clone();
+        let tile = PixelBounds {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 4096,
+        };
+        let source_bounds = PixelBounds {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 4096,
+        };
+        large_viewport_plan.tile_request.output_rect = OutputPixelRect(tile);
+        large_viewport_plan.tile_request.valid_rect = OutputPixelRect(tile);
+        large_viewport_plan.ordered_sources[0]
+            .oriented_dimensions
+            .width = source_bounds.width;
+        large_viewport_plan.ordered_sources[0]
+            .oriented_dimensions
+            .height = source_bounds.height;
+        let region = &mut large_viewport_plan.ordered_regions[0];
+        region.source_crop = SourcePixelRect(source_bounds);
+        region.sampling_plan.prepared_domain_dimensions =
+            [source_bounds.width, source_bounds.height];
+        region.sampling_plan.candidate.crop = Some(SourceCrop {
+            x: source_bounds.x,
+            y: source_bounds.y,
+            width: source_bounds.width,
+            height: source_bounds.height,
+        });
+        region.sampling_plan.slot_physical_size = [
+            f64::from(source_bounds.width),
+            f64::from(source_bounds.height),
+        ];
+        large_viewport_plan.final_plan_hash = ContentDigest(String::new());
+        large_viewport_plan = large_viewport_plan
+            .finalize()
+            .expect("large exact viewport fixture plan");
+        let large_viewport_maps =
+            requested_material_maps(&large_viewport_plan).expect("large viewport requested maps");
+        let large_viewport_schedule = schedule_compiled_export_tiles(
+            &large_viewport_plan,
+            &large_viewport_maps,
+            &gpu_tiled_export_caps(32_768),
+        )
+        .expect("large viewport schedule");
+        ensure_schedule_publishable_by_current_executor(
+            &large_viewport_plan,
+            &large_viewport_schedule,
+            &large_viewport_maps,
+        )
+        .expect("bounded exact viewport tile should not be rejected by full-atlas output budget");
+
+        let mut all_map_viewport_plan = large_viewport_plan.clone();
+        all_map_viewport_plan.requested_maps = vec![
+            MaterialMapKind::BaseColor,
+            MaterialMapKind::Height,
+            MaterialMapKind::Normal,
+            MaterialMapKind::Roughness,
+            MaterialMapKind::Metallic,
+            MaterialMapKind::AmbientOcclusion,
+            MaterialMapKind::RegionId,
+        ];
+        all_map_viewport_plan.final_plan_hash = ContentDigest(String::new());
+        all_map_viewport_plan = all_map_viewport_plan
+            .finalize()
+            .expect("all-map viewport fixture plan");
+        let all_map_viewport_maps =
+            requested_material_maps(&all_map_viewport_plan).expect("all-map requested maps");
+        let all_map_viewport_schedule = schedule_compiled_export_tiles(
+            &all_map_viewport_plan,
+            &all_map_viewport_maps,
+            &gpu_tiled_export_caps(32_768),
+        )
+        .expect("all-map viewport schedule");
+        assert!(
+            current_executor_tile_residency_bytes(&all_map_viewport_plan, &all_map_viewport_maps)
+                .expect("current tile residency")
+                > all_map_viewport_schedule.output_monolithic_budget_bytes
+        );
+        let error = ensure_schedule_publishable_by_current_executor(
+            &all_map_viewport_plan,
+            &all_map_viewport_schedule,
+            &all_map_viewport_maps,
+        )
+        .expect_err("multi-map tile residency must be admitted as one concurrent working set");
+        assert!(error.to_string().contains("multi-output-tile streaming"));
+
+        let multi_source_plan = gpu_tiled_export_three_source_plan();
+        let multi_source_maps =
+            requested_material_maps(&multi_source_plan).expect("multi-source requested maps");
+        let multi_source_schedule = schedule_compiled_export_tiles(
+            &multi_source_plan,
+            &multi_source_maps,
+            &gpu_tiled_export_caps(32_768),
+        )
+        .expect("multi-source compiled export schedule");
+        assert!(
+            multi_source_schedule
+                .source_monolithic_bytes
+                .iter()
+                .all(|bytes| *bytes <= multi_source_schedule.source_monolithic_budget_bytes)
+        );
+        assert!(
+            multi_source_schedule
+                .source_monolithic_bytes
+                .iter()
+                .copied()
+                .sum::<u64>()
+                > multi_source_schedule.source_monolithic_budget_bytes
+        );
+        let error = ensure_schedule_publishable_by_current_executor(
+            &multi_source_plan,
+            &multi_source_schedule,
+            &multi_source_maps,
+        )
+        .expect_err("aggregate source budget overflow must not reach monolithic execution");
+        assert!(error.to_string().contains("source-tile uploads"));
+    }
+
+    #[test]
+    fn gpu_tiled_export_loop_and_radial_footprints_cover_wrapped_extrema() {
+        let loop_plan = gpu_tiled_export_loop_x_plan();
+        let loop_region = &loop_plan.ordered_regions[0];
+        let loop_footprints = compiled_region_source_footprints(
+            loop_region,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 257,
+                height: 257,
+            },
+            257,
+            257,
+        )
+        .expect("loop footprint");
+        assert!(loop_footprints.iter().any(|rect| rect.width >= 128));
+
+        for radial_plan in [
+            gpu_tiled_export_planar_radial_plan(),
+            gpu_tiled_export_polar_radial_plan(),
+            gpu_tiled_export_offset_polar_radial_plan(),
+        ] {
+            let radial_region = &radial_plan.ordered_regions[0];
+            let radial_footprints = compiled_region_source_footprints(
+                radial_region,
+                PixelRect {
+                    x: 511,
+                    y: 511,
+                    width: 2,
+                    height: 2,
+                },
+                1024,
+                1024,
+            )
+            .expect("radial footprint");
+            assert_eq!(
+                radial_footprints,
+                vec![PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 1024
+                }]
+            );
+        }
+
+        let radial_plan = gpu_tiled_export_polar_radial_plan();
+        let radial_footprints = compiled_region_source_footprints(
+            &radial_plan.ordered_regions[0],
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 1024,
+                height: 1024,
+            },
+            1024,
+            1024,
+        )
+        .expect("radial footprint");
+        assert!(
+            radial_footprints
+                .iter()
+                .any(|rect| rect.width >= 1024 && rect.height >= 1024)
+        );
+    }
 }

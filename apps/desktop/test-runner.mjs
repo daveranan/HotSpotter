@@ -5,6 +5,7 @@ const suites = {
   "hotspot-preview-lifecycle": "src/hotspot-preview-lifecycle.test.ts",
   "manual-layout-presets": "src/manual-layout-presets.test.ts",
   "multi-source-patch-assignment": "src/multi-source-patch-assignment.test.ts",
+  "workbench-interactions": "src/workbench-interactions.test.ts",
 };
 const requested = process.argv.slice(2);
 const files = requested.length

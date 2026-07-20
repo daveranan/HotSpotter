@@ -18,6 +18,9 @@ import {
   type CompiledMapView,
   type ContentReference,
   type IntermediateAtlasProjection,
+  type NativeStage14ExportProgress,
+  type NativeStage14ExportProgressEvent,
+  type NativeStage14ExportProjection,
   type NormalizedBounds,
   type NormalConvention,
   type Patch,
@@ -46,6 +49,7 @@ import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFram
 import { GpuTiledPreviewPainter, gpuTiledPreviewMapMatches, shouldDisplayGpuTiledPreview, SourceFramePreviewController, type GpuTiledPreviewPaintSummary } from "./source-frame-preview-controller";
 import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
 import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
+import { canInteractWithPatch, compiledMapViewForSourceChannel, sourceChannelForCompiledMapView, sourceSetIdForRegion } from "./workbench-interactions";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
@@ -116,10 +120,27 @@ function requestedMaterialMapsForView(view: CompiledMapView): readonly SourceFra
   return map ? [map] : ["base_color"];
 }
 
+const exportableMaterialMaps: readonly SourceFramePreviewMaterialMap[] = [
+  "base_color",
+  "height",
+  "normal",
+  "roughness",
+  "metallic",
+  "ambient_occlusion",
+  "region_id",
+];
+
+function requestedMaterialMapsForExport(project: ProjectProjection | null): readonly SourceFramePreviewMaterialMap[] {
+  const channels = project?.document?.renderSettings.channels;
+  if (!channels) return ["base_color"];
+  const requested = exportableMaterialMaps.filter((map) => channels[map]?.enabled);
+  return requested.length > 0 ? requested : ["base_color"];
+}
+
 function gpuTilePublicationForView(artifact: IntermediateAtlasProjection | null | undefined, view: CompiledMapView) {
   if (!artifact) return undefined;
   return artifact.tileManifests?.[view]
-    ?? (gpuTiledPreviewMapMatches(artifact.tileManifest.manifest.map, view) ? artifact.tileManifest : undefined);
+    ?? (artifact.tileManifest && gpuTiledPreviewMapMatches(artifact.tileManifest.manifest.map, view) ? artifact.tileManifest : undefined);
 }
 
 function artifactMapAvailable(artifact: IntermediateAtlasProjection | null | undefined, view: CompiledMapView): boolean {
@@ -190,7 +211,7 @@ function RegionBehaviorCue({ behavior }: { behavior: RegionBehavior }) {
   </span>;
 }
 
-type Activity = "starting" | "idle" | "importing" | "compiling" | "editing" | "saving" | "opening";
+type Activity = "starting" | "idle" | "importing" | "compiling" | "editing" | "saving" | "opening" | "exporting";
 type CropProjection = Extract<RegionMapping["projection"], { type: "crop" }>;
 type PaneLayoutMode = "full" | "without-inspector" | "without-library" | "sheet-only";
 
@@ -332,10 +353,11 @@ function App() {
   const [actualDraftPreviewFps, setActualDraftPreviewFps] = useState<number | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [sourceFrameEditing, setSourceFrameEditing] = useState(false);
-  const [mapView, setMapView] = useState<CompiledMapView>("baseColor");
+  const [mapView, setMapViewState] = useState<CompiledMapView>("baseColor");
   const [activity, setActivity] = useState<Activity>("starting");
   const [problem, setProblem] = useState<CommandFailure | null>(null);
   const [importProgress, setImportProgress] = useState<{ stage: string; fraction: number } | null>(null);
+  const [exportProgress, setExportProgress] = useState<NativeStage14ExportProgress | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [showRecents, setShowRecents] = useState(false);
   const [panes, setPanes] = useState<PaneState>(() => {
@@ -408,6 +430,15 @@ function App() {
     return () => { disposed = true; };
   }, [native]);
 
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    void listen<NativeStage14ExportProgressEvent>("stage-14-export-progress", (event) => {
+      if (!disposed) setExportProgress(event.payload.progress);
+    }).then((unlisten) => { if (disposed) unlisten(); });
+    return () => { disposed = true; };
+  }, [native]);
+
   const sourceSets = project?.materialSources ?? [];
   const activeSourceSetId = selectedSourceSetId || sourceSets[0]?.id || "";
   const activeSources = useMemo(
@@ -448,7 +479,9 @@ function App() {
   const sourceFrameLayout = !!project?.document?.sourceFrame;
   const showLibrary = sourceWorkbenchOpen && (paneMode === "full" || paneMode === "without-inspector");
   const showSourceWorkspace = sourceWorkbenchOpen && paneMode !== "sheet-only";
-  const showInspector = paneMode === "full";
+  // The Layout sidebar is the single region inspector. Keep the former context
+  // inspector out of the pane layout so it cannot duplicate map or region controls.
+  const showInspector = false;
   const visibleTracks: string[] = [];
   if (showLibrary) visibleTracks.push(`${paneMode === "without-inspector" ? Math.min(240, panes.library) : panes.library}px`);
   if (showSourceWorkspace && hotspotSheetOpen) visibleTracks.push(`minmax(280px, ${sourceSheetShare}fr)`, `minmax(320px, ${1 - sourceSheetShare}fr)`);
@@ -560,13 +593,13 @@ function App() {
     const content = selectedBinding?.content;
     if (!content) return;
     if (content.type === "material_source") {
-      setSelectedSourceSetId(content.id); setSelectedChannel("base_color"); setActivePatchId(null);
+      setSelectedSourceSetId(content.id); selectSourceChannel("base_color"); setActivePatchId(null);
     } else if (content.type === "patch") {
       const patch = project?.patches.find((value) => value.id === content.id);
       const owner = patch && project?.materialSources.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
-      if (owner) { setSelectedSourceSetId(owner.id); setSelectedChannel("base_color"); setActivePatchId(content.id); }
+      if (owner) { setSelectedSourceSetId(owner.id); selectSourceChannel("base_color"); setActivePatchId(content.id); }
     } else if (content.type === "inherit_primary_material" && project?.document?.primaryMaterial) {
-      setSelectedSourceSetId(project.document.primaryMaterial); setSelectedChannel("base_color"); setActivePatchId(null);
+      setSelectedSourceSetId(project.document.primaryMaterial); selectSourceChannel("base_color"); setActivePatchId(null);
     }
   }, [selectedRegionId]);
 
@@ -710,7 +743,7 @@ function App() {
     lastAutomaticPreviewKey.current = null;
     pendingAutomaticPreviewKey.current = null;
     setSelectedSourceSetId(next.document?.primaryMaterial ?? next.materialSources[0]?.id ?? "");
-    setSelectedChannel("base_color");
+    selectSourceChannel("base_color");
     setTemplateId(templates[0][0]);
     setShowRecents(false);
   }
@@ -765,7 +798,7 @@ function App() {
       }
       setProject(next);
       setSelectedSourceSetId(sourceSetId);
-      setSelectedChannel(assignments.at(-1)?.channel ?? "base_color");
+      selectSourceChannel(assignments.at(-1)?.channel ?? "base_color");
       if (!next.document && assignments.some((assignment) => assignment.channel === "base_color")) {
         await createDocumentAndCompile(next, sourceSetId);
       }
@@ -790,7 +823,7 @@ function App() {
       });
       setProject(next);
       setSelectedSourceSetId(sourceSetId);
-      setSelectedChannel(channel);
+      selectSourceChannel(channel);
       if (!next.document && channel === "base_color") {
         await createDocumentAndCompile(next, sourceSetId);
       }
@@ -1085,6 +1118,9 @@ function App() {
           viewportRect,
         },
       });
+      if (next.project) {
+        setProject(next.project);
+      }
       setPreviewClientTelemetry([`profile=${profile}`, `requested_revision=${requestedRevision}`, `requested_map=${requestedMapView}`, `artifact_revision=${next.documentRevision}`, `artifact_dimensions=${next.width}x${next.height}`, `request_outcome=published`, `ipc_round_trip_ms=${Math.round(performance.now() - (previewPublishStartedAt.current ?? performance.now()))}`]);
       if (automaticKey && draftId !== previewDraftId.current && pendingAutomaticPreviewKey.current === automaticKey) {
         pendingAutomaticPreviewKey.current = null;
@@ -1247,6 +1283,57 @@ function App() {
     }
   }
 
+  async function exportMaterialMaps(): Promise<boolean> {
+    if (!native || !project?.document || activity !== "idle") return false;
+    const path = await save({
+      title: "Export material maps",
+      defaultPath: `${project.name || "HotTrimmer"}.hottrim`,
+      filters: [{ name: "Hot Trimmer Package", extensions: ["hottrim"] }],
+    });
+    if (!path) return false;
+    setActivity("exporting");
+    setExportProgress(null);
+    setProblem(null);
+    try {
+      let current = project;
+      const normalPolicy = current.document?.renderSettings.channels.normal;
+      if (normalPolicy?.enabled && normalPolicy.bitDepth !== "eight") {
+        current = await applyCommand({
+          type: "set_channel_render_policy",
+          channel: "normal",
+          policy: { enabled: true, bitDepth: "eight" },
+        });
+        setProject(current);
+        setArtifact(null);
+      }
+      const revision = current.document!.documentRevision;
+      const requestedMaps = requestedMaterialMapsForExport(current);
+      const exported = await invoke<NativeStage14ExportProjection>("export_stage_14_material_maps", {
+        request: { ...protocol, revision, path, requestedMaps },
+      });
+      if (exported.project) {
+        current = exported.project;
+        setProject(current);
+        setArtifact(null);
+      }
+      setPreviewClientTelemetry([
+        `export_path=${exported.path}`,
+        `export_revision=${exported.revision}`,
+        `export_bytes=${exported.bytesWritten}`,
+        `export_outputs=${exported.outputs.map((output) => `${output.fileName}:${output.map}:${output.width}x${output.height}:${output.bytes}:${output.checksum}`).join(",")}`,
+        ...exported.telemetry,
+      ]);
+      setProblem(null);
+      return true;
+    } catch (reason) {
+      setProblem(failure(reason));
+      return false;
+    } finally {
+      setExportProgress(null);
+      setActivity("idle");
+    }
+  }
+
   async function closeToDraft() {
     // Drop browser-held data URLs and decoded preview surfaces before the native project/cache
     // boundary. WebView allocators may retain committed pages, but no old project image remains reachable.
@@ -1325,7 +1412,7 @@ function App() {
       const patch = project?.patches.find((candidate) => candidate.id === content.id);
       const owner = patch && project?.materialSources.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
       if (patch && owner) {
-        setSelectedSourceSetId(owner.id); setSelectedChannel("base_color"); setActivePatchId(patch.id);
+        setSelectedSourceSetId(owner.id); selectSourceChannel("base_color"); setActivePatchId(patch.id);
         setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
       }
       return;
@@ -1361,7 +1448,7 @@ function App() {
         },
       });
       await assignPatchToRegion(patchId, regionId);
-      setSelectedSourceSetId(owner.id); setSelectedChannel("base_color"); setActivePatchId(patchId);
+      setSelectedSourceSetId(owner.id); selectSourceChannel("base_color"); setActivePatchId(patchId);
       setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
     } catch (reason) { patchFallbackContent.current.delete(patchId); setProblem(failure(reason)); }
   }
@@ -1582,8 +1669,36 @@ function App() {
   }
 
   function chooseSource(sourceSetId: string, channel: SourceChannel) {
+    const selectedRegionSourceSetId = sourceSetIdForRegion({
+      content: selectedBinding?.content,
+      primarySourceSetId: project?.document?.primaryMaterial,
+      patches: project?.patches ?? [],
+      sourceSets: project?.materialSources.map((sourceSet) => ({
+        id: sourceSet.id,
+        sourceIds: sourceSet.registeredChannels?.channels.map((source) => source.id) ?? [],
+      })) ?? [],
+    });
+    if (selectedRegionId && selectedRegionSourceSetId !== sourceSetId) {
+      setSelectedRegionId(null);
+      setActivePatchId(null);
+      setRegionPatchEditId(null);
+      setDraftPatchPreview(null);
+      setSourceFrameEditing(false);
+    }
     setSelectedSourceSetId(sourceSetId);
+    selectSourceChannel(channel);
+  }
+
+  function selectSourceChannel(channel: SourceChannel) {
     setSelectedChannel(channel);
+    const view = compiledMapViewForSourceChannel(channel);
+    if (view && materialMapRouteAvailable(view)) setMapViewState(view);
+  }
+
+  function selectCompiledMapView(view: CompiledMapView) {
+    setMapViewState(view);
+    const channel = sourceChannelForCompiledMapView(view);
+    if (channel) setSelectedChannel(channel);
   }
 
   function selectPatchAndLinkedRegion(patchId: string, sourceSetId?: string) {
@@ -1637,7 +1752,7 @@ function App() {
         </nav>
         <span className="window-drag-space" data-tauri-drag-region />
         <div className="publish-actions">
-          <button disabled title="Export requires the export document command.">Export</button>
+          <button onClick={() => void exportMaterialMaps()} disabled={!native || !project?.document || activity !== "idle"} title="Export the current material map through the native streaming encoder.">Export</button>
           <button disabled title="Send to Blender requires publish and companion commands.">Send to Blender</button>
         </div>
         {native ? <div className="window-controls" aria-label="Window controls">
@@ -1668,7 +1783,7 @@ function App() {
           <MapSlots
             sources={activeSources}
             selectedChannel={selectedChannel}
-            onSelect={(channel) => setSelectedChannel(channel)}
+            onSelect={selectSourceChannel}
             onOpen={(channel) => {
               const replacingDiffuse = channel === "base_color" && activeSources.some((source) => source.channel === "base_color");
               if (replacingDiffuse) replaceBaseWithPreflight(activeSourceSetId);
@@ -1739,11 +1854,11 @@ function App() {
           preparedPatchPreviews={preparedPatchPreviews}
           activePatchId={activePatchId}
           mapView={mapView}
-          setMapView={setMapView}
+          setMapView={selectCompiledMapView}
           selectedRegionId={selectedRegionId}
           setSelectedRegionId={(id) => { setSelectedRegionId(id); if (!id) { setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSourceFrameEditing(false); } }}
           sourceFrameEditing={sourceFrameEditing}
-          onEditSourceFrame={() => { const frame = project?.document?.sourceFrame; if (!frame) return; setSelectedRegionId(null); setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSelectedSourceSetId(frame.sourceSetId); setSelectedChannel("base_color"); setSourceWorkbenchOpen(true); setSourceFrameEditing(true); }}
+          onEditSourceFrame={() => { const frame = project?.document?.sourceFrame; if (!frame) return; setSelectedRegionId(null); setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSelectedSourceSetId(frame.sourceSetId); selectSourceChannel("base_color"); setSourceWorkbenchOpen(true); setSourceFrameEditing(true); }}
           buildState={buildState}
           problem={problem}
           templateId={templateId}
@@ -1755,6 +1870,7 @@ function App() {
           setInteractivePreviewProfile={setInteractivePreviewProfile}
           previewProgress={previewProgress}
           previewElapsedMs={previewElapsedMs}
+          exportProgress={exportProgress}
           activity={activity}
           setResolution={setResolution}
           setAtlasPadding={setAtlasPadding}
@@ -1791,7 +1907,7 @@ function App() {
           sourceAnalysis={activePatchId ? preparedPatchPreview : null}
           selectedRegion={selectedRegion}
           mapView={mapView}
-          setMapView={setMapView}
+          setMapView={selectCompiledMapView}
           onUndo={() => void history(false)}
           onRedo={() => void history(true)}
           onClassify={(materialSourceId, classificationCommand) => void applyMaterialClassificationCommand(materialSourceId, classificationCommand)}
@@ -2548,13 +2664,14 @@ function SourceCanvas(props: {
         const transformHandle = 10 / viewport.view.scale;
         const rotationInset = 15 / viewport.view.scale;
         const center = { x: (bounds.left + bounds.right) * 0.5, y: (bounds.top + bounds.bottom) * 0.5 };
-        return <g key={patch.id} className={`patch-outline ${active ? "active" : ""} ${pointEditing ? "point-editing" : ""}`} onContextMenu={(event) => openPatchMenu(event, patch)}>
+        const patchInteractionEnabled = canInteractWithPatch(pointEditPatchId, patch.id);
+        return <g key={patch.id} className={`patch-outline ${active ? "active" : ""} ${pointEditing ? "point-editing" : ""}`} style={patchInteractionEnabled ? undefined : { pointerEvents: "none" }} onContextMenu={patchInteractionEnabled ? (event) => openPatchMenu(event, patch) : undefined}>
           <polygon
             points={points}
             style={radialEditing && active ? { pointerEvents: "none" } : undefined}
-            onPointerDown={radialEditing && active ? undefined : (event) => beginPatchMove(event, patch)}
-            onClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); }}
-            onDoubleClick={(event) => { event.stopPropagation(); props.onEditPatch(patch.id); setPointEditPatchId(patch.id); }}
+            onPointerDown={!patchInteractionEnabled || (radialEditing && active) ? undefined : (event) => beginPatchMove(event, patch)}
+            onClick={patchInteractionEnabled ? (event) => { event.stopPropagation(); props.onEditPatch(patch.id); } : undefined}
+            onDoubleClick={patchInteractionEnabled ? (event) => { event.stopPropagation(); props.onEditPatch(patch.id); setPointEditPatchId(patch.id); } : undefined}
           />
           {active && !pointEditing ? <g className="patch-transform">
             <rect className="rotation-guide" x={box.left - rotationInset} y={box.top - rotationInset} width={box.right - box.left + rotationInset * 2} height={box.bottom - box.top + rotationInset * 2} />
@@ -2809,6 +2926,7 @@ function SheetWorkbench(props: {
   setInteractivePreviewProfile: (profile: InteractivePreviewProfile) => void;
   previewProgress: PreviewProgress | null;
   previewElapsedMs: number;
+  exportProgress: NativeStage14ExportProgress | null;
   activity: Activity;
   setResolution: (size: number) => void;
   setAtlasPadding: (paddingPx: number) => void;
@@ -3353,6 +3471,11 @@ function SheetWorkbench(props: {
         <span>{props.previewProgress?.phase === "received" ? "Decoding and painting" : "Compiling, rendering, and encoding"} - {fullResolutionPreviewSeconds.toFixed(1)}s</span>
         <progress aria-label="Full-resolution preview in progress" />
       </div> : null}
+      {props.activity === "exporting" ? <div className="preview-busy-overlay" role="status" aria-live="polite" aria-atomic="true">
+        <strong>Exporting material maps</strong>
+        <span>{props.exportProgress ? `Rendering and encoding ${props.exportProgress.map} - tile ${props.exportProgress.completedTiles}/${Math.max(props.exportProgress.totalTiles, 1)}` : "Compiling, rendering, and encoding"}</span>
+        {props.exportProgress ? <progress aria-label="Material map export in progress" value={props.exportProgress.completedTiles} max={Math.max(props.exportProgress.totalTiles, 1)} /> : <progress aria-label="Material map export in progress" />}
+      </div> : null}
       {workpieceSize ? <div className="viewport-tools">
         <button onClick={() => viewport.zoom(0.8)}>-</button>
         <output>{Math.round(viewport.view.scale * 100)}%</output>
@@ -3820,6 +3943,7 @@ function buildStatus(project: ProjectProjection | null, artifact: IntermediateAt
   if (activity === "importing") return "Importing";
   if (activity === "compiling") return `Compiling revision ${project?.document?.documentRevision ?? 1}`;
   if (activity === "editing") return "Committing layout metadata";
+  if (activity === "exporting") return "Exporting";
   if (problem) return "Region error";
   if (!project?.materialSources.some((source) => source.registeredChannels?.channels.some((channel) => channel.channel === "base_color"))) return "Empty";
   if (!project.document) return "Ready";

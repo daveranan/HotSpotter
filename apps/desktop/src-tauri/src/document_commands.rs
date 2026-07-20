@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -13,15 +13,20 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hot_trimmer_domain::{
     ALGORITHM_STACK_CONTRACT_VERSION, AlgorithmProvenance, AssignmentProvenance,
-    AuthoredLayoutPreset, CancellationToken as EngineCancellationToken, ChannelRegistration,
-    CompilerRequestHeader, ContentDigest, ContentReference, DelightingIntent, ErrorCode,
-    FoundationStatusRequest, IPC_PROTOCOL_VERSION, MaterialBehaviorClass,
+    AuthoredLayoutPreset, CancellationToken as EngineCancellationToken, Channel, ChannelBitDepth,
+    ChannelRegistration, CompilerRequestHeader, ContentDigest, ContentReference, DelightingIntent,
+    ErrorCode, FoundationStatusRequest, IPC_PROTOCOL_VERSION, MaterialBehaviorClass,
     MaterialCalibrationCommand, MaterialCalibrationIntent, MaterialChannelRole,
     MaterialClassificationCommand, MaterialClassificationIntent, MaterialMapKind, NormalConvention,
     OrientedPixelSize, OriginalAssetProvenance, OutputSpecHeader, PartitionRecipe, PatchCommand,
     PatchGeometry, PatchId, PixelBounds, Projection, RegionId, RegisteredChannel,
-    RegisteredChannelSet, SourceId, SourceOwnershipIntent, SourceSetId, TrimSheetDocument,
-    TrimSheetDocumentCommand, UserFacingError,
+    RegisteredChannelSet, RevisionAuthority, SourceId, SourceOwnershipIntent, SourceSetId,
+    TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
+};
+use hot_trimmer_export::{
+    ExportMemoryBudgets, ExportProgress, FitAxis, HOTTRIM_MANIFEST_FILE_NAME, HottrimManifest,
+    HottrimSlot, ManifestExportInput, MapRecord, NormalizedRect, TiledExportError, UvFit,
+    UvFitKind, choose_bounded_tile_edge, manifest_from_template, write_package_manifest,
 };
 use hot_trimmer_image_io::{
     CancellationToken, ColorPolicy, DecodeLimits, InspectedImage, NormalizationSettings,
@@ -34,7 +39,8 @@ use hot_trimmer_material_analysis::{
     scale_orientation_cache_key, source_analysis_cache_key,
 };
 use hot_trimmer_project_store::{
-    ProjectStore, SourceChannel, SourceInput, SourceOwnership, StoreError, StoredSource,
+    ProjectStore, ProjectSummary, SourceChannel, SourceInput, SourceOwnership, StoreError,
+    StoredSource,
 };
 use hot_trimmer_render_core::{
     ExemplarMaskIntent, PlanarArea, PreparedExemplar, PreparedExemplarCache,
@@ -49,7 +55,12 @@ use image::{
     ColorType, ImageEncoder,
     codecs::png::{CompressionType, FilterType, PngEncoder},
 };
+use png::{
+    BitDepth as PngBitDepth, ColorType as PngColorType, Compression as PngCompression,
+    Encoder as PngStreamEncoder, Filter as PngFilter,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
@@ -183,6 +194,10 @@ pub struct PreviewService {
 impl PreviewService {
     fn reset(&self) {
         self.latest_draft_id.fetch_add(1, Ordering::AcqRel);
+        self.clear_cached_outputs();
+    }
+
+    fn clear_cached_outputs(&self) {
         if let Ok(mut cache) = self.source_frame_cache.lock() {
             *cache = hot_trimmer_sheet_compiler::SourceFramePreviewCache::default();
         }
@@ -613,6 +628,49 @@ pub struct Stage14PreviewRequest {
     candidate_recipe: Option<PartitionRecipe>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeStage14ExportRequest {
+    protocol_version: u16,
+    revision: u64,
+    path: String,
+    #[serde(default)]
+    requested_maps: Vec<MaterialMapKind>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeStage14ExportOutput {
+    id: String,
+    map: String,
+    file_name: String,
+    checksum: String,
+    bytes: u64,
+    width: u32,
+    height: u32,
+    pixel_format: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeStage14ExportProjection {
+    path: String,
+    revision: u64,
+    bytes_written: u64,
+    outputs: Vec<NativeStage14ExportOutput>,
+    progress: Vec<ExportProgress>,
+    telemetry: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<ProjectProjection>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeStage14ExportProgressEvent {
+    revision: u64,
+    progress: ExportProgress,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewViewIntent {
@@ -766,7 +824,8 @@ pub struct IntermediateAtlasProjection {
     topology: hot_trimmer_domain::CompiledTemplateTopology,
     placement_plan_id: String,
     maps: BTreeMap<String, String>,
-    tile_manifest: GpuTiledPreviewPublication,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tile_manifest: Option<GpuTiledPreviewPublication>,
     tile_manifests: BTreeMap<String, GpuTiledPreviewPublication>,
     region_id_lookup: Vec<hot_trimmer_sheet_compiler::CompiledCompactRegionIdLookup>,
     regions: Vec<ResolvedRegion>,
@@ -778,6 +837,8 @@ pub struct IntermediateAtlasProjection {
     export_available: bool,
     blender_available: bool,
     source_frame: Option<hot_trimmer_domain::SourceFrame>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<ProjectProjection>,
 }
 
 #[tauri::command]
@@ -1655,6 +1716,28 @@ pub async fn preview_through_stage_14(
     })?
 }
 
+#[tauri::command]
+pub async fn export_stage_14_material_maps(
+    request: NativeStage14ExportRequest,
+    session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
+    app: AppHandle,
+) -> Result<NativeStage14ExportProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    let session = Arc::clone(session.inner());
+    let preview_service = Arc::clone(preview_service.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        export_stage_14_material_maps_impl(&session, &preview_service, request, &app)
+    })
+    .await
+    .map_err(|join| {
+        error(
+            ErrorCode::Internal,
+            &format!("Stage 14 export worker failed: {join}"),
+        )
+    })?
+}
+
 /// Returns cache-owned interactive tile bytes as a Tauri binary IPC response.
 /// The JSON manifest is published separately and contains no pixel transport.
 #[tauri::command]
@@ -2300,27 +2383,1310 @@ fn srgb_to_linear(value: u8) -> f32 {
     }
 }
 
+fn refreshed_stage_14_project_summary(
+    session: &SharedProjectSession,
+    preview_service: &PreviewService,
+) -> Result<(ProjectSummary, bool), UserFacingError> {
+    let mut guard = session.lock().map_err(|_| poisoned())?;
+    let refreshed = {
+        let store = guard.store.as_mut().ok_or_else(no_project)?;
+        store.refresh_document_assets().map_err(store_error)?
+    };
+    if refreshed {
+        preview_service.clear_cached_outputs();
+        guard.mark_mutated();
+    }
+    let summary = guard
+        .store
+        .as_ref()
+        .ok_or_else(no_project)?
+        .summary()
+        .map_err(store_error)?;
+    Ok((summary, refreshed))
+}
+
+fn export_stage_14_material_maps_impl(
+    session: &SharedProjectSession,
+    preview_service: &PreviewService,
+    request: NativeStage14ExportRequest,
+    app: &AppHandle,
+) -> Result<NativeStage14ExportProjection, UserFacingError> {
+    let final_path = PathBuf::from(&request.path);
+    if final_path.as_os_str().is_empty() {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Choose an export destination.",
+        ));
+    }
+    let (mut summary, refreshed_document_assets) =
+        refreshed_stage_14_project_summary(session, preview_service)?;
+    let document = summary
+        .document
+        .as_ref()
+        .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?
+        .clone();
+    let accepted_revision = document.document_revision;
+    let accepted_refreshed_revision =
+        refreshed_document_assets && accepted_revision == request.revision.saturating_add(1);
+    if accepted_revision != request.revision && !accepted_refreshed_revision {
+        return Err(error(
+            ErrorCode::OperationCancelled,
+            "A newer document revision superseded this export.",
+        ));
+    }
+    let requested_maps = if request.requested_maps.is_empty() {
+        native_export_enabled_maps(&document)
+    } else {
+        request.requested_maps
+    };
+    let mut unique_maps = Vec::with_capacity(requested_maps.len());
+    for map in requested_maps {
+        if !unique_maps.contains(&map) {
+            unique_maps.push(map);
+        }
+    }
+    if unique_maps.is_empty() {
+        unique_maps.push(MaterialMapKind::BaseColor);
+    }
+    summary.document = Some(document.clone());
+    let full_rect = OutputPixelRect(PixelBounds {
+        x: 0,
+        y: 0,
+        width: document.render_settings.output_size.width,
+        height: document.render_settings.output_size.height,
+    });
+    let gpu = preview_service
+        .gpu_capabilities
+        .initialize()
+        .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
+    let tile_edge = native_export_tile_edge(full_rect, gpu.capabilities()).map_err(export_error)?;
+    let planned_tiles = native_export_planned_tiles(full_rect, tile_edge, &unique_maps);
+    let job = preview_service
+        .latest_draft_id
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    let revision_current = AtomicBool::new(true);
+    let monitoring_complete = AtomicBool::new(false);
+    let cancellation = EngineCancellationToken::new();
+    let revisions = RevisionAuthority::new(accepted_revision);
+    let export_token = EngineCancellationToken::new();
+    let mut telemetry = Vec::new();
+    let package = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !monitoring_complete.load(Ordering::Acquire) {
+                let live = session
+                    .lock()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .store
+                            .as_ref()?
+                            .summary()
+                            .ok()?
+                            .document
+                            .map(|document| document.document_revision == accepted_revision)
+                    })
+                    .unwrap_or(false);
+                if !live {
+                    revision_current.store(false, Ordering::Release);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let result = (|| {
+            let mut writer = begin_native_stage14_export_package(
+                &final_path,
+                accepted_revision,
+                revisions.clone(),
+                &export_token,
+                &document,
+                full_rect,
+                &unique_maps,
+                &planned_tiles,
+            )?;
+            let gpu_executor = hot_trimmer_sheet_compiler::GpuAtlasRenderExecutor {
+                service: &preview_service.gpu_capabilities,
+                source_texture_cache: &preview_service.gpu_source_cache,
+            };
+            let current = || {
+                let live = preview_service.latest_draft_id.load(Ordering::Acquire) == job
+                    && revision_current.load(Ordering::Acquire);
+                if !live {
+                    revisions.supersede_with(accepted_revision.saturating_add(1));
+                    export_token.cancel();
+                    cancellation.cancel();
+                }
+                live
+            };
+            for planned_rect in native_export_unique_rects(&planned_tiles) {
+                ensure_native_export_current(&export_token, &current)?;
+                let artifact = AlgorithmCompiler::new()
+                    .compile_persisted_stage_14_preview_with_cache_and_executor(
+                        hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                            project: &summary,
+                            revision: accepted_revision,
+                            draft_id: Some(job),
+                            input_hash: Some(format!(
+                                "native-export:{}:{}:{}:{}",
+                                planned_rect.0.x,
+                                planned_rect.0.y,
+                                planned_rect.0.width,
+                                planned_rect.0.height
+                            )),
+                            profile:
+                                hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+                            view_intent: Some(
+                                hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewportMaterialMaps {
+                                    rect: planned_rect,
+                                    maps: unique_maps.clone(),
+                                },
+                            ),
+                        },
+                        &cancellation,
+                        || {
+                            preview_service.latest_draft_id.load(Ordering::Acquire) == job
+                                && revision_current.load(Ordering::Acquire)
+                        },
+                        Some(&preview_service.source_frame_cache),
+                        Some(&gpu_executor),
+                    )
+                    .map_err(|failure| TiledExportError::GpuValidation(failure.to_string()))?;
+                telemetry.extend(artifact.telemetry);
+                for map in &unique_maps {
+                    let planned = planned_tiles
+                        .iter()
+                        .find(|tile| tile.map == *map && tile.rect == planned_rect)
+                        .ok_or_else(|| {
+                            TiledExportError::Encoder(format!(
+                                "missing planned native export tile for {map:?}"
+                            ))
+                        })?;
+                    let tile = artifact.rendered_tiles.get(map).ok_or_else(|| {
+                        TiledExportError::Readback(format!(
+                            "The GPU export did not publish the requested {map:?} map."
+                        ))
+                    })?;
+                    let progress = writer.write_tile(
+                        &planned.id,
+                        NativeExportTile {
+                            map: *map,
+                            manifest: &tile.manifest,
+                            pixels: tile.pixels(),
+                        },
+                        &export_token,
+                        &current,
+                    )?;
+                    emit_native_stage14_export_progress(app, accepted_revision, &progress);
+                }
+            }
+            let mut emit_progress = |progress: &ExportProgress| {
+                emit_native_stage14_export_progress(app, accepted_revision, progress);
+            };
+            writer.finish(&export_token, &current, &document, &mut emit_progress)
+        })();
+        monitoring_complete.store(true, Ordering::Release);
+        result
+    })
+    .map_err(export_error)?;
+    let output_count = package.outputs.len();
+    let refreshed_project = if refreshed_document_assets {
+        let guard = session.lock().map_err(|_| poisoned())?;
+        Some(project_projection(&guard)?)
+    } else {
+        None
+    };
+    Ok(NativeStage14ExportProjection {
+        path: final_path.display().to_string(),
+        revision: accepted_revision,
+        bytes_written: package.bytes_written,
+        outputs: package.outputs,
+        progress: package.progress,
+        telemetry: telemetry
+            .into_iter()
+            .chain([format!(
+                "native_export_bytes={}; native_export_outputs={}; native_export_tile_edge={}; native_export_format=hot-trimmer-package-v1",
+                package.bytes_written, output_count, tile_edge
+            )])
+            .collect(),
+        project: refreshed_project,
+    })
+}
+
+struct NativeExportTile<'a> {
+    map: MaterialMapKind,
+    manifest: &'a CompiledAtlasTileManifest,
+    pixels: &'a [u8],
+}
+
+#[derive(Clone, Debug)]
+struct NativeExportPlannedTile {
+    id: String,
+    map: MaterialMapKind,
+    rect: OutputPixelRect,
+}
+
+#[derive(Debug)]
+struct NativeExportPackageResult {
+    bytes_written: u64,
+    outputs: Vec<NativeStage14ExportOutput>,
+    progress: Vec<ExportProgress>,
+}
+
+struct NativeExportPackageWriter {
+    final_path: PathBuf,
+    temporary_path: PathBuf,
+    revisions: RevisionAuthority,
+    expected_revision: u64,
+    maps: BTreeMap<MaterialMapKind, NativeExportMapWriter>,
+    progress: Vec<ExportProgress>,
+    total_tiles: u32,
+    completed_tiles: u32,
+    finalized: bool,
+}
+
+struct NativeExportPackageInitGuard {
+    path: PathBuf,
+    active: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeExportPixelLayout {
+    bit_depth: u8,
+    source_bytes_per_pixel: usize,
+    output_bytes_per_pixel: usize,
+    png_color_type: PngColorType,
+    png_bit_depth: PngBitDepth,
+    pixel_format: &'static str,
+}
+
+struct NativeExportMapWriter {
+    map: MaterialMapKind,
+    file_name: String,
+    spool_path: PathBuf,
+    spool: Option<File>,
+    width: u32,
+    height: u32,
+    layout: NativeExportPixelLayout,
+    color_space: String,
+    region_id_palette: BTreeMap<u32, [u8; 4]>,
+}
+
+fn native_export_enabled_maps(document: &TrimSheetDocument) -> Vec<MaterialMapKind> {
+    let ordered = [
+        (Channel::BaseColor, MaterialMapKind::BaseColor),
+        (Channel::Height, MaterialMapKind::Height),
+        (Channel::Normal, MaterialMapKind::Normal),
+        (Channel::Roughness, MaterialMapKind::Roughness),
+        (Channel::Metallic, MaterialMapKind::Metallic),
+        (Channel::AmbientOcclusion, MaterialMapKind::AmbientOcclusion),
+        (Channel::RegionId, MaterialMapKind::RegionId),
+    ];
+    let requested = ordered
+        .into_iter()
+        .filter_map(|(channel, map)| {
+            document
+                .render_settings
+                .channels
+                .get(&channel)
+                .is_some_and(|policy| policy.enabled)
+                .then_some(map)
+        })
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        vec![MaterialMapKind::BaseColor]
+    } else {
+        requested
+    }
+}
+
+fn native_export_tile_edge(
+    full_rect: OutputPixelRect,
+    caps: &hot_trimmer_preview::GpuCapabilityRecord,
+) -> Result<u32, TiledExportError> {
+    let budgets = ExportMemoryBudgets::default();
+    let concurrency = budgets.total_in_flight_tiles.max(1);
+    choose_bounded_tile_edge(
+        full_rect.0.width.max(full_rect.0.height),
+        caps.maximum_texture_dimension_2d,
+        4,
+        2,
+        budgets
+            .gpu_output_intermediate_residency_bytes
+            .min(budgets.staging_buffers_bytes)
+            / u64::from(concurrency),
+        caps.copy_bytes_per_row_alignment,
+    )
+}
+
+fn native_export_planned_tiles(
+    full_rect: OutputPixelRect,
+    tile_edge: u32,
+    maps: &[MaterialMapKind],
+) -> Vec<NativeExportPlannedTile> {
+    let mut planned = Vec::new();
+    let tile_edge = tile_edge.max(1);
+    let right = full_rect.0.x.saturating_add(full_rect.0.width);
+    let bottom = full_rect.0.y.saturating_add(full_rect.0.height);
+    let mut y = full_rect.0.y;
+    while y < bottom {
+        let height = tile_edge.min(bottom - y);
+        let mut x = full_rect.0.x;
+        while x < right {
+            let width = tile_edge.min(right - x);
+            let rect = OutputPixelRect(PixelBounds {
+                x,
+                y,
+                width,
+                height,
+            });
+            for map in maps {
+                planned.push(NativeExportPlannedTile {
+                    id: native_export_output_id(*map, rect),
+                    map: *map,
+                    rect,
+                });
+            }
+            x = x.saturating_add(width);
+        }
+        y = y.saturating_add(height);
+    }
+    planned
+}
+
+fn native_export_unique_rects(planned_tiles: &[NativeExportPlannedTile]) -> Vec<OutputPixelRect> {
+    let mut rects = Vec::new();
+    for tile in planned_tiles {
+        if !rects.contains(&tile.rect) {
+            rects.push(tile.rect);
+        }
+    }
+    rects
+}
+
+fn native_export_output_id(map: MaterialMapKind, rect: OutputPixelRect) -> String {
+    format!(
+        "{}@{},{}-{}x{}",
+        material_map_view_key(map),
+        rect.0.x,
+        rect.0.y,
+        rect.0.width,
+        rect.0.height
+    )
+}
+
+fn begin_native_stage14_export_package(
+    final_path: &Path,
+    revision: u64,
+    revisions: RevisionAuthority,
+    cancellation: &EngineCancellationToken,
+    document: &TrimSheetDocument,
+    full_rect: OutputPixelRect,
+    maps: &[MaterialMapKind],
+    planned_tiles: &[NativeExportPlannedTile],
+) -> Result<NativeExportPackageWriter, TiledExportError> {
+    if planned_tiles.is_empty() {
+        return Err(TiledExportError::InvalidRequest(
+            "native Stage 14 export requires at least one GPU map tile".into(),
+        ));
+    }
+    let temporary_path = native_export_temporary_package_path(final_path);
+    let _ = fs::remove_dir_all(&temporary_path);
+    fs::create_dir_all(temporary_path.join("maps"))?;
+    let mut init_guard = NativeExportPackageInitGuard {
+        path: temporary_path,
+        active: true,
+    };
+    let region_id_palette = native_export_region_id_palette(document);
+    let mut map_buffers = BTreeMap::new();
+    for map in maps {
+        map_buffers.insert(
+            *map,
+            NativeExportMapWriter::new(
+                *map,
+                document,
+                &init_guard.path,
+                full_rect.0.width,
+                full_rect.0.height,
+                &region_id_palette,
+            )?,
+        );
+    }
+    if cancellation.is_cancelled() {
+        return Err(TiledExportError::Cancelled);
+    }
+    let temporary_path = init_guard.disarm();
+    Ok(NativeExportPackageWriter {
+        final_path: final_path.to_path_buf(),
+        temporary_path,
+        revisions,
+        expected_revision: revision,
+        maps: map_buffers,
+        progress: Vec::new(),
+        total_tiles: planned_tiles.len() as u32,
+        completed_tiles: 0,
+        finalized: false,
+    })
+}
+
+impl NativeExportPackageInitGuard {
+    fn disarm(&mut self) -> PathBuf {
+        self.active = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for NativeExportPackageInitGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn emit_native_stage14_export_progress(app: &AppHandle, revision: u64, progress: &ExportProgress) {
+    let _ = app.emit(
+        "stage-14-export-progress",
+        NativeStage14ExportProgressEvent {
+            revision,
+            progress: progress.clone(),
+        },
+    );
+}
+
+impl NativeExportPackageWriter {
+    fn write_tile(
+        &mut self,
+        output_id: &str,
+        tile: NativeExportTile<'_>,
+        cancellation: &EngineCancellationToken,
+        is_current: &impl Fn() -> bool,
+    ) -> Result<ExportProgress, TiledExportError> {
+        ensure_native_export_current(cancellation, is_current)?;
+        let map = self.maps.get_mut(&tile.map).ok_or_else(|| {
+            TiledExportError::Encoder(format!(
+                "missing final map buffer for native export tile {output_id}"
+            ))
+        })?;
+        map.blit_valid_tile(&tile)?;
+        self.completed_tiles = self.completed_tiles.saturating_add(1);
+        let progress = ExportProgress {
+            map: material_map_view_key(tile.map).to_owned(),
+            mip_level: tile.manifest.mip_level,
+            completed_tiles: self.completed_tiles,
+            total_tiles: self.total_tiles,
+            render_ms: 0,
+            readback_ms: 0,
+            encode_ms: 0,
+            bytes_written: 0,
+            estimated_remaining_tiles: self.total_tiles.saturating_sub(self.completed_tiles),
+        };
+        self.progress.push(progress.clone());
+        Ok(progress)
+    }
+
+    fn finish(
+        mut self,
+        cancellation: &EngineCancellationToken,
+        is_current: &impl Fn() -> bool,
+        document: &TrimSheetDocument,
+        progress_sink: &mut dyn FnMut(&ExportProgress),
+    ) -> Result<NativeExportPackageResult, TiledExportError> {
+        ensure_native_export_current(cancellation, is_current)?;
+        if self.revisions.current() != self.expected_revision {
+            return Err(TiledExportError::StaleRevision);
+        }
+        let mut outputs = Vec::new();
+        let mut records = BTreeMap::new();
+        let mut bytes_written = 0_u64;
+        for map in self.maps.values_mut() {
+            ensure_native_export_current(cancellation, is_current)?;
+            let finalize_started = Instant::now();
+            let file_path = Path::new("maps").join(&map.file_name);
+            let absolute_path = self.temporary_path.join(&file_path);
+            map.encode_png_to_file(&absolute_path, cancellation, is_current)?;
+            map.close_and_remove_spool();
+            let (encoded_bytes, checksum) = checksum_file(&absolute_path)?;
+            bytes_written = bytes_written.saturating_add(encoded_bytes);
+            let progress = ExportProgress {
+                map: material_map_view_key(map.map).to_owned(),
+                mip_level: 0,
+                completed_tiles: self.total_tiles,
+                total_tiles: self.total_tiles,
+                render_ms: 0,
+                readback_ms: 0,
+                encode_ms: finalize_started.elapsed().as_millis(),
+                bytes_written: encoded_bytes,
+                estimated_remaining_tiles: 0,
+            };
+            progress_sink(&progress);
+            self.progress.push(progress);
+            let relative_path = file_path.to_string_lossy().replace('\\', "/");
+            records.insert(
+                material_map_view_key(map.map).to_owned(),
+                MapRecord {
+                    role: material_map_view_key(map.map).to_owned(),
+                    relative_path: relative_path.clone(),
+                    dimensions: [map.width, map.height],
+                    bit_depth: map.layout.bit_depth,
+                    color_space: map.color_space.clone(),
+                    checksum: checksum.clone(),
+                },
+            );
+            outputs.push(NativeStage14ExportOutput {
+                id: material_map_view_key(map.map).to_owned(),
+                map: material_map_view_key(map.map).to_owned(),
+                file_name: relative_path,
+                checksum,
+                bytes: encoded_bytes,
+                width: map.width,
+                height: map.height,
+                pixel_format: map.layout.pixel_format.to_owned(),
+            });
+        }
+        let manifest = native_export_manifest_from_document(document, records)?;
+        write_package_manifest(&self.temporary_path, &manifest)
+            .map_err(|failure| TiledExportError::Encoder(failure.to_string()))?;
+        bytes_written = bytes_written.saturating_add(
+            fs::metadata(self.temporary_path.join(HOTTRIM_MANIFEST_FILE_NAME))?.len(),
+        );
+        ensure_native_export_current(cancellation, is_current)?;
+        if self.revisions.current() != self.expected_revision {
+            return Err(TiledExportError::StaleRevision);
+        }
+        if self.final_path.exists() {
+            return Err(TiledExportError::InvalidRequest(format!(
+                "export package destination already exists: {}",
+                self.final_path.display()
+            )));
+        }
+        fs::rename(&self.temporary_path, &self.final_path)?;
+        self.finalized = true;
+        let progress = std::mem::take(&mut self.progress);
+        Ok(NativeExportPackageResult {
+            bytes_written,
+            outputs,
+            progress,
+        })
+    }
+}
+
+impl Drop for NativeExportPackageWriter {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _ = fs::remove_dir_all(&self.temporary_path);
+        }
+    }
+}
+
+#[cfg(test)]
+fn write_native_stage14_export_package(
+    final_path: &Path,
+    revision: u64,
+    revisions: RevisionAuthority,
+    cancellation: &EngineCancellationToken,
+    document: &TrimSheetDocument,
+    tiles: Vec<NativeExportTile<'_>>,
+    is_current: impl Fn() -> bool,
+) -> Result<NativeExportPackageResult, TiledExportError> {
+    let planned_tiles = tiles
+        .iter()
+        .map(|tile| NativeExportPlannedTile {
+            id: native_export_output_id(tile.map, tile.manifest.valid_rect),
+            map: tile.map,
+            rect: tile.manifest.valid_rect,
+        })
+        .collect::<Vec<_>>();
+    let full_rect = OutputPixelRect(PixelBounds {
+        x: 0,
+        y: 0,
+        width: document.render_settings.output_size.width,
+        height: document.render_settings.output_size.height,
+    });
+    let maps = tiles.iter().map(|tile| tile.map).collect::<Vec<_>>();
+    let mut writer = begin_native_stage14_export_package(
+        final_path,
+        revision,
+        revisions,
+        cancellation,
+        document,
+        full_rect,
+        &maps,
+        &planned_tiles,
+    )?;
+    ensure_native_export_current(cancellation, &is_current)?;
+    for (tile, planned) in tiles.into_iter().zip(planned_tiles.iter()) {
+        writer.write_tile(&planned.id, tile, cancellation, &is_current)?;
+    }
+    let mut ignore_progress = |_progress: &ExportProgress| {};
+    writer.finish(cancellation, &is_current, document, &mut ignore_progress)
+}
+
+impl NativeExportMapWriter {
+    fn new(
+        map: MaterialMapKind,
+        document: &TrimSheetDocument,
+        package_path: &Path,
+        width: u32,
+        height: u32,
+        region_id_palette: &BTreeMap<u32, [u8; 4]>,
+    ) -> Result<Self, TiledExportError> {
+        let layout = native_export_pixel_layout(document, map)?;
+        let len = usize::try_from(
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(layout.output_bytes_per_pixel as u64),
+        )
+        .map_err(|_| TiledExportError::OutOfMemory("final map spool is too large".into()))?;
+        let spool_path = package_path.join(format!(".{}.raw", native_export_map_file_stem(map)));
+        let spool = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&spool_path)?;
+        spool.set_len(len as u64)?;
+        Ok(Self {
+            map,
+            file_name: native_export_map_file_name(map),
+            spool_path,
+            spool: Some(spool),
+            width,
+            height,
+            layout,
+            color_space: native_export_color_space(map).to_owned(),
+            region_id_palette: region_id_palette.clone(),
+        })
+    }
+
+    fn blit_valid_tile(&mut self, tile: &NativeExportTile<'_>) -> Result<u64, TiledExportError> {
+        let valid = tile.manifest.valid_rect.0;
+        let output = tile.manifest.output_rect.0;
+        if valid.x.saturating_add(valid.width) > self.width
+            || valid.y.saturating_add(valid.height) > self.height
+            || valid.x < output.x
+            || valid.y < output.y
+        {
+            return Err(TiledExportError::Encoder(format!(
+                "tile {} has invalid export bounds",
+                native_export_output_id(tile.map, tile.manifest.valid_rect)
+            )));
+        }
+        let src_x = valid.x - output.x;
+        let src_y = valid.y - output.y;
+        let row_stride = usize::try_from(tile.manifest.row_stride)
+            .map_err(|_| TiledExportError::Encoder("tile row stride is too large".into()))?;
+        let expected = row_stride
+            .checked_mul(
+                usize::try_from(tile.manifest.height)
+                    .map_err(|_| TiledExportError::Encoder("tile height is too large".into()))?,
+            )
+            .ok_or_else(|| TiledExportError::Encoder("tile payload size overflows".into()))?;
+        if tile.pixels.len() != expected {
+            return Err(TiledExportError::Encoder(
+                "tile payload does not match its manifest dimensions".into(),
+            ));
+        }
+        if tile.manifest.pixel_format != native_export_source_pixel_format(self.map) {
+            return Err(TiledExportError::Encoder(format!(
+                "tile {:?} has pixel format {:?}, but native export expects {:?}",
+                self.map,
+                tile.manifest.pixel_format,
+                native_export_source_pixel_format(self.map)
+            )));
+        }
+        let row_len = usize::try_from(
+            u64::from(valid.width).saturating_mul(self.layout.output_bytes_per_pixel as u64),
+        )
+        .map_err(|_| TiledExportError::Encoder("final map row size overflows".into()))?;
+        let mut row = vec![0; row_len];
+        for y in 0..valid.height {
+            row.fill(0);
+            for x in 0..valid.width {
+                let source_index = usize::try_from(
+                    u64::from(src_y + y)
+                        .saturating_mul(u64::from(tile.manifest.row_stride))
+                        .saturating_add(
+                            u64::from(src_x + x)
+                                .saturating_mul(self.layout.source_bytes_per_pixel as u64),
+                        ),
+                )
+                .map_err(|_| TiledExportError::Encoder("tile source offset overflows".into()))?;
+                let destination_index = usize::try_from(
+                    u64::from(x).saturating_mul(self.layout.output_bytes_per_pixel as u64),
+                )
+                .map_err(|_| TiledExportError::Encoder("final map row offset overflows".into()))?;
+                let source_end = source_index
+                    .checked_add(self.layout.source_bytes_per_pixel)
+                    .ok_or_else(|| {
+                        TiledExportError::Encoder("tile source offset overflows".into())
+                    })?;
+                self.write_converted_pixel(
+                    &tile.pixels[source_index..source_end],
+                    &mut row
+                        [destination_index..destination_index + self.layout.output_bytes_per_pixel],
+                )?;
+            }
+            let destination_row_offset = u64::from(valid.y + y)
+                .saturating_mul(u64::from(self.width))
+                .saturating_add(u64::from(valid.x))
+                .saturating_mul(self.layout.output_bytes_per_pixel as u64);
+            let spool = self.spool_mut()?;
+            spool.seek(SeekFrom::Start(destination_row_offset))?;
+            spool.write_all(&row)?;
+        }
+        Ok(u64::from(valid.width)
+            .saturating_mul(u64::from(valid.height))
+            .saturating_mul(self.layout.output_bytes_per_pixel as u64))
+    }
+
+    fn write_converted_pixel(
+        &self,
+        source: &[u8],
+        destination: &mut [u8],
+    ) -> Result<(), TiledExportError> {
+        match self.map {
+            MaterialMapKind::BaseColor | MaterialMapKind::Normal => {
+                destination.copy_from_slice(source);
+            }
+            MaterialMapKind::RegionId => {
+                let compact_index = u32::from_le_bytes(source.try_into().map_err(|_| {
+                    TiledExportError::Encoder("region ID source sample is malformed".into())
+                })?);
+                let color = if compact_index == u32::MAX {
+                    [0, 0, 0, 0]
+                } else {
+                    self.region_id_palette
+                        .get(&compact_index)
+                        .copied()
+                        .unwrap_or([0, 0, 0, 0])
+                };
+                destination.copy_from_slice(&color);
+            }
+            MaterialMapKind::Height
+            | MaterialMapKind::Roughness
+            | MaterialMapKind::Metallic
+            | MaterialMapKind::AmbientOcclusion => {
+                let value = f32::from_le_bytes(source.try_into().map_err(|_| {
+                    TiledExportError::Encoder("scalar source sample is malformed".into())
+                })?);
+                if self.layout.bit_depth == 8 {
+                    destination[0] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                } else {
+                    let encoded = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                    destination.copy_from_slice(&encoded.to_be_bytes());
+                }
+            }
+            MaterialMapKind::Specular
+            | MaterialMapKind::Opacity
+            | MaterialMapKind::EdgeMask
+            | MaterialMapKind::MaterialId => {
+                return Err(TiledExportError::UnsupportedFeatureOrFormat(format!(
+                    "unsupported native export conversion for {:?}",
+                    self.map
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_png_to_file(
+        &mut self,
+        path: &Path,
+        cancellation: &EngineCancellationToken,
+        is_current: &impl Fn() -> bool,
+    ) -> Result<(), TiledExportError> {
+        let spool = self.spool_mut()?;
+        spool.flush()?;
+        spool.seek(SeekFrom::Start(0))?;
+        let file = File::create(path)?;
+        let output = BufWriter::new(file);
+        let mut encoder = PngStreamEncoder::new(output, self.width, self.height);
+        encoder.set_color(self.layout.png_color_type);
+        encoder.set_depth(self.layout.png_bit_depth);
+        encoder.set_compression(PngCompression::Fast);
+        encoder.set_filter(PngFilter::Sub);
+        let mut header = encoder
+            .write_header()
+            .map_err(|failure| TiledExportError::Encoder(failure.to_string()))?;
+        let mut writer = header
+            .stream_writer()
+            .map_err(|failure| TiledExportError::Encoder(failure.to_string()))?;
+        let row_len = usize::try_from(
+            u64::from(self.width).saturating_mul(self.layout.output_bytes_per_pixel as u64),
+        )
+        .map_err(|_| TiledExportError::Encoder("final PNG row size overflows".into()))?;
+        let mut row = vec![0; row_len];
+        for _ in 0..self.height {
+            ensure_native_export_current(cancellation, is_current)?;
+            self.spool_mut()?.read_exact(&mut row)?;
+            writer
+                .write_all(&row)
+                .map_err(|failure| TiledExportError::Encoder(failure.to_string()))?;
+        }
+        ensure_native_export_current(cancellation, is_current)?;
+        writer
+            .finish()
+            .map_err(|failure| TiledExportError::Encoder(failure.to_string()))?;
+        Ok(())
+    }
+
+    fn close_and_remove_spool(&mut self) {
+        let _ = self.spool.take();
+        let _ = fs::remove_file(&self.spool_path);
+    }
+
+    fn spool_mut(&mut self) -> Result<&mut File, TiledExportError> {
+        self.spool.as_mut().ok_or_else(|| {
+            TiledExportError::Encoder(format!(
+                "native export spool for {:?} is already closed",
+                self.map
+            ))
+        })
+    }
+}
+
+impl Drop for NativeExportMapWriter {
+    fn drop(&mut self) {
+        let _ = self.spool.take();
+        let _ = fs::remove_file(&self.spool_path);
+    }
+}
+
+fn native_export_pixel_layout(
+    document: &TrimSheetDocument,
+    map: MaterialMapKind,
+) -> Result<NativeExportPixelLayout, TiledExportError> {
+    let bit_depth = native_export_bit_depth(document, map)?;
+    let layout = match map {
+        MaterialMapKind::BaseColor => NativeExportPixelLayout {
+            bit_depth: 8,
+            source_bytes_per_pixel: 4,
+            output_bytes_per_pixel: 4,
+            png_color_type: PngColorType::Rgba,
+            png_bit_depth: PngBitDepth::Eight,
+            pixel_format: "PNG RGBA8 sRGB",
+        },
+        MaterialMapKind::Normal => {
+            if bit_depth == 16 {
+                return Err(TiledExportError::UnsupportedFeatureOrFormat(
+                    "Normal requests 16-bit output, but the current GPU normal pass publishes RGBA8; 16-bit Normal export requires a true 16-bit render/readback target".into(),
+                ));
+            }
+            NativeExportPixelLayout {
+                bit_depth: 8,
+                source_bytes_per_pixel: 4,
+                output_bytes_per_pixel: 4,
+                png_color_type: PngColorType::Rgba,
+                png_bit_depth: PngBitDepth::Eight,
+                pixel_format: "PNG RGBA8 linear",
+            }
+        }
+        MaterialMapKind::RegionId => NativeExportPixelLayout {
+            bit_depth: 8,
+            source_bytes_per_pixel: 4,
+            output_bytes_per_pixel: 4,
+            png_color_type: PngColorType::Rgba,
+            png_bit_depth: PngBitDepth::Eight,
+            pixel_format: "PNG RGBA8 categorical",
+        },
+        MaterialMapKind::Height
+        | MaterialMapKind::Roughness
+        | MaterialMapKind::Metallic
+        | MaterialMapKind::AmbientOcclusion => {
+            if bit_depth == 8 {
+                NativeExportPixelLayout {
+                    bit_depth: 8,
+                    source_bytes_per_pixel: 4,
+                    output_bytes_per_pixel: 1,
+                    png_color_type: PngColorType::Grayscale,
+                    png_bit_depth: PngBitDepth::Eight,
+                    pixel_format: "PNG L8 linear",
+                }
+            } else {
+                NativeExportPixelLayout {
+                    bit_depth: 16,
+                    source_bytes_per_pixel: 4,
+                    output_bytes_per_pixel: 2,
+                    png_color_type: PngColorType::Grayscale,
+                    png_bit_depth: PngBitDepth::Sixteen,
+                    pixel_format: "PNG L16 linear",
+                }
+            }
+        }
+        MaterialMapKind::Specular
+        | MaterialMapKind::Opacity
+        | MaterialMapKind::EdgeMask
+        | MaterialMapKind::MaterialId => {
+            return Err(TiledExportError::UnsupportedFeatureOrFormat(format!(
+                "{map:?} is not currently supported by the native GPU export encoder"
+            )));
+        }
+    };
+    Ok(layout)
+}
+
+fn native_export_source_pixel_format(
+    map: MaterialMapKind,
+) -> hot_trimmer_sheet_compiler::CompiledTilePixelFormat {
+    match map {
+        MaterialMapKind::BaseColor => {
+            hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormSrgb
+        }
+        MaterialMapKind::Height
+        | MaterialMapKind::Roughness
+        | MaterialMapKind::Metallic
+        | MaterialMapKind::AmbientOcclusion => {
+            hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Float
+        }
+        MaterialMapKind::RegionId => hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Uint,
+        _ => hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear,
+    }
+}
+
+fn native_export_region_id_palette(document: &TrimSheetDocument) -> BTreeMap<u32, [u8; 4]> {
+    document
+        .topology
+        .regions
+        .iter()
+        .enumerate()
+        .map(|(index, region)| {
+            let [red, green, blue] = region.id_color.0;
+            (index as u32, [red, green, blue, 255])
+        })
+        .collect()
+}
+
+fn checksum_file(path: &Path) -> Result<(u64, String), TiledExportError> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total = total.saturating_add(read as u64);
+    }
+    let digest = hasher.finalize();
+    Ok((
+        total,
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    ))
+}
+
+fn native_export_temporary_package_path(final_path: &Path) -> PathBuf {
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export.hottrim");
+    final_path.with_file_name(format!(".{file_name}.tmp-{}", Uuid::new_v4()))
+}
+
+fn native_export_map_file_name(map: MaterialMapKind) -> String {
+    format!("{}.png", native_export_map_file_stem(map))
+}
+
+fn native_export_map_file_stem(map: MaterialMapKind) -> &'static str {
+    match map {
+        MaterialMapKind::BaseColor => "base_color",
+        MaterialMapKind::Normal => "normal",
+        MaterialMapKind::Height => "height",
+        MaterialMapKind::Roughness => "roughness",
+        MaterialMapKind::Metallic => "metallic",
+        MaterialMapKind::AmbientOcclusion => "ambient_occlusion",
+        MaterialMapKind::RegionId => "region_id",
+        MaterialMapKind::MaterialId => "material_id",
+        MaterialMapKind::Specular => "specular",
+        MaterialMapKind::Opacity => "opacity",
+        MaterialMapKind::EdgeMask => "edge_mask",
+    }
+}
+
+fn native_export_color_space(map: MaterialMapKind) -> &'static str {
+    match map {
+        MaterialMapKind::BaseColor => "sRGB",
+        MaterialMapKind::RegionId | MaterialMapKind::MaterialId => "categorical",
+        _ => "linear",
+    }
+}
+
+fn native_export_bit_depth(
+    document: &TrimSheetDocument,
+    map: MaterialMapKind,
+) -> Result<u8, TiledExportError> {
+    let channel = match map {
+        MaterialMapKind::BaseColor => Channel::BaseColor,
+        MaterialMapKind::Normal => Channel::Normal,
+        MaterialMapKind::Height => Channel::Height,
+        MaterialMapKind::Roughness => Channel::Roughness,
+        MaterialMapKind::Metallic => Channel::Metallic,
+        MaterialMapKind::AmbientOcclusion => Channel::AmbientOcclusion,
+        MaterialMapKind::RegionId => Channel::RegionId,
+        MaterialMapKind::MaterialId => Channel::MaterialId,
+        MaterialMapKind::Specular | MaterialMapKind::Opacity | MaterialMapKind::EdgeMask => {
+            return Ok(8);
+        }
+    };
+    let bit_depth = match document
+        .render_settings
+        .channels
+        .get(&channel)
+        .map(|policy| policy.bit_depth)
+    {
+        Some(ChannelBitDepth::Eight) => 8,
+        Some(ChannelBitDepth::ThirtyTwoFloat) => {
+            return Err(TiledExportError::UnsupportedFeatureOrFormat(format!(
+                "{map:?} requests 32-bit float output, but the native package encoder currently supports PNG 8-bit and 16-bit material maps"
+            )));
+        }
+        Some(ChannelBitDepth::Sixteen) | None => {
+            if matches!(map, MaterialMapKind::BaseColor | MaterialMapKind::RegionId) {
+                8
+            } else {
+                16
+            }
+        }
+    };
+    Ok(bit_depth)
+}
+
+fn native_export_manifest_from_document(
+    document: &TrimSheetDocument,
+    maps: BTreeMap<String, MapRecord>,
+) -> Result<HottrimManifest, TiledExportError> {
+    let material_id = document
+        .primary_material
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| document.id.to_string());
+    let material_name = document
+        .primary_material
+        .and_then(|id| document.materials.iter().find(|material| material.id == id))
+        .map_or_else(
+            || "Hot Trimmer Material".to_owned(),
+            |material| material.name.clone(),
+        );
+    let input = ManifestExportInput {
+        project_id: document.id.to_string(),
+        material_id,
+        material_name,
+        material_revision: document.document_revision,
+        output_size: [
+            document.render_settings.output_size.width,
+            document.render_settings.output_size.height,
+        ],
+        normal_orientation: "OpenGL".to_owned(),
+        maps,
+    };
+    if let Some(snapshot) = document.topology.snapshot.template.as_ref() {
+        let definition: hot_trimmer_domain::TemplateDefinition =
+            serde_json::from_str(&snapshot.snapshot_json)
+                .map_err(|failure| TiledExportError::Encoder(failure.to_string()))?;
+        return manifest_from_template(&definition, input)
+            .map_err(|failure| TiledExportError::Encoder(failure.to_string()));
+    }
+    Ok(HottrimManifest {
+        schema_version: 1,
+        project_id: input.project_id,
+        material_id: input.material_id,
+        material_name: input.material_name,
+        material_revision: input.material_revision,
+        template_id: "source-frame".to_owned(),
+        template_version: document.partition_provenance.as_ref().map_or_else(
+            || "authored".to_owned(),
+            |value| value.recipe.recipe_version.to_string(),
+        ),
+        compatibility_key: document.topology.compatibility_key.clone(),
+        template_snapshot_hash: hash_hex(document.topology.topology_hash),
+        output_size: input.output_size,
+        normal_orientation: input.normal_orientation,
+        maps: input.maps,
+        slots: document
+            .topology
+            .regions
+            .iter()
+            .map(|region| native_export_slot_manifest(document, region))
+            .collect(),
+    })
+}
+
+fn native_export_slot_manifest(
+    document: &TrimSheetDocument,
+    region: &hot_trimmer_domain::RegionDefinition,
+) -> HottrimSlot {
+    let output = document.render_settings.output_size;
+    let behavior = document
+        .region_bindings
+        .get(&region.id)
+        .map(|binding| &binding.mapping.behavior);
+    let radial_mapping = behavior.and_then(|behavior| behavior.radial).or_else(|| {
+        region
+            .radial_parameters
+            .map(hot_trimmer_domain::RadialMappingSettings::from)
+    });
+    let radial_parameters = radial_mapping.map(native_export_radial_parameters);
+    let is_radial = radial_mapping.is_some()
+        || behavior
+            .is_some_and(|behavior| behavior.role == hot_trimmer_domain::ManualRegionRole::Radial);
+    let sampling = behavior.map(|behavior| native_export_sampling_name(behavior.sampling));
+    let repeat_period_pixels = behavior.and_then(|behavior| behavior.period_pixels);
+    HottrimSlot {
+        slot_id: region.id.to_string(),
+        region_id: region.id.to_string(),
+        name: region.display_name.clone(),
+        allocation_rect: export_pixel_rect(region.allocation_rect),
+        pixel_hotspot_rect: export_pixel_rect(region.hotspot_rect),
+        normalized_hotspot_rect: export_normalized_rect(
+            region.hotspot_rect,
+            output.width,
+            output.height,
+        ),
+        role: format!("{:?}", region.role),
+        uv_fit: UvFit {
+            kind: if is_radial {
+                UvFitKind::Radial
+            } else {
+                UvFitKind::Rectangular
+            },
+            fit_axis: if is_radial {
+                FitAxis::None
+            } else {
+                FitAxis::Automatic
+            },
+            keep_proportion: true,
+            allowed_rotations: if is_radial {
+                vec![0]
+            } else {
+                vec![0, 90, 180, 270]
+            },
+            mirror_allowed: !is_radial,
+            classification_tags: vec![format!("{:?}", region.structural_profile)],
+        },
+        world_size_meters: [
+            f64::from(region.allocation_rect.width),
+            f64::from(region.allocation_rect.height),
+        ],
+        variation_group: region.material_group.clone(),
+        enabled: region.enabled,
+        region_id_color: region.id_color.0,
+        radial_parameters,
+        behavior_role: behavior
+            .map(|behavior| native_export_behavior_role_name(behavior.role).to_owned()),
+        sampling: sampling.map(str::to_owned),
+        repeat_period_pixels,
+        orientation: behavior
+            .map(|behavior| native_export_orientation_name(behavior.orientation).to_owned()),
+        radial_mapping,
+    }
+}
+
+fn native_export_radial_parameters(
+    value: hot_trimmer_domain::RadialMappingSettings,
+) -> hot_trimmer_domain::RadialParameters {
+    hot_trimmer_domain::RadialParameters {
+        center_x: value.center_x,
+        center_y: value.center_y,
+        inner_radius: value.inner_radius,
+        outer_radius: value.outer_radius,
+    }
+}
+
+fn native_export_behavior_role_name(role: hot_trimmer_domain::ManualRegionRole) -> &'static str {
+    match role {
+        hot_trimmer_domain::ManualRegionRole::Panel => "panel",
+        hot_trimmer_domain::ManualRegionRole::HorizontalStrip => "horizontal_strip",
+        hot_trimmer_domain::ManualRegionRole::VerticalStrip => "vertical_strip",
+        hot_trimmer_domain::ManualRegionRole::Unique => "unique",
+        hot_trimmer_domain::ManualRegionRole::Radial => "radial",
+    }
+}
+
+fn native_export_sampling_name(sampling: hot_trimmer_domain::RegionSampling) -> &'static str {
+    match sampling {
+        hot_trimmer_domain::RegionSampling::OneShot => "one_shot",
+        hot_trimmer_domain::RegionSampling::LoopX => "loop_x",
+        hot_trimmer_domain::RegionSampling::LoopY => "loop_y",
+        hot_trimmer_domain::RegionSampling::LoopXy => "loop_xy",
+    }
+}
+
+fn native_export_orientation_name(orientation: hot_trimmer_domain::QuarterTurn) -> &'static str {
+    match orientation {
+        hot_trimmer_domain::QuarterTurn::Zero => "zero",
+        hot_trimmer_domain::QuarterTurn::Ninety => "ninety",
+        hot_trimmer_domain::QuarterTurn::OneEighty => "one_eighty",
+        hot_trimmer_domain::QuarterTurn::TwoSeventy => "two_seventy",
+    }
+}
+
+fn export_pixel_rect(rect: hot_trimmer_domain::CanonicalRect) -> hot_trimmer_export::PixelRect {
+    hot_trimmer_export::PixelRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn export_normalized_rect(
+    rect: hot_trimmer_domain::CanonicalRect,
+    width: u32,
+    height: u32,
+) -> NormalizedRect {
+    NormalizedRect {
+        x: f64::from(rect.x) / f64::from(width),
+        y: f64::from(rect.y) / f64::from(height),
+        width: f64::from(rect.width) / f64::from(width),
+        height: f64::from(rect.height) / f64::from(height),
+    }
+}
+
+fn ensure_native_export_current(
+    cancellation: &EngineCancellationToken,
+    is_current: &impl Fn() -> bool,
+) -> Result<(), TiledExportError> {
+    if cancellation.is_cancelled() || !is_current() {
+        return Err(TiledExportError::StaleRevision);
+    }
+    Ok(())
+}
+
+fn export_error(error_value: TiledExportError) -> UserFacingError {
+    match error_value {
+        TiledExportError::Cancelled | TiledExportError::StaleRevision => error(
+            ErrorCode::OperationCancelled,
+            "The export was cancelled or superseded before publication.",
+        ),
+        TiledExportError::InvalidRequest(message)
+        | TiledExportError::GpuValidation(message)
+        | TiledExportError::UnsupportedFeatureOrFormat(message)
+        | TiledExportError::OutOfMemory(message)
+        | TiledExportError::DeviceLost(message)
+        | TiledExportError::Readback(message)
+        | TiledExportError::Encoder(message) => error(ErrorCode::LayoutInvalid, &message),
+        TiledExportError::Filesystem(failure) => io_error(failure),
+    }
+}
+
 fn build_stage_14_preview(
     session: &SharedProjectSession,
     preview_service: &PreviewService,
     request: Stage14PreviewRequest,
     job: u64,
 ) -> Result<IntermediateAtlasProjection, UserFacingError> {
-    let mut summary = {
-        let guard = session.lock().map_err(|_| poisoned())?;
-        guard
-            .store
-            .as_ref()
-            .ok_or_else(no_project)?
-            .summary()
-            .map_err(store_error)?
-    };
+    let (mut summary, refreshed_document_assets) =
+        refreshed_stage_14_project_summary(session, preview_service)?;
     let accepted_document = summary
         .document
         .as_ref()
         .ok_or_else(|| error(ErrorCode::LayoutInvalid, "Create a trim sheet first."))?
         .clone();
-    if accepted_document.document_revision != request.revision {
+    let accepted_revision = accepted_document.document_revision;
+    let accepted_refreshed_revision =
+        refreshed_document_assets && accepted_revision == request.revision.saturating_add(1);
+    if accepted_revision != request.revision && !accepted_refreshed_revision {
         return Err(error(
             ErrorCode::OperationCancelled,
             "A newer document revision superseded this preview.",
@@ -2346,8 +3712,8 @@ fn build_stage_14_preview(
         // This is an in-memory candidate snapshot.  Match the accepted revision only so the
         // compiler's persisted-revision guard continues to protect cancellation/publication.
         let mut candidate = candidate;
-        candidate.document_revision = request.revision;
-        candidate.appearance_revision = request.revision;
+        candidate.document_revision = accepted_revision;
+        candidate.appearance_revision = accepted_revision;
         candidate.topology_revision = accepted_document.topology_revision;
         summary.document = Some(candidate);
     }
@@ -2392,7 +3758,7 @@ fn build_stage_14_preview(
                             .summary()
                             .ok()?
                             .document
-                            .map(|document| document.document_revision == request.revision)
+                            .map(|document| document.document_revision == accepted_revision)
                     })
                     .unwrap_or(false);
                 if !live {
@@ -2410,7 +3776,7 @@ fn build_stage_14_preview(
             .compile_persisted_stage_14_preview_with_cache_and_executor(
                 hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
                     project: &summary,
-                    revision: request.revision,
+                    revision: accepted_revision,
                     // Native owns publication generation. The frontend draft ID is
                     // scheduling metadata and is absent on several valid commands.
                     draft_id: Some(job),
@@ -2441,7 +3807,7 @@ fn build_stage_14_preview(
                     .summary()
                     .ok()?
                     .document
-                    .map(|document| document.document_revision == request.revision)
+                    .map(|document| document.document_revision == accepted_revision)
             })
             .unwrap_or(false)
             && preview_service.latest_draft_id.load(Ordering::Acquire) == job
@@ -2461,35 +3827,41 @@ fn build_stage_14_preview(
             "The compiled SourceFrame artifact did not publish profile-local region metadata.",
         ));
     }
-    let rendered_tile = artifact.rendered_tile.clone().ok_or_else(|| {
-        error(
-            ErrorCode::LayoutInvalid,
-            "The GPU executor completed without a bounded tile payload.",
-        )
-    })?;
     let output_size = artifact.topology.output_size;
-    let tile_manifest = publish_gpu_tiled_preview(
-        preview_service,
-        rendered_tile.manifest.clone(),
-        rendered_tile.payload(),
-    )?;
+    let mut maps = BTreeMap::new();
+    let mut tile_manifest = None;
     let mut tile_manifests = BTreeMap::new();
-    tile_manifests.insert(
-        material_map_view_key(rendered_tile.manifest.map).to_string(),
-        tile_manifest.clone(),
-    );
-    for (map, tile) in &artifact.rendered_display_tiles {
-        if *map == rendered_tile.manifest.map {
-            continue;
-        }
+    if let Some(rendered_tile) = artifact.rendered_tile.clone() {
         let publication = publish_gpu_tiled_preview(
             preview_service,
-            tile.manifest.clone(),
-            tile.payload(),
+            rendered_tile.manifest.clone(),
+            rendered_tile.payload(),
         )?;
-        tile_manifests.insert(material_map_view_key(*map).to_string(), publication);
+        tile_manifests.insert(
+            material_map_view_key(rendered_tile.manifest.map).to_string(),
+            publication.clone(),
+        );
+        for (map, tile) in &artifact.rendered_display_tiles {
+            if *map == rendered_tile.manifest.map {
+                continue;
+            }
+            let publication =
+                publish_gpu_tiled_preview(preview_service, tile.manifest.clone(), tile.payload())?;
+            tile_manifests.insert(material_map_view_key(*map).to_string(), publication);
+        }
+        tile_manifest = Some(publication);
+    } else {
+        for channel in &artifact.channels {
+            maps.insert(
+                channel_key(channel.role).into(),
+                png_data_url(
+                    artifact.topology.output_size.width,
+                    artifact.topology.output_size.height,
+                    channel.rgba8.clone(),
+                )?,
+            );
+        }
     }
-    let maps = BTreeMap::new();
     if !preview_is_current() {
         cancellation.cancel();
         preview_service
@@ -2510,11 +3882,19 @@ fn build_stage_14_preview(
             preview_service.gpu_capabilities.generation()
         )),
     }
-    artifact.telemetry.push(format!("native_tile_publish_ms={}; raw_ipc_bytes={}; raw_ipc_ms={}; tile_generation={}; tile_dimensions={}x{}; rgba_nontransparent_bounds={}; cancellation_count={}",
-        tile_manifest.telemetry.native_publish_ms, tile_manifest.telemetry.raw_ipc_bytes,
-        tile_manifest.telemetry.raw_ipc_ms, tile_manifest.telemetry.generation,
-        tile_manifest.manifest.width, tile_manifest.manifest.height, "executor_tile",
-        preview_service.cancellation_count.load(Ordering::Acquire)));
+    if let Some(tile_manifest) = &tile_manifest {
+        artifact.telemetry.push(format!("native_tile_publish_ms={}; raw_ipc_bytes={}; raw_ipc_ms={}; tile_generation={}; tile_dimensions={}x{}; rgba_nontransparent_bounds={}; cancellation_count={}",
+            tile_manifest.telemetry.native_publish_ms, tile_manifest.telemetry.raw_ipc_bytes,
+            tile_manifest.telemetry.raw_ipc_ms, tile_manifest.telemetry.generation,
+            tile_manifest.manifest.width, tile_manifest.manifest.height, "executor_tile",
+            preview_service.cancellation_count.load(Ordering::Acquire)));
+    } else {
+        artifact.telemetry.push(format!(
+            "cpu_channel_publication_maps={}; cancellation_count={}",
+            maps.len(),
+            preview_service.cancellation_count.load(Ordering::Acquire)
+        ));
+    }
     let slots = artifact
         .slots
         .iter()
@@ -2570,6 +3950,12 @@ fn build_stage_14_preview(
             .map_err(|_| poisoned())?
             .insert((request.revision, recipe.hash()));
     }
+    let refreshed_project = if refreshed_document_assets {
+        let guard = session.lock().map_err(|_| poisoned())?;
+        Some(project_projection(&guard)?)
+    } else {
+        None
+    };
     Ok(IntermediateAtlasProjection {
         label: artifact.label,
         non_exportable: true,
@@ -2604,6 +3990,7 @@ fn build_stage_14_preview(
         export_available: false,
         blender_available: false,
         source_frame: document.source_frame.clone(),
+        project: refreshed_project,
     })
 }
 
@@ -3240,7 +4627,7 @@ fn encode_preview_png(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>,
         return Err(error(ErrorCode::Internal, "Compiled pixels are invalid."));
     }
     // Preview publication optimizes latency, not file size. Export encoding remains separate.
-    // The default adaptive PNG path is disproportionately expensive for high-entropy 2K–8K
+    // The default adaptive PNG path is disproportionately expensive for high-entropy 2Kâ€“8K
     // material imagery, especially in development builds.
     let mut encoded = Vec::new();
     PngEncoder::new_with_quality(&mut encoded, CompressionType::Fast, FilterType::Sub)
@@ -3628,16 +5015,17 @@ mod algorithm_stage_14_preview_a_tests {
 #[cfg(test)]
 mod persisted_algorithm_stage_14_preview_a_tests {
     use std::{
-        collections::HashSet,
+        collections::{BTreeMap, HashSet},
         io::Cursor,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
 
     use hot_trimmer_domain::{
-        ContentDigest, ContentReference, MaterialBehaviorClass, MaterialClassificationCommand,
-        NormalizedPoint, Patch, PatchCommand, PatchGeometry, PatchId, PatchProperties, PixelSize,
-        RectificationSettings, SourceId, TrimSheetDocumentCommand,
+        Channel, ChannelBitDepth, ContentDigest, ContentReference, ManualRegionRole,
+        MaterialBehaviorClass, MaterialClassificationCommand, NormalizedPoint, Patch, PatchCommand,
+        PatchGeometry, PatchId, PatchProperties, PixelSize, QuarterTurn, RectificationSettings,
+        RegionBehavior, RegionSampling, SourceId, TrimSheetDocumentCommand,
     };
     use hot_trimmer_project_store::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -3661,6 +5049,434 @@ mod persisted_algorithm_stage_14_preview_a_tests {
             .write_to(&mut bytes, ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    fn native_export_manifest(map: MaterialMapKind) -> CompiledAtlasTileManifest {
+        let output_rect = OutputPixelRect(PixelBounds {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        });
+        let pixel_format = native_export_source_pixel_format(map);
+        let identity = hot_trimmer_sheet_compiler::CompiledAtlasTileIdentity {
+            plan_hash: ContentDigest::sha256(b"native-export-plan"),
+            map,
+            pixel_format,
+            mip_level: 0,
+            output_rect,
+            halo_px: 0,
+            valid_rect: output_rect,
+            profile: hot_trimmer_sheet_compiler::CompiledAtlasPreviewProfile::Authoritative,
+            shader_version: "native-export-test".into(),
+            structural_plan_id: ContentDigest::sha256(b"native-export-structure"),
+            scale_microunits: 1_000_000,
+            normal_convention: None,
+            generation: 7,
+        };
+        CompiledAtlasTileManifest {
+            identity,
+            map,
+            mip_level: 0,
+            output_rect,
+            valid_rect: output_rect,
+            halo_px: 0,
+            generation: 7,
+            pixel_format,
+            width: 2,
+            height: 2,
+            row_stride: 8,
+            opaque_handle: "native-export-test".into(),
+        }
+    }
+
+    fn native_export_test_document(root: &Path) -> TrimSheetDocument {
+        let project_path = root.join(format!("export-doc-{}.hottrimmer", Uuid::new_v4()));
+        let mut store = ProjectStore::create(&project_path, "Export Package").unwrap();
+        let bytes = encoded_source();
+        store
+            .replace_source(
+                SourceChannel::BaseColor,
+                &SourceInput {
+                    id: SourceId::new(),
+                    ownership: SourceOwnership::OwnedCopy,
+                    external_path: None,
+                    origin_path: PathBuf::from("export-package.png"),
+                    sha256: ContentDigest::sha256(&bytes).0,
+                    width: 192,
+                    height: 128,
+                    format: "PNG".into(),
+                    color_type: "Rgba8".into(),
+                    has_alpha: true,
+                    exif_orientation: 1,
+                    has_embedded_icc_profile: false,
+                    encoded_bytes: u64::try_from(bytes.len()).unwrap(),
+                    owned_bytes: Some(bytes),
+                },
+            )
+            .unwrap();
+        store.create_source_frame_document().unwrap();
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution {
+                output_size: PixelSize {
+                    width: 2,
+                    height: 2,
+                },
+            })
+            .unwrap();
+        let document = store.summary().unwrap().document.unwrap();
+        drop(store);
+        document
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_plans_distinct_tile_completion_ids() {
+        let planned = native_export_planned_tiles(
+            OutputPixelRect(PixelBounds {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+            }),
+            2,
+            &[MaterialMapKind::BaseColor, MaterialMapKind::Height],
+        );
+        let ids = planned
+            .iter()
+            .map(|tile| tile.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(planned.len(), 4);
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains("baseColor@0,0-2x2"));
+        assert!(ids.contains("height@2,0-1x2"));
+        assert_eq!(native_export_unique_rects(&planned).len(), 2);
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_package_streams_and_preserves_stale_output() {
+        let root =
+            std::env::temp_dir().join(format!("hot-trimmer-native-export-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("material.hottrim");
+        let document = native_export_test_document(&root);
+        let revisions = RevisionAuthority::new(7);
+        let cancellation = EngineCancellationToken::new();
+        let manifest = native_export_manifest(MaterialMapKind::BaseColor);
+        let pixels = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let package = write_native_stage14_export_package(
+            &final_path,
+            7,
+            revisions,
+            &cancellation,
+            &document,
+            vec![NativeExportTile {
+                map: MaterialMapKind::BaseColor,
+                manifest: &manifest,
+                pixels: &pixels,
+            }],
+            || true,
+        )
+        .expect("native package writes material-map files");
+        assert!(final_path.is_dir());
+        let manifest_bytes = fs::read(final_path.join(HOTTRIM_MANIFEST_FILE_NAME)).unwrap();
+        assert!(manifest_bytes.starts_with(b"{"));
+        let png_bytes = fs::read(final_path.join("maps/base_color.png")).unwrap();
+        assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(
+            package.bytes_written,
+            (manifest_bytes.len() + png_bytes.len()) as u64
+        );
+        assert_eq!(package.outputs.len(), 1);
+        assert_eq!(package.outputs[0].id, "baseColor");
+        assert_eq!(package.outputs[0].map, "baseColor");
+        assert_eq!(package.outputs[0].file_name, "maps/base_color.png");
+        assert_eq!(
+            package.outputs[0].checksum,
+            ContentDigest::sha256(&png_bytes).0
+        );
+        assert_eq!(package.outputs[0].width, 2);
+        assert_eq!(package.outputs[0].height, 2);
+        assert_eq!(package.progress.len(), 2);
+        assert_eq!(package.progress[0].map, "baseColor");
+        assert_eq!(package.progress[0].completed_tiles, 1);
+        assert_eq!(package.progress[0].total_tiles, 1);
+        assert_eq!(package.progress[0].bytes_written, 0);
+        assert_eq!(package.progress[1].map, "baseColor");
+        assert_eq!(package.progress[1].completed_tiles, 1);
+        assert_eq!(package.progress[1].total_tiles, 1);
+        assert_eq!(package.progress[1].bytes_written, png_bytes.len() as u64);
+
+        let stale_path = root.join("stale.hottrim");
+        fs::write(&stale_path, b"existing").unwrap();
+        let stale = write_native_stage14_export_package(
+            &stale_path,
+            7,
+            RevisionAuthority::new(7),
+            &EngineCancellationToken::new(),
+            &document,
+            vec![NativeExportTile {
+                map: MaterialMapKind::BaseColor,
+                manifest: &manifest,
+                pixels: &pixels,
+            }],
+            || false,
+        )
+        .expect_err("stale export must not publish");
+        assert!(matches!(stale, TiledExportError::StaleRevision));
+        assert_eq!(fs::read(&stale_path).unwrap(), b"existing");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_failed_init_removes_temp_package() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-native-export-init-fail-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("failed.hottrim");
+        let mut document = native_export_test_document(&root);
+        document
+            .render_settings
+            .channels
+            .get_mut(&Channel::Normal)
+            .expect("normal channel policy")
+            .bit_depth = ChannelBitDepth::Sixteen;
+        let full_rect = OutputPixelRect(PixelBounds {
+            x: 0,
+            y: 0,
+            width: document.render_settings.output_size.width,
+            height: document.render_settings.output_size.height,
+        });
+        let planned = native_export_planned_tiles(full_rect, 2, &[MaterialMapKind::Normal]);
+        let error = match begin_native_stage14_export_package(
+            &final_path,
+            7,
+            RevisionAuthority::new(7),
+            &EngineCancellationToken::new(),
+            &document,
+            full_rect,
+            &[MaterialMapKind::Normal],
+            &planned,
+        ) {
+            Ok(_) => panic!("unsupported 16-bit Normal must fail during writer initialization"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TiledExportError::UnsupportedFeatureOrFormat(_)
+        ));
+        let leftovers = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".failed.hottrim.tmp-")
+            })
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "temporary package directories leaked");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_region_id_uses_manifest_palette() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-native-export-region-id-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("region-id.hottrim");
+        let document = native_export_test_document(&root);
+        let region_color = document.topology.regions[0].id_color.0;
+        let manifest = native_export_manifest(MaterialMapKind::RegionId);
+        let pixels = [0_u32, u32::MAX, 0, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let package = write_native_stage14_export_package(
+            &final_path,
+            7,
+            RevisionAuthority::new(7),
+            &EngineCancellationToken::new(),
+            &document,
+            vec![NativeExportTile {
+                map: MaterialMapKind::RegionId,
+                manifest: &manifest,
+                pixels: &pixels,
+            }],
+            || true,
+        )
+        .expect("region ID package writes from compact IDs");
+        assert_eq!(package.outputs[0].file_name, "maps/region_id.png");
+        let decoded =
+            image::load_from_memory(&fs::read(final_path.join("maps/region_id.png")).unwrap())
+                .unwrap()
+                .to_rgba8();
+        assert_eq!(
+            decoded.get_pixel(0, 0).0,
+            [region_color[0], region_color[1], region_color[2], 255]
+        );
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 0, 0, 0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_rejects_fake_sixteen_bit_normal() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-native-export-normal-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("normal.hottrim");
+        let mut document = native_export_test_document(&root);
+        document
+            .render_settings
+            .channels
+            .get_mut(&Channel::Normal)
+            .expect("normal channel policy")
+            .bit_depth = ChannelBitDepth::Sixteen;
+        let manifest = native_export_manifest(MaterialMapKind::Normal);
+        let pixels = [128, 128, 255, 255].repeat(4);
+        let error = write_native_stage14_export_package(
+            &final_path,
+            7,
+            RevisionAuthority::new(7),
+            &EngineCancellationToken::new(),
+            &document,
+            vec![NativeExportTile {
+                map: MaterialMapKind::Normal,
+                manifest: &manifest,
+                pixels: &pixels,
+            }],
+            || true,
+        )
+        .expect_err("16-bit Normal must not be widened from RGBA8");
+        assert!(matches!(
+            error,
+            TiledExportError::UnsupportedFeatureOrFormat(_)
+        ));
+        assert!(!final_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_manifest_uses_authored_behavior_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-native-export-manifest-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut document = native_export_test_document(&root);
+        assert!(
+            document.topology.regions.len() >= 2,
+            "source-frame fixture should expose multiple authored regions"
+        );
+        let radial_region = document.topology.regions[0].id;
+        let loop_region = document.topology.regions[1].id;
+        let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
+        radial.radial.as_mut().unwrap().center_x = 0.25;
+        radial.radial.as_mut().unwrap().center_y = 0.75;
+        radial.radial.as_mut().unwrap().inner_radius = 0.1;
+        radial.radial.as_mut().unwrap().outer_radius = 0.6;
+        radial.radial.as_mut().unwrap().falloff = 2.0;
+        radial.synchronize_derived_fields();
+        {
+            let binding = document
+                .region_bindings
+                .get_mut(&radial_region)
+                .expect("radial binding");
+            binding.mapping.radial = radial.radial;
+            binding.mapping.behavior = radial.clone();
+        }
+        let mut repeat = RegionBehavior::default();
+        repeat.sampling = RegionSampling::LoopXy;
+        repeat.period_pixels = Some([7, 11]);
+        repeat.orientation = QuarterTurn::Ninety;
+        repeat.synchronize_derived_fields();
+        document
+            .region_bindings
+            .get_mut(&loop_region)
+            .expect("loop binding")
+            .mapping
+            .behavior = repeat.clone();
+
+        let manifest =
+            native_export_manifest_from_document(&document, BTreeMap::new()).expect("manifest");
+        let radial_slot = manifest
+            .slots
+            .iter()
+            .find(|slot| slot.region_id == radial_region.to_string())
+            .expect("radial slot");
+        assert_eq!(radial_slot.uv_fit.kind, UvFitKind::Radial);
+        assert_eq!(radial_slot.behavior_role.as_deref(), Some("radial"));
+        assert_eq!(radial_slot.radial_parameters.unwrap().center_x, 0.25);
+        assert_eq!(radial_slot.radial_mapping.unwrap().falloff, 2.0);
+        let loop_slot = manifest
+            .slots
+            .iter()
+            .find(|slot| slot.region_id == loop_region.to_string())
+            .expect("loop slot");
+        assert_eq!(loop_slot.sampling.as_deref(), Some("loop_xy"));
+        assert_eq!(loop_slot.repeat_period_pixels, Some([7, 11]));
+        assert_eq!(loop_slot.orientation.as_deref(), Some("ninety"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_empty_request_uses_enabled_exportable_maps() {
+        let root =
+            std::env::temp_dir().join(format!("hot-trimmer-native-export-maps-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let project_path = root.join("export-maps.hottrimmer");
+        let mut store = ProjectStore::create(&project_path, "Export Maps").unwrap();
+        let bytes = encoded_source();
+        store
+            .replace_source(
+                SourceChannel::BaseColor,
+                &SourceInput {
+                    id: SourceId::new(),
+                    ownership: SourceOwnership::OwnedCopy,
+                    external_path: None,
+                    origin_path: PathBuf::from("export-maps.png"),
+                    sha256: ContentDigest::sha256(&bytes).0,
+                    width: 192,
+                    height: 128,
+                    format: "PNG".into(),
+                    color_type: "Rgba8".into(),
+                    has_alpha: true,
+                    exif_orientation: 1,
+                    has_embedded_icc_profile: false,
+                    encoded_bytes: u64::try_from(bytes.len()).unwrap(),
+                    owned_bytes: Some(bytes),
+                },
+            )
+            .unwrap();
+        store.create_source_frame_document().unwrap();
+        let document = store.summary().unwrap().document.unwrap();
+        assert_eq!(
+            document.render_settings.channels[&Channel::Normal].bit_depth,
+            ChannelBitDepth::Eight
+        );
+
+        assert_eq!(
+            native_export_enabled_maps(&document),
+            vec![
+                MaterialMapKind::BaseColor,
+                MaterialMapKind::Height,
+                MaterialMapKind::Normal,
+                MaterialMapKind::Roughness,
+                MaterialMapKind::Metallic,
+                MaterialMapKind::AmbientOcclusion,
+                MaterialMapKind::RegionId,
+            ]
+        );
+        drop(document);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

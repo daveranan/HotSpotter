@@ -2,7 +2,7 @@ use std::{io::Cursor, path::PathBuf};
 
 use hot_trimmer_domain::{
     generate_partition, resolve_boundaries, ContentDigest, LogicalGridSpec, MaterialMapContent,
-    MaterialMapKind, MaterialSourceSet, OrientedPixelSize, PartitionRecipe, PixelSize,
+    MaterialMapKind, MaterialSourceSet, OrientedPixelSize, PartitionRecipe, PixelBounds, PixelSize,
     SamplingMode, SourceFrame, SourceId, TrimSheetDocument, TrimSheetDocumentCommand, NormalizedBounds,
     NormalizedScalar, source_frame_region_id,
     ManualRegionRole, QuarterTurn, RegionBehavior, RegionContinuity, RegionSampling,
@@ -92,6 +92,105 @@ fn compile_behavior_document(
             || true,
         )
         .expect("manual behavior compile")
+}
+
+#[test]
+fn source_frame_exact_viewport_material_map_rehashes_after_tile_request_change() {
+    let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-viewport-hash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create viewport hash fixture directory");
+    let project_path = root.join("viewport-hash.hottrimmer");
+    let mut store = ProjectStore::create(&project_path, "Viewport Hash").expect("create viewport hash project");
+    let (encoded, _) = striped_source(64, 64);
+    let initial = store.summary().expect("initial summary");
+    let source_set_id = Uuid::from_bytes(initial.source_sets[0].id.to_bytes());
+    let input = SourceInput {
+        id: SourceId::new(), ownership: SourceOwnership::OwnedCopy, external_path: None,
+        origin_path: PathBuf::from("viewport-hash.png"), sha256: ContentDigest::sha256(&encoded).0,
+        width: 64, height: 64, format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+        exif_orientation: 1, has_embedded_icc_profile: false, encoded_bytes: encoded.len() as u64,
+        owned_bytes: Some(encoded),
+    };
+    store.replace_source_in_set(source_set_id, SourceChannel::BaseColor, &input).expect("register viewport hash source");
+    store.create_source_frame_document().expect("create viewport hash document");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution { output_size: PixelSize { width: 64, height: 64 } }).expect("set viewport hash output");
+    let summary = store.summary().expect("viewport hash summary");
+    let revision = summary.document.as_ref().expect("viewport hash document").document_revision;
+    let artifact = hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
+        .compile_persisted_stage_14_preview(
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                project: &summary,
+                revision,
+                draft_id: Some(17),
+                input_hash: Some("viewport-hash-regression".into()),
+                profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+                view_intent: Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewportMaterialMaps {
+                    rect: hot_trimmer_sheet_compiler::OutputPixelRect(PixelBounds { x: 8, y: 8, width: 24, height: 24 }),
+                    maps: vec![MaterialMapKind::BaseColor],
+                }),
+            },
+            &CancellationToken::new(),
+            || true,
+        )
+        .expect("exact viewport material-map compile should rehash after tile mutation");
+    assert!(artifact.telemetry.iter().any(|entry| entry.contains("maps=BaseColor")));
+    drop(store);
+    std::fs::remove_dir_all(root).expect("remove viewport hash fixture directory");
+}
+
+#[test]
+fn source_frame_preview_retries_after_companion_map_revision_refresh() {
+    let root = std::env::temp_dir().join(format!("hot-trimmer-source-frame-refresh-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create source frame refresh fixture directory");
+    let project_path = root.join("source-frame-refresh.hottrimmer");
+    let mut store = ProjectStore::create(&project_path, "Source Frame Refresh").expect("create source frame refresh project");
+    let (base_encoded, _) = striped_source(64, 64);
+    let initial = store.summary().expect("initial source frame refresh summary");
+    let source_set_id = Uuid::from_bytes(initial.source_sets[0].id.to_bytes());
+    let base_input = SourceInput {
+        id: SourceId::new(), ownership: SourceOwnership::OwnedCopy, external_path: None,
+        origin_path: PathBuf::from("source-frame-refresh-base.png"), sha256: ContentDigest::sha256(&base_encoded).0,
+        width: 64, height: 64, format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+        exif_orientation: 1, has_embedded_icc_profile: false, encoded_bytes: base_encoded.len() as u64,
+        owned_bytes: Some(base_encoded),
+    };
+    store.replace_source_in_set(source_set_id, SourceChannel::BaseColor, &base_input).expect("register base source");
+    store.create_source_frame_document().expect("create source frame document");
+    store.execute_document_command(&TrimSheetDocumentCommand::SetOutputResolution { output_size: PixelSize { width: 64, height: 64 } }).expect("set source frame refresh output");
+    let stale_summary = store.summary().expect("stale source frame refresh summary");
+    let stale_revision = stale_summary.document.as_ref().expect("stale source frame refresh document").document_revision;
+    let (rough_encoded, _) = striped_source(64, 64);
+    let rough_input = SourceInput {
+        id: SourceId::new(), ownership: SourceOwnership::OwnedCopy, external_path: None,
+        origin_path: PathBuf::from("source-frame-refresh-rough.png"), sha256: ContentDigest::sha256(&rough_encoded).0,
+        width: 64, height: 64, format: "PNG".into(), color_type: "Rgba8".into(), has_alpha: true,
+        exif_orientation: 1, has_embedded_icc_profile: false, encoded_bytes: rough_encoded.len() as u64,
+        owned_bytes: Some(rough_encoded),
+    };
+    store.replace_source_in_set(source_set_id, SourceChannel::Roughness, &rough_input).expect("register companion source");
+    let _ = store.refresh_document_assets().expect("refresh document assets");
+    let refreshed_summary = store.summary().expect("refreshed source frame summary");
+    let refreshed_revision = refreshed_summary.document.as_ref().expect("refreshed source frame document").document_revision;
+    assert!(refreshed_revision >= stale_revision);
+    let artifact = hot_trimmer_sheet_compiler::AlgorithmCompiler::new()
+        .compile_persisted_stage_14_preview(
+            hot_trimmer_sheet_compiler::PersistedStage14PreviewRequest {
+                project: &refreshed_summary,
+                revision: refreshed_revision,
+                draft_id: Some(24),
+                input_hash: Some("source-frame-refresh-regression-refreshed".into()),
+                profile: hot_trimmer_sheet_compiler::SourceFramePreviewProfile::Authoritative,
+                view_intent: Some(hot_trimmer_sheet_compiler::SourceFramePreviewViewIntent::ExactViewportMaterialMaps {
+                    rect: hot_trimmer_sheet_compiler::OutputPixelRect(PixelBounds { x: 0, y: 0, width: 32, height: 32 }),
+                    maps: vec![MaterialMapKind::BaseColor],
+                }),
+            },
+            &CancellationToken::new(),
+            || true,
+        )
+        .expect("source frame preview should succeed after asset refresh");
+    assert!(artifact.telemetry.iter().any(|entry| entry.contains("maps=BaseColor")));
+    drop(store);
+    std::fs::remove_dir_all(root).expect("remove source frame refresh fixture directory");
 }
 
 fn selected_region_pixels(

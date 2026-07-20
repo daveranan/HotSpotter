@@ -351,14 +351,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 } else if (header.map_kind == 1u) {
                     color = vec4<f32>(final_height, final_height, final_height, 1.0);
                 } else if (header.map_kind == 2u) {
-                    let decoded = blended.xyz * 2.0 - vec3<f32>(1.0);
-                    let authored = transform_tangent_normal(decoded, cmd.rotation, cmd.mirror);
-                    color = vec4<f32>(
-                        encode_normal(authored.x),
-                        encode_normal(authored.y),
-                        encode_normal(authored.z),
-                        blended.a,
-                    );
+                    if (header.source_role == 2u) {
+                        let decoded = blended.xyz * 2.0 - vec3<f32>(1.0);
+                        let authored = transform_tangent_normal(decoded, cmd.rotation, cmd.mirror);
+                        color = vec4<f32>(
+                            encode_normal(authored.x),
+                            encode_normal(authored.y),
+                            encode_normal(authored.z),
+                            blended.a,
+                        );
+                    } else {
+                        color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                    }
                 } else if (header.map_kind == 3u) {
                     let base = select(170.0 / 255.0, clamp(blended.r, 0.0, 1.0), header.source_role == 3u);
                     let value = clamp(base + max(0.0, 0.5 - final_height) * (70.0 / 255.0), 0.0, 1.0);

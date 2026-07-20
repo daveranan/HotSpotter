@@ -650,11 +650,13 @@ fn compile_persisted(
             sampling_policy: authored_sampling_policy(&binding.mapping)?,
             radial_mapping: binding.mapping.radial,
             stretch_override: StretchOverrideProvenance::NotAuthorized,
-            slice_geometry: slice_geometry(
-                region.role,
-                artifacts.domain.width,
-                artifacts.domain.height,
-            ),
+            slice_geometry: if binding.mapping.radial.is_some()
+                || region.role == hot_trimmer_domain::TemplateSlotRole::Radial
+            {
+                SliceGeometry::None
+            } else {
+                slice_geometry(region.role, artifacts.domain.width, artifacts.domain.height)
+            },
             maximum_seam_cost_milli: 450,
             reuse_permissions: ReusePermissions {
                 require_spatially_distinct_crops,
@@ -700,7 +702,7 @@ fn compile_persisted(
                 SlotSynthesisRequest {
                     plan,
                     domain: &artifacts.domain,
-                    output_dimensions: [slot.allocation.width, slot.allocation.height],
+                    output_dimensions: [slot.hotspot.width, slot.hotspot.height],
                     limits: SlotSynthesisLimits::default(),
                 },
                 &|| !active(),
@@ -1368,6 +1370,7 @@ fn compile_source_frame(
         request.draft_id.unwrap_or_default(),
         &source_frame_atlas_plan.ordered_regions,
     )?;
+    source_frame_atlas_plan.final_plan_hash = ContentDigest(String::new());
     source_frame_atlas_plan = source_frame_atlas_plan
         .finalize()
         .map_err(|error| error.to_string())?;
@@ -2347,7 +2350,10 @@ fn prepared_channel_digest(
             canonical_convention,
             alpha_policy,
         } => {
-            hash.update(format!("{source_convention:?}|{canonical_convention:?}|{alpha_policy:?}").as_bytes());
+            hash.update(
+                format!("{source_convention:?}|{canonical_convention:?}|{alpha_policy:?}")
+                    .as_bytes(),
+            );
             for tile in plane.tiles() {
                 for value in &tile.pixels {
                     for component in value.xyz {

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 hot-trimmer-domain.workspace = true
 hot-trimmer-effect-compiler.workspace = true
+hot-trimmer-export = { path = "../export" }
 hot-trimmer-geometry = { path = "../geometry" }
 hot-trimmer-image-io = { path = "../image-io" }
 hot-trimmer-material-analysis.workspace = true

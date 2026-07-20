@@ -2,8 +2,8 @@
 
 **Status:** Approved planning baseline  
 **Source of truth:** `docs/hot-trimmer-v1-full-algorithm-stack-revised.md` revision 1.1  
-**Implementation posture:** Quality-first engine replacement. Existing project files, schema versions, compiler internals, and render behavior do not require backward compatibility.  
-**Product boundary:** Preserve the useful desktop authoring workflow and replace or reshape its native contracts, algorithm, compiler, and render layers as required.
+**Implementation posture:** Quality-first algorithm replacement on the accepted GPU execution architecture. Existing project files and obsolete schema/algorithm behavior do not require backward compatibility.
+**Product boundary:** Preserve the useful desktop authoring workflow plus `TrimSheetDocument -> compile_persisted -> immutable compiled plan -> one application-owned GPU executor -> tiled artifact -> preview/streaming export`. Reshape algorithms and contracts beneath that authority without creating a second renderer or compiler facade.
 
 ## 1. Outcome
 
@@ -20,7 +20,9 @@ The completed system must:
 - Produce exact IDs, metadata, diagnostics, preview output, and Blender assignments.
 - Return explicit insufficiency and fallback decisions instead of hiding invalid source or effect choices.
 
-This is not an extension of the present rendering shortcut. The new plans and compiler become authoritative, and obsolete paths are deleted after parity gates pass.
+This is not an extension of the normalized material-rendering shortcut. New typed algorithm plans become authoritative
+inside `compile_persisted`; their production pixel evaluation extends the existing tiled GPU pass graph. Obsolete CPU
+pixel and algorithm paths are deleted after their compact-plan/GPU parity gates pass.
 
 ## 2. Scope decisions
 
@@ -38,7 +40,8 @@ This is not an extension of the present rendering shortcut. The new plans and co
 ### Out of scope
 
 - Opening or migrating old Hot Trimmer project files.
-- Preserving the current SQLite schema, document JSON shape, IPC protocol, or renderer API.
+- Preserving obsolete SQLite/schema details or superseded IPC payload shapes. The accepted `compile_persisted` compiler/
+  executor boundary, GPU service, tiled binary artifact, and streaming exporter are preserved and extended.
 - Pixel parity with the current sheet compiler.
 - Keeping current template repacking, manual crop, normalized-profile, or universal-weathering assumptions.
 - Network-hosted inference. Any learned route must be local, version-pinned, bounded, and reproducible.
@@ -157,27 +160,29 @@ Owns effect capacity and Stages 15, 16, and 18:
 
 ### `crates/render-core`
 
-Becomes a low-level deterministic raster/kernel library:
+Becomes a low-level deterministic math/shader-contract library:
 
-- Typed float/scalar/vector/ID planes.
-- Filtered sampling, correspondence evaluation, graph costs, SDFs, gradients, normal composition, masks, noise, morphology, and channel-correct resampling.
+- Typed float/scalar/vector/ID formats and compact GPU command contracts.
+- WGSL/shared pure math for filtered sampling, correspondence evaluation, SDFs, gradients, normal composition, masks,
+  noise, morphology, channel-correct resampling, padding, mips, and reductions.
+- Minimal bounded CPU implementations only where required for planning or explicit small-fixture GPU parity oracles.
 - No UI policy, no candidate selection, and no uncompiled raw effect rendering.
 
 ### `crates/sheet-compiler`
 
-Becomes the sole orchestration boundary:
+`compile_persisted` remains the sole live orchestration boundary. `AlgorithmCompiler` responsibilities are internal
+low-volume plan compilation beneath it, not a second public facade:
 
 ```text
-prepare sources
+prepare/decode sources
 -> build/select material domains
 -> compile fixed topology
 -> resolve slot demands
 -> solve placements
--> synthesize slot material
--> compile profiles/details/weathering
--> compose PBR
--> finish atlas and validate
--> return maps + SamplingPlan + EffectPlan + diagnostics
+-> compile SamplingPlan/profile/detail/EffectPlan commands
+-> schedule requested GPU map/tile dependencies
+-> execute sampling/profiles/details/effects/PBR/finishing on GPU
+-> return tiled CompiledSheet lineage + plans + bounded validation summaries + diagnostics
 ```
 
 ### Persistence, IPC, UI, export, and Blender
@@ -185,8 +190,23 @@ prepare sources
 - `crates/project-store` persists the new document without legacy migration code and manages content-addressed cache records.
 - `packages/ipc-contracts` exposes staged jobs, progress, cancellation, summaries, overrides, plans, and debug views.
 - `apps/desktop` keeps the useful source/sheet workbench but replaces controls that assume manual per-slot crop/render truth.
-- `crates/export` packages authoritative compiler output and the complete manifest atomically.
+- `crates/export` streams bounded authoritative GPU tile readbacks into the complete package and manifest atomically;
+  it never requests monolithic CPU maps.
 - `integrations/blender` consumes manifest semantics and performs actual material synchronization and UV fitting.
+
+### CPU/GPU execution rule for Phases 6–9
+
+- CPU: document commands, decode scheduling, analysis/branch-heavy solvers, physical legality, role/LOD/fallback and
+  dependency compilation, cache identities, scheduling policy, diagnostics, bounded reductions, final encoding,
+  metadata, filesystem I/O, and explicit test oracles.
+- GPU: all production sampling/rasterization, SDF/occupancy fields, stamps/details, weathering/masks, PBR composition,
+  padding/dilation, channel filtering, mips, exact ID writes, pixel QA views, and pixel-parallel validation reductions.
+- Intermediates stay GPU-resident in bounded tiles with declared halos and requested-map dependency caching. Read back
+  only requested final tiles/export batches or bounded summaries. Never add full-frame CPU fields or a GPU-to-CPU-to-
+  GPU pass boundary.
+- Reuse the one application-owned GPU service, binary preview artifact, Prompt 005 budgets/scheduler, streaming export,
+  cancellation/revision/device-loss behavior, and supported-hardware policy. No second renderer/exporter or silent CPU
+  production fallback is permitted.
 
 ## 5. Authoritative contracts
 
@@ -543,14 +563,25 @@ cargo test -p hot-trimmer-desktop algorithm_stage_14_preview_b
 
 ### Phase 6A - Structural profiles and semantic occupancy (Stage 15)
 
+Prerequisite: Render Prompt 005 is accepted, and every Stage 14 `SamplingPlan` used by the full stack—including
+TextureSynthesis/prepared-domain lowering, contain/cover, three-/nine-slice, and planar/polar radial variants—has an
+exact compact GPU execution route. Do not start Stage 15 while a supported Stage 14 mode is rejected, collapsed into
+ordinary direct sampling, or routed through CPU production rasterization.
+
 Deliverables:
 
+- Compile physical legality, evaluator, LOD, supersampling, fallback, halo, and cache identity into compact
+  `CompiledProfile` commands on the CPU; shaders never decide product policy.
 - Implement the complete profile set: Flat, convex/concave/rounded/double bevel, raised lip, recessed seam, panel
   frame, fully rounded strip, merged opposing bevel, radial disc, annulus, and custom profile curve.
 - Resolve profile widths and amplitudes in physical units; test opposing-profile legality and required flat center.
 - Implement declared profile fallbacks and record every decision.
-- Publish semantic profile occupancy, SDF, flat-center, raised/recessed/cap/groove, physical Height, and derivative
-  contributions. Allocation rectangles are not semantic edges and receive no implicit bevel.
+- Evaluate semantic profile occupancy, SDF, flat-center, raised/recessed/cap/groove, physical Height, derivatives,
+  filtering, and supersampling through the existing GPU requested-map/tile graph. Keep fields GPU-resident; publish
+  only requested QA tiles or bounded summaries. Allocation rectangles are not semantic edges and receive no implicit
+  bevel.
+- Remove normalized CPU production rasterization and the hard-coded normalized GPU profile shortcut after parity;
+  retain only small explicit CPU oracle fixtures.
 
 Acceptance gate:
 
@@ -558,11 +589,13 @@ Acceptance gate:
   four output sizes.
 - Opposing profiles never overlap accidentally, and a boundary without an authored profile remains flat.
 - Stage 16 and Stage 18 can query occupancy without reverse-engineering flattened pixels.
+- Tile seams/halos, requested-pass telemetry, bounded residency, cancellation/revision safety, and zero production CPU
+  profile raster calls are proven.
 
 Targeted verification:
 
 ```powershell
-cargo test -p hot-trimmer-effect-compiler algorithm_stage_15_profiles
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_15_gpu_profiles
 ```
 
 ### Phase 6L - Reusable source and authoring library with management window (Prompt LIB)
@@ -584,6 +617,9 @@ Deliverables:
   physical/pivot defaults, version history, project usage, and unresolved-reference recovery.
 - Define `StampAssetRef` as the only library-to-compiler boundary. Defer brush strokes and scattering to Stage 20,
   and do not allow thumbnails, filenames, latest-version pointers, or absolute paths to become compiler authority.
+- Keep hashing/versioning/dependencies/database transactions on CPU. Reuse the application GPU service and bounded
+  source/tile caches for materially beneficial registered-channel, mask/SDF, thumbnail, and atlas-sheet pixel previews;
+  never create a library renderer or treat GPU preview pixels as source authority.
 
 Acceptance gate:
 
@@ -602,8 +638,12 @@ cargo test -p hot-trimmer-desktop reusable_asset_library
 
 Deliverables:
 
+- Compile role/fit/LOD/fallback, immutable asset resolution, physical transforms, dependency/layer order, deterministic
+  feature placement, halos, formats, and cache identities into compact `CompiledDetail`/`CompiledEffect` commands on
+  CPU. Raw recipes and UI state never reach shaders.
 - Implement semantic repeating strips, unique/radial details, trim caps, bolt groups, vents, stamps, grooves, decals, and procedural motifs.
-- Convert masks to SDFs for coherent Height/Normal contributions.
+- Convert masks to SDFs and evaluate stamps/motifs/relief/scatter/weathering/masks/channel contributions as bounded GPU
+  tile passes for coherent Height/Normal inputs.
 - Store library-backed stamps as non-destructive typed operations with immutable asset version, physical transform,
   pivot, rotation/mirror, layer order, occupancy relation, seed/scatter, channel targets, and reusable-atlas versus
   asset-specific-deferred scope.
@@ -614,6 +654,8 @@ Deliverables:
 - Select deterministic feature LOD and 1x/2x/4x/8x supersampling from physical and raster constraints.
 - Compile profile/detail/stamp/weathering dependencies and blend legality into one ordered `EffectPlan`; never use
   flattened painter's-order pixels as routing authority, and never bake asset-specific operations into a shared atlas.
+- Keep Stage 15 occupancy and Stage 16/18 contributions GPU-resident for Stage 17; generate only dependencies of the
+  requested map/QA view, declare operation halos, and derive deterministic features from global physical coordinates.
 
 Acceptance gate:
 
@@ -624,30 +666,37 @@ Acceptance gate:
 - Unfit effects are rejected or use a declared fallback visible in `EffectPlan` diagnostics.
 - Resolution changes preserve stamp physical placement, scope, library version, and deterministic seed; layer-order
   fixtures distinguish below-profile, above-surface, and conforming effects.
+- Tile-boundary/parity tests prove registered channels, deterministic scatter/weathering, exact IDs, bounded residency,
+  zero unrequested dispatches, and zero production CPU detail/effect raster calls.
 
 Targeted verification:
 
 ```powershell
-cargo test -p hot-trimmer-effect-compiler scale_aware_effect_goldens
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_18_gpu_effects
 ```
 
 ### Phase 7 - PBR composition and atlas finishing (Stages 17 and 19)
 
 Deliverables:
 
-- Compose Height with explicit physical amplitudes and material-class clamps.
+- Compile PBR precedence/provenance, requested-map dependencies, formats, conventions, finishing policy, validation
+  thresholds, and manifest lineage on CPU; do not allocate CPU map planes.
+- Compose Height on GPU tiles with explicit physical amplitudes and material-class clamps.
 - Resolve all ordered physical Height contributions before deriving normals; then vector-compose imported normal
   details. Apply color/alpha, scalar, vector, and exact-ID blend semantics independently.
-- Generate normals from physical Height using Scharr gradients and per-axis meters per pixel.
-- Combine imported and generated normals with vector-correct reoriented normal mapping.
+- Generate normals from physical Height on GPU using Scharr gradients, per-axis meters per pixel, and declared halos.
+- Combine imported and generated normals on GPU with vector-correct reoriented normal mapping.
 - Prefer imported Roughness; otherwise estimate it with explicit Estimated provenance.
 - Keep Metallic at zero unless imported, labeled metal, material-ID-driven, or exposed-metal effect-driven.
-- Generate multi-radius physical AO/cavity.
-- Render effects at compiled supersampling, then downsample by channel semantics.
-- Render/evaluate allocation bleed without contaminating IDs.
-- Fill Region ID over hotspot only and Material ID by exact material label.
-- Generate channel-correct mips and validate feature survival at mip 0, 1, 2, and configured viewing target.
+- Generate multi-radius physical AO/cavity as bounded GPU passes.
+- Render effects at compiled supersampling, then downsample by channel semantics on GPU.
+- Render/evaluate allocation bleed without contaminating IDs using the accepted GPU padding/ownership infrastructure.
+- Fill compact Region ID over hotspot only and Material ID by exact material label on GPU.
+- Generate channel-correct GPU mips and reduce feature-survival statistics at mip 0, 1, 2, and configured viewing
+  target; read back bounded results only.
 - Produce the complete manifest payload and deterministic compilation summary.
+- Reuse Prompt 005 tiling/budgets/staging/streaming export at 8K/16K/24K. `CompiledSheet` is a tiled lineage/manifest,
+  not a monolithic CPU map collection.
 
 Acceptance gate:
 
@@ -657,11 +706,13 @@ Acceptance gate:
 - Supersampling changes raster fidelity, never physical dimensions.
 - Mip validation catches disappearing and over-strengthened features.
 - Same complete input tuple produces byte-identical maps and reports.
+- Requested-map/pass telemetry, tile seams, bounded residency, exact IDs, and zero production CPU PBR/finishing/QA
+  pixel calls are proven.
 
 Targeted verification:
 
 ```powershell
-cargo test -p hot-trimmer-sheet-compiler atlas_finishing_acceptance
+cargo test -p hot-trimmer-sheet-compiler algorithm_stage_19_gpu_atlas_finishing
 ```
 
 ### Phase 8 - UI, preview, QA, export, and Blender (Stage 20)
@@ -676,12 +727,15 @@ UI deliverables:
   physical transform, pivot, rotate/mirror, opacity, channel targeting, undo/redo, deterministic scatter, and explicit
   reusable-atlas versus asset-specific scope.
 - Add all QA views from Stage 20, including crop usage/repetition, seam energy, texel density, effect route/occupancy/LOD/supersampling, mip warnings, and Blender status.
-- Run analysis, placement, compile, and export as cancellable revision-guarded jobs with bounded preview refinement.
+- Run analysis, placement, compile, and the accepted streaming export as cancellable revision-guarded jobs with bounded
+  GPU tile preview refinement. Pixel QA requests use authoritative GPU tiles/reductions; the UI performs no material
+  math.
 
 Preview/export/Blender deliverables:
 
-- Preview Plane, Cube, Cylinder, Beveled Block, Wall Module, Archway, Radial Disc, and Mechanical Prop, including authored hotspot UV fixtures.
-- Export all compiled maps, checksums, colorspaces, topology, world sizes, fit rules, radial data, route summaries, and revision data atomically.
+- Preview Plane, Cube, Cylinder, Beveled Block, Wall Module, Archway, Radial Disc, and Mechanical Prop, including authored hotspot UV fixtures, by sampling exported-equivalent GPU map handles.
+- Supply complete maps/metadata to the existing Prompt 005 bounded streaming exporter; do not build another exporter,
+  encoder/finalizer, or full-frame staging path.
 - Build/update the complete Blender Principled material, including AO/Height policy.
 - Describe selected UV islands, classify compatible slots, and fit rectangular, strip, unique, cap, and radial semantics without non-uniform distortion.
 - Preserve locked assignments across material/effect/resolution updates.
@@ -699,11 +753,13 @@ Acceptance gate:
 - Blender fixtures pass rectangular, strip, and radial mapping without non-uniform UV distortion.
 - Locked assignments survive material updates and map revisions reload without remapping.
 - Failed/cancelled exports never publish a partial package.
+- QA/geometry/map previews use bounded binary GPU tile publication, and 16K/24K package export retains Prompt 005
+  memory/failure guarantees with the completed Stage 15–19 passes.
 
 Targeted verification:
 
 ```powershell
-npm test --workspace @hot-trimmer/desktop -- stage-20 && python -m unittest discover integrations/blender/hot_trimmer_companion/tests
+npm run check:algorithm-stage-20
 ```
 
 ### Phase 9 - Full V1 qualification and old-engine removal
@@ -712,10 +768,16 @@ Deliverables:
 
 - Run every acceptance criterion in section 30 of the revised design.
 - Run the complete golden matrix across material classes, source quality failures, mapping roles, effects, atlas sizes, and Blender fixtures.
-- Measure 8K memory, analysis/solve/compile time, preview latency, cancellation latency, and cache reuse on named hardware.
+- Measure CPU planning separately from GPU upload/dispatch/cache/readback/publication/encode at 8K, and rerun
+  representative/full-product 16K/24K Prompt 005 qualification after Stages 15–19 are enabled.
 - Fuzz/bound all image dimensions, parameters, candidate counts, graph sizes, iteration counts, supersampling, and IPC payloads.
 - Verify offline determinism, crash-safe project writes, cache loss recovery, and atomic export.
-- Delete the legacy sheet compiler, normalized profile path, legacy IPC/contracts, obsolete layout repacking, and unused schema/migration fixtures.
+- Delete concretely identified CPU production sampling/atlas/profile/detail/effect/PBR/finishing/QA raster paths,
+  normalized profile/effect shortcuts, duplicate renderer/IPC/frontend material authority, obsolete layout repacking,
+  and unused schema/migration fixtures. Preserve `compile_persisted`, the immutable plan boundary, the application GPU
+  service, tiled artifacts, streaming export, and the smallest explicitly test-only CPU GPU-parity oracles.
+- Prove with route counters that every production pixel class executes on GPU, only requested maps run, no intermediate
+  makes a GPU-to-CPU-to-GPU round trip, and unsupported hardware never selects a CPU production fallback.
 - Update technical, architecture, diagnostics, algorithm-version, and Blender documentation.
 
 Final gate:
