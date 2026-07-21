@@ -1014,16 +1014,25 @@ function App() {
     if (previewRegionId) void requestFeedbackTile(revision, previewRegionId, feedbackPreviewAllRegions);
   }
 
-  async function requestFeedbackTile(revision: number, regionId: string, allRegions = false, requestedView = feedbackView) {
+  async function requestFeedbackTile(
+    revision: number,
+    regionId: string,
+    allRegions = false,
+    requestedView = feedbackView,
+    requestedProfile: FeedbackPreviewProfile | "authoritative" = feedbackProfile,
+  ) {
     const dependency = visibleMapDependency(requestedView);
     if (!native || !dependency) return;
-    const profile = feedbackProfile === "preview1024" ? "refinement1024" : feedbackProfile;
+    const profile = requestedProfile === "preview1024" ? "refinement1024" : requestedProfile;
     const generation = ++previewDraftId.current;
     const startedAt = performance.now();
     previewPublishStartedAt.current = startedAt;
-    const targetDimensions = previewProfileDimensions(profile);
+    const targetDimensions = previewProfileDimensions(
+      profile,
+      projectRef.current?.document?.renderSettings.outputSize,
+    );
     const requestDescriptor: FeedbackPixelRequestIdentity = {
-      revision, regionId, allRegions, view: requestedView, map: dependency, profile: feedbackProfile,
+      revision, regionId, allRegions, view: requestedView, map: dependency, profile: requestedProfile,
       comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId,
     };
     const requestIdentity = feedbackPixelRequestIdentity(requestDescriptor);
@@ -1341,7 +1350,21 @@ function App() {
     const revision = project?.document?.documentRevision;
     if (!native || revision === undefined || activity !== "idle") return;
     setActivity("compiling");
-    try { await requestPreview(undefined, undefined, "authoritative", revision, false); }
+    try {
+      const feedbackRegionId = selectedRegionId
+        ?? (feedbackPreviewAllRegions ? project?.document?.topology.regions[0]?.id ?? null : null);
+      if (feedbackWorkbenchOpen && feedbackRegionId && visibleMapDependency(feedbackView)) {
+        await requestFeedbackTile(
+          revision,
+          feedbackRegionId,
+          feedbackPreviewAllRegions,
+          feedbackView,
+          "authoritative",
+        );
+      } else {
+        await requestPreview(undefined, undefined, "authoritative", revision, false);
+      }
+    }
     finally { setActivity("idle"); }
   }
 

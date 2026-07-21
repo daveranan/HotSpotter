@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const EDGE_DETAIL_ALGORITHM_ID: &str = "hot_trimmer.edge_detail_mvp";
-pub const EDGE_DETAIL_ALGORITHM_VERSION: &str = "1.1.0";
+pub const EDGE_DETAIL_ALGORITHM_VERSION: &str = "1.3.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,8 +179,14 @@ pub fn compile_edge_detail_plan(
         let below_physical_lod = request.intent.edge_width_m < maximum_meters_per_pixel
             || request.intent.breakup_scale_m < maximum_meters_per_pixel * 2.0
             || request.intent.micro_detail_scale_m < maximum_meters_per_pixel * 2.0;
-        let preview_fallback_allowed = request.resolution_profile.starts_with("preview");
-        if below_physical_lod && !preview_fallback_allowed {
+        let preview_fallback_allowed = request
+            .resolution_profile
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("preview"));
+        let authoritative_fallback_allowed = request
+            .resolution_profile
+            .eq_ignore_ascii_case("authoritative");
+        if below_physical_lod && !preview_fallback_allowed && !authoritative_fallback_allowed {
             return Err(EdgeDetailCompileError::BelowPhysicalLod(region.region_id));
         }
         let effective_edge_width_m = request.intent.edge_width_m.max(maximum_meters_per_pixel);
@@ -193,7 +199,12 @@ pub fn compile_edge_detail_plan(
             .micro_detail_scale_m
             .max(maximum_meters_per_pixel * 2.0);
         let lod_fallback = below_physical_lod.then(|| EdgeDetailLodFallback {
-            policy: "preview_scale_floor".into(),
+            policy: if authoritative_fallback_allowed {
+                "authoritative_scale_floor"
+            } else {
+                "preview_scale_floor"
+            }
+            .into(),
             maximum_meters_per_pixel,
             authored_edge_width_m: request.intent.edge_width_m,
             effective_edge_width_m,

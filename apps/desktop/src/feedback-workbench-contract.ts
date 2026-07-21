@@ -153,7 +153,7 @@ export interface FeedbackPixelRequestIdentity {
   allRegions: boolean;
   view: FeedbackContributionView;
   map: CompiledMapView;
-  profile: FeedbackPreviewProfile;
+  profile: FeedbackPreviewProfile | "authoritative";
   comparisonMode: FeedbackComparisonMode;
   selectedOperationId: string | null;
 }
@@ -229,7 +229,8 @@ export function feedbackViewAfterCommand(
   command: FeedbackWorkbenchCommand,
   currentView: FeedbackContributionView,
 ): FeedbackContributionView {
-  return command.type === "set_edge_detail" ? "stage16BaseColor" : currentView;
+  // ED-2 publishes the combined mask and signed Height; ED-3 owns final composition.
+  return command.type === "set_edge_detail" ? "stage16RegisteredMask" : currentView;
 }
 
 export function updateFeedbackOperationIntent(

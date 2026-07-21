@@ -136,9 +136,10 @@ fn evaluate(cmd: ProfileCommand, atlas_position: vec2<f32>) -> ProfileSample {
     let distance_gradient = distance_data.yz;
     let selected_width = select(cmd.first_width_m, cmd.second_width_m, distance_data.w > 0.5);
     let width = max(selected_width, 0.0000001);
-    let signed_distance_enabled = (cmd.occupancy_bits & 1u) != 0u;
     let lod_enabled = cmd.lod != 4u;
-    let output_sdf = select(0.0, distance, signed_distance_enabled && lod_enabled);
+    // Physical allocation distance remains authoritative even when the optional
+    // structural profile contribution is flat or disabled by its own LOD policy.
+    let output_sdf = distance;
     let t = clamp(distance / width, 0.0, 1.0);
     let in_profile = select(0.0, 1.0, distance > 0.0 && distance < width);
     var height = 0.0;
@@ -178,7 +179,9 @@ fn evaluate(cmd: ProfileCommand, atlas_position: vec2<f32>) -> ProfileSample {
         dh_dd = cmd.amplitude_m * curve.y / width * in_profile;
     }
     let derivative = distance_gradient * dh_dd;
-    let inside = lod_enabled && (cmd.occupancy_bits & 2u) != 0u && distance >= 0.0;
+    // Allocation membership is authoritative semantic data, not a structural-height
+    // LOD feature. Flat and LOD-disabled profiles must still publish it for ED-2.
+    let inside = distance >= 0.0;
     let flat = lod_enabled && (cmd.occupancy_bits & 4u) != 0u && distance >= width;
     let raised = lod_enabled && (cmd.occupancy_bits & 8u) != 0u && height > 0.0;
     let recessed = lod_enabled && (cmd.occupancy_bits & 16u) != 0u && height < 0.0;

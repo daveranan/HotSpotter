@@ -43,8 +43,6 @@ struct RegionCommand {
     slice_top: u32,
     slice_bottom: u32,
     slice_center: u32,
-    edge_wear_flags: u32,
-    edge_wear_seed: u32,
     slot_width: f32,
     slot_height: f32,
     pixels_per_unit: f32,
@@ -62,16 +60,6 @@ struct RegionCommand {
     transform_offset_y: f32,
     transform_rotation_sin: f32,
     transform_rotation_cos: f32,
-    edge_wear_coverage: f32,
-    edge_wear_strength: f32,
-    edge_wear_width_m: f32,
-    edge_wear_breakup_scale_m: f32,
-    edge_wear_height_m: f32,
-    edge_wear_hue_degrees: f32,
-    edge_wear_saturation: f32,
-    edge_wear_value_offset: f32,
-    edge_wear_roughness_offset: f32,
-    edge_wear_metallic_offset: f32,
 };
 
 @group(0) @binding(0) var<uniform> header: AtlasHeader;
@@ -93,7 +81,15 @@ fn height_at(atlas_pixel: vec2<u32>) -> f32 {
 }
 
 fn valid_height(candidate: f32, fallback: f32) -> f32 {
-    return select(fallback, candidate, candidate >= 0.0);
+    return select(fallback, candidate, candidate == candidate && candidate != -1.0);
+}
+
+// Reoriented Normal Mapping: both inputs are decoded tangent vectors. A flat
+// imported normal is the identity, so generated bevel structure is preserved.
+fn compose_rnm(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
+    let t = base + vec3<f32>(0.0, 0.0, 1.0);
+    let u = detail * vec3<f32>(-1.0, -1.0, 1.0);
+    return t * dot(t, u) / max(t.z, 0.000001) - u;
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -109,21 +105,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (pixel.x >= cmd.dst_x && pixel.x < cmd.dst_x + cmd.dst_width &&
             pixel.y >= cmd.dst_y && pixel.y < cmd.dst_y + cmd.dst_height) {
             let center_h = height_at(pixel);
-            if (center_h >= 0.0) {
-                let left_x = max(pixel.x, cmd.semantic_x + 1u) - 1u;
-                let right_x = min(pixel.x + 1u, cmd.semantic_x + cmd.semantic_width - 1u);
-                let top_y = max(pixel.y, cmd.semantic_y + 1u) - 1u;
-                let bottom_y = min(pixel.y + 1u, cmd.semantic_y + cmd.semantic_height - 1u);
-                let left_h = valid_height(height_at(vec2<u32>(left_x, pixel.y)), center_h);
-                let right_h = valid_height(height_at(vec2<u32>(right_x, pixel.y)), center_h);
-                let top_h = valid_height(height_at(vec2<u32>(pixel.x, top_y)), center_h);
-                let bottom_h = valid_height(height_at(vec2<u32>(pixel.x, bottom_y)), center_h);
-                let horizontal_span = max(f32(right_x - left_x), 1.0);
-                let vertical_span = max(f32(bottom_y - top_y), 1.0);
-                let height_scale = min(f32(cmd.semantic_width), f32(cmd.semantic_height));
-                let dx = (right_h - left_h) * height_scale / horizontal_span;
-                let dy = (bottom_h - top_h) * height_scale / vertical_span;
-                let height_normal = normalize(vec3<f32>(-dx, -dy, 1.0));
+            if (center_h == center_h && center_h != -1.0) {
+                let semantic_min = vec2<u32>(cmd.semantic_x, cmd.semantic_y);
+                let semantic_max = semantic_min + vec2<u32>(cmd.semantic_width, cmd.semantic_height) - vec2<u32>(1u);
+                var h: array<f32, 9>;
+                var sample_index = 0u;
+                for (var oy = -1; oy <= 1; oy = oy + 1) {
+                    for (var ox = -1; ox <= 1; ox = ox + 1) {
+                        let candidate = clamp(vec2<i32>(pixel) + vec2<i32>(ox, oy), vec2<i32>(semantic_min), vec2<i32>(semantic_max));
+                        h[sample_index] = valid_height(height_at(vec2<u32>(candidate)), center_h);
+                        sample_index = sample_index + 1u;
+                    }
+                }
+                // Physical Scharr derivative, with independent texel pitch on each axis.
+                let meters_per_pixel_x = max(cmd.slot_width / f32(max(cmd.semantic_width, 1u)), 0.000001);
+                let meters_per_pixel_y = max(cmd.slot_height / f32(max(cmd.semantic_height, 1u)), 0.000001);
+                let dHdx = ((3.0 * (h[2] - h[0])) + (10.0 * (h[5] - h[3])) + (3.0 * (h[8] - h[6]))) / (32.0 * meters_per_pixel_x);
+                let dHdy = ((3.0 * (h[6] - h[0])) + (10.0 * (h[7] - h[1])) + (3.0 * (h[8] - h[2]))) / (32.0 * meters_per_pixel_y);
+                let height_normal = vec3<f32>(-dHdx, -dHdy, 1.0);
                 let authored_sample = textureLoad(
                     authored_normal_tex,
                     vec2<i32>(i32(id.x), i32(id.y)),
@@ -132,13 +131,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let authored_decoded = authored_sample.xyz * 2.0 - vec3<f32>(1.0);
                 var n = height_normal;
                 if (header.source_role == 2u && authored_sample.a > 0.0 && dot(authored_decoded, authored_decoded) > 0.0001) {
-                    // Combine decoded tangent vectors. Encoded RGB is never
-                    // multiplied or blended, and final Height still contributes.
-                    n = normalize(height_normal + vec3<f32>(authored_decoded.xy, authored_decoded.z - 1.0));
+                    // Vector-correct RNM; encoded normal RGB is never scalar-blended.
+                    n = compose_rnm(authored_decoded, height_normal);
                 }
                 if (header.normal_convention == 1u) {
                     n.y = -n.y;
                 }
+                n = normalize(n);
                 color = vec4<f32>(encode_normal(n.x), encode_normal(n.y), encode_normal(n.z), 1.0);
                 matched = true;
             }

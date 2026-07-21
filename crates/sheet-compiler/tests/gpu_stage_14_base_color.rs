@@ -6,7 +6,7 @@ use std::{
 };
 
 use hot_trimmer_domain::{
-    CancellationToken, ContentDigest, DocumentHash, EdgeEligibility, EdgeWearIntent,
+    CancellationToken, ContentDigest, DocumentHash, EdgeEligibility,
     MaterialChannelRole, MaterialMapKind, NormalConvention, NormalizedBounds, NormalizedPoint, NormalizedScalar,
     OrientedPixelSize, PixelBounds, PixelSize, Projection, QuarterTurn, RadialMappingSettings,
     RegionBehavior, RegionContinuity, RegionId, RegionSampling, SamplingMode, SamplingPolicy,
@@ -586,6 +586,45 @@ fn material_domain() -> Arc<PreparedMaterialDomain> {
     )
 }
 
+fn edge_detail_material_domain(base_rgb: [f32; 3], height_value: Option<f32>) -> Arc<PreparedMaterialDomain> {
+    let width = 64;
+    let height = 64;
+    let colors = vec![LinearColor { rgb: base_rgb, alpha: 1.0 }; (width * height) as usize];
+    let normals = vec![TangentNormal { xyz: [0.0, 0.0, 1.0], alpha: 1.0 }; (width * height) as usize];
+    let scalar = |value: f32| vec![LinearScalar(value); (width * height) as usize];
+    let mut channels = vec![
+        PreparedExemplarChannel::BaseColor {
+            plane: ImagePlane::from_row_major(width, height, 4, &colors).unwrap(),
+            alpha_mode: ResolvedAlphaMode::Opaque,
+        },
+        PreparedExemplarChannel::Normal {
+            plane: ImagePlane::from_row_major(width, height, 4, &normals).unwrap(),
+            source_convention: NormalConvention::OpenGl,
+            canonical_convention: NormalConvention::OpenGl,
+            alpha_policy: NormalAlphaPolicy::Ignore,
+        },
+        PreparedExemplarChannel::Scalar {
+            role: MaterialChannelRole::Roughness,
+            plane: ImagePlane::from_row_major(width, height, 4, &scalar(0.25)).unwrap(),
+        },
+        PreparedExemplarChannel::Scalar {
+            role: MaterialChannelRole::Metallic,
+            plane: ImagePlane::from_row_major(width, height, 4, &scalar(0.2)).unwrap(),
+        },
+    ];
+    if let Some(height_value) = height_value {
+        channels.push(PreparedExemplarChannel::Scalar {
+            role: MaterialChannelRole::Height,
+            plane: ImagePlane::from_row_major(width, height, 4, &scalar(height_value)).unwrap(),
+        });
+    }
+    Arc::new(PreparedMaterialDomain::from_registered_channels(
+        ContentDigest::sha256(b"gpu-edge-detail-domain"),
+        ContentDigest::sha256(b"gpu-edge-detail-source"),
+        channels,
+    ).unwrap())
+}
+
 fn material_domain_with_transparent_outer_row() -> Arc<PreparedMaterialDomain> {
     let width = 4;
     let height = 4;
@@ -776,18 +815,64 @@ fn material_map_plan(domain: &PreparedMaterialDomain, map: MaterialMapKind) -> C
 }
 
 fn mvp_edge_wear_plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
-    let mut plan = material_map_plan(domain, MaterialMapKind::BaseColor);
-    plan.requested_maps = vec![
-        MaterialMapKind::BaseColor,
-        MaterialMapKind::EdgeMask,
-        MaterialMapKind::Height,
-        MaterialMapKind::Normal,
-        MaterialMapKind::Roughness,
-        MaterialMapKind::Metallic,
-    ];
+    mvp_edge_detail_plan_with_intent(domain, hot_trimmer_domain::EdgeDetailIntentV1 {
+        wear_amount: 0.8,
+        intensity: 0.85,
+        edge_width_m: 0.008,
+        bevel_radius_m: 0.005,
+        edge_softness: 0.3,
+        breakup_amount: 0.7,
+        breakup_scale_m: 0.016,
+        micro_detail_amount: 0.25,
+        micro_detail_scale_m: 0.002,
+        source_height_influence: 0.0,
+        source_luminance_influence: 0.0,
+        height_amplitude_m: -0.00035,
+        ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+    })
+}
+
+fn mvp_edge_detail_plan_with_intent(
+    domain: &PreparedMaterialDomain,
+    edge_intent: hot_trimmer_domain::EdgeDetailIntentV1,
+) -> CompiledAtlasPlanV1 {
+    mvp_edge_detail_plan_for_rect(
+        domain,
+        edge_intent,
+        PixelBounds { x: 0, y: 0, width: 64, height: 64 },
+    )
+}
+
+fn mvp_edge_detail_plan_for_rect(
+    domain: &PreparedMaterialDomain,
+    edge_intent: hot_trimmer_domain::EdgeDetailIntentV1,
+    destination: PixelBounds,
+) -> CompiledAtlasPlanV1 {
+    let mut plan = material_map_plan(domain, MaterialMapKind::EdgeMask);
+    plan.requested_maps = vec![MaterialMapKind::EdgeMask];
+    plan.output_size = PixelSize { width: 64, height: 64 };
+    plan.tile_request.output_rect = OutputPixelRect(PixelBounds {
+        x: 0, y: 0, width: 64, height: 64,
+    });
+    plan.tile_request.valid_rect = plan.tile_request.output_rect;
+    plan.ordered_sources[0].oriented_dimensions = OrientedPixelSize { width: 64, height: 64 };
     let region = &mut plan.ordered_regions[0];
-    region.sampling_plan.slot_physical_size = [0.016, 0.016];
-    region.sampling_plan.source_pixels_per_physical_unit = 250.0;
+    region.source_crop = SourcePixelRect(PixelBounds {
+        x: 0, y: 0, width: 64, height: 64,
+    });
+    region.destination_rect = OutputPixelRect(destination);
+    region.sampling_plan.prepared_domain_dimensions = [64, 64];
+    region.sampling_plan.candidate.crop = Some(SourceCrop {
+        x: 0, y: 0, width: 64, height: 64,
+    });
+    region.sampling_plan.slot_physical_size = [
+        f64::from(destination.width) / 1000.0,
+        f64::from(destination.height) / 1000.0,
+    ];
+    region.sampling_plan.source_pixels_per_physical_unit = 1000.0;
+    region.edge_eligibility = EdgeEligibility {
+        left: true, right: true, top: true, bottom: true,
+    };
     region.compiled_profile = hot_trimmer_sheet_compiler::compile_profile_for_region(
         StructuralProfile::Flat,
         &region.sampling_plan,
@@ -795,84 +880,274 @@ fn mvp_edge_wear_plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
         &ContentDigest::sha256(b"mvp-edge-wear-gpu-profile"),
     )
     .unwrap();
-    region.edge_wear = Some(EdgeWearIntent {
-        enabled: true,
-        target_region: None,
-        coverage: 1.0,
-        strength: 1.0,
-        edge_width_m: 0.004,
-        breakup_scale_m: 0.012,
-        breakup_seed: 201_516,
-        height_amplitude_m: -0.001,
-        hue_shift_degrees: 0.0,
-        saturation_multiplier: 1.0,
-        value_offset: 0.3,
-        roughness_offset: 0.25,
-        exposed_metal_enabled: false,
-        metallic_offset: 0.0,
-    });
+    let edge_input = hot_trimmer_effect_compiler::EdgeDetailRegionInput {
+        region_id: region.region_id,
+        role: region.sampling_plan.role,
+        manual_role: region.region_role,
+        structural_profile: region.structural_profile,
+        slot_size_m: region.sampling_plan.slot_physical_size,
+        destination_pixels: [destination.width, destination.height],
+        edge_eligibility: region.edge_eligibility,
+        stage15_plan_identity: region.compiled_profile.cache_identity.clone(),
+        source_height_identity: None,
+        source_luminance_identity: None,
+    };
+    let edge_plan = hot_trimmer_effect_compiler::compile_edge_detail_plan(
+        &hot_trimmer_effect_compiler::EdgeDetailCompileRequest {
+            intent: &edge_intent,
+            regions: &[edge_input],
+            requested_maps: &[
+                MaterialMapKind::BaseColor, MaterialMapKind::EdgeMask, MaterialMapKind::Height,
+                MaterialMapKind::Normal, MaterialMapKind::Roughness, MaterialMapKind::Metallic,
+            ],
+            resolution_profile: "Authoritative",
+        },
+    )
+    .expect("native ED-2 compile");
+    region.edge_wear = None;
+    region.edge_detail = edge_plan.commands.into_iter().next();
     region.render_cache_key = ContentDigest::sha256(b"mvp-edge-wear-gpu-region");
     plan.final_plan_hash = ContentDigest(String::new());
     plan.finalize().unwrap()
 }
 
+fn execute_edge_detail_map(
+    plan: &CompiledAtlasPlanV1,
+    domain: &Arc<PreparedMaterialDomain>,
+    map: MaterialMapKind,
+) -> AtlasFinalAtlasOutput {
+    let mut requested = plan.clone();
+    requested.requested_maps = vec![map];
+    requested.final_plan_hash = ContentDigest(String::new());
+    requested = requested.finalize().expect("ED-3 requested-map plan");
+    execute_final_atlas(
+        &requested,
+        prepared_sources_for_plan(&requested, Arc::clone(domain)),
+    )
+}
+
 #[test]
 fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
-    let domain = material_domain();
-    let baseline_plan = material_map_plan(&domain, MaterialMapKind::BaseColor);
-    let baseline = execute_final_atlas(
-        &baseline_plan,
-        prepared_sources_for_plan(&baseline_plan, Arc::clone(&domain)),
-    );
+    let domain = edge_detail_material_domain([0.4, 0.4, 0.4], Some(0.25));
     let plan = mvp_edge_wear_plan(&domain);
     let output = execute_final_atlas(
         &plan,
         prepared_sources_for_plan(&plan, Arc::clone(&domain)),
     );
 
-    for map in [
-        MaterialMapKind::BaseColor,
-        MaterialMapKind::EdgeMask,
-        MaterialMapKind::Height,
-        MaterialMapKind::Normal,
-        MaterialMapKind::Roughness,
-        MaterialMapKind::Metallic,
-    ] {
-        assert!(output.map_tiles.contains_key(&map), "missing real GPU {map:?} tile");
+    assert!(output.map_tiles.contains_key(&MaterialMapKind::EdgeMask));
+    for label in ["edge-detail.core", "edge-detail.transition", "edge-detail.fade", "edge-detail.combined", "edge-detail.height"] {
+        assert!(output.intermediate_tiles.contains_key(label), "missing inspectable {label}");
     }
 
     let edge_mask = output.map_tiles.get(&MaterialMapKind::EdgeMask).unwrap();
-    let height = output.map_tiles.get(&MaterialMapKind::Height).unwrap();
-    let roughness = output.map_tiles.get(&MaterialMapKind::Roughness).unwrap();
-    let base_color = output.map_tiles.get(&MaterialMapKind::BaseColor).unwrap();
-    let baseline_color = baseline.map_tiles.get(&MaterialMapKind::BaseColor).unwrap();
-    let normal = output.map_tiles.get(&MaterialMapKind::Normal).unwrap();
-
-    let edge_mask_value = output_f32(edge_mask.pixels(), 4, 0, 0);
-    let center_mask_value = output_f32(edge_mask.pixels(), 4, 2, 2);
-    assert!(edge_mask_value > center_mask_value + 0.1, "edge mask did not resolve an edge");
-    assert!(
-        output_f32(height.pixels(), 4, 0, 0) < output_f32(height.pixels(), 4, 2, 2),
-        "negative Edge Wear height did not indent the edge",
+    assert_eq!(
+        edge_mask.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Float,
+        "raw inspectable mask must remain physical R32Float",
     );
-    assert!(
-        output_f32(roughness.pixels(), 4, 0, 0) > output_f32(roughness.pixels(), 4, 2, 2),
-        "Edge Wear roughness did not affect the edge",
+    assert_eq!(
+        output.interactive_tile.manifest.pixel_format,
+        hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear,
+        "interactive Edge Mask must publish an RGBA8 display tile",
     );
-    assert_ne!(
-        output_pixel(base_color.pixels(), 4, 0, 0),
-        output_pixel(baseline_color.pixels(), 4, 0, 0),
-        "Edge Wear did not modify Base Color",
-    );
-    assert!(
-        normal.pixels().chunks_exact(4).any(|pixel| pixel[0].abs_diff(128) > 8 || pixel[1].abs_diff(128) > 8),
-        "Normal was not derived from the worn final Height",
-    );
+    let mask_values = edge_mask.pixels().chunks_exact(4)
+        .map(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mask_min = mask_values.iter().copied().fold(f32::INFINITY, f32::min);
+    let mask_max = mask_values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    assert!(mask_values.iter().any(|value| *value > 0.0 && *value < 1.0), "combined mask lacks smooth values: min={mask_min}, max={mask_max}");
+    assert!(mask_values.iter().copied().fold(0.0_f32, f32::max) > 0.25, "edge mask is empty");
+    assert!(output_f32(edge_mask.pixels(), 64, 32, 32) < 0.01, "mask escaped the physical edge band");
+    let height = output.intermediate_tiles.get("edge-detail.height").unwrap();
+    let height_values = height.pixels().chunks_exact(4)
+        .map(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()).to_bits())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(height_values.len() > 3, "signed physical Height is not rounded");
     assert!(output.telemetry.iter().any(|line| {
         line.contains("requested_map=EdgeMask")
-            && line.contains("logical_passes=hotspot-profile,edge-wear-mask,publish")
-            && line.contains("executed_gpu_passes=material-r32float-publish")
+            && line.contains("logical_passes=stage15-sdf,stage15-semantics,edge-detail-masks,publish")
+            && line.contains("executed_gpu_passes=stage15-profile,edge-detail-mvp-v2")
     }));
+
+    let authoritative_identity = plan.ordered_regions[0].edge_detail.as_ref().unwrap().cache_identity.0.clone();
+    let mut publications = std::collections::BTreeMap::new();
+    for map in [
+        MaterialMapKind::BaseColor, MaterialMapKind::Height, MaterialMapKind::Normal,
+        MaterialMapKind::Roughness, MaterialMapKind::Metallic,
+    ] {
+        let published = execute_edge_detail_map(&plan, &domain, map);
+        assert!(published.telemetry.iter().any(|line| {
+            line.contains("edge_detail_mask_identity=") && line.contains(&authoritative_identity)
+        }), "{map:?} did not report the authoritative Edge Detail identity");
+        publications.insert(map, published);
+    }
+
+    let final_height = publications[&MaterialMapKind::Height].map_tiles[&MaterialMapKind::Height].pixels();
+    let edge_height = output_f32(final_height, 64, 1, 32);
+    let center_height = output_f32(final_height, 64, 32, 32);
+    assert!(edge_height < 0.0, "negative signed edge Height was lost: {edge_height}");
+    assert!((center_height + 0.000_5).abs() < 0.000_01, "normalized source Height did not map to the explicit ±1 mm contract: {center_height}");
+    let adjacent_height = output_f32(final_height, 64, 2, 32);
+    assert!((adjacent_height - edge_height).abs() < 0.001, "final Height cross-section is discontinuous");
+    let height_display = publications[&MaterialMapKind::Height].display_tiles[&MaterialMapKind::Height].pixels();
+    assert_ne!(output_pixel(height_display, 64, 1, 32), output_pixel(height_display, 64, 32, 32), "Height preview bypassed composition");
+    assert!((i16::from(output_pixel(height_display, 64, 32, 32)[0]) - 64).abs() <= 2, "Height display did not invert the physical range contract");
+
+    let normal = publications[&MaterialMapKind::Normal].map_tiles[&MaterialMapKind::Normal].pixels();
+    let edge_normal = output_pixel(normal, 64, 2, 32);
+    assert_ne!(edge_normal, [128, 128, 255, 255], "flat imported Normal erased the generated bevel");
+    let structured_columns = (0..16).filter(|x| {
+        let pixel = output_pixel(normal, 64, *x, 32);
+        (i16::from(pixel[0]) - 128).abs() > 2 || (i16::from(pixel[1]) - 128).abs() > 2
+    }).count();
+    assert!(structured_columns >= 2, "generated Normal collapsed to a dominant one-pixel stripe");
+    for pixel in normal.chunks_exact(4) {
+        let decoded = [
+            f32::from(pixel[0]) / 255.0 * 2.0 - 1.0,
+            f32::from(pixel[1]) / 255.0 * 2.0 - 1.0,
+            f32::from(pixel[2]) / 255.0 * 2.0 - 1.0,
+        ];
+        let length = (decoded[0] * decoded[0] + decoded[1] * decoded[1] + decoded[2] * decoded[2]).sqrt();
+        assert!(length.is_finite() && (length - 1.0).abs() < 0.03, "Normal is not finite/unit length: {decoded:?}");
+    }
+    let mut directx_plan = plan.clone();
+    directx_plan.normal_convention = CompiledNormalConvention::DirectX;
+    directx_plan.final_plan_hash = ContentDigest(String::new());
+    directx_plan = directx_plan.finalize().unwrap();
+    let directx = execute_edge_detail_map(&directx_plan, &domain, MaterialMapKind::Normal);
+    let directx_normal = directx.map_tiles[&MaterialMapKind::Normal].pixels();
+    for (gl, dx) in normal.chunks_exact(4).zip(directx_normal.chunks_exact(4)) {
+        assert!((i16::from(gl[0]) - i16::from(dx[0])).abs() <= 1);
+        assert!((i16::from(gl[2]) - i16::from(dx[2])).abs() <= 1);
+        assert!((i16::from(gl[1]) + i16::from(dx[1]) - 255).abs() <= 1);
+    }
+
+    let roughness = publications[&MaterialMapKind::Roughness].map_tiles[&MaterialMapKind::Roughness].pixels();
+    let roughness_display = publications[&MaterialMapKind::Roughness].display_tiles[&MaterialMapKind::Roughness].pixels();
+    assert!(roughness.chunks_exact(4).all(|pixel| (0.0..=1.0).contains(&f32::from_le_bytes(pixel.try_into().unwrap()))));
+    assert_ne!(output_pixel(roughness_display, 64, 1, 32), output_pixel(roughness_display, 64, 32, 32), "Roughness preview bypassed composition");
+
+    let mut disabled = plan.clone();
+    disabled.ordered_regions[0].edge_detail = None;
+    disabled.final_plan_hash = ContentDigest(String::new());
+    disabled = disabled.finalize().unwrap();
+    let disabled_metallic = execute_edge_detail_map(&disabled, &domain, MaterialMapKind::Metallic);
+    assert_eq!(
+        publications[&MaterialMapKind::Metallic].map_tiles[&MaterialMapKind::Metallic].pixels(),
+        disabled_metallic.map_tiles[&MaterialMapKind::Metallic].pixels(),
+        "Metallic changed while exposed metal was disabled",
+    );
+    let disabled_intent = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
+        enabled: false,
+        ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+    });
+    assert!(disabled_intent.ordered_regions[0].edge_detail.is_none());
+    for map in [
+        MaterialMapKind::BaseColor, MaterialMapKind::EdgeMask, MaterialMapKind::Height,
+        MaterialMapKind::Normal, MaterialMapKind::Roughness, MaterialMapKind::Metallic,
+    ] {
+        let without_intent = execute_edge_detail_map(&disabled, &domain, map);
+        let disabled_output = execute_edge_detail_map(&disabled_intent, &domain, map);
+        assert_eq!(disabled_output.map_tiles[&map].pixels(), without_intent.map_tiles[&map].pixels(), "disabled Edge Detail changed {map:?}");
+        assert!(disabled_output.telemetry.iter().all(|line| !line.contains("edge-detail-composition-v2") && !line.contains("edge-detail-mvp-v2")), "disabled Edge Detail dispatched work for {map:?}: {:#?}", disabled_output.telemetry);
+    }
+
+    let zero_intensity = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
+        intensity: 0.0, source_height_influence: 0.0, source_luminance_influence: 0.0,
+        ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+    });
+    let zero_color = execute_edge_detail_map(&zero_intensity, &domain, MaterialMapKind::BaseColor);
+    let disabled_color = execute_edge_detail_map(&disabled, &domain, MaterialMapKind::BaseColor);
+    assert_eq!(zero_color.map_tiles[&MaterialMapKind::BaseColor].pixels(), disabled_color.map_tiles[&MaterialMapKind::BaseColor].pixels(), "zero intensity still modified Base Color");
+
+    let zero_normal_strength = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
+        normal_detail_strength: 0.0, source_height_influence: 0.0, source_luminance_influence: 0.0,
+        ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+    });
+    let flat_normal = execute_edge_detail_map(&zero_normal_strength, &domain, MaterialMapKind::Normal);
+    assert_ne!(flat_normal.map_tiles[&MaterialMapKind::Normal].pixels(), normal, "normalDetailStrength did not affect pixels");
+
+    let explicit_metal = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
+        exposed_metal_enabled: true, metallic_offset: 0.5,
+        source_height_influence: 0.0, source_luminance_influence: 0.0,
+        ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+    });
+    let metal = execute_edge_detail_map(&explicit_metal, &domain, MaterialMapKind::Metallic);
+    let metal_pixels = metal.map_tiles[&MaterialMapKind::Metallic].pixels();
+    let baseline_pixels = disabled_metallic.map_tiles[&MaterialMapKind::Metallic].pixels();
+    assert_ne!(output_f32(metal_pixels, 64, 1, 32), output_f32(baseline_pixels, 64, 1, 32));
+    assert_eq!(output_f32(metal_pixels, 64, 32, 32), output_f32(baseline_pixels, 64, 32, 32));
+    assert_ne!(
+        output_pixel(metal.display_tiles[&MaterialMapKind::Metallic].pixels(), 64, 1, 32),
+        output_pixel(disabled_metallic.display_tiles[&MaterialMapKind::Metallic].pixels(), 64, 1, 32),
+        "Metallic preview bypassed explicit composition",
+    );
+
+    let missing_height_domain = edge_detail_material_domain([0.4, 0.4, 0.4], None);
+    let missing_height_plan = mvp_edge_wear_plan(&missing_height_domain);
+    let missing_height = execute_edge_detail_map(
+        &missing_height_plan, &missing_height_domain, MaterialMapKind::Height,
+    );
+    let missing_height_pixels = missing_height.map_tiles[&MaterialMapKind::Height].pixels();
+    assert!(
+        output_f32(missing_height_pixels, 64, 32, 32).abs() < 0.000_01,
+        "missing imported Height contributed a false physical offset",
+    );
+
+    let inset_plan = mvp_edge_detail_plan_for_rect(
+        &domain,
+        hot_trimmer_domain::EdgeDetailIntentV1 {
+            source_height_influence: 0.0,
+            source_luminance_influence: 0.0,
+            ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+        },
+        PixelBounds { x: 8, y: 8, width: 48, height: 48 },
+    );
+    for map in [MaterialMapKind::Height, MaterialMapKind::Roughness, MaterialMapKind::Metallic] {
+        let inset = execute_edge_detail_map(&inset_plan, &domain, map);
+        let preview = inset.display_tiles[&map].pixels();
+        assert_eq!(output_pixel(preview, 64, 0, 0)[3], 0, "{map:?} preview made an atlas gap opaque");
+        assert_eq!(output_pixel(preview, 64, 32, 32)[3], 255, "{map:?} preview hid an allocated region");
+    }
+
+    let cache_plan = mvp_edge_detail_plan_with_intent(
+        &domain,
+        hot_trimmer_domain::EdgeDetailIntentV1 {
+            normal_detail_strength: 0.25,
+            source_height_influence: 0.0,
+            source_luminance_influence: 0.0,
+            ..hot_trimmer_domain::EdgeDetailIntentV1::default()
+        },
+    );
+    let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+    let mut height_request = cache_plan.clone();
+    height_request.requested_maps = vec![MaterialMapKind::Height];
+    height_request.final_plan_hash = ContentDigest(String::new());
+    height_request = height_request.finalize().unwrap();
+    execute_final_atlas_with_cache(
+        &height_request,
+        prepared_sources_for_plan(&height_request, Arc::clone(&domain)),
+        &cache,
+    );
+    let mut normal_request = cache_plan.clone();
+    normal_request.requested_maps = vec![MaterialMapKind::Normal];
+    normal_request.final_plan_hash = ContentDigest(String::new());
+    normal_request = normal_request.finalize().unwrap();
+    let cached_normal = execute_final_atlas_with_cache(
+        &normal_request,
+        prepared_sources_for_plan(&normal_request, Arc::clone(&domain)),
+        &cache,
+    );
+    let fresh_normal = execute_final_atlas(
+        &normal_request,
+        prepared_sources_for_plan(&normal_request, Arc::clone(&domain)),
+    );
+    assert_eq!(
+        cached_normal.map_tiles[&MaterialMapKind::Normal].pixels(),
+        fresh_normal.map_tiles[&MaterialMapKind::Normal].pixels(),
+        "cached physical Height bypassed normalDetailStrength",
+    );
 }
 
 fn material_map_modes_plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {

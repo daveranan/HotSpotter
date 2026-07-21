@@ -3333,7 +3333,8 @@ mod source_frame_partition_tests {
             intent: &intent,
             regions: &[region],
             requested_maps: &[MaterialMapKind::BaseColor, MaterialMapKind::Height],
-            resolution_profile: "preview2048",
+            // Persisted compilation supplies the Rust Debug spelling of ResolutionProfile.
+            resolution_profile: "Preview2048",
         })
         .expect("preview LOD fallback");
         let command = &plan.commands[0];
@@ -3348,6 +3349,21 @@ mod source_frame_partition_tests {
         assert_eq!(command.breakup_scale_m, intent.breakup_scale_m as f32);
         assert_eq!(command.micro_detail_scale_m, 0.008);
         assert_eq!(intent.micro_detail_scale_m, 0.002, "authored intent remains unchanged");
+
+        let mut authoritative_region =
+            edge_detail_region(7, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        authoritative_region.slot_size_m = [0.4, 0.4];
+        let authoritative = compile_edge_detail_plan(&EdgeDetailCompileRequest {
+            intent: &intent,
+            regions: &[authoritative_region],
+            requested_maps: &[MaterialMapKind::EdgeMask],
+            resolution_profile: "Authoritative",
+        })
+        .expect("full-resolution preview LOD fallback");
+        assert_eq!(
+            authoritative.commands[0].lod_fallback.as_ref().expect("authoritative fallback").policy,
+            "authoritative_scale_floor",
+        );
     }
 
     #[test]

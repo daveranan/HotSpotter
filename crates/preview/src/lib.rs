@@ -118,6 +118,8 @@ pub const REGION_ID_DISPLAY_ATLAS_WGSL: &str = include_str!("gpu_region_id_displ
 pub const STRUCTURAL_PROFILE_ATLAS_WGSL: &str = include_str!("gpu_structural_profile.wgsl");
 pub const SEMANTIC_DETAIL_ATLAS_WGSL: &str = include_str!("gpu_semantic_detail.wgsl");
 pub const EDGE_DETAIL_ATLAS_WGSL: &str = include_str!("gpu_edge_detail.wgsl");
+pub const EDGE_DETAIL_COMPOSITION_ATLAS_WGSL: &str = include_str!("gpu_edge_detail_composition.wgsl");
+pub const SCALAR_DISPLAY_ATLAS_WGSL: &str = include_str!("gpu_scalar_display.wgsl");
 
 /// Application-owned, one-time GPU initialization boundary. Prompt 1 only
 /// reports capabilities; no pixel executor consumes this state yet.

@@ -40,7 +40,7 @@ test("mvp-edge-wear apply acquires a deterministic preview region when none is s
     ["region-a", "region-b"],
   );
   assert.equal(targeted, "region-b");
-  assert.equal(feedbackViewAfterCommand({ type: "set_edge_detail", intent: edgeDetail({ enabled: false }) }, "stage15Height"), "stage16BaseColor");
+  assert.equal(feedbackViewAfterCommand({ type: "set_edge_detail", intent: edgeDetail({ enabled: false }) }, "stage15Height"), "stage16RegisteredMask");
 });
 
 const edgeDetail = (patch: Partial<ReturnType<typeof sanitizeEdgeDetailIntent>> = {}) => ({
@@ -61,6 +61,7 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   const shader = read("crates/preview/src/gpu_edge_detail.wgsl");
   const baseColor = read("crates/preview/src/gpu_base_color.wgsl");
   const normal = read("crates/preview/src/gpu_normal_from_height.wgsl");
+  const composition = read("crates/preview/src/gpu_edge_detail_composition.wgsl");
   const executor = read("crates/sheet-compiler/src/atlas_executor.rs");
   assert.match(shader, /var stage15_sdf: texture_2d<f32>/);
   assert.match(shader, /var stage15_semantics: texture_2d<f32>/);
@@ -89,12 +90,40 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(executor, /EdgeDetailSourceModulationRoute::HighPassedLinearLuminance => 2/);
   assert.match(executor, /selected_source_routes=/);
   assert.match(executor, /lod_fallbacks=/);
+  assert.match(executor, /display_format=Rgba8UnormLinear/);
+  assert.match(executor, /scalar-display-rgba8/);
   assert.match(executor, /stage15_sdf_identity=/);
   assert.match(executor, /bounded-resolution-cross-section/);
   assert.match(executor, /tile-origin overlap changed/);
   assert.match(baseColor, /var source_tex: texture_2d_array<f32>/, "ED-3 still owns final source composition");
+  assert.doesNotMatch(baseColor, /edge_wear_mask|edge_wear_flags|edge_wear_coverage/);
+  assert.match(composition, /var physical_height_m = authored_height_m \+ textureLoad\(stage15_height_tex/);
+  assert.match(composition, /cmd\.source_height_range_m/);
+  assert.match(composition, /base\.r != -1\.0/);
+  assert.match(composition, /cmd\.normal_detail_strength - 1\.0/);
+  assert.match(composition, /cmd\.normal_detail_strength/);
+  assert.match(composition, /core_tex, p, 0\)\.r \* cmd\.intensity/);
+  assert.match(composition, /textureLoad\(stage16_height_tex/);
+  assert.match(composition, /textureLoad\(edge_height_tex/);
+  assert.match(composition, /let core = clamp\(textureLoad\(core_tex/);
+  assert.match(composition, /let transition = clamp\(textureLoad\(transition_tex/);
+  assert.match(composition, /let fade = clamp\(textureLoad\(fade_tex/);
+  assert.match(composition, /let mask = clamp\(textureLoad\(combined_tex/);
+  assert.match(composition, /roughness = clamp\(base\.r \+ mask \* cmd\.roughness_offset/);
+  assert.match(composition, /cmd\.exposed_metal_enabled != 0u/);
+  assert.match(composition, /Decode once[\s\S]*encode exactly once/);
   assert.match(executor, /execute_height_normal_gpu/);
+  assert.match(executor, /compose_edge_detail_map/);
+  assert.match(executor, /edge_detail_mask_identity=/);
+  assert.match(executor, /SOURCE_HEIGHT_RANGE_M: f32 = 0\.002/);
+  assert.match(executor, /scalar_display_from_composed_map/);
+  assert.match(read("crates/preview/src/gpu_scalar_display.wgsl"), /var allocation_tex: texture_2d<f32>/);
   assert.match(normal, /textureLoad\(final_height_tex/);
+  assert.match(normal, /Physical Scharr derivative/);
+  assert.match(normal, /meters_per_pixel_x/);
+  assert.match(normal, /meters_per_pixel_y/);
+  assert.match(normal, /compose_rnm/);
+  assert.match(normal, /center_h == center_h && center_h != -1\.0/);
   assert.doesNotMatch(normal, /mix\([^\n]*authored_decoded/);
 });
 
@@ -136,6 +165,9 @@ test("mvp-edge-wear Edge Detail V1 fields agree with the native persisted contra
   assert.match(focusedNative, /mvp_edge_wear_compiler_rejects_invalid_and_subpixel_intents_and_disables_cleanly/);
   assert.match(focusedNative, /mvp_edge_wear_preview_scales_subpixel_detail_without_changing_authored_intent/);
   assert.match(focusedNative, /preview_scale_floor/);
+  assert.match(focusedNative, /authoritative_scale_floor/);
+  const app = read("apps/desktop/src/source-first-app.tsx");
+  assert.match(app, /requestFeedbackTile\([\s\S]*"authoritative"/);
   const store = read("crates/project-store/src/lib.rs");
   assert.match(store, /mvp_edge_wear_project_save_reopen_migrates_once_to_edge_detail_v1/);
   assert.match(read("apps/desktop/src-tauri/src/document_commands.rs"), /"18": \{ "state": FeedbackExecutionState::NotInstalled/);

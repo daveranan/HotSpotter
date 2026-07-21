@@ -27,7 +27,7 @@ struct EdgeCommand {
     declared_halo_px: u32,
     cap_major_axis: u32,
     source_stencil_halo_px: u32,
-    _pad_u1: u32,
+    exposed_metal_enabled: u32,
     slot_width_m: f32,
     slot_height_m: f32,
     meters_per_pixel_x: f32,
@@ -44,11 +44,14 @@ struct EdgeCommand {
     source_height_influence: f32,
     source_luminance_influence: f32,
     height_amplitude_m: f32,
+    normal_detail_strength: f32,
+    source_height_range_m: f32,
     requested_extent_m: f32,
-    _pad_f0: f32,
-    _pad_f1: f32,
-    _pad_f2: f32,
-    _pad_f3: f32,
+    hue_shift_degrees: f32,
+    saturation_multiplier: f32,
+    value_multiplier: f32,
+    roughness_offset: f32,
+    metallic_offset: f32,
 };
 
 @group(0) @binding(0) var<uniform> header: EdgeHeader;
