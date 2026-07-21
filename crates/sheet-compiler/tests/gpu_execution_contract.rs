@@ -185,6 +185,29 @@ fn base_plan() -> CompiledAtlasPlanV1 {
             },
             radial_parameters: None,
             structural_profile: StructuralProfile::Bevel,
+            compiled_profile: hot_trimmer_sheet_compiler::compile_profile_for_region(
+                StructuralProfile::Bevel,
+                &test_sampling_plan(
+                    region_a,
+                    first_source.clone(),
+                    SourceCrop {
+                        x: 0,
+                        y: 0,
+                        width: 256,
+                        height: 256,
+                    },
+                    RegionSampling::OneShot,
+                    None,
+                ),
+                PixelBounds {
+                    x: 0,
+                    y: 0,
+                    width: 256,
+                    height: 256,
+                },
+                &ContentDigest::sha256(b"region-a-profile"),
+            )
+            .unwrap(),
             continuity: RegionContinuity::None,
             padding_px: 4,
             edge_eligibility: EdgeEligibility::default(),
@@ -231,6 +254,29 @@ fn base_plan() -> CompiledAtlasPlanV1 {
             },
             radial_parameters: None,
             structural_profile: StructuralProfile::Groove,
+            compiled_profile: hot_trimmer_sheet_compiler::compile_profile_for_region(
+                StructuralProfile::Groove,
+                &test_sampling_plan(
+                    region_b,
+                    first_source.clone(),
+                    SourceCrop {
+                        x: 256,
+                        y: 0,
+                        width: 256,
+                        height: 256,
+                    },
+                    RegionSampling::LoopX,
+                    None,
+                ),
+                PixelBounds {
+                    x: 256,
+                    y: 0,
+                    width: 256,
+                    height: 256,
+                },
+                &ContentDigest::sha256(b"region-b-profile"),
+            )
+            .unwrap(),
             continuity: RegionContinuity::X,
             padding_px: 8,
             edge_eligibility: EdgeEligibility {
@@ -282,6 +328,29 @@ fn base_plan() -> CompiledAtlasPlanV1 {
             },
             radial_parameters: None,
             structural_profile: StructuralProfile::PanelFrame,
+            compiled_profile: hot_trimmer_sheet_compiler::compile_profile_for_region(
+                StructuralProfile::PanelFrame,
+                &test_sampling_plan(
+                    region_c,
+                    second_source.clone(),
+                    SourceCrop {
+                        x: 0,
+                        y: 256,
+                        width: 256,
+                        height: 512,
+                    },
+                    RegionSampling::LoopY,
+                    None,
+                ),
+                PixelBounds {
+                    x: 0,
+                    y: 256,
+                    width: 256,
+                    height: 512,
+                },
+                &ContentDigest::sha256(b"region-c-profile"),
+            )
+            .unwrap(),
             continuity: RegionContinuity::Y,
             padding_px: 6,
             edge_eligibility: EdgeEligibility {

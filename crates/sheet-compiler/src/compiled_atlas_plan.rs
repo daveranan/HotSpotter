@@ -10,7 +10,7 @@ use hot_trimmer_domain::{
 use hot_trimmer_placement_solver::SamplingPlan;
 
 pub const COMPILED_ATLAS_PLAN_SCHEMA_VERSION: u16 = 1;
-pub const COMPILED_ATLAS_ALGORITHM_VERSION: &str = "gpu-prompt-1-cpu-stage14-v1";
+pub const COMPILED_ATLAS_ALGORITHM_VERSION: &str = "gpu-stage15-compiled-profiles-v1";
 
 #[derive(Debug, Error)]
 pub enum CompiledAtlasPlanValidationError {
@@ -509,9 +509,10 @@ impl CompiledAtlasPlanV1 {
             .iter()
             .map(|region| {
                 format!(
-                    "{}:{:?}:{:?}:{:?}:{}x{};",
+                    "{}:{:?}:{}:{:?}:{:?}:{}x{};",
                     region.region_id,
                     region.structural_profile,
+                    region.compiled_profile.cache_identity.0,
                     region.continuity,
                     region.edge_eligibility,
                     region.destination_rect.0.width,
@@ -710,6 +711,15 @@ fn validate_region(
     source: &CompiledSourceCommandV1,
     output_size: PixelSize,
 ) -> Result<(), CompiledAtlasPlanValidationError> {
+    if region.compiled_profile.cache_identity.0.is_empty()
+        || region.compiled_profile.algorithm_version.is_empty()
+        || region.compiled_profile.slot_size_m != region.sampling_plan.slot_physical_size
+    {
+        return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
+            region_id: region.region_id,
+            reason: "compiled structural profile identity or physical slot size is invalid".into(),
+        });
+    }
     if region.sampling_plan.slot_id != region.region_id {
         return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
             region_id: region.region_id,
@@ -875,6 +885,7 @@ pub struct CompiledRegionCommandV1 {
     pub source_to_region_transform: MappingTransform,
     pub radial_parameters: Option<RadialMappingSettings>,
     pub structural_profile: StructuralProfile,
+    pub compiled_profile: hot_trimmer_effect_compiler::CompiledProfile,
     pub continuity: RegionContinuity,
     pub padding_px: u32,
     pub edge_eligibility: EdgeEligibility,
@@ -882,6 +893,27 @@ pub struct CompiledRegionCommandV1 {
     /// later GPU parity implementations. It is compiled before pixel execution.
     pub sampling_plan: SamplingPlan,
     pub render_cache_key: ContentDigest,
+}
+
+pub fn compile_profile_for_region(
+    intent: StructuralProfile,
+    sampling_plan: &SamplingPlan,
+    destination: PixelBounds,
+    upstream_identity: &ContentDigest,
+) -> Result<
+    hot_trimmer_effect_compiler::CompiledProfile,
+    hot_trimmer_effect_compiler::ProfileCompileError,
+> {
+    hot_trimmer_effect_compiler::compile_structural_intent(
+        intent,
+        sampling_plan.slot_physical_size,
+        [destination.width, destination.height],
+        &hot_trimmer_effect_compiler::conservative_profile_capacity(
+            sampling_plan.slot_physical_size,
+        ),
+        upstream_identity,
+        sampling_plan.candidate.seed,
+    )
 }
 
 impl CompiledRegionCommandV1 {

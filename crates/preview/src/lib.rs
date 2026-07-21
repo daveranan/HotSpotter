@@ -115,6 +115,7 @@ pub const FILL_R32_FLOAT_ATLAS_WGSL: &str = include_str!("gpu_fill_r32float.wgsl
 pub const NORMAL_FROM_HEIGHT_ATLAS_WGSL: &str = include_str!("gpu_normal_from_height.wgsl");
 pub const REGION_ID_ATLAS_WGSL: &str = include_str!("gpu_region_id.wgsl");
 pub const REGION_ID_DISPLAY_ATLAS_WGSL: &str = include_str!("gpu_region_id_display.wgsl");
+pub const STRUCTURAL_PROFILE_ATLAS_WGSL: &str = include_str!("gpu_structural_profile.wgsl");
 
 /// Application-owned, one-time GPU initialization boundary. Prompt 1 only
 /// reports capabilities; no pixel executor consumes this state yet.

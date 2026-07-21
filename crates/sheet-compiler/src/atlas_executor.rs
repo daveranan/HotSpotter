@@ -789,6 +789,7 @@ enum GpuAtlasPipelineKind {
     NormalFromHeight,
     RegionIdR32Uint,
     RegionIdDisplayRgba8,
+    StructuralProfile,
 }
 
 #[derive(Default)]
@@ -1282,6 +1283,51 @@ struct GpuRegionCommand {
     transform_rotation_sin: f32,
     transform_rotation_cos: f32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct GpuProfileHeader {
+    output_width: u32,
+    output_height: u32,
+    tile_x: u32,
+    tile_y: u32,
+    tile_width: u32,
+    tile_height: u32,
+    command_count: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct GpuProfileCommand {
+    program: u32,
+    lod: u32,
+    supersampling: u32,
+    occupancy_bits: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_width: u32,
+    dst_height: u32,
+    edge_mask: u32,
+    curve_offset: u32,
+    curve_count: u32,
+    sdf_kind: u32,
+    slot_width_m: f32,
+    slot_height_m: f32,
+    pixels_per_meter_x: f32,
+    pixels_per_meter_y: f32,
+    first_width_m: f32,
+    second_width_m: f32,
+    minimum_flat_center_m: f32,
+    amplitude_m: f32,
+    angle_radians: f32,
+    inner_radius_m: f32,
+    outer_radius_m: f32,
+    _pad_float: f32,
+}
+
+const GPU_PROFILE_HEADER_BYTES: usize = 32;
+const GPU_PROFILE_COMMAND_BYTES: usize = 96;
 
 const GPU_HEADER_BYTES: usize = 88;
 const GPU_COMMAND_BYTES: usize = 176;
@@ -2267,12 +2313,24 @@ fn source_position_for_command(cmd: &GpuRegionCommand, pixel: [u32; 2]) -> Plann
         11 => {
             p = [
                 slice_axis_cpu(
-                    m[0], source_size[0], crop_origin[0], crop_size[0], cmd.slice_left,
-                    cmd.slice_right, scale, cmd.slice_center,
+                    m[0],
+                    source_size[0],
+                    crop_origin[0],
+                    crop_size[0],
+                    cmd.slice_left,
+                    cmd.slice_right,
+                    scale,
+                    cmd.slice_center,
                 ),
                 slice_axis_cpu(
-                    m[1], source_size[1], crop_origin[1], crop_size[1], cmd.slice_top,
-                    cmd.slice_bottom, scale, cmd.slice_center,
+                    m[1],
+                    source_size[1],
+                    crop_origin[1],
+                    crop_size[1],
+                    cmd.slice_top,
+                    cmd.slice_bottom,
+                    scale,
+                    cmd.slice_center,
                 ),
             ];
         }
@@ -2519,9 +2577,7 @@ fn validate_gpu_prepared_domain_sampling(
             )));
         };
         let candidate = &command.sampling_plan.candidate;
-        if candidate.crop.is_some()
-            || candidate.route != CandidateRoute::Synthesis
-        {
+        if candidate.crop.is_some() || candidate.route != CandidateRoute::Synthesis {
             return Err(AtlasRenderExecutionError::InvalidInput(format!(
                 "region {} has incompatible prepared synthesis provenance",
                 command.region_id
@@ -2564,8 +2620,7 @@ fn validate_gpu_prepared_domain_sampling(
         }
         let rotated = matches!(
             candidate.transform.rotation,
-            hot_trimmer_domain::QuarterTurn::Ninety
-                | hot_trimmer_domain::QuarterTurn::TwoSeventy
+            hot_trimmer_domain::QuarterTurn::Ninety | hot_trimmer_domain::QuarterTurn::TwoSeventy
         );
         let slot = command.sampling_plan.slot_physical_size;
         let required = if rotated { [slot[1], slot[0]] } else { slot };
@@ -2643,8 +2698,7 @@ fn validate_gpu_synthesized_slice_centers(
         let crop = command.source_crop.0;
         let rotated = matches!(
             plan.candidate.transform.rotation,
-            hot_trimmer_domain::QuarterTurn::Ninety
-                | hot_trimmer_domain::QuarterTurn::TwoSeventy
+            hot_trimmer_domain::QuarterTurn::Ninety | hot_trimmer_domain::QuarterTurn::TwoSeventy
         );
         let size = if rotated {
             [plan.slot_physical_size[1], plan.slot_physical_size[0]]
@@ -2694,10 +2748,7 @@ fn validate_gpu_synthesized_slice_centers(
     Ok(())
 }
 
-fn synthesis_family_matches_domain_route(
-    family: CandidateFamily,
-    route: DomainRoute,
-) -> bool {
+fn synthesis_family_matches_domain_route(family: CandidateFamily, route: DomainRoute) -> bool {
     match family {
         CandidateFamily::PanelQuiltedExpansion
         | CandidateFamily::RepeatXQuilted
@@ -3443,6 +3494,16 @@ fn pipeline(
             uint_storage_layout_entry(1),
             storage_texture_layout_entry(2, wgpu::TextureFormat::Rgba8Unorm),
         ],
+        GpuAtlasPipelineKind::StructuralProfile => vec![
+            uniform_layout_entry(0, GPU_PROFILE_HEADER_BYTES as u64),
+            readonly_storage_layout_entry(1, GPU_PROFILE_COMMAND_BYTES as u64),
+            storage_texture_layout_entry(2, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(3, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(4, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(5, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(6, wgpu::TextureFormat::R32Float),
+            readonly_storage_layout_entry(7, 8),
+        ],
     };
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(match kind {
@@ -3454,6 +3515,7 @@ fn pipeline(
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => {
                 "hot-trimmer-region-id-display-bind-layout"
             }
+            GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-bind-layout",
         }),
         entries: &entries,
     });
@@ -3473,6 +3535,9 @@ fn pipeline(
         GpuAtlasPipelineKind::RegionIdDisplayRgba8 => {
             hot_trimmer_preview::REGION_ID_DISPLAY_ATLAS_WGSL.into()
         }
+        GpuAtlasPipelineKind::StructuralProfile => {
+            hot_trimmer_preview::STRUCTURAL_PROFILE_ATLAS_WGSL.into()
+        }
     };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(match kind {
@@ -3482,6 +3547,7 @@ fn pipeline(
             GpuAtlasPipelineKind::NormalFromHeight => "hot-trimmer-normal-from-height-wgsl",
             GpuAtlasPipelineKind::RegionIdR32Uint => "hot-trimmer-region-id-wgsl",
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-wgsl",
+            GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-wgsl",
         }),
         source: wgpu::ShaderSource::Wgsl(shader_source),
     });
@@ -3498,6 +3564,7 @@ fn pipeline(
             GpuAtlasPipelineKind::NormalFromHeight => "hot-trimmer-normal-from-height-pipeline",
             GpuAtlasPipelineKind::RegionIdR32Uint => "hot-trimmer-region-id-pipeline",
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-pipeline",
+            GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-pipeline",
         }),
         layout: Some(&pipeline_layout),
         module: &shader,
@@ -3521,6 +3588,32 @@ fn header_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
             min_binding_size: NonZeroU64::new(GPU_HEADER_BYTES as u64),
+        },
+        count: None,
+    }
+}
+
+fn uniform_layout_entry(binding: u32, minimum_size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: NonZeroU64::new(minimum_size),
+        },
+        count: None,
+    }
+}
+
+fn readonly_storage_layout_entry(binding: u32, minimum_size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: NonZeroU64::new(minimum_size),
         },
         count: None,
     }
@@ -3767,6 +3860,285 @@ struct GpuMaterialDispatchStats {
     dispatch_ms: u128,
 }
 
+#[derive(Default)]
+struct GpuProfileDispatchStats {
+    cache_hit: bool,
+    dispatches: u32,
+    command_count: u32,
+    command_bytes: u64,
+    resident_bytes: u64,
+    required_halo_px: u32,
+    dispatch_ms: u128,
+}
+
+const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
+    (MaterialMapKind::Height, "stage15-profile-height-v1"),
+    (MaterialMapKind::Roughness, "stage15-profile-sdf-v1"),
+    (
+        MaterialMapKind::AmbientOcclusion,
+        "stage15-profile-semantics-v1",
+    ),
+    (MaterialMapKind::Metallic, "stage15-profile-derivative-x-v1"),
+    (MaterialMapKind::Opacity, "stage15-profile-derivative-y-v1"),
+];
+
+fn execute_or_load_profile_fields(
+    executor: &GpuAtlasRenderExecutor<'_>,
+    plan: &CompiledAtlasPlanV1,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cancellation: &CancellationToken,
+    is_current: &dyn Fn() -> bool,
+) -> Result<GpuProfileDispatchStats, AtlasRenderExecutionError> {
+    if cancellation.is_cancelled() {
+        return Err(AtlasRenderExecutionError::Cancelled);
+    }
+    if !is_current() {
+        return Err(AtlasRenderExecutionError::Superseded);
+    }
+    let tile = plan.tile_request.output_rect.0;
+    let bytes_per_field = u64::from(tile.width)
+        .saturating_mul(u64::from(tile.height))
+        .saturating_mul(4);
+    let resident_bytes = bytes_per_field.saturating_mul(5);
+    if resident_bytes
+        > GpuAtlasSourceTextureCache::budgets().gpu_output_intermediate_residency_bytes
+    {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "Stage 15 profile fields require {resident_bytes} bytes, exceeding the bounded GPU tile residency budget"
+        )));
+    }
+    let identities = PROFILE_FIELD_IDENTITIES.map(|(map, shader)| plan.tile_identity(map, shader));
+    let cached_count = executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .rendered_textures
+        .iter()
+        .filter(|texture| {
+            identities
+                .iter()
+                .any(|identity| texture.pixel_identity == identity.pixel_identity())
+                && texture.format == wgpu::TextureFormat::R32Float
+                && texture.width == tile.width
+                && texture.height == tile.height
+        })
+        .count();
+    let required_halo_px = plan
+        .ordered_regions
+        .iter()
+        .map(|region| region.compiled_profile.required_halo_px)
+        .max()
+        .unwrap_or(0);
+    if cached_count == identities.len() {
+        return Ok(GpuProfileDispatchStats {
+            cache_hit: true,
+            resident_bytes,
+            required_halo_px,
+            ..GpuProfileDispatchStats::default()
+        });
+    }
+
+    let started = Instant::now();
+    let (profile_pipeline, _) = pipeline(
+        device,
+        executor.source_texture_cache,
+        GpuAtlasPipelineKind::StructuralProfile,
+    )?;
+    let mut commands = Vec::with_capacity(plan.ordered_regions.len());
+    let mut curve_points = Vec::<[f32; 2]>::new();
+    for region in &plan.ordered_regions {
+        let profile = &region.compiled_profile;
+        let curve_offset = curve_points.len() as u32;
+        curve_points.extend(
+            profile
+                .custom_curve
+                .iter()
+                .map(|point| [point.position as f32, point.height as f32]),
+        );
+        let edges = region.edge_eligibility;
+        let edge_mask = u32::from(edges.left)
+            | (u32::from(edges.right) << 1)
+            | (u32::from(edges.top) << 2)
+            | (u32::from(edges.bottom) << 3);
+        let occupancy_bits = u32::from(profile.occupancy.signed_distance)
+            | (u32::from(profile.occupancy.inside_outside) << 1)
+            | (u32::from(profile.occupancy.flat_center) << 2)
+            | (u32::from(profile.occupancy.raised) << 3)
+            | (u32::from(profile.occupancy.recessed) << 4)
+            | (u32::from(profile.occupancy.cap) << 5)
+            | (u32::from(profile.occupancy.groove) << 6)
+            | (u32::from(profile.occupancy.profile_exclusion) << 7);
+        let dst = region.destination_rect.0;
+        commands.push(GpuProfileCommand {
+            program: profile_program_code(profile.program),
+            lod: profile_lod_code(profile.lod),
+            supersampling: u32::from(profile.supersampling),
+            occupancy_bits,
+            dst_x: dst.x,
+            dst_y: dst.y,
+            dst_width: dst.width,
+            dst_height: dst.height,
+            edge_mask,
+            curve_offset,
+            curve_count: profile.custom_curve.len() as u32,
+            sdf_kind: profile_sdf_code(profile.sdf),
+            slot_width_m: profile.slot_size_m[0] as f32,
+            slot_height_m: profile.slot_size_m[1] as f32,
+            pixels_per_meter_x: profile.pixels_per_meter[0] as f32,
+            pixels_per_meter_y: profile.pixels_per_meter[1] as f32,
+            first_width_m: profile.first_width_m as f32,
+            second_width_m: profile.second_width_m as f32,
+            minimum_flat_center_m: profile.minimum_flat_center_m as f32,
+            amplitude_m: profile.amplitude_m as f32,
+            angle_radians: (profile.angle_degrees as f32).to_radians(),
+            inner_radius_m: profile.inner_radius_m as f32,
+            outer_radius_m: profile.outer_radius_m as f32,
+            _pad_float: 0.0,
+        });
+    }
+    if commands.is_empty() {
+        return Ok(GpuProfileDispatchStats {
+            required_halo_px,
+            ..Default::default()
+        });
+    }
+    if curve_points.is_empty() {
+        curve_points.push([0.0, 0.0]);
+    }
+    let header = GpuProfileHeader {
+        output_width: plan.output_size.width,
+        output_height: plan.output_size.height,
+        tile_x: tile.x,
+        tile_y: tile.y,
+        tile_width: tile.width,
+        tile_height: tile.height,
+        command_count: commands.len() as u32,
+        _pad: 0,
+    };
+    let header_bytes = encode_profile_header(header);
+    let command_bytes = encode_profile_commands(&commands);
+    let curve_bytes = encode_profile_curves(&curve_points);
+    let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-profile-header"),
+        contents: &header_bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let command_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-profile-commands"),
+        contents: &command_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let curve_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-profile-curves"),
+        contents: &curve_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut fields = Vec::with_capacity(5);
+    for label in ["height", "sdf", "semantics", "derivative-x", "derivative-y"] {
+        fields.push(create_working_texture(
+            device,
+            match label {
+                "height" => "hot-trimmer-profile-height",
+                "sdf" => "hot-trimmer-profile-sdf",
+                "semantics" => "hot-trimmer-profile-semantics",
+                "derivative-x" => "hot-trimmer-profile-derivative-x",
+                _ => "hot-trimmer-profile-derivative-y",
+            },
+            tile.width,
+            tile.height,
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        ));
+    }
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hot-trimmer-profile-bind-group"),
+        layout: &profile_pipeline.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: header_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: command_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&fields[0].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&fields[1].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&fields[2].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&fields[3].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&fields[4].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: curve_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-profile-encoder"),
+    });
+    for (texture, _) in &fields {
+        encoder.clear_texture(texture, &wgpu::ImageSubresourceRange::default());
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("hot-trimmer-profile-dispatch"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&profile_pipeline.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(tile.width.div_ceil(16), tile.height.div_ceil(16), 1);
+    }
+    submit_encoder_and_wait(device, queue, encoder)?;
+    if cancellation.is_cancelled() {
+        return Err(AtlasRenderExecutionError::Cancelled);
+    }
+    if !is_current() {
+        return Err(AtlasRenderExecutionError::Superseded);
+    }
+    let mut cache = executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+    for ((texture, view), identity) in fields.into_iter().zip(identities) {
+        cache.remember_rendered_texture(
+            identity,
+            texture,
+            view,
+            tile.width,
+            tile.height,
+            wgpu::TextureFormat::R32Float,
+            bytes_per_field,
+        );
+    }
+    Ok(GpuProfileDispatchStats {
+        cache_hit: false,
+        dispatches: 1,
+        command_count: commands.len() as u32,
+        command_bytes: command_bytes.len() as u64,
+        resident_bytes,
+        required_halo_px,
+        dispatch_ms: started.elapsed().as_millis(),
+    })
+}
+
 fn execute_r32float_material_tile(
     executor: &GpuAtlasRenderExecutor<'_>,
     plan: &CompiledAtlasPlanV1,
@@ -3836,6 +4208,8 @@ fn execute_r32float_material_tile(
     require_format(state.capabilities(), "Rgba8Unorm", false, true)?;
     let device = state.device();
     let queue = state.queue();
+    let profile_stats =
+        execute_or_load_profile_fields(executor, plan, device, queue, cancellation, is_current)?;
     let pipeline_started = Instant::now();
     let (material_pipeline, pipeline_cache_hit) = pipeline(
         device,
@@ -4042,6 +4416,16 @@ fn execute_r32float_material_tile(
         readback_ms.saturating_add(display_readback_ms),
         started.elapsed().as_millis()
     )];
+    telemetry.push(format!(
+        "profile_pass_dispatches={}; profile_cache_hit={}; profile_commands={}; profile_command_bytes={}; profile_resident_bytes={}; profile_required_halo={}; profile_dispatch_ms={}",
+        profile_stats.dispatches,
+        profile_stats.cache_hit,
+        profile_stats.command_count,
+        profile_stats.command_bytes,
+        profile_stats.resident_bytes,
+        profile_stats.required_halo_px,
+        profile_stats.dispatch_ms,
+    ));
     if let Some(timing) = timing {
         telemetry.extend(timing.finish(device)?);
     }
@@ -4441,6 +4825,8 @@ fn execute_height_normal_gpu(
     require_format(state.capabilities(), "Rgba8Unorm", false, true)?;
     let device = state.device();
     let queue = state.queue();
+    let profile_stats =
+        execute_or_load_profile_fields(executor, plan, device, queue, cancellation, is_current)?;
     let pipeline_started = Instant::now();
     let has_authored_normal = plan
         .ordered_sources
@@ -5031,6 +5417,16 @@ fn execute_height_normal_gpu(
             ),
         started.elapsed().as_millis()
     )];
+    telemetry.push(format!(
+        "profile_pass_dispatches={}; profile_cache_hit={}; profile_commands={}; profile_command_bytes={}; profile_resident_bytes={}; profile_required_halo={}; profile_dispatch_ms={}",
+        profile_stats.dispatches,
+        profile_stats.cache_hit,
+        profile_stats.command_count,
+        profile_stats.command_bytes,
+        profile_stats.resident_bytes,
+        profile_stats.required_halo_px,
+        profile_stats.dispatch_ms,
+    ));
     if publish_height {
         telemetry.push(
             "executor=gpu; dependency=Normal<-Height; final_height_publication=R32Float; intermediate_cache=final-height:live-gpu-readback"
@@ -6504,7 +6900,9 @@ fn source_texture_page_array<'cache>(
         .checked_mul(u64::from(page_height))
         .and_then(|pixels| pixels.checked_mul(u64::from(layer_count)))
         .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| AtlasRenderExecutionError::Gpu("validity page array bytes overflow".into()))?;
+        .ok_or_else(|| {
+            AtlasRenderExecutionError::Gpu("validity page array bytes overflow".into())
+        })?;
     let byte_len = source_byte_len
         .checked_add(validity_byte_len)
         .ok_or_else(|| AtlasRenderExecutionError::Gpu("source page array bytes overflow".into()))?;
@@ -6640,12 +7038,14 @@ fn create_validity_texture_array(
         view_formats: &[],
     });
     for (layer_index, page) in layout.source_page_table.iter().enumerate() {
-        let interior_x = layout.source_rect.x.saturating_add(
-            page.x.saturating_mul(layout.source_page_interior_width),
-        );
-        let interior_y = layout.source_rect.y.saturating_add(
-            page.y.saturating_mul(layout.source_page_interior_height),
-        );
+        let interior_x = layout
+            .source_rect
+            .x
+            .saturating_add(page.x.saturating_mul(layout.source_page_interior_width));
+        let interior_y = layout
+            .source_rect
+            .y
+            .saturating_add(page.y.saturating_mul(layout.source_page_interior_height));
         let page_x = interior_x
             .saturating_sub(layout.source_page_halo)
             .max(layout.source_rect.x);
@@ -7193,8 +7593,7 @@ fn validate_gpu_slice_contract(
     };
     let rotated = matches!(
         plan.candidate.transform.rotation,
-        hot_trimmer_domain::QuarterTurn::Ninety
-            | hot_trimmer_domain::QuarterTurn::TwoSeventy
+        hot_trimmer_domain::QuarterTurn::Ninety | hot_trimmer_domain::QuarterTurn::TwoSeventy
     );
     let size = if rotated {
         [plan.slot_physical_size[1], plan.slot_physical_size[0]]
@@ -7207,10 +7606,7 @@ fn validate_gpu_slice_contract(
             leading_cap_pixels,
             trailing_cap_pixels,
             ..
-        } => {
-            size[0]
-                > f64::from(leading_cap_pixels.saturating_add(trailing_cap_pixels)) / scale
-        }
+        } => size[0] > f64::from(leading_cap_pixels.saturating_add(trailing_cap_pixels)) / scale,
         SliceGeometry::Nine {
             left_pixels,
             right_pixels,
@@ -7283,6 +7679,113 @@ fn encode_header(header: GpuAtlasHeader) -> [u8; GPU_HEADER_BYTES] {
     ];
     for (index, value) in values.into_iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn profile_program_code(program: hot_trimmer_effect_compiler::ProfileProgram) -> u32 {
+    use hot_trimmer_effect_compiler::ProfileProgram::*;
+    match program {
+        Flat => 0,
+        ConvexBevel => 1,
+        ConcaveGroove => 2,
+        RoundedBevel => 3,
+        DoubleBevel => 4,
+        RaisedLip => 5,
+        RecessedSeam => 6,
+        PanelFrame => 7,
+        FullyRoundedStrip => 8,
+        MergedOpposingBevel => 9,
+        RadialDisc => 10,
+        Annulus => 11,
+        CustomCurve => 12,
+    }
+}
+
+fn profile_lod_code(lod: hot_trimmer_effect_compiler::ProfileLod) -> u32 {
+    use hot_trimmer_effect_compiler::ProfileLod::*;
+    match lod {
+        FullHeight => 0,
+        SimplifiedHeight => 1,
+        NormalOnly => 2,
+        RoughnessOnly => 3,
+        Disabled => 4,
+    }
+}
+
+fn profile_sdf_code(sdf: hot_trimmer_effect_compiler::ProfileSdf) -> u32 {
+    match sdf {
+        hot_trimmer_effect_compiler::ProfileSdf::Rectangle => 0,
+        hot_trimmer_effect_compiler::ProfileSdf::Disc => 1,
+        hot_trimmer_effect_compiler::ProfileSdf::Annulus => 2,
+    }
+}
+
+fn encode_profile_header(header: GpuProfileHeader) -> [u8; GPU_PROFILE_HEADER_BYTES] {
+    let mut bytes = [0_u8; GPU_PROFILE_HEADER_BYTES];
+    for (index, value) in [
+        header.output_width,
+        header.output_height,
+        header.tile_x,
+        header.tile_y,
+        header.tile_width,
+        header.tile_height,
+        header.command_count,
+        header._pad,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn encode_profile_commands(commands: &[GpuProfileCommand]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(commands.len() * GPU_PROFILE_COMMAND_BYTES);
+    for command in commands {
+        for value in [
+            command.program,
+            command.lod,
+            command.supersampling,
+            command.occupancy_bits,
+            command.dst_x,
+            command.dst_y,
+            command.dst_width,
+            command.dst_height,
+            command.edge_mask,
+            command.curve_offset,
+            command.curve_count,
+            command.sdf_kind,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [
+            command.slot_width_m,
+            command.slot_height_m,
+            command.pixels_per_meter_x,
+            command.pixels_per_meter_y,
+            command.first_width_m,
+            command.second_width_m,
+            command.minimum_flat_center_m,
+            command.amplitude_m,
+            command.angle_radians,
+            command.inner_radius_m,
+            command.outer_radius_m,
+            command._pad_float,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(bytes.len(), commands.len() * GPU_PROFILE_COMMAND_BYTES);
+    bytes
+}
+
+fn encode_profile_curves(curves: &[[f32; 2]]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(curves.len() * 8);
+    for point in curves {
+        bytes.extend_from_slice(&point[0].to_le_bytes());
+        bytes.extend_from_slice(&point[1].to_le_bytes());
     }
     bytes
 }
@@ -7506,6 +8009,16 @@ mod tests {
             width: 8192,
             height: 8192,
         };
+        let sampling_plan = gpu_tiled_export_sampling_plan(
+            region_id,
+            source_id.clone(),
+            SourceCrop {
+                x: source_crop.x,
+                y: source_crop.y,
+                width: source_crop.width,
+                height: source_crop.height,
+            },
+        );
         CompiledAtlasPlanV1 {
             schema_version: COMPILED_ATLAS_PLAN_SCHEMA_VERSION,
             algorithm_version: COMPILED_ATLAS_ALGORITHM_VERSION.into(),
@@ -7565,19 +8078,17 @@ mod tests {
                 source_to_region_transform: MappingTransform::default(),
                 radial_parameters: None,
                 structural_profile: StructuralProfile::Bevel,
+                compiled_profile: crate::compile_profile_for_region(
+                    StructuralProfile::Bevel,
+                    &sampling_plan,
+                    source_crop,
+                    &ContentDigest::sha256(b"gpu-tiled-export-profile"),
+                )
+                .expect("profile fixture should compile"),
                 continuity: RegionContinuity::None,
                 padding_px: 0,
                 edge_eligibility: EdgeEligibility::default(),
-                sampling_plan: gpu_tiled_export_sampling_plan(
-                    region_id,
-                    source_id,
-                    SourceCrop {
-                        x: source_crop.x,
-                        y: source_crop.y,
-                        width: source_crop.width,
-                        height: source_crop.height,
-                    },
-                ),
+                sampling_plan,
                 render_cache_key: ContentDigest::sha256(b"gpu-tiled-export-region-render"),
             }],
             final_plan_hash: ContentDigest(String::new()),
@@ -7613,9 +8124,147 @@ mod tests {
             height: edge,
         });
         region.sampling_plan.slot_physical_size = [f64::from(edge), f64::from(edge)];
+        region.compiled_profile = crate::compile_profile_for_region(
+            region.structural_profile,
+            &region.sampling_plan,
+            bounds,
+            &ContentDigest::sha256(b"gpu-tiled-export-resized-profile"),
+        )
+        .expect("resized profile fixture should compile");
         plan.final_plan_hash = ContentDigest(String::new());
         plan.finalize()
             .expect("resized fixture plan should validate")
+    }
+
+    fn read_cached_profile_field(
+        handle: &hot_trimmer_preview::GpuDeviceState,
+        cache: &Mutex<GpuAtlasSourceTextureCache>,
+        plan: &CompiledAtlasPlanV1,
+        map: MaterialMapKind,
+        shader: &str,
+    ) -> Arc<[u8]> {
+        let identity = plan.tile_identity(map, shader);
+        let texture = cache
+            .lock()
+            .unwrap()
+            .cached_rendered_texture(&identity)
+            .expect("profile field must remain GPU resident");
+        let tile = plan.tile_request.output_rect.0;
+        let mut encoder = handle
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("stage15-profile-field-readback"),
+            });
+        let pending = schedule_readback(
+            handle.device(),
+            cache,
+            &mut encoder,
+            &texture._texture,
+            tile.width,
+            tile.height,
+            4,
+        )
+        .expect("bounded profile readback should schedule");
+        handle.queue().submit(Some(encoder.finish()));
+        finish_readback(handle.device(), pending)
+            .expect("profile field readback")
+            .0
+    }
+
+    fn r32_pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> f32 {
+        let offset = ((y * width + x) * 4) as usize;
+        f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn run_single_profile_fixture(
+        gpu: &hot_trimmer_preview::GpuCapabilityService,
+        handle: &hot_trimmer_preview::GpuDeviceState,
+        requested: &hot_trimmer_effect_compiler::RequestedProfile,
+        upstream: &[u8],
+    ) -> (
+        hot_trimmer_effect_compiler::CompiledProfile,
+        Arc<[u8]>,
+        Arc<[u8]>,
+        Arc<[u8]>,
+        Arc<[u8]>,
+        Arc<[u8]>,
+    ) {
+        let mut plan = gpu_tiled_export_resized_plan(64);
+        plan.ordered_regions[0].compiled_profile = hot_trimmer_effect_compiler::compile_profile(
+            hot_trimmer_effect_compiler::ProfileCompileRequest {
+                requested,
+                slot_size_m: [64.0, 64.0],
+                destination_pixels: [64, 64],
+                capacity: &hot_trimmer_effect_compiler::conservative_profile_capacity([64.0, 64.0]),
+                upstream_identity: &ContentDigest::sha256(upstream),
+            },
+        )
+        .expect("single profile fixture should compile");
+        let profile = plan.ordered_regions[0].compiled_profile.clone();
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan = plan
+            .finalize()
+            .expect("single profile fixture plan should validate");
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let executor = GpuAtlasRenderExecutor {
+            service: gpu,
+            source_texture_cache: &cache,
+        };
+        let cancellation = CancellationToken::new();
+        execute_or_load_profile_fields(
+            &executor,
+            &plan,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("single profile fixture should execute on GPU");
+        (
+            profile,
+            read_cached_profile_field(
+                handle,
+                &cache,
+                &plan,
+                MaterialMapKind::Height,
+                "stage15-profile-height-v1",
+            ),
+            read_cached_profile_field(
+                handle,
+                &cache,
+                &plan,
+                MaterialMapKind::Roughness,
+                "stage15-profile-sdf-v1",
+            ),
+            read_cached_profile_field(
+                handle,
+                &cache,
+                &plan,
+                MaterialMapKind::AmbientOcclusion,
+                "stage15-profile-semantics-v1",
+            ),
+            read_cached_profile_field(
+                handle,
+                &cache,
+                &plan,
+                MaterialMapKind::Metallic,
+                "stage15-profile-derivative-x-v1",
+            ),
+            read_cached_profile_field(
+                handle,
+                &cache,
+                &plan,
+                MaterialMapKind::Opacity,
+                "stage15-profile-derivative-y-v1",
+            ),
+        )
+    }
+
+    fn assert_close(actual: f32, expected: f32, tolerance: f32, label: &str) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}: actual={actual} expected={expected} tolerance={tolerance}"
+        );
     }
 
     fn gpu_tiled_export_three_source_plan() -> CompiledAtlasPlanV1 {
@@ -8419,5 +9068,516 @@ mod tests {
             layer_count: 1,
             last_used: 0,
         })
+    }
+
+    #[test]
+    fn algorithm_stage_15_gpu_profiles_match_oracle_cache_and_cancellation() {
+        let gpu = hot_trimmer_preview::GpuCapabilityService::default();
+        let handle = gpu
+            .initialize()
+            .expect("GPU service should initialize for Stage 15 profile parity");
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &cache,
+        };
+        let plan = gpu_tiled_export_resized_plan(64);
+        let cancellation = CancellationToken::new();
+        let stats = execute_or_load_profile_fields(
+            &executor,
+            &plan,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("compiled profile GPU pass should execute");
+        assert_eq!(stats.dispatches, 1);
+        assert_eq!(stats.command_count, 1);
+        assert!(!stats.cache_hit);
+
+        let bytes = read_cached_profile_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::Height,
+            "stage15-profile-height-v1",
+        );
+        let pixel = |x: u32, y: u32| {
+            let offset = ((y * 64 + x) * 4) as usize;
+            f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let profile = &plan.ordered_regions[0].compiled_profile;
+        let oracle = |distance_m: f32| {
+            let width = profile.first_width_m as f32;
+            let t = (distance_m / width).clamp(0.0, 1.0);
+            profile.amplitude_m as f32 * (2.0 * t - t * t)
+        };
+        assert!((pixel(0, 32) - oracle(0.5)).abs() <= 2.0e-5);
+        assert!((pixel(32, 32) - oracle(31.5)).abs() <= 2.0e-5);
+
+        let cached = execute_or_load_profile_fields(
+            &executor,
+            &plan,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("identical plan should hit GPU field cache");
+        assert!(cached.cache_hit);
+        assert_eq!(cached.dispatches, 0);
+
+        let cancelled_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let cancelled_executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &cancelled_cache,
+        };
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            execute_or_load_profile_fields(
+                &cancelled_executor,
+                &plan,
+                handle.device(),
+                handle.queue(),
+                &cancelled,
+                &|| true,
+            ),
+            Err(AtlasRenderExecutionError::Cancelled)
+        ));
+        assert_eq!(cancelled_cache.lock().unwrap().rendered_textures.len(), 0);
+    }
+
+    #[test]
+    fn algorithm_stage_15_gpu_profiles_cover_programs_resolutions_and_fallbacks() {
+        use hot_trimmer_effect_compiler::{
+            CustomProfilePoint, ProfileCompileRequest, ProfileFallback, ProfileLegalityPolicy,
+            ProfileLength, ProfileLod, ProfileLodPolicy, ProfileProgram, RequestedProfile,
+            compile_profile, conservative_profile_capacity,
+        };
+        let programs = [
+            ProfileProgram::Flat,
+            ProfileProgram::ConvexBevel,
+            ProfileProgram::ConcaveGroove,
+            ProfileProgram::RoundedBevel,
+            ProfileProgram::DoubleBevel,
+            ProfileProgram::RaisedLip,
+            ProfileProgram::RecessedSeam,
+            ProfileProgram::PanelFrame,
+            ProfileProgram::FullyRoundedStrip,
+            ProfileProgram::MergedOpposingBevel,
+            ProfileProgram::RadialDisc,
+            ProfileProgram::Annulus,
+            ProfileProgram::CustomCurve,
+        ];
+        for edge in [1024, 2048, 4096, 8192] {
+            for program in programs {
+                let mut requested =
+                    RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x15);
+                requested.program = program;
+                if program == ProfileProgram::Annulus {
+                    requested.inner_radius = ProfileLength::RelativeMinor(0.10);
+                    requested.outer_radius = ProfileLength::RelativeMinor(0.40);
+                }
+                requested.custom_curve = if program == ProfileProgram::CustomCurve {
+                    vec![
+                        CustomProfilePoint {
+                            position: 0.0,
+                            height: 0.0,
+                        },
+                        CustomProfilePoint {
+                            position: 0.5,
+                            height: 1.0,
+                        },
+                        CustomProfilePoint {
+                            position: 1.0,
+                            height: 0.0,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let compiled = compile_profile(ProfileCompileRequest {
+                    requested: &requested,
+                    slot_size_m: [4.0, 0.25],
+                    destination_pixels: [edge, edge / 16],
+                    capacity: &conservative_profile_capacity([4.0, 0.25]),
+                    upstream_identity: &ContentDigest::sha256(b"stage15-resolution-fixture"),
+                })
+                .expect("broad, strip, radial, cap, and curve fixtures compile");
+                assert_eq!(compiled.first_width_m, 0.03125);
+                assert_eq!(compiled.amplitude_m, 0.015625);
+                assert_eq!(compiled.seed, 0x15);
+                assert!(matches!(compiled.supersampling, 1 | 2 | 4 | 8));
+            }
+        }
+
+        let gpu = hot_trimmer_preview::GpuCapabilityService::default();
+        let handle = gpu
+            .initialize()
+            .expect("GPU service should initialize for complete Stage 15 profile coverage");
+        for program in programs {
+            let mut requested =
+                RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x515);
+            requested.program = program;
+            if program == ProfileProgram::Annulus {
+                requested.inner_radius = ProfileLength::RelativeMinor(0.10);
+                requested.outer_radius = ProfileLength::RelativeMinor(0.40);
+            }
+            requested.custom_curve = if program == ProfileProgram::CustomCurve {
+                vec![
+                    CustomProfilePoint {
+                        position: 0.0,
+                        height: 0.0,
+                    },
+                    CustomProfilePoint {
+                        position: 0.5,
+                        height: 1.0,
+                    },
+                    CustomProfilePoint {
+                        position: 1.0,
+                        height: 0.0,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let mut plan = gpu_tiled_export_resized_plan(64);
+            plan.ordered_regions[0].compiled_profile = compile_profile(ProfileCompileRequest {
+                requested: &requested,
+                slot_size_m: [64.0, 64.0],
+                destination_pixels: [64, 64],
+                capacity: &conservative_profile_capacity([64.0, 64.0]),
+                upstream_identity: &ContentDigest::sha256(b"stage15-gpu-program-fixture"),
+            })
+            .expect("GPU profile fixture should compile");
+            plan.final_plan_hash = ContentDigest(String::new());
+            plan = plan
+                .finalize()
+                .expect("profile fixture plan should validate");
+            let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+            let executor = GpuAtlasRenderExecutor {
+                service: &gpu,
+                source_texture_cache: &cache,
+            };
+            let cancellation = CancellationToken::new();
+            let stats = execute_or_load_profile_fields(
+                &executor,
+                &plan,
+                handle.device(),
+                handle.queue(),
+                &cancellation,
+                &|| true,
+            )
+            .expect("each Stage 15 profile program should execute on GPU");
+            assert_eq!(stats.command_count, 1, "{program:?}");
+            let height_bytes = read_cached_profile_field(
+                &handle,
+                &cache,
+                &plan,
+                MaterialMapKind::Height,
+                "stage15-profile-height-v1",
+            );
+            let semantics_bytes = read_cached_profile_field(
+                &handle,
+                &cache,
+                &plan,
+                MaterialMapKind::AmbientOcclusion,
+                "stage15-profile-semantics-v1",
+            );
+            let edge_height = r32_pixel(&height_bytes, 64, 0, 32);
+            let center_semantics = r32_pixel(&semantics_bytes, 64, 32, 32);
+            assert!(edge_height.is_finite(), "{program:?}");
+            assert!(center_semantics.is_finite(), "{program:?}");
+            if program == ProfileProgram::Flat {
+                assert_eq!(edge_height, 0.0);
+                assert_eq!(center_semantics, 0.0);
+            }
+        }
+
+        let smooth = |value: f32| {
+            let x = value.clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let radial_probe = |x: u32, y: u32| {
+            let px = x as f32 + 0.5 - 32.0;
+            let py = y as f32 + 0.5 - 32.0;
+            let radius = (px * px + py * py).sqrt();
+            (radius, px / radius, py / radius)
+        };
+
+        let mut radial = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x616);
+        radial.program = ProfileProgram::RadialDisc;
+        radial.first_width = ProfileLength::Meters(6.0);
+        radial.outer_radius = ProfileLength::Meters(20.0);
+        radial.maximum_supersampling = 1;
+        let (profile, height, sdf, semantics, dx, _) =
+            run_single_profile_fixture(&gpu, &handle, &radial, b"stage15-radial-oracle");
+        let (radius, radial_x, _) = radial_probe(51, 32);
+        let distance = profile.outer_radius_m as f32 - radius;
+        let t = distance / profile.first_width_m as f32;
+        let ramp = smooth(t);
+        let ramp_derivative = 6.0 * t.clamp(0.0, 1.0) * (1.0 - t.clamp(0.0, 1.0));
+        assert_close(
+            r32_pixel(&height, 64, 51, 32),
+            profile.amplitude_m as f32 * ramp,
+            2.0e-5,
+            "radial height",
+        );
+        assert_close(r32_pixel(&sdf, 64, 51, 32), distance, 2.0e-5, "radial sdf");
+        assert_close(
+            r32_pixel(&semantics, 64, 51, 32),
+            69.0,
+            0.0,
+            "radial semantics",
+        );
+        assert_close(
+            r32_pixel(&dx, 64, 51, 32),
+            -radial_x * profile.amplitude_m as f32 * ramp_derivative / profile.first_width_m as f32,
+            2.0e-5,
+            "radial derivative-x",
+        );
+
+        let mut annulus = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x617);
+        annulus.program = ProfileProgram::Annulus;
+        annulus.first_width = ProfileLength::Meters(4.0);
+        annulus.second_width = ProfileLength::Meters(2.0);
+        annulus.inner_radius = ProfileLength::Meters(16.0);
+        annulus.outer_radius = ProfileLength::Meters(24.0);
+        annulus.maximum_supersampling = 1;
+        let (profile, height, sdf, semantics, _, _) =
+            run_single_profile_fixture(&gpu, &handle, &annulus, b"stage15-annulus-oracle");
+        let (outer_radius, _, _) = radial_probe(55, 32);
+        let outer_distance = profile.outer_radius_m as f32 - outer_radius;
+        assert_close(
+            r32_pixel(&height, 64, 55, 32),
+            profile.amplitude_m as f32 * smooth(outer_distance / profile.first_width_m as f32),
+            2.0e-5,
+            "annulus outer height uses first width",
+        );
+        let (inner_radius, _, _) = radial_probe(48, 32);
+        let inner_distance = inner_radius - profile.inner_radius_m as f32;
+        assert_close(
+            r32_pixel(&height, 64, 48, 32),
+            profile.amplitude_m as f32 * smooth(inner_distance / profile.second_width_m as f32),
+            2.0e-5,
+            "annulus inner height uses second width",
+        );
+        assert_close(
+            r32_pixel(&sdf, 64, 48, 32),
+            inner_distance,
+            2.0e-5,
+            "annulus inner sdf",
+        );
+        assert_close(
+            r32_pixel(&semantics, 64, 48, 32),
+            69.0,
+            0.0,
+            "annulus semantics",
+        );
+
+        let mut cap = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x618);
+        cap.program = ProfileProgram::FullyRoundedStrip;
+        cap.maximum_supersampling = 1;
+        let (profile, height, _, semantics, _, _) =
+            run_single_profile_fixture(&gpu, &handle, &cap, b"stage15-cap-oracle");
+        let across = 0.5 / 32.0_f32;
+        let rounded = (1.0 - (1.0 - across) * (1.0 - across)).sqrt();
+        assert_close(
+            r32_pixel(&height, 64, 0, 32),
+            profile.amplitude_m as f32 * rounded,
+            2.0e-5,
+            "cap rounded height",
+        );
+        assert_close(r32_pixel(&semantics, 64, 0, 32), 85.0, 0.0, "cap semantics");
+
+        let mut groove = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x619);
+        groove.program = ProfileProgram::ConcaveGroove;
+        groove.maximum_supersampling = 1;
+        let (profile, height, _, semantics, _, _) =
+            run_single_profile_fixture(&gpu, &handle, &groove, b"stage15-groove-oracle");
+        assert_close(
+            r32_pixel(&height, 64, 0, 32),
+            -profile.amplitude_m as f32 * (1.0 - 0.5 / profile.first_width_m as f32),
+            2.0e-5,
+            "groove recessed height",
+        );
+        assert_close(
+            r32_pixel(&semantics, 64, 0, 32),
+            105.0,
+            0.0,
+            "groove semantics",
+        );
+
+        let mut custom = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x620);
+        custom.program = ProfileProgram::CustomCurve;
+        custom.maximum_supersampling = 1;
+        custom.custom_curve = vec![
+            CustomProfilePoint {
+                position: 0.0,
+                height: 0.0,
+            },
+            CustomProfilePoint {
+                position: 0.5,
+                height: 1.0,
+            },
+            CustomProfilePoint {
+                position: 1.0,
+                height: 0.0,
+            },
+        ];
+        let (profile, height, _, _, dx, _) =
+            run_single_profile_fixture(&gpu, &handle, &custom, b"stage15-custom-oracle");
+        assert_close(
+            r32_pixel(&height, 64, 3, 32),
+            profile.amplitude_m as f32 * 0.875,
+            2.0e-5,
+            "custom curve height",
+        );
+        assert_close(
+            r32_pixel(&dx, 64, 3, 32),
+            profile.amplitude_m as f32 * 2.0 / profile.first_width_m as f32,
+            2.0e-5,
+            "custom curve derivative",
+        );
+
+        let mut normal_only =
+            RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x621);
+        normal_only.lod_policy = ProfileLodPolicy::Force(ProfileLod::NormalOnly);
+        normal_only.maximum_supersampling = 1;
+        let (profile, height, _, _, dx, _) =
+            run_single_profile_fixture(&gpu, &handle, &normal_only, b"stage15-normal-only-oracle");
+        assert_close(
+            r32_pixel(&height, 64, 0, 32),
+            0.0,
+            0.0,
+            "normal-only height",
+        );
+        assert_close(
+            r32_pixel(&dx, 64, 0, 32),
+            profile.amplitude_m as f32 * (2.0 - 2.0 * (0.5 / profile.first_width_m as f32))
+                / profile.first_width_m as f32,
+            2.0e-5,
+            "normal-only derivative remains",
+        );
+
+        let mut roughness_only =
+            RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x622);
+        roughness_only.lod_policy = ProfileLodPolicy::Force(ProfileLod::RoughnessOnly);
+        roughness_only.maximum_supersampling = 1;
+        let (_, height, _, _, dx, _) =
+            run_single_profile_fixture(&gpu, &handle, &roughness_only, b"stage15-roughness-oracle");
+        assert_close(
+            r32_pixel(&height, 64, 0, 32),
+            0.0,
+            0.0,
+            "roughness-only height",
+        );
+        assert_close(
+            r32_pixel(&dx, 64, 0, 32),
+            0.0,
+            0.0,
+            "roughness-only derivative",
+        );
+
+        let mut disabled =
+            RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 0x623);
+        disabled.lod_policy = ProfileLodPolicy::Force(ProfileLod::Disabled);
+        disabled.maximum_supersampling = 1;
+        let (_, height, sdf, semantics, dx, _) =
+            run_single_profile_fixture(&gpu, &handle, &disabled, b"stage15-disabled-oracle");
+        assert_close(r32_pixel(&height, 64, 0, 32), 0.0, 0.0, "disabled height");
+        assert_close(r32_pixel(&sdf, 64, 0, 32), 0.0, 0.0, "disabled sdf");
+        assert_close(
+            r32_pixel(&semantics, 64, 0, 32),
+            0.0,
+            0.0,
+            "disabled semantics",
+        );
+        assert_close(r32_pixel(&dx, 64, 0, 32), 0.0, 0.0, "disabled derivative");
+
+        let mut asymmetric = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 9);
+        asymmetric.program = ProfileProgram::DoubleBevel;
+        asymmetric.first_width = ProfileLength::Meters(12.0);
+        asymmetric.second_width = ProfileLength::Meters(2.0);
+        let mut plan = gpu_tiled_export_resized_plan(64);
+        plan.ordered_regions[0].compiled_profile = compile_profile(ProfileCompileRequest {
+            requested: &asymmetric,
+            slot_size_m: [64.0, 64.0],
+            destination_pixels: [64, 64],
+            capacity: &conservative_profile_capacity([64.0, 64.0]),
+            upstream_identity: &ContentDigest::sha256(b"stage15-gpu-asymmetric-opposing"),
+        })
+        .expect("asymmetric opposing profile should compile");
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan = plan
+            .finalize()
+            .expect("asymmetric profile fixture should validate");
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &cache,
+        };
+        let cancellation = CancellationToken::new();
+        execute_or_load_profile_fields(
+            &executor,
+            &plan,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("asymmetric opposing profile should execute on GPU");
+        let height_bytes = read_cached_profile_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::Height,
+            "stage15-profile-height-v1",
+        );
+        let left = r32_pixel(&height_bytes, 64, 0, 32);
+        let right = r32_pixel(&height_bytes, 64, 63, 32);
+        assert!(
+            right > left * 2.0,
+            "second opposing width should produce a distinct right-edge profile: left={left} right={right}"
+        );
+
+        let mut opposing = RequestedProfile::from_structural_intent(StructuralProfile::Bevel, 7);
+        opposing.program = ProfileProgram::DoubleBevel;
+        opposing.first_width = ProfileLength::Meters(0.18);
+        opposing.second_width = ProfileLength::Meters(0.18);
+        opposing.minimum_flat_center = ProfileLength::Meters(0.05);
+        opposing.legality_policy = ProfileLegalityPolicy::FullyRounded;
+        let rounded = compile_profile(ProfileCompileRequest {
+            requested: &opposing,
+            slot_size_m: [2.0, 0.25],
+            destination_pixels: [8192, 1024],
+            capacity: &conservative_profile_capacity([2.0, 0.25]),
+            upstream_identity: &ContentDigest::sha256(b"stage15-opposing-fixture"),
+        })
+        .expect("opposing fallback should compile");
+        assert_eq!(rounded.fallback, ProfileFallback::FullyRounded);
+        assert_eq!(rounded.program, ProfileProgram::FullyRoundedStrip);
+        assert!(rounded.first_width_m + rounded.second_width_m <= 0.25);
+
+        opposing.first_width = ProfileLength::Meters(0.00001);
+        opposing.second_width = ProfileLength::Meters(0.00001);
+        opposing.minimum_flat_center = ProfileLength::Meters(0.001);
+        opposing.legality_policy = ProfileLegalityPolicy::Clamp;
+        opposing.lod_policy = ProfileLodPolicy::Auto;
+        let subpixel = compile_profile(ProfileCompileRequest {
+            requested: &opposing,
+            slot_size_m: [2.0, 0.25],
+            destination_pixels: [1024, 128],
+            capacity: &conservative_profile_capacity([2.0, 0.25]),
+            upstream_identity: &ContentDigest::sha256(b"stage15-subpixel-fixture"),
+        })
+        .expect("sub-pixel fixture should compile without widening");
+        assert_eq!(subpixel.first_width_m, 0.00001);
+        assert!(matches!(
+            subpixel.lod,
+            ProfileLod::NormalOnly | ProfileLod::RoughnessOnly | ProfileLod::Disabled
+        ));
     }
 }

@@ -388,6 +388,13 @@ fn plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
             source_to_region_transform: Default::default(),
             radial_parameters: None,
             structural_profile: StructuralProfile::Flat,
+            compiled_profile: hot_trimmer_sheet_compiler::compile_profile_for_region(
+                StructuralProfile::Flat,
+                &sampling_plan,
+                dst,
+                &ContentDigest::sha256(format!("profile-{id}").as_bytes()),
+            )
+            .unwrap(),
             continuity: RegionContinuity::None,
             padding_px: 0,
             edge_eligibility: EdgeEligibility::default(),
@@ -1489,6 +1496,13 @@ fn region_command(
         source_to_region_transform: hot_trimmer_domain::MappingTransform::default(),
         radial_parameters: None,
         structural_profile: StructuralProfile::Flat,
+        compiled_profile: hot_trimmer_sheet_compiler::compile_profile_for_region(
+            StructuralProfile::Flat,
+            &sampling_plan,
+            dst,
+            &ContentDigest::sha256(format!("profile-{region_id}").as_bytes()),
+        )
+        .unwrap(),
         continuity: RegionContinuity::None,
         padding_px: 0,
         edge_eligibility: EdgeEligibility::default(),
@@ -2886,7 +2900,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             )
             .expect_err("insufficient prepared synthesis coverage must fail before dispatch")
     });
-    assert!(error.to_string().contains("lacks required physical coverage"));
+    assert!(
+        error
+            .to_string()
+            .contains("lacks required physical coverage")
+    );
 
     let mut mismatched_family = plan.clone();
     mismatched_family.ordered_regions[0]
@@ -2911,9 +2929,9 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             )
             .expect_err("PatchMatch family must reject a quilting prepared domain")
     });
-    assert!(error
-        .to_string()
-        .contains("prepared synthesis domain identity, route, dimensions, or validity is incompatible"));
+    assert!(error.to_string().contains(
+        "prepared synthesis domain identity, route, dimensions, or validity is incompatible"
+    ));
 
     let direct_domain = domain_with_size(
         b"gpu-stage-14-fit-domain",
@@ -2940,7 +2958,10 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             width: 6,
             height: 4,
         });
-        exact.ordered_regions[0].sampling_plan.candidate.mapping_mode = mode;
+        exact.ordered_regions[0]
+            .sampling_plan
+            .candidate
+            .mapping_mode = mode;
         exact.ordered_regions[0].sampling_plan.candidate.family = match mode {
             SamplingMode::UniqueContain => CandidateFamily::UniqueContain,
             SamplingMode::UniqueCover => CandidateFamily::UniqueCover,
@@ -2970,7 +2991,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             &direct_domain,
             [4, 4],
         );
-        assert_eq!(output.base_color_rgba8.as_ref(), oracle.as_slice(), "{mode:?}");
+        assert_eq!(
+            output.base_color_rgba8.as_ref(),
+            oracle.as_slice(),
+            "{mode:?}"
+        );
     }
 
     for (center_domain, center, stretch_override) in [
@@ -2988,10 +3013,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
         ),
     ] {
         let mut exact = material_map_plan(&center_domain, MaterialMapKind::BaseColor);
-        exact.ordered_regions[0].sampling_plan.candidate.mapping_mode =
-            SamplingMode::NineSlicePanel;
-        exact.ordered_regions[0].sampling_plan.candidate.family =
-            CandidateFamily::NineSlicePanel;
+        exact.ordered_regions[0]
+            .sampling_plan
+            .candidate
+            .mapping_mode = SamplingMode::NineSlicePanel;
+        exact.ordered_regions[0].sampling_plan.candidate.family = CandidateFamily::NineSlicePanel;
         exact.ordered_regions[0].sampling_plan.candidate.route = CandidateRoute::Cap;
         exact.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
             left_pixels: 1,
@@ -3011,7 +3037,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             &center_domain,
             [4, 4],
         );
-        assert_eq!(output.base_color_rgba8.as_ref(), oracle.as_slice(), "{center:?}");
+        assert_eq!(
+            output.base_color_rgba8.as_ref(),
+            oracle.as_slice(),
+            "{center:?}"
+        );
     }
 
     let mut unsynthesized_center = material_map_plan(&direct_domain, MaterialMapKind::BaseColor);
@@ -3027,7 +3057,9 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
         .sampling_plan
         .candidate
         .route = CandidateRoute::Cap;
-    unsynthesized_center.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+    unsynthesized_center.ordered_regions[0]
+        .sampling_plan
+        .slice_geometry = SliceGeometry::Nine {
         left_pixels: 1,
         right_pixels: 1,
         top_pixels: 1,
@@ -3052,9 +3084,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             )
             .expect_err("synthesized center on a direct domain must fail")
     });
-    assert!(error
-        .to_string()
-        .contains("requires a synthesis-capable prepared domain"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires a synthesis-capable prepared domain")
+    );
 
     let mut insufficient_center = material_map_plan(&prepared_domain, MaterialMapKind::BaseColor);
     insufficient_center.ordered_regions[0]
@@ -3069,7 +3103,9 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
         .sampling_plan
         .candidate
         .route = CandidateRoute::Cap;
-    insufficient_center.ordered_regions[0].sampling_plan.slice_geometry = SliceGeometry::Nine {
+    insufficient_center.ordered_regions[0]
+        .sampling_plan
+        .slice_geometry = SliceGeometry::Nine {
         left_pixels: 1,
         right_pixels: 1,
         top_pixels: 1,
@@ -3097,9 +3133,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             )
             .expect_err("synthesized center beyond prepared coverage must fail")
     });
-    assert!(error
-        .to_string()
-        .contains("exceeds prepared center coverage"));
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds prepared center coverage")
+    );
 
     let mut mismatched_center = insufficient_center.clone();
     mismatched_center.ordered_regions[0]
@@ -3123,9 +3161,11 @@ fn gpu_stage_14_base_color_lowers_prepared_synthesis_nine_slice_and_unique_fit_m
             )
             .expect_err("stale synthesized-center domain identity must fail")
     });
-    assert!(error
-        .to_string()
-        .contains("synthesized slice center prepared-domain identity is incompatible"));
+    assert!(
+        error
+            .to_string()
+            .contains("synthesized slice center prepared-domain identity is incompatible")
+    );
 
     let mut illegal_slice = material_map_plan(&direct_domain, MaterialMapKind::BaseColor);
     illegal_slice.ordered_regions[0]

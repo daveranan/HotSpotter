@@ -260,64 +260,6 @@ fn sample_linear(p: vec2<f32>, linear_filter: bool) -> vec4<f32> {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
-fn linear_ramp(value: f32) -> f32 {
-    return clamp(value, 0.0, 1.0);
-}
-
-fn smooth_ramp(value: f32) -> f32 {
-    let x = linear_ramp(value);
-    return x * x * (3.0 - 2.0 * x);
-}
-
-fn structural_height_at(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
-    if (cmd.structural_profile == 0u) {
-        return 0.0;
-    }
-    let sem_x = clamp(pixel.x, cmd.semantic_x, cmd.semantic_x + cmd.semantic_width - 1u) - cmd.semantic_x;
-    let sem_y = clamp(pixel.y, cmd.semantic_y, cmd.semantic_y + cmd.semantic_height - 1u) - cmd.semantic_y;
-    let width = f32(max(cmd.semantic_width, 1u));
-    let height = f32(max(cmd.semantic_height, 1u));
-    let scale = max(min(width, height), 1.0);
-    let px = f32(sem_x) + 0.5;
-    let py = f32(sem_y) + 0.5;
-    let x_edge = min(px, width - px) / scale;
-    let y_edge = min(py, height - py) / scale;
-    var edge_distance = min(x_edge, y_edge);
-    if (cmd.mode == 2u) {
-        edge_distance = y_edge;
-    } else if (cmd.mode == 3u) {
-        edge_distance = x_edge;
-    } else if (cmd.mode == 1u) {
-        edge_distance = 1.0;
-    }
-    let center_x = px - width * 0.5;
-    let center_y = py - height * 0.5;
-    let radius = length(vec2<f32>(center_x, center_y)) / scale;
-    if (cmd.structural_profile == 1u) {
-        return 0.125 * linear_ramp(edge_distance / 0.125);
-    }
-    if (cmd.structural_profile == 2u) {
-        return -0.125 * (1.0 - linear_ramp(edge_distance / 0.125));
-    }
-    if (cmd.structural_profile == 3u) {
-        let phase = linear_ramp(edge_distance / 0.125) * 1.57079632679;
-        return 0.125 * sin(phase);
-    }
-    if (cmd.structural_profile == 4u) {
-        let outer = smooth_ramp(edge_distance / 0.04);
-        let inner = smooth_ramp((0.20 - edge_distance) / 0.04);
-        return 0.04 * outer * inner;
-    }
-    if (cmd.structural_profile == 5u) {
-        return 0.06 * smooth_ramp((0.42 - radius) / 0.06);
-    }
-    if (cmd.structural_profile == 6u) {
-        let inside = min(radius - 0.24, 0.44 - radius) / 0.04;
-        return 0.04 * smooth_ramp(inside);
-    }
-    return 0.0;
-}
-
 fn material_height_sample(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
     if (header.source_role != 1u) {
         return 0.0;
@@ -339,7 +281,9 @@ fn material_height_sample(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
 }
 
 fn final_height_at(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
-    return clamp(0.5 + material_height_sample(cmd, pixel) + structural_height_at(cmd, pixel), 0.0, 1.0);
+    // Stage 15 structural Height is compiled and evaluated by the dedicated
+    // physical profile pass. This material pass only samples authored Height.
+    return clamp(0.5 + material_height_sample(cmd, pixel), 0.0, 1.0);
 }
 
 fn slice_axis(value: f32, destination: f32, origin: f32, extent: f32, leading: u32, trailing: u32, scale: f32, center: u32) -> f32 {

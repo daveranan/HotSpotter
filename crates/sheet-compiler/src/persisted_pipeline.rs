@@ -15,8 +15,9 @@ use hot_trimmer_domain::{
     SourceOwnershipIntent, StageResult, TemplateSlotRole,
 };
 use hot_trimmer_effect_compiler::{
-    RequiredSourceFootprint, SlotDemandIntent, SourceFootprintUnit, VisualImportance,
-    WorldDimensionSource, resolve_slot_demands_with_guard,
+    RequiredSourceFootprint, ResolvedSlotDemand, SlotDemandIntent, SourceFootprintUnit,
+    VisualImportance, WorldDimensionSource, compile_structural_intent,
+    conservative_profile_capacity, resolve_slot_demands_with_guard,
 };
 use hot_trimmer_image_io::{
     CancellationToken as ImageCancellationToken, ImagePlane, LinearColor, NormalizationSettings,
@@ -708,6 +709,7 @@ fn compile_persisted(
             &ordered_plans,
             &domains,
             &region_domains,
+            &stage10.slots,
         )?;
         let mut prepared_sources = BTreeMap::new();
         for artifacts in &domains {
@@ -1402,6 +1404,15 @@ fn compile_source_frame(
             source_to_region_transform,
             radial_parameters: behavior.radial,
             structural_profile: region.structural_profile,
+            compiled_profile: compile_structural_intent(
+                region.structural_profile,
+                sampling_plan.slot_physical_size,
+                [allocation.width, allocation.height],
+                &conservative_profile_capacity(sampling_plan.slot_physical_size),
+                &render_cache_key,
+                sampling_plan.candidate.seed,
+            )
+            .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))?,
             continuity: behavior.continuity,
             padding_px: preview_padding_px,
             edge_eligibility: behavior.edge_eligibility,
@@ -2001,6 +2012,7 @@ fn fixed_template_compiled_atlas_plan(
     ordered_plans: &[&SamplingPlan],
     domains: &[DomainArtifacts],
     region_domains: &[usize],
+    demands: &[ResolvedSlotDemand],
 ) -> Result<CompiledAtlasPlanV1, String> {
     let mut source_records = Vec::new();
     let mut source_index = BTreeMap::new();
@@ -2112,6 +2124,19 @@ fn fixed_template_compiled_atlas_plan(
             source_to_region_transform: binding.mapping.transform,
             radial_parameters: binding.mapping.behavior.radial,
             structural_profile: region.structural_profile,
+            compiled_profile: compile_structural_intent(
+                region.structural_profile,
+                sampling_plan.slot_physical_size,
+                [slot.allocation.width, slot.allocation.height],
+                &demands
+                    .iter()
+                    .find(|demand| demand.slot_id == region.id)
+                    .ok_or_else(|| format!("region {} has no Stage 10 capacity", region.id))?
+                    .effect_capacity,
+                &render_cache_key,
+                sampling_plan.candidate.seed,
+            )
+            .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))?,
             continuity: binding.mapping.behavior.continuity,
             padding_px,
             edge_eligibility: binding.mapping.behavior.edge_eligibility,
@@ -3887,10 +3912,7 @@ fn slice_geometry(
     }
 }
 
-fn synthesis_family_matches_domain_route(
-    family: CandidateFamily,
-    route: DomainRoute,
-) -> bool {
+fn synthesis_family_matches_domain_route(family: CandidateFamily, route: DomainRoute) -> bool {
     match family {
         CandidateFamily::PanelQuiltedExpansion
         | CandidateFamily::RepeatXQuilted

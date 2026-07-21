@@ -313,10 +313,8 @@ fn validate(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotSynthesisError> {
     }
     let prepared_synthesis = p.candidate.mapping_mode == SamplingMode::TextureSynthesis;
     if (p.candidate.crop.is_none() && !radial_without_crop(p) && !prepared_synthesis)
-        || (prepared_synthesis
-            && !matches!(p.sampling_basis, SamplingBasis::PreparedDomain { .. }))
-        || (!prepared_synthesis
-            && matches!(p.sampling_basis, SamplingBasis::PreparedDomain { .. }))
+        || (prepared_synthesis && !matches!(p.sampling_basis, SamplingBasis::PreparedDomain { .. }))
+        || (!prepared_synthesis && matches!(p.sampling_basis, SamplingBasis::PreparedDomain { .. }))
     {
         return Err(SlotSynthesisError::InvalidPlan);
     }
@@ -619,10 +617,7 @@ fn validate_prepared_synthesis(r: &SlotSynthesisRequest<'_>) -> Result<(), SlotS
     Ok(())
 }
 
-fn synthesis_family_matches_domain_route(
-    family: CandidateFamily,
-    route: DomainRoute,
-) -> bool {
+fn synthesis_family_matches_domain_route(family: CandidateFamily, route: DomainRoute) -> bool {
     match family {
         CandidateFamily::PanelQuiltedExpansion
         | CandidateFamily::RepeatXQuilted

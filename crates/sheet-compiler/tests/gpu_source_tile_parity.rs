@@ -371,6 +371,13 @@ fn region_command(
         source_to_region_transform: Default::default(),
         radial_parameters,
         structural_profile: StructuralProfile::Flat,
+        compiled_profile: hot_trimmer_sheet_compiler::compile_profile_for_region(
+            StructuralProfile::Flat,
+            &sampling_plan,
+            destination,
+            &ContentDigest::sha256(format!("profile-{region_id}").as_bytes()),
+        )
+        .unwrap(),
         continuity: match sampling {
             RegionSampling::LoopX => RegionContinuity::X,
             RegionSampling::LoopY => RegionContinuity::Y,

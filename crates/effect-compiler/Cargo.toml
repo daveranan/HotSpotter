@@ -10,6 +10,8 @@ hot-trimmer-domain.workspace = true
 hot-trimmer-placement-solver.workspace = true
 hot-trimmer-render-core = { path = "../render-core" }
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
