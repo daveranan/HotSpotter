@@ -3236,7 +3236,8 @@ mod document_tests {
 mod edge_detail_migration_tests {
     use std::{fs, path::PathBuf};
 
-    use hot_trimmer_domain::{ContentDigest, EdgeDetailIntentV1, EdgeWearIntent, SourceId};
+    use hot_trimmer_domain::{ContentDigest, EdgeDetailIntentV1, EdgeWearIntent,
+        LEGACY_EDGE_WEAR_METERS_PER_PIXEL, SourceId};
     use rusqlite::{Connection, params};
     use uuid::Uuid;
 
@@ -3289,7 +3290,13 @@ mod edge_detail_migration_tests {
         drop(connection);
 
         let reopened = ProjectStore::open(&path).expect("migrate legacy Edge Wear");
-        assert_eq!(reopened.document().unwrap().edge_detail, Some(EdgeDetailIntentV1::default()));
+        assert_eq!(
+            reopened.document().unwrap().edge_detail,
+            Some(EdgeDetailIntentV1::migrate_from_edge_wear(
+                &EdgeWearIntent::default(), LEGACY_EDGE_WEAR_METERS_PER_PIXEL,
+            )),
+            "legacy projects preserve the exact legacy-authored appearance instead of adopting new-document defaults",
+        );
         drop(reopened);
 
         let connection = Connection::open(&path).unwrap();

@@ -64,3 +64,15 @@ test("gpu-tiled-preview rejects a stale generation and releases its cache handle
   assert.equal(painted, false);
   assert.deepEqual(released, ["tile-7"]);
 });
+
+test("gpu-tiled-preview can retain a complete material generation for map switching", async () => {
+  const painter = new GpuTiledPreviewPainter();
+  painter.beginGeneration(8);
+  const released: string[] = [];
+  const painted = await painter.paint({} as HTMLCanvasElement, publication(7), {
+    getPayload: async () => new Uint8Array(32),
+    releasePayload: async (request) => { released.push(request.opaqueHandle); },
+  }, 1, false);
+  assert.equal(painted, false);
+  assert.deepEqual(released, []);
+});

@@ -272,7 +272,7 @@ def _restore_context(context, active, selected_objects, original_mode):
             bpy.ops.object.mode_set(mode="EDIT")
 
 
-def _unwrap_object(context, obj, face_indices):
+def _prepare_edit_selection(context, obj, face_indices):
     if context.view_layer.objects.active and context.view_layer.objects.active.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
     for candidate in context.selected_objects:
@@ -286,8 +286,44 @@ def _unwrap_object(context, obj, face_indices):
     for face_index in face_indices:
         bm.faces[face_index].select_set(True)
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-    bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.001)
+
+
+def _unwrap_object(context, obj, face_indices):
+    _prepare_edit_selection(context, obj, face_indices)
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    selected = {bm.faces[index] for index in face_indices}
+    original_seams = tuple(edge.seam for edge in bm.edges)
+    try:
+        for edge in bm.edges:
+            selected_links = [face for face in edge.link_faces if face in selected]
+            if not selected_links:
+                continue
+            selection_boundary = len(selected_links) != len(edge.link_faces)
+            sharp_boundary = not edge.smooth
+            flat_boundary = any(not face.smooth for face in selected_links)
+            if selection_boundary or sharp_boundary or flat_boundary:
+                edge.seam = True
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        result = bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.001)
+        if result != {"FINISHED"}:
+            raise ValueError(f"{obj.name}: Blender unwrap could not solve the selected faces")
+    finally:
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        for edge, seam in zip(bm.edges, original_seams):
+            edge.seam = seam
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _smart_project_object(context, obj, face_indices):
+    _prepare_edit_selection(context, obj, face_indices)
+    result = bpy.ops.uv.smart_project()
+    bpy.ops.object.mode_set(mode="OBJECT")
+    if result != {"FINISHED"}:
+        raise ValueError(f"{obj.name}: Blender Smart UV Project could not solve the selected faces")
 
 
 def _assign_material(mesh, material, face_indices):
@@ -297,6 +333,20 @@ def _assign_material(mesh, material, face_indices):
         material_index = len(mesh.materials) - 1
     for face_index in face_indices:
         mesh.polygons[face_index].material_index = material_index
+    return material_index
+
+
+def _enable_material_preview(context):
+    """Make a successful 3D View invocation visibly show the assigned maps."""
+    space = getattr(context, "space_data", None)
+    if getattr(space, "type", None) != "VIEW_3D":
+        return False
+    shading = getattr(space, "shading", None)
+    if shading is None:
+        return False
+    if shading.type not in {"MATERIAL", "RENDERED"}:
+        shading.type = "MATERIAL"
+    return True
 
 
 class HOTTRIM_OT_import_package(Operator):
@@ -304,24 +354,29 @@ class HOTTRIM_OT_import_package(Operator):
     bl_label = "Import Hot Trimmer Package"
     bl_options = {"REGISTER"}
 
-    manifest_path: StringProperty(subtype="FILE_PATH")
+    filepath: StringProperty(name="Hot Trimmer Manifest", subtype="FILE_PATH")
+    filter_glob: StringProperty(default="*.hottrim.json", options={"HIDDEN"})
+    filename_ext = ".hottrim.json"
 
     def invoke(self, context, event):
-        if not self.manifest_path:
-            self.manifest_path = context.scene.get("ht_manifest_path", "")
-            context.window_manager.fileselect_add(self)
-            return {"RUNNING_MODAL"}
-        return self.execute(context)
+        # ``filepath`` is the Blender file browser's canonical selected-file
+        # property. Custom path/directory properties render as unrelated side
+        # fields and do not receive the highlighted file.
+        connected_manifest = context.scene.get("ht_manifest_path", "")
+        self.filepath = connected_manifest
+        _result(context, "Select manifest.hottrim.json, then click Import Hot Trimmer Package")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
 
     def execute(self, context):
         try:
-            manifest = load_manifest(self.manifest_path)
+            manifest = load_manifest(self.filepath)
             material = create_or_update_material(manifest, bpy)
         except Exception as error:
             return _fail(self, context, f"Hot Trimmer import failed: {error}")
         context.scene["ht_manifest_path"] = str(manifest["_manifest_path"])
         context.scene["ht_material_name"] = material.name
-        _result(context, f"Connected {manifest['materialName']} revision {manifest['materialRevision']}")
+        _result(context, f"Connected {manifest['materialName']} revision {manifest['materialRevision']} from {manifest['_package_path'].name}")
         self.report({"INFO"}, context.scene["ht_last_result"])
         return {"FINISHED"}
 
@@ -374,7 +429,10 @@ class HOTTRIM_OT_fit_selected(Operator):
                     _unwrap_object(context, obj, face_indices)
                     uv_layer = mesh.uv_layers.active
                     if not _has_usable_uvs(mesh, uv_layer, face_indices):
-                        raise ValueError(f"{obj.name}: Blender unwrap produced a zero-area island")
+                        _smart_project_object(context, obj, face_indices)
+                        uv_layer = mesh.uv_layers.active
+                    if not _has_usable_uvs(mesh, uv_layer, face_indices):
+                        raise ValueError(f"{obj.name}: automatic unwrap produced a zero-area island; inspect the selected faces for overlapping or invalid geometry")
 
             plans = []
             for obj, face_indices in targets.items():
@@ -417,7 +475,8 @@ class HOTTRIM_OT_fit_selected(Operator):
                         for loop_index in mesh.polygons[face_index].loop_indices:
                             uv_layer.data[loop_index].uv = fitted[cursor]
                             cursor += 1
-                _assign_material(mesh, material, island)
+                material_index = _assign_material(mesh, material, island)
+                obj.active_material_index = material_index
                 assignments = by_object.setdefault(obj, _assignment_map(mesh))
                 for face_index in island:
                     assignments[str(face_index)] = record
@@ -425,7 +484,8 @@ class HOTTRIM_OT_fit_selected(Operator):
                 obj.data["ht_assignments"] = json.dumps(assignments, sort_keys=True, separators=(",", ":"))
                 obj.data["ht_compatibility_key"] = manifest["compatibilityKey"]
             slot_names = sorted({plan[2].slot.slot_id for plan in plans})
-            _result(context, f"Hotspotted {len(plans)} island(s): {', '.join(slot_names)}")
+            preview_note = "; Base Color preview active" if _enable_material_preview(context) else ""
+            _result(context, f"Hotspotted {len(plans)} island(s) across {len(slot_names)} manifest slot(s){preview_note}")
         except Exception as error:
             if context.view_layer.objects.active and context.view_layer.objects.active.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
@@ -449,6 +509,7 @@ class HOTTRIM_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.label(text="Add-on 0.2.7")
         layout.operator(HOTTRIM_OT_import_package.bl_idname, text="Import Package", icon="FILE_FOLDER")
         path = context.scene.get("ht_manifest_path")
         if path:

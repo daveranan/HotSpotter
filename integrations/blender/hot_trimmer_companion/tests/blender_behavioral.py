@@ -61,6 +61,10 @@ def uv_aspect(points):
     return width / height
 
 
+def polygon_uv_area(points):
+    return abs(0.5 * sum(points[index][0] * points[(index + 1) % len(points)][1] - points[(index + 1) % len(points)][0] * points[index][1] for index in range(len(points))))
+
+
 def make_package(directory):
     data = json.loads(FIXTURE.read_text(encoding="utf-8"))
     data["maps"] = {}
@@ -139,13 +143,17 @@ def assert_face_inside(mesh, face_index, rect, tolerance=1.0e-6):
 def run():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     hot_trimmer_companion.register()
+    import_properties = bpy.ops.hottrimmer.import_package.get_rna_type().properties
+    require("filepath" in import_properties and import_properties["filepath"].subtype == "FILE_PATH", "import dialog is not bound to Blender's standard filepath")
+    require("manifest_path" not in import_properties and "directory" not in import_properties, "import dialog exposes a stale custom path field")
     with tempfile.TemporaryDirectory(prefix="hot-trimmer-20b-") as temp_name:
         temp = Path(temp_name)
         manifest_path, manifest_data = make_package(temp)
-        result = bpy.ops.hottrimmer.import_package(manifest_path=str(manifest_path))
-        require(result == {"FINISHED"}, "real import operator failed")
+        result = bpy.ops.hottrimmer.import_package(filepath=str(temp))
+        require(result == {"FINISHED"}, "real package-directory import operator failed")
         material = bpy.data.materials["Hot Trimmer Fixture"]
         require(material.get("ht_compatibility_key") == "fixture-v1", "material package metadata missing")
+        require(material.node_tree.nodes.active is not None and material.node_tree.nodes.active.name == "HT basecolor Texture", "Base Color texture is not the active preview image")
 
         rect = rectangular_object()
         mesh = rect.data
@@ -174,6 +182,7 @@ def run():
         require(assignments["1"]["slotId"] == "rect_tall", "tall island did not choose expected manifest slot")
         material_index = next(index for index, candidate in enumerate(mesh.materials) if candidate == material)
         require(mesh.polygons[0].material_index == material_index and mesh.polygons[1].material_index == material_index, "Hot Trimmer material was not assigned")
+        require(rect.active_material == material, "Hot Trimmer material slot was not made active for preview")
         require(mesh.polygons[2].material_index == unselected_material_before, "unselected face material changed")
         require(tuple(face_uvs(mesh, 2)) == unselected_uv_before, "unselected face UV changed")
         require(tuple(tuple(vertex.co) for vertex in mesh.vertices) == vertices_before, "mesh positions changed")
@@ -197,6 +206,24 @@ def run():
         bpy.ops.object.mode_set(mode="OBJECT")
         require(uv_bytes(mesh) == first_uv_bytes, "second identical run was not byte-stable")
         require(mesh["ht_assignments"] == first_assignments, "second identical assignment was not stable")
+
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        bpy.ops.mesh.primitive_cube_add(calc_uvs=False, location=(10.0, 0.0, 0.0))
+        closed_cube = bpy.context.object
+        closed_cube.name = "HT Closed No-UV Fixture"
+        closed_mesh = closed_cube.data
+        require(len(closed_mesh.uv_layers) == 0, "closed fixture unexpectedly began with UVs")
+        closed_seams_before = tuple(edge.use_seam for edge in closed_mesh.edges)
+        closed_positions_before = tuple(tuple(vertex.co) for vertex in closed_mesh.vertices)
+        result = bpy.ops.hottrimmer.fit_selected(classification="AUTO")
+        require(result == {"FINISHED"}, "one-click closed-mesh automatic unwrap and hotspot failed")
+        require(closed_mesh.uv_layers.active is not None, "automatic unwrap did not create a UV map")
+        require(all(polygon_uv_area(face_uvs(closed_mesh, polygon.index)) > 1.0e-9 for polygon in closed_mesh.polygons), "automatic unwrap left a zero-area face")
+        require(len(json.loads(closed_mesh["ht_assignments"])) == len(closed_mesh.polygons), "automatic unwrap did not assign every closed-mesh face")
+        require(closed_cube.active_material == material, "closed-mesh hotspot did not activate the Hot Trimmer material")
+        require(tuple(edge.use_seam for edge in closed_mesh.edges) == closed_seams_before, "temporary automatic unwrap seams were not restored")
+        require(tuple(tuple(vertex.co) for vertex in closed_mesh.vertices) == closed_positions_before, "automatic unwrap changed closed-mesh positions")
 
         for obj in bpy.context.selected_objects:
             obj.select_set(False)
@@ -229,7 +256,7 @@ def run():
         material = bpy.data.materials["Hot Trimmer Fixture"]
         node_names_before = tuple(sorted(node.name for node in material.node_tree.nodes))
         images_before = tuple(sorted(image.filepath for image in bpy.data.images if image.get("ht_material_id") == "material-fixture"))
-        result = bpy.ops.hottrimmer.import_package(manifest_path=str(manifest_path))
+        result = bpy.ops.hottrimmer.import_package(filepath=str(manifest_path))
         require(result == {"FINISHED"}, "package reimport failed")
         material = bpy.data.materials["Hot Trimmer Fixture"]
         require(tuple(sorted(node.name for node in material.node_tree.nodes)) == node_names_before, "package reimport duplicated or changed material nodes")
@@ -245,7 +272,7 @@ def run():
         material_count = len(bpy.data.materials)
         material_nodes = tuple(sorted(node.name for node in material.node_tree.nodes))
         connected_path = bpy.context.scene["ht_manifest_path"]
-        expect_operator_error(lambda: bpy.ops.hottrimmer.import_package(manifest_path=str(malformed_path)), "normalizedHotspotRect")
+        expect_operator_error(lambda: bpy.ops.hottrimmer.import_package(filepath=str(malformed_path)), "normalizedHotspotRect")
         require(len(bpy.data.materials) == material_count and tuple(sorted(node.name for node in material.node_tree.nodes)) == material_nodes, "malformed import partially mutated materials")
         require(bpy.context.scene["ht_manifest_path"] == connected_path, "malformed import partially mutated scene connection state")
 

@@ -163,6 +163,7 @@ export class GpuTiledPreviewPainter {
     publication: GpuTiledPreviewPublication,
     client: GpuTiledPreviewPayloadClient,
     protocolVersion: number,
+    releaseAfterPaint = true,
   ): Promise<boolean> {
     const { manifest } = publication;
     try {
@@ -202,7 +203,9 @@ export class GpuTiledPreviewPainter {
       this.summary = summarizePayload(manifest.generation, payload, true, true);
       return true;
     } finally {
-      void client.releasePayload({ protocolVersion, generation: manifest.generation, opaqueHandle: manifest.opaqueHandle });
+      if (releaseAfterPaint) {
+        void client.releasePayload({ protocolVersion, generation: manifest.generation, opaqueHandle: manifest.opaqueHandle });
+      }
     }
   }
 

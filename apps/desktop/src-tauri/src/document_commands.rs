@@ -752,6 +752,16 @@ pub struct Stage14PreviewRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FeedbackContributionView {
+    EdgeDetailCoreMask,
+    EdgeDetailTransitionMask,
+    EdgeDetailFadeMask,
+    EdgeDetailCombinedMask,
+    EdgeDetailHeightContribution,
+    EdgeDetailFinalHeight,
+    EdgeDetailFinalNormal,
+    EdgeDetailBaseColorContribution,
+    EdgeDetailRoughnessContribution,
+    EdgeDetailMetallicContribution,
     Stage15Occupancy,
     Stage15Height,
     Stage15ProfileRoute,
@@ -771,6 +781,21 @@ pub enum FeedbackContributionView {
     Stage16Lod,
     Stage16Scope,
     Stage16AssetResolution,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EdgeDetailInspectionField {
+    CoreMask,
+    TransitionMask,
+    FadeMask,
+    CombinedMask,
+    HeightContribution,
+    FinalHeight,
+    FinalNormal,
+    BaseColorContribution,
+    RoughnessContribution,
+    MetallicContribution,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -795,6 +820,7 @@ pub struct FeedbackQaTileRequest {
     profile: PreviewProfile,
     comparison_mode: FeedbackComparisonMode,
     selected_operation_id: Option<String>,
+    edge_detail_inspection: Option<EdgeDetailInspectionField>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2663,6 +2689,13 @@ pub async fn preview_stage_15_16_feedback(
             "The Stage 15/16 QA request version is stale or unknown.",
         ));
     }
+    let expected_inspection = feedback_inspection_for_view(request.view);
+    if request.edge_detail_inspection != expected_inspection {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "The typed Edge Detail inspection field does not match the requested view.",
+        ));
+    }
     let map = feedback_map_for_view(request.view)?.ok_or_else(|| error(
         ErrorCode::InvalidInput,
         "This compiler QA view is metadata-only and intentionally dispatches zero pixel work.",
@@ -2700,6 +2733,13 @@ fn feedback_map_for_view(
 ) -> Result<Option<MaterialMapKind>, UserFacingError> {
     use FeedbackContributionView as View;
     Ok(Some(match view {
+        View::EdgeDetailCoreMask | View::EdgeDetailTransitionMask
+        | View::EdgeDetailFadeMask | View::EdgeDetailCombinedMask => MaterialMapKind::EdgeMask,
+        View::EdgeDetailHeightContribution | View::EdgeDetailFinalHeight => MaterialMapKind::Height,
+        View::EdgeDetailFinalNormal => MaterialMapKind::Normal,
+        View::EdgeDetailBaseColorContribution => MaterialMapKind::BaseColor,
+        View::EdgeDetailRoughnessContribution => MaterialMapKind::Roughness,
+        View::EdgeDetailMetallicContribution => MaterialMapKind::Metallic,
         View::Stage15Occupancy => MaterialMapKind::AmbientOcclusion,
         View::Stage15Height | View::Stage16Height => MaterialMapKind::Height,
         View::Stage16RegisteredMask => MaterialMapKind::EdgeMask,
@@ -2713,6 +2753,39 @@ fn feedback_map_for_view(
         | View::Stage16Route | View::Stage16Occupancy | View::Stage16Lod
         | View::Stage16Scope | View::Stage16AssetResolution => return Ok(None),
     }))
+}
+
+fn feedback_inspection_for_view(view: FeedbackContributionView) -> Option<EdgeDetailInspectionField> {
+    use EdgeDetailInspectionField as Field;
+    use FeedbackContributionView as View;
+    match view {
+        View::EdgeDetailCoreMask => Some(Field::CoreMask),
+        View::EdgeDetailTransitionMask => Some(Field::TransitionMask),
+        View::EdgeDetailFadeMask => Some(Field::FadeMask),
+        View::EdgeDetailCombinedMask => Some(Field::CombinedMask),
+        View::EdgeDetailHeightContribution => Some(Field::HeightContribution),
+        View::EdgeDetailFinalHeight => Some(Field::FinalHeight),
+        View::EdgeDetailFinalNormal => Some(Field::FinalNormal),
+        View::EdgeDetailBaseColorContribution => Some(Field::BaseColorContribution),
+        View::EdgeDetailRoughnessContribution => Some(Field::RoughnessContribution),
+        View::EdgeDetailMetallicContribution => Some(Field::MetallicContribution),
+        _ => None,
+    }
+}
+
+fn feedback_intermediate_display(field: EdgeDetailInspectionField) -> Option<&'static str> {
+    use EdgeDetailInspectionField as Field;
+    match field {
+        Field::CoreMask => Some("edge-detail.core.display"),
+        Field::TransitionMask => Some("edge-detail.transition.display"),
+        Field::FadeMask => Some("edge-detail.fade.display"),
+        Field::CombinedMask => Some("edge-detail.combined.display"),
+        Field::HeightContribution => Some("edge-detail.height.display"),
+        Field::BaseColorContribution => Some("edge-detail.base-color-contribution.display"),
+        Field::RoughnessContribution => Some("edge-detail.roughness-contribution.display"),
+        Field::MetallicContribution => Some("edge-detail.metallic-contribution.display"),
+        Field::FinalHeight | Field::FinalNormal => None,
+    }
 }
 
 fn feedback_preview_cache_identity(
@@ -2729,6 +2802,7 @@ fn feedback_preview_cache_identity(
         request.profile,
         request.comparison_mode,
         request.selected_operation_id.as_deref(),
+        request.edge_detail_inspection,
     ))
     .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
     Ok(ContentDigest::sha256(&payload).0)
@@ -4194,7 +4268,8 @@ impl NativeExportMapWriter {
             MaterialMapKind::Height
             | MaterialMapKind::Roughness
             | MaterialMapKind::Metallic
-            | MaterialMapKind::AmbientOcclusion => {
+            | MaterialMapKind::AmbientOcclusion
+            | MaterialMapKind::EdgeMask => {
                 let value = f32::from_le_bytes(source.try_into().map_err(|_| {
                     TiledExportError::Encoder("scalar source sample is malformed".into())
                 })?);
@@ -4205,10 +4280,7 @@ impl NativeExportMapWriter {
                     destination.copy_from_slice(&encoded.to_be_bytes());
                 }
             }
-            MaterialMapKind::Specular
-            | MaterialMapKind::Opacity
-            | MaterialMapKind::EdgeMask
-            | MaterialMapKind::MaterialId => {
+            MaterialMapKind::Specular | MaterialMapKind::Opacity | MaterialMapKind::MaterialId => {
                 return Err(TiledExportError::UnsupportedFeatureOrFormat(format!(
                     "unsupported native export conversion for {:?}",
                     self.map
@@ -4321,7 +4393,8 @@ fn native_export_pixel_layout(
         MaterialMapKind::Height
         | MaterialMapKind::Roughness
         | MaterialMapKind::Metallic
-        | MaterialMapKind::AmbientOcclusion => {
+        | MaterialMapKind::AmbientOcclusion
+        | MaterialMapKind::EdgeMask => {
             if bit_depth == 8 {
                 NativeExportPixelLayout {
                     bit_depth: 8,
@@ -4342,10 +4415,7 @@ fn native_export_pixel_layout(
                 }
             }
         }
-        MaterialMapKind::Specular
-        | MaterialMapKind::Opacity
-        | MaterialMapKind::EdgeMask
-        | MaterialMapKind::MaterialId => {
+        MaterialMapKind::Specular | MaterialMapKind::Opacity | MaterialMapKind::MaterialId => {
             return Err(TiledExportError::UnsupportedFeatureOrFormat(format!(
                 "{map:?} is not currently supported by the native GPU export encoder"
             )));
@@ -4364,7 +4434,8 @@ fn native_export_source_pixel_format(
         MaterialMapKind::Height
         | MaterialMapKind::Roughness
         | MaterialMapKind::Metallic
-        | MaterialMapKind::AmbientOcclusion => {
+        | MaterialMapKind::AmbientOcclusion
+        | MaterialMapKind::EdgeMask => {
             hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Float
         }
         MaterialMapKind::RegionId => hot_trimmer_sheet_compiler::CompiledTilePixelFormat::R32Uint,
@@ -4822,7 +4893,7 @@ fn build_stage_14_preview(
     let revision_current = AtomicBool::new(true);
     let monitoring_complete = AtomicBool::new(false);
     let cancellation = EngineCancellationToken::new();
-    let artifact = std::thread::scope(|scope| {
+    let mut artifact = std::thread::scope(|scope| {
         scope.spawn(|| {
             while !monitoring_complete.load(Ordering::Acquire) {
                 let live = session
@@ -4904,6 +4975,21 @@ fn build_stage_14_preview(
             "The compiled SourceFrame artifact did not publish profile-local region metadata.",
         ));
     }
+    if let Some(field) = request.feedback_view.and_then(feedback_inspection_for_view)
+        && let Some(display) = feedback_intermediate_display(field)
+    {
+        artifact.rendered_tile = Some(artifact
+            .rendered_intermediate_tiles
+            .get(display)
+            .cloned()
+            .ok_or_else(|| error(
+                ErrorCode::Internal,
+                &format!("The requested Edge Detail inspection field '{display}' was not published."),
+            ))?);
+        artifact.telemetry.push(format!(
+            "feedback_intermediate_display={display}; source=authoritative-edge-detail-gpu-field"
+        ));
+    }
     let output_size = artifact.topology.output_size;
     let mut maps = BTreeMap::new();
     let mut tile_manifest = None;
@@ -4951,7 +5037,6 @@ fn build_stage_14_preview(
             "A newer document revision superseded this preview after publication.",
         ));
     }
-    let mut artifact = artifact;
     match preview_service.gpu_capabilities.initialize() {
         Ok(state) => artifact
             .telemetry
@@ -5047,7 +5132,10 @@ fn build_stage_14_preview(
         let cache_reused = artifact
             .telemetry
             .iter()
-            .any(|entry| entry.contains("composed_cache=hit"));
+            .any(|entry| {
+                entry.contains("cache_outcome:CacheHit")
+                    || entry.contains("cache_result=CacheHit")
+            });
         FeedbackPreviewExecution {
             request_identity: request.input_hash.clone().expect("feedback requests carry an exact identity"),
             client_generation: request.draft_id.unwrap_or(job),
@@ -5064,6 +5152,26 @@ fn build_stage_14_preview(
             cache_reused,
         }
     });
+    if let Some(execution) = feedback_execution.as_ref() {
+        let publication = tile_manifest.as_ref()
+            .expect("feedback pixel requests publish the selected tile manifest");
+        artifact.telemetry.push(format!(
+            "feedback_publication_evidence=request_identity:{}; view:{:?}; inspection:{:?}; requested_map:{}; revision:{}; client_generation:{}; published_generation:{}; outcome:{:?}; cache_reused:{}; structural_plan_id:{}; shader_identity:{}; pixel_format:{:?}; output_rect:{:?}",
+            execution.request_identity,
+            execution.view,
+            feedback_inspection_for_view(execution.view),
+            execution.requested_map,
+            execution.revision,
+            execution.client_generation,
+            execution.published_generation,
+            execution.outcome,
+            execution.cache_reused,
+            publication.manifest.identity.structural_plan_id.0,
+            publication.manifest.identity.shader_version,
+            publication.manifest.pixel_format,
+            publication.manifest.output_rect.0,
+        ));
+    }
     Ok(IntermediateAtlasProjection {
         label: artifact.label,
         non_exportable: true,
@@ -5870,6 +5978,7 @@ mod algorithm_stage_20a_feedback_workbench_tests {
             profile: PreviewProfile::Refinement1024,
             comparison_mode,
             selected_operation_id: selected_operation_id.map(str::to_owned),
+            edge_detail_inspection: None,
         }
     }
 
@@ -5883,6 +5992,28 @@ mod algorithm_stage_20a_feedback_workbench_tests {
         ));
         request.all_regions = true;
         assert!(feedback_preview_view_intent(&request).is_none());
+        assert_eq!(
+            feedback_intermediate_display(EdgeDetailInspectionField::CoreMask),
+            Some("edge-detail.core.display"),
+        );
+        assert_eq!(
+            feedback_intermediate_display(EdgeDetailInspectionField::TransitionMask),
+            Some("edge-detail.transition.display"),
+        );
+        assert_eq!(
+            feedback_intermediate_display(EdgeDetailInspectionField::FadeMask),
+            Some("edge-detail.fade.display"),
+        );
+        assert_eq!(
+            feedback_intermediate_display(EdgeDetailInspectionField::CombinedMask),
+            Some("edge-detail.combined.display"),
+        );
+        assert_eq!(feedback_intermediate_display(EdgeDetailInspectionField::HeightContribution), Some("edge-detail.height.display"));
+        assert_eq!(feedback_intermediate_display(EdgeDetailInspectionField::FinalHeight), None);
+        assert_eq!(feedback_intermediate_display(EdgeDetailInspectionField::FinalNormal), None);
+        assert_eq!(feedback_intermediate_display(EdgeDetailInspectionField::BaseColorContribution), Some("edge-detail.base-color-contribution.display"));
+        assert_eq!(feedback_intermediate_display(EdgeDetailInspectionField::RoughnessContribution), Some("edge-detail.roughness-contribution.display"));
+        assert_eq!(feedback_intermediate_display(EdgeDetailInspectionField::MetallicContribution), Some("edge-detail.metallic-contribution.display"));
     }
 
     fn solid_png(pixel: [u8; 4]) -> Vec<u8> {
@@ -6773,6 +6904,49 @@ mod persisted_algorithm_stage_14_preview_a_tests {
             [region_color[0], region_color[1], region_color[2], 255]
         );
         assert_eq!(decoded.get_pixel(1, 0).0, [0, 0, 0, 0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_tiled_export_native_stage14_writes_edge_mask_png() {
+        let root = std::env::temp_dir().join(format!(
+            "hot-trimmer-native-export-edge-mask-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("edge-mask.hottrim");
+        let document = native_export_test_document(&root);
+        let manifest = native_export_manifest(MaterialMapKind::EdgeMask);
+        let pixels = [0.0_f32, 0.25, 0.5, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let package = write_native_stage14_export_package(
+            &final_path,
+            7,
+            RevisionAuthority::new(7),
+            &EngineCancellationToken::new(),
+            &document,
+            vec![NativeExportTile {
+                map: MaterialMapKind::EdgeMask,
+                manifest: &manifest,
+                pixels: &pixels,
+                render_ms: 5,
+                readback_ms: 3,
+            }],
+            || true,
+        )
+        .expect("Edge Mask package writes the generated mask");
+        assert_eq!(package.outputs[0].file_name, "maps/edge_mask.png");
+        let decoded = image::load_from_memory(
+            &fs::read(final_path.join("maps/edge_mask.png")).unwrap(),
+        )
+        .unwrap()
+        .to_luma8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [0]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [64]);
+        assert_eq!(decoded.get_pixel(0, 1).0, [128]);
+        assert_eq!(decoded.get_pixel(1, 1).0, [255]);
         fs::remove_dir_all(root).unwrap();
     }
 

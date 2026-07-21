@@ -2,7 +2,38 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { feedbackPreviewRegionAfterCommand, feedbackViewAfterCommand, sanitizeEdgeDetailIntent } from "./feedback-workbench-contract.ts";
+import { EDGE_DETAIL_PRESETS, edgeDetailInspectionForView, edgeDetailIntentFromPreset, edgeDetailPresetForIntent, feedbackPreviewRegionAfterCommand, feedbackRequestIsCurrent, feedbackViewAfterCommand, sanitizeEdgeDetailIntent } from "./feedback-workbench-contract.ts";
+
+test("mvp-edge-wear ignores a stale cancellation after newer preview publication", () => {
+  assert.equal(feedbackRequestIsCurrent(5, 6), false);
+  assert.equal(feedbackRequestIsCurrent(6, 6), true);
+});
+
+test("mvp-edge-wear exposes four editable typed presets with distinct exact intents", () => {
+  const names = ["Soft Worn Edge", "Chipped Paint", "Heavy Erosion", "Clean Bevel"] as const;
+  assert.deepEqual(Object.keys(EDGE_DETAIL_PRESETS), names);
+  const intents = names.map((name) => edgeDetailIntentFromPreset(name, edgeDetail({ targetRegion: "stable-region-uuid" })));
+  assert.equal(new Set(intents.map((intent) => JSON.stringify(intent))).size, names.length);
+  assert.ok(intents.every((intent) => intent.targetRegion === "stable-region-uuid"));
+  assert.equal(intents[3].breakupAmount, 0);
+  assert.equal(intents[3].microDetailAmount, 0);
+  assert.ok(intents[0].edgeWidthM <= 0.006, "the default wear band stays narrow");
+  assert.ok(intents[0].saturationMultiplier >= 0.9, "the default does not bleach Base Color");
+  assert.ok(intents[0].valueMultiplier <= 1.06, "the default does not paint a bright halo");
+  assert.deepEqual(intents.map(edgeDetailPresetForIntent), names);
+  assert.equal(edgeDetailPresetForIntent({ ...intents[0], heightAmplitudeM: -0.0014 }), "Custom");
+});
+
+test("mvp-edge-wear maps every inspection route to one typed field", () => {
+  const routes = [
+    ["edgeDetailCoreMask", "coreMask"], ["edgeDetailTransitionMask", "transitionMask"],
+    ["edgeDetailFadeMask", "fadeMask"], ["edgeDetailCombinedMask", "combinedMask"],
+    ["edgeDetailHeightContribution", "heightContribution"], ["edgeDetailFinalHeight", "finalHeight"],
+    ["edgeDetailFinalNormal", "finalNormal"], ["edgeDetailBaseColorContribution", "baseColorContribution"],
+    ["edgeDetailRoughnessContribution", "roughnessContribution"], ["edgeDetailMetallicContribution", "metallicContribution"],
+  ] as const;
+  for (const [view, field] of routes) assert.equal(edgeDetailInspectionForView(view), field);
+});
 
 test("mvp-edge-wear corrects invalid numeric UI values before the native command", () => {
   const sanitized = sanitizeEdgeDetailIntent({
@@ -40,17 +71,17 @@ test("mvp-edge-wear apply acquires a deterministic preview region when none is s
     ["region-a", "region-b"],
   );
   assert.equal(targeted, "region-b");
-  assert.equal(feedbackViewAfterCommand({ type: "set_edge_detail", intent: edgeDetail({ enabled: false }) }, "stage15Height"), "stage16RegisteredMask");
+  assert.equal(feedbackViewAfterCommand({ type: "set_edge_detail", intent: edgeDetail({ enabled: false }) }, "stage15Height"), "edgeDetailCombinedMask");
 });
 
 const edgeDetail = (patch: Partial<ReturnType<typeof sanitizeEdgeDetailIntent>> = {}) => ({
-  schemaVersion: 1 as const, enabled: true, wearAmount: 0.55, intensity: 0.8,
-  edgeWidthM: 0.004, bevelRadiusM: 0.0025, edgeSoftness: 0.3,
-  breakupAmount: 0.7, breakupScaleM: 0.012, microDetailAmount: 0.25,
-  microDetailScaleM: 0.002, seed: 201516, sourceHeightInfluence: 0.65,
-  sourceLuminanceInfluence: 0.2, heightAmplitudeM: -0.00035,
-  normalDetailStrength: 1, hueShiftDegrees: 0, saturationMultiplier: 0.55,
-  valueMultiplier: 1.12, roughnessOffset: 0.18, exposedMetalEnabled: false,
+  schemaVersion: 1 as const, enabled: true, wearAmount: 0.5, intensity: 0.72,
+  edgeWidthM: 0.006, bevelRadiusM: 0.004, edgeSoftness: 0.2,
+  breakupAmount: 0.78, breakupScaleM: 0.012, microDetailAmount: 0.35,
+  microDetailScaleM: 0.0015, seed: 201516, sourceHeightInfluence: 0.55,
+  sourceLuminanceInfluence: 0.16, heightAmplitudeM: -0.0008,
+  normalDetailStrength: 1.1, hueShiftDegrees: 0, saturationMultiplier: 0.96,
+  valueMultiplier: 1.03, roughnessOffset: 0.1, exposedMetalEnabled: false,
   metallicOffset: 0, ...patch,
 });
 
@@ -69,6 +100,10 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(shader, /fn role_coordinates/);
   assert.match(shader, /Periodic angular embedding/);
   assert.match(shader, /fn srgb_to_linear/);
+  assert.match(shader, /fn source_luminance_height/);
+  assert.match(shader, /source_linear_luminance\(local\) - 0\.5/);
+  assert.match(shader, /cmd\.source_height_range_m/);
+  assert.match(shader, /surface_height \+ edge_height/);
   assert.match(shader, /clamp\(local \+ vec2<i32>\(x, y\), stencil_min, stencil_max\)/);
   assert.match(shader, /transition_micro/);
   assert.match(shader, /cmd\.cap_major_axis == 1u/);
@@ -86,6 +121,14 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(executor, /edge-detail\.fade/);
   assert.match(executor, /edge-detail\.combined/);
   assert.match(executor, /edge-detail\.height/);
+  assert.match(executor, /edge-detail\.core\.display/);
+  assert.match(executor, /edge-detail\.transition\.display/);
+  assert.match(executor, /edge-detail\.fade\.display/);
+  assert.match(read("crates/sheet-compiler/src/intermediate_atlas.rs"), /rendered_intermediate_tiles/);
+  assert.match(read("apps/desktop/src-tauri/src/document_commands.rs"), /feedback_intermediate_display/);
+  assert.match(executor, /edge-detail\.base-color-contribution\.display/);
+  assert.match(executor, /edge-detail\.roughness-contribution\.display/);
+  assert.match(executor, /edge-detail\.metallic-contribution\.display/);
   assert.match(executor, /EdgeDetailSourceModulationRoute::RegisteredHeight => 1/);
   assert.match(executor, /EdgeDetailSourceModulationRoute::HighPassedLinearLuminance => 2/);
   assert.match(executor, /selected_source_routes=/);
@@ -111,6 +154,8 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(composition, /let mask = clamp\(textureLoad\(combined_tex/);
   assert.match(composition, /roughness = clamp\(base\.r \+ mask \* cmd\.roughness_offset/);
   assert.match(composition, /cmd\.exposed_metal_enabled != 0u/);
+  assert.match(composition, /else if \(header\.inspection_mode != 0u\)[\s\S]*result = vec4<f32>\(0\.0\)/,
+    "disabled exposed-metal inspection must publish zero contribution while preserving the base Metallic route");
   assert.match(composition, /Decode once[\s\S]*encode exactly once/);
   assert.match(executor, /execute_height_normal_gpu/);
   assert.match(executor, /compose_edge_detail_map/);
@@ -143,6 +188,10 @@ test("mvp-edge-wear runs the real native Edge Detail GPU fixture", () => {
     cwd: new URL("../../..", import.meta.url), encoding: "utf8",
   });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  for (const name of ["ed4-combined-edge-mask-64.png", "ed4-edge-height-64.png", "ed4-final-normal-64.png", "ed4-final-base-color-64.png"]) {
+    const bytes = readFileSync(new URL(`target/edge-detail-goldens/${name}`, root));
+    assert.ok(bytes.length > 100, `${name} must be a bounded non-empty PNG golden`);
+  }
 });
 
 test("mvp-edge-wear Edge Detail V1 fields agree with the native persisted contract", () => {
@@ -173,13 +222,99 @@ test("mvp-edge-wear Edge Detail V1 fields agree with the native persisted contra
   assert.match(read("apps/desktop/src-tauri/src/document_commands.rs"), /"18": \{ "state": FeedbackExecutionState::NotInstalled/);
 });
 
-test("mvp-edge-wear UI is a right-docked ordered card with the five inspection routes", () => {
+test("mvp-edge-wear authoring restores the default Workbench plus Hotspot split while Processing stays exclusive", () => {
   const workbench = read("apps/desktop/src/feedback-workbench.tsx");
   const shell = read("apps/desktop/src/source-first-app.tsx");
   const css = read("apps/desktop/src/document-app.css");
-  for (const label of ["Base Color", "Mask", "Height", "Normal", "Roughness"]) assert.match(workbench, new RegExp(`>${label}<`));
-  assert.match(workbench, /className="layer-card-list"/);
-  assert.match(shell, /!feedbackWorkbenchOpen/);
-  assert.match(shell, /minmax\(360px, 430px\)/);
-  assert.match(css, /\.feedback-workbench \{ position: relative/);
+  assert.match(shell, /type WorkspaceMode = "authoring" \| "processing"/);
+  assert.match(shell, /new Set\(\["workbench", "hotspotSheet"\]\)/);
+  assert.match(shell, /sourceWorkbenchOpen = workspaceMode === "authoring" && authoringPanes\.has\("workbench"\)/);
+  assert.match(shell, /hotspotSheetOpen = workspaceMode === "authoring" && authoringPanes\.has\("hotspotSheet"\)/);
+  assert.match(shell, /if \(workspaceMode === "processing"\) \{ setWorkspaceMode\("authoring"\); return; \}/);
+  assert.match(shell, /\(hotspotSheetOpen \|\| processingOpen\) \? <SheetWorkbench/);
+  assert.match(shell, /processingOpen \? <ProcessingSidebar/);
+  assert.match(shell, /debugOpen \? <div id="debug-drawer"/);
+  assert.match(css, /\.debug-drawer \{ position: fixed/);
+  assert.match(workbench, /Debug \/ Fixtures · Create bundled sample/);
+});
+
+test("mvp-edge-wear Processing switches retained map publications, keeps the prior atlas pending, and has no unclear Edit mode", () => {
+  const shell = read("apps/desktop/src/source-first-app.tsx");
+  for (const label of ["Material", "Base Color", "Normal", "Height", "Roughness", "Metallic", "AO", "Edge Mask"]) assert.match(shell, new RegExp(`'${label}'|>${label}<`));
+  assert.match(shell, /authoringOverlaysVisible = !processing/);
+  assert.match(shell, /authoringOverlaysVisible \? <div className=\{`overlays/);
+  assert.doesNotMatch(shell, /processingCanvasMode|Atlas interaction mode/);
+  assert.match(shell, /if \(processingOpen\) \{\s*setProcessingRequestedMap\(view\);\s*setMapViewState\(view\);\s*mapViewRef\.current = view;\s*return;\s*\}/);
+  assert.match(shell, /requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false, true, processingRequestedMap\)/);
+  assert.doesNotMatch(shell, /processingViewForMap/);
+  assert.match(shell, /previewProgress\?\.feedbackRequestIdentity && dimensions\.generation/);
+  assert.match(shell, /Preview superseded/);
+  assert.match(shell, /supersessionRetry === 0/);
+  assert.match(shell, /window\.setTimeout\(resolve, 180\)/);
+  assert.match(shell, /return requestPreview\(regionId, projection, profile, latestRevision, scheduleRefinement, true, requestedMapView, 1\)/);
+  assert.match(shell, /projectRef\.current = result\.project/);
+  assert.match(shell, /Math\.max\(requestedRevision, observedRevision\)/);
+  assert.match(shell, /onRender=\{\(\) => void renderFullResolutionPreview\(\)\}/);
+  assert.match(shell, /\}, \[processingOpen, interactivePreviewProfile\]\)/);
+  assert.doesNotMatch(shell, /feedbackCommandPreviewRevision/);
+  assert.match(shell, /const radialCommitId = useRef\(0\)/);
+  assert.match(shell, /if \(commitId !== radialCommitId\.current\) return/);
+  assert.match(shell, /await requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false, true\)/);
+});
+
+test("mvp-edge-wear Processing makes Edge Detail application explicit and truthful", () => {
+  const workbench = read("apps/desktop/src/feedback-workbench.tsx");
+  assert.match(workbench, /persisted = props\.project\?\.document\?\.edgeDetail/);
+  assert.match(workbench, /persisted \?\? \{ \.\.\.defaultEdgeWearIntent\(\), enabled: false \}/);
+  assert.match(workbench, /targetRegion = committed\.targetRegion/);
+  assert.match(workbench, /targetLabel = targetRegion \? `\$\{targetRegion\.displayName\} · \$\{targetRegion\.id\}` : "All regions"/);
+  assert.match(workbench, /Selected region ·/);
+  assert.match(workbench, /onBlur=\{finish\}/);
+  assert.match(workbench, /onPointerUp=\{finish\}/);
+  assert.match(workbench, /Apply Edge Detail/);
+  assert.match(workbench, /Apply Changes/);
+  assert.match(workbench, /Render Edge Detail/);
+  assert.match(workbench, /if \(applied && !dirty\)/);
+  assert.match(workbench, /if \(!artifactCurrent\) props\.onRender\(\)/);
+  assert.match(workbench, /Edge Detail is not applied/);
+  assert.match(workbench, /Edge Detail has unapplied changes/);
+  assert.match(workbench, /sanitizeEdgeDetailIntent\(\{ \.\.\.draft, enabled: true \}\)/);
+  assert.doesNotMatch(workbench, /Changes publish live/);
+  assert.match(workbench, /edgeDetailIntentFromPreset\(event\.currentTarget\.value as EdgeDetailPresetName, \{ \.\.\.draft, enabled: true \}\)/);
+  assert.doesNotMatch(workbench, /<strong>Structural Profile<\/strong>/);
+  assert.doesNotMatch(workbench, /What feeds these maps\?/);
+  for (const control of ["Wear Amount", "Intensity", "Edge Width", "Bevel Radius", "Breakup", "Height"]) assert.match(workbench, new RegExp(`label: "${control}"`));
+  assert.match(workbench, /props\.value \* 1000/);
+  for (const control of ["Edge Softness", "Microdetail Amount", "Source Height", "Base Color bump", "Normal detail"]) assert.match(workbench, new RegExp(control));
+});
+
+test("mvp-edge-wear ED-6 Outputs require current publication evidence", () => {
+  const workbench = read("apps/desktop/src/feedback-workbench.tsx");
+  assert.match(workbench, /artifactCurrent = revision !== undefined && props\.artifact\?\.documentRevision === revision/);
+  for (const map of ["Base Color", "Edge Mask", "Height", "Normal", "Roughness", "Metallic", "AO"]) assert.match(workbench, new RegExp(`\\["${map}"`));
+  assert.match(workbench, /ready \? "Ready" : "Not ready"/);
+});
+
+test("mvp-edge-wear publishes a complete material set, lights it without geometry, and exports every Edge Detail output", () => {
+  const shell = read("apps/desktop/src/source-first-app.tsx");
+  const css = read("apps/desktop/src/document-app.css");
+  const materialPreview = read("apps/desktop/src/material-preview.tsx");
+  const native = read("apps/desktop/src-tauri/src/document_commands.rs");
+  for (const map of ["base_color", "normal", "height", "roughness", "metallic", "ambient_occlusion", "edge_mask"]) {
+    assert.match(shell, new RegExp(`processingPreviewMaterialMaps[\\s\\S]*?"${map}"`));
+  }
+  assert.match(shell, /const requestedMaps = processingOpen\s*\? processingPreviewMaterialMaps/);
+  assert.match(shell, /<MaterialPreviewCanvas artifact=\{artifact\}/);
+  assert.doesNotMatch(shell, /role="tab" disabled[^>]*>Material/);
+  assert.match(materialPreview, /uniform sampler2D u_base_color/);
+  assert.match(materialPreview, /uniform sampler2D u_normal/);
+  assert.match(materialPreview, /uniform sampler2D u_height/);
+  assert.match(materialPreview, /height_toward_light/);
+  assert.match(materialPreview, /onPointerMove/);
+  assert.match(shell, />Export All Maps</);
+  assert.match(shell, />Refresh All Maps</);
+  assert.match(css, /\.processing-inspection-controls button \{[^}]*min-width: max-content;[^}]*max-width: none;[^}]*white-space: nowrap;/);
+  assert.match(shell, /"metallic", "edge_mask"/);
+  assert.match(native, /MaterialMapKind::AmbientOcclusion\s*\| MaterialMapKind::EdgeMask => \{/);
+  assert.match(native, /"maps\/edge_mask\.png"/);
 });

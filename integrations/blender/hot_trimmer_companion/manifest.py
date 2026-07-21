@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 SUPPORTED_SCHEMA_VERSION = 1
+MANIFEST_FILE_NAME = "manifest.hottrim.json"
 SUPPORTED_KINDS = frozenset(("rectangular", "radial"))
 SUPPORTED_FIT_AXES = frozenset(("automatic", "none"))
 SUPPORTED_ROTATIONS = frozenset((0, 90, 180, 270))
@@ -175,10 +176,33 @@ def validate_manifest(data, manifest_path):
     return data
 
 
+def resolve_manifest_path(path):
+    """Accept either an exported package directory or its manifest file."""
+    selected_path = Path(path).expanduser().resolve()
+    if selected_path.is_file():
+        return selected_path
+    if selected_path.is_dir():
+        canonical = selected_path / MANIFEST_FILE_NAME
+        if canonical.is_file():
+            return canonical
+        manifests = sorted(candidate for candidate in selected_path.glob("*.hottrim.json") if candidate.is_file())
+        if len(manifests) == 1:
+            return manifests[0]
+        package_manifests = sorted(
+            candidate / MANIFEST_FILE_NAME
+            for candidate in selected_path.iterdir()
+            if candidate.is_dir() and candidate.name.lower().endswith(".hottrim") and (candidate / MANIFEST_FILE_NAME).is_file()
+        )
+        if len(package_manifests) == 1:
+            return package_manifests[0]
+        if len(manifests) + len(package_manifests) > 1:
+            raise ValueError("multiple Hot Trimmer packages were found; select the intended .hottrim folder or manifest.hottrim.json")
+        raise ValueError(f"Hot Trimmer package does not contain {MANIFEST_FILE_NAME}: {selected_path}")
+    raise ValueError(f"Hot Trimmer package or manifest does not exist: {selected_path}")
+
+
 def load_manifest(path):
-    manifest_path = Path(path).expanduser().resolve()
-    if not manifest_path.is_file():
-        raise ValueError(f"Hot Trimmer manifest does not exist: {manifest_path}")
+    manifest_path = resolve_manifest_path(path)
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

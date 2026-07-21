@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const EDGE_DETAIL_ALGORITHM_ID: &str = "hot_trimmer.edge_detail_mvp";
-pub const EDGE_DETAIL_ALGORITHM_VERSION: &str = "1.3.0";
+pub const EDGE_DETAIL_ALGORITHM_VERSION: &str = "1.4.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

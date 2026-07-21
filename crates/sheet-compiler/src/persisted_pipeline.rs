@@ -2922,6 +2922,7 @@ fn final_atlas_artifact_from_gpu(
         rendered_tiles: output.map_tiles.clone(),
         rendered_tile_timings: output.tile_timings.clone(),
         rendered_display_tiles: output.display_tiles.clone(),
+        rendered_intermediate_tiles: output.intermediate_tiles.clone(),
         pending: vec![
             "profiles",
             "semantic details",
@@ -3345,7 +3346,7 @@ mod source_frame_partition_tests {
         assert_eq!(fallback.authored_edge_width_m, intent.edge_width_m);
         assert_eq!(fallback.authored_breakup_scale_m, intent.breakup_scale_m);
         assert_eq!(fallback.authored_micro_detail_scale_m, intent.micro_detail_scale_m);
-        assert_eq!(command.edge_width_m, 0.004);
+        assert_eq!(command.edge_width_m, intent.edge_width_m as f32);
         assert_eq!(command.breakup_scale_m, intent.breakup_scale_m as f32);
         assert_eq!(command.micro_detail_scale_m, 0.008);
         assert_eq!(intent.micro_detail_scale_m, 0.002, "authored intent remains unchanged");

@@ -531,11 +531,19 @@ export type FeedbackExecutionState =
   | "Superseded" | "NotInstalled";
 
 export type FeedbackContributionView =
+  | "edgeDetailCoreMask" | "edgeDetailTransitionMask" | "edgeDetailFadeMask" | "edgeDetailCombinedMask"
+  | "edgeDetailHeightContribution" | "edgeDetailFinalHeight" | "edgeDetailFinalNormal"
+  | "edgeDetailBaseColorContribution" | "edgeDetailRoughnessContribution" | "edgeDetailMetallicContribution"
   | "stage15Occupancy" | "stage15Height" | "stage15ProfileRoute" | "stage15Lod" | "stage15Fallback"
   | "stage16RegisteredMask" | "stage16Height" | "stage16VectorNormal" | "stage16ScalarRoughness"
   | "stage16ScalarMetallic" | "stage16ScalarAmbientOcclusion" | "stage16BaseColor"
   | "stage16MaterialId" | "stage16MaterialIdValidity" | "stage16Route" | "stage16Occupancy"
   | "stage16Lod" | "stage16Scope" | "stage16AssetResolution";
+
+export type EdgeDetailInspectionField =
+  | "coreMask" | "transitionMask" | "fadeMask" | "combinedMask" | "heightContribution"
+  | "finalHeight" | "finalNormal" | "baseColorContribution" | "roughnessContribution"
+  | "metallicContribution";
 
 export type FeedbackPreviewProfile = "preview1024" | "preview2048" | "preview4096" | "preview8192";
 export type FeedbackComparisonMode = "after" | "before" | "selectedOperationIsolation";
@@ -617,6 +625,7 @@ export interface FeedbackQaTileRequest {
   protocolVersion: number; commandVersion: 1; revision: number; generation: number; regionId: string;
   view: FeedbackContributionView; profile: "refinement1024" | "preview2048" | "preview4096" | "preview8192";
   comparisonMode: FeedbackComparisonMode; allRegions: boolean; selectedOperationId?: string;
+  edgeDetailInspection?: EdgeDetailInspectionField;
 }
 
 export interface FeedbackPreviewExecution {

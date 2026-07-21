@@ -2,7 +2,7 @@ struct DisplayHeader {
     width: u32,
     height: u32,
     map_kind: u32,
-    _pad_u0: u32,
+    signed_unit_delta: u32,
     source_height_range_m: f32,
     _pad_f0: f32,
     _pad_f1: f32,
@@ -24,7 +24,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let value = textureLoad(physical_tex, vec2<i32>(id.xy), 0).r;
     var encoded = clamp(value, 0.0, 1.0);
-    if (header.map_kind == 1u) {
+    if (header.signed_unit_delta != 0u) {
+        encoded = clamp(0.5 + value * 0.5, 0.0, 1.0);
+    } else if (header.map_kind == 1u) {
         // Exact inverse of the normalized source Height -> signed meters contract.
         encoded = clamp(0.5 + value / header.source_height_range_m, 0.0, 1.0);
     }

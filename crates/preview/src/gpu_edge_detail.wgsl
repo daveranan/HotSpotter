@@ -119,6 +119,25 @@ fn srgb_to_linear(value: f32) -> f32 {
     return select(value / 12.92, pow((value + 0.055) / 1.055, 2.4), value > 0.04045);
 }
 
+fn source_linear_luminance(local: vec2<i32>) -> f32 {
+    let encoded = textureLoad(source_color, local, 0).rgb;
+    return linear_luminance(vec3<f32>(
+        srgb_to_linear(encoded.r),
+        srgb_to_linear(encoded.g),
+        srgb_to_linear(encoded.b),
+    ));
+}
+
+// When no authored Height exists, the resampled Base Color becomes an explicit
+// physical surface-height layer. Centering around zero keeps the absolute
+// offset neutral while preserving every luminance gradient for final Normal.
+fn source_luminance_height(local: vec2<i32>, cmd: EdgeCommand) -> f32 {
+    if (cmd.source_route != 2u) { return 0.0; }
+    return (source_linear_luminance(local) - 0.5)
+        * cmd.source_height_range_m
+        * cmd.source_luminance_influence;
+}
+
 fn source_high_pass(local: vec2<i32>, cmd: EdgeCommand) -> f32 {
     if (cmd.source_route == 0u) { return 0.0; }
     let tile_origin = vec2<u32>(header.tile_x, header.tile_y);
@@ -134,14 +153,8 @@ fn source_high_pass(local: vec2<i32>, cmd: EdgeCommand) -> f32 {
     for (var y = -1; y <= 1; y = y + 1) {
         for (var x = -1; x <= 1; x = x + 1) {
             let q = clamp(local + vec2<i32>(x, y), stencil_min, stencil_max);
-            let encoded = textureLoad(source_color, q, 0).rgb;
-            let linear_rgb = vec3<f32>(
-                srgb_to_linear(encoded.r),
-                srgb_to_linear(encoded.g),
-                srgb_to_linear(encoded.b),
-            );
             let v = select(
-                linear_luminance(linear_rgb),
+                source_linear_luminance(q),
                 textureLoad(source_height, q, 0).x,
                 cmd.source_route == 1u,
             );
@@ -169,6 +182,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 vec2<u32>(cmd.semantic_width, cmd.semantic_height))) { continue; }
         let semantic_bits = u32(round(textureLoad(stage15_semantics, local, 0).x));
         if ((semantic_bits & 1u) == 0u) { continue; }
+        let surface_height = source_luminance_height(local, cmd);
         let q = (vec2<f32>(atlas_pixel - vec2<u32>(cmd.dst_x, cmd.dst_y)) + vec2<f32>(0.5))
             / vec2<f32>(f32(max(cmd.dst_width, 1u)), f32(max(cmd.dst_height, 1u)));
         let physical = q * vec2<f32>(cmd.slot_width_m, cmd.slot_height_m);
@@ -183,7 +197,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             + source_bias * cmd.edge_width_m * 0.15;
         let distance = max(textureLoad(stage15_sdf, local, 0).x, 0.0);
         let warped = max(0.0, distance + warp);
-        if (warped > cmd.requested_extent_m) { continue; }
+        if (warped > cmd.requested_extent_m) {
+            textureStore(height_out, local, vec4<f32>(surface_height));
+            continue;
+        }
         let pixel_feather = max(cmd.meters_per_pixel_x, cmd.meters_per_pixel_y);
         let feather = max(pixel_feather, cmd.edge_width_m * (0.04 + cmd.edge_softness * 0.16));
         let coverage = smoothstep(1.0 - cmd.wear_amount - 0.12, 1.0 - cmd.wear_amount + 0.12, middle + source_bias * 0.2);
@@ -211,6 +228,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(transition_out, local, vec4<f32>(transition));
         textureStore(fade_out, local, vec4<f32>(fade));
         textureStore(combined_out, local, vec4<f32>(combined));
-        textureStore(height_out, local, vec4<f32>(edge_height));
+        textureStore(height_out, local, vec4<f32>(surface_height + edge_height));
     }
 }

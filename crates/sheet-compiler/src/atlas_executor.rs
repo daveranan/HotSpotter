@@ -2915,6 +2915,43 @@ fn edge_detail_plan_identity(plan: &CompiledAtlasPlanV1) -> String {
         .collect::<Vec<_>>().join("|")
 }
 
+fn edge_detail_execution_evidence(
+    plan: &CompiledAtlasPlanV1,
+    requested_map: MaterialMapKind,
+    cache_outcome: &str,
+    dispatch_ms: u128,
+    resident_bytes: u64,
+) -> Option<String> {
+    let edges = plan.ordered_regions.iter().filter_map(|region| {
+        region.edge_detail.as_ref().map(|edge| (region, edge))
+    }).collect::<Vec<_>>();
+    if edges.is_empty() {
+        return None;
+    }
+    let eligible = plan.ordered_regions.iter().filter(|region| {
+        let edge = region.edge_eligibility;
+        edge.left || edge.right || edge.top || edge.bottom
+    }).count();
+    let scope = if edges.len() == eligible { "global" } else { "region" };
+    let join = |values: BTreeSet<String>| values.into_iter().collect::<Vec<_>>().join("|");
+    let intent_ids = join(edges.iter().map(|(_, edge)| edge.intent_identity.0.clone()).collect());
+    let algorithms = join(edges.iter().map(|(_, edge)| format!("{}@{}", edge.algorithm_id, edge.algorithm_version)).collect());
+    let region_ids = join(edges.iter().map(|(region, _)| format!("{:?}", region.region_id)).collect());
+    let source_routes = join(edges.iter().map(|(_, edge)| format!("{:?}", edge.source_modulation_route)).collect());
+    let source_ids = join(edges.iter().filter_map(|(_, edge)| edge.source_modulation_identity.as_ref().map(|id| id.0.clone())).collect());
+    let sdf = plan.tile_identity(MaterialMapKind::Roughness, "stage15-profile-sdf-v2");
+    let semantics = plan.tile_identity(MaterialMapKind::AmbientOcclusion, "stage15-profile-semantics-v2");
+    let (format, display_format) = match requested_map {
+        MaterialMapKind::BaseColor | MaterialMapKind::Normal => ("Rgba8Unorm", "Rgba8Unorm"),
+        _ => ("R32Float", "Rgba8UnormLinear"),
+    };
+    Some(format!(
+        "edge_detail_execution_evidence=requested_map:{requested_map:?}; intent_ids:{intent_ids}; plan_id:{}; algorithms:{algorithms}; scope:{scope}; region_ids:{region_ids}; stage15_sdf:{}@{}; stage15_semantics:{}@{}; source_routes:{source_routes}; source_identities:{source_ids}; format:{format}; display_format:{display_format}; dispatch_ms:{dispatch_ms}; residency_bytes:{resident_bytes}; cache_outcome:{cache_outcome}; publication_required:true",
+        edge_detail_plan_identity(plan), sdf.structural_plan_id.0, sdf.shader_version,
+        semantics.structural_plan_id.0, semantics.shader_version,
+    ))
+}
+
 impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
     fn execute(
         &self,
@@ -3177,7 +3214,17 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             .source_texture_cache
             .lock()
             .ok()
-            .and_then(|mut cache| cache.cached_tile(&identity, plan.tile_request.generation))
+            .and_then(|mut cache| {
+                let edge_detail_inspection = matches!(
+                    requested_map,
+                    MaterialMapKind::EdgeMask | MaterialMapKind::Height
+                        | MaterialMapKind::Normal | MaterialMapKind::BaseColor
+                        | MaterialMapKind::Roughness | MaterialMapKind::Metallic
+                ) && plan.ordered_regions.iter().any(|region| region.edge_detail.is_some());
+                (!edge_detail_inspection).then(|| {
+                    cache.cached_tile(&identity, plan.tile_request.generation)
+                }).flatten()
+            })
         {
             let interactive_tile = if matches!(
                 requested_map,
@@ -3462,8 +3509,16 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         let dispatch_ms = dispatch_started.elapsed().as_millis();
         let edge_composition = compose_edge_detail_map(
             self, plan, input, device, queue, requested_map, &output_view,
-            wgpu::TextureFormat::Rgba8Unorm, false, cancellation, is_current,
+            wgpu::TextureFormat::Rgba8Unorm, false, 0, cancellation, is_current,
         )?;
+        let edge_contribution = if edge_composition.is_some() {
+            compose_edge_detail_map(
+                self, plan, input, device, queue, requested_map, &output_view,
+                wgpu::TextureFormat::Rgba8Unorm, false, 1, cancellation, is_current,
+            )?
+        } else {
+            None
+        };
         let published_texture = edge_composition.as_ref().map_or(&output_texture, |value| &value.0);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("hot-trimmer-base-color-readback-encoder"),
@@ -3504,6 +3559,12 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 depth_or_array_layers: 1,
             },
         );
+        let contribution_pending = edge_contribution.as_ref().map(|value| {
+            schedule_readback(
+                device, self.source_texture_cache, &mut encoder, &value.0,
+                tile_width, tile_height, 4,
+            )
+        }).transpose()?;
         if cancellation.is_cancelled() {
             return Err(AtlasRenderExecutionError::Cancelled);
         }
@@ -3521,6 +3582,10 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             height: tile_height,
         };
         let (pixels, readback_ms) = finish_readback(device, readback_pending)?;
+        let contribution_pixels = contribution_pending
+            .map(|pending| finish_readback(device, pending))
+            .transpose()?
+            .map(|value| value.0);
         if !is_current() {
             return Err(AtlasRenderExecutionError::Superseded);
         }
@@ -3553,6 +3618,20 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         map_tiles.insert(requested_map, Arc::clone(&interactive_tile));
         let mut display_tiles = BTreeMap::new();
         display_tiles.insert(requested_map, Arc::clone(&interactive_tile));
+        let mut intermediate_tiles = BTreeMap::new();
+        if let Some(contribution_pixels) = contribution_pixels {
+            let mut contribution_identity = plan.tile_identity(
+                requested_map, "edge-detail-base-color-contribution-display-rgba8-v1",
+            );
+            contribution_identity.pixel_format = crate::CompiledTilePixelFormat::Rgba8UnormLinear;
+            let contribution_tile = remember_rendered_tile_with_identity(
+                self.source_texture_cache, plan, requested_map, contribution_identity,
+                contribution_pixels,
+            )?;
+            intermediate_tiles.insert(
+                "edge-detail.base-color-contribution.display".into(), contribution_tile,
+            );
+        }
         let (source_resident_bytes, source_resident_layers) = self
             .source_texture_cache
             .lock()
@@ -3573,6 +3652,13 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         )];
         if let Some((_, _, edge_stats)) = &edge_composition {
             telemetry.push(format!("requested_map_dependencies={requested_map:?}<-RegisteredSource|Stage15Sdf|Stage15Semantics|EdgeDetailCore|EdgeDetailTransition|EdgeDetailFade; edge_detail_mask_identity={}; edge_detail_dispatches={}", edge_detail_plan_identity(plan), edge_stats.dispatches));
+            if let Some(evidence) = edge_detail_execution_evidence(
+                plan, requested_map,
+                if edge_stats.cache_hit { "CacheHit" } else { "CacheMiss" },
+                edge_stats.dispatch_ms, edge_stats.resident_bytes,
+            ) {
+                telemetry.push(evidence);
+            }
         }
         telemetry.push(format!(
             "profile_pass_dispatches={}; profile_cache_hit={}; profile_commands={}; profile_command_bytes={}; profile_resident_bytes={}; profile_required_halo={}; profile_dispatch_ms={}",
@@ -3603,7 +3689,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             AtlasFinalAtlasOutput {
                 map_tiles: map_tiles.clone(),
                 display_tiles,
-                intermediate_tiles: BTreeMap::new(),
+                intermediate_tiles,
                 base_color_rgba8: Arc::clone(&pixels),
                 interactive_tile,
                 tile_timings: tile_timings_for(&map_tiles, dispatch_ms, readback_ms),
@@ -4182,11 +4268,11 @@ const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
 ];
 
 const EDGE_DETAIL_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
-    (MaterialMapKind::BaseColor, "edge-detail-core-r32float-v2"),
-    (MaterialMapKind::Roughness, "edge-detail-transition-r32float-v2"),
-    (MaterialMapKind::AmbientOcclusion, "edge-detail-fade-r32float-v2"),
-    (MaterialMapKind::EdgeMask, "edge-detail-combined-r32float-v2"),
-    (MaterialMapKind::Height, "edge-detail-height-r32float-v2"),
+    (MaterialMapKind::BaseColor, "edge-detail-core-r32float-v3"),
+    (MaterialMapKind::Roughness, "edge-detail-transition-r32float-v3"),
+    (MaterialMapKind::AmbientOcclusion, "edge-detail-fade-r32float-v3"),
+    (MaterialMapKind::EdgeMask, "edge-detail-combined-r32float-v3"),
+    (MaterialMapKind::Height, "edge-detail-surface-and-edge-height-r32float-v3"),
 ];
 
 #[derive(Clone, Copy)]
@@ -4872,6 +4958,7 @@ fn compose_edge_detail_map(
     base_view: &wgpu::TextureView,
     output_format: wgpu::TextureFormat,
     base_height_is_physical: bool,
+    inspection_mode: u32,
     cancellation: &CancellationToken,
     is_current: &dyn Fn() -> bool,
 ) -> Result<Option<(wgpu::Texture, wgpu::TextureView, GpuEdgeDetailDispatchStats)>, AtlasRenderExecutionError> {
@@ -4932,7 +5019,7 @@ fn compose_edge_detail_map(
     let mut header_bytes = Vec::with_capacity(32);
     for value in [
         tile.width, tile.height, gpu_map_code(requested_map), commands.len() as u32,
-        tile.x, tile.y, u32::from(base_height_is_physical), 0,
+        tile.x, tile.y, u32::from(base_height_is_physical), inspection_mode,
     ] {
         header_bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -4983,6 +5070,7 @@ fn scalar_display_from_composed_map(
     source_view: &wgpu::TextureView,
     width: u32,
     height: u32,
+    signed_unit_delta: bool,
 ) -> Result<(wgpu::Texture, wgpu::TextureView), AtlasRenderExecutionError> {
     let pipeline = pipeline(
         device, executor.source_texture_cache, GpuAtlasPipelineKind::ScalarDisplayRgba8,
@@ -5000,7 +5088,7 @@ fn scalar_display_from_composed_map(
         .cached_rendered_texture(&allocation_identity)
         .ok_or_else(|| AtlasRenderExecutionError::Gpu("Stage 15 allocation semantics are missing".into()))?;
     let mut header = Vec::with_capacity(32);
-    for value in [width, height, gpu_map_code(requested_map), 0] {
+    for value in [width, height, gpu_map_code(requested_map), u32::from(signed_unit_delta)] {
         header.extend_from_slice(&value.to_le_bytes());
     }
     for value in [SOURCE_HEIGHT_RANGE_M, 0.0, 0.0, 0.0] {
@@ -5422,16 +5510,20 @@ fn execute_edge_detail_gpu_tile(
             })?);
         }
     }
-    let (display_texture, _) = scalar_display_from_composed_map(
-        executor,
-        plan,
-        device,
-        queue,
-        MaterialMapKind::EdgeMask,
-        &cached_fields[3].view,
-        tile.width,
-        tile.height,
-    )?;
+    let mut display_fields = Vec::with_capacity(5);
+    for (index, field) in cached_fields.iter().enumerate() {
+        display_fields.push(scalar_display_from_composed_map(
+            executor,
+            plan,
+            device,
+            queue,
+            if index == 4 { MaterialMapKind::Height } else { MaterialMapKind::EdgeMask },
+            &field.view,
+            tile.width,
+            tile.height,
+            false,
+        )?);
+    }
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("hot-trimmer-edge-detail-readback"),
     });
@@ -5442,15 +5534,18 @@ fn execute_edge_detail_gpu_tile(
             tile.width, tile.height, 4,
         )?);
     }
-    let display_pending = schedule_readback(
-        device,
-        executor.source_texture_cache,
-        &mut encoder,
-        &display_texture,
-        tile.width,
-        tile.height,
-        4,
-    )?;
+    let mut display_pending = Vec::with_capacity(5);
+    for (texture, _) in &display_fields {
+        display_pending.push(schedule_readback(
+            device,
+            executor.source_texture_cache,
+            &mut encoder,
+            texture,
+            tile.width,
+            tile.height,
+            4,
+        )?);
+    }
     queue.submit(Some(encoder.finish()));
     let mut payloads = Vec::with_capacity(5);
     let mut readback_ms = 0;
@@ -5461,9 +5556,14 @@ fn execute_edge_detail_gpu_tile(
         readback_bytes += pixels.len() as u64;
         payloads.push(pixels);
     }
-    let (display_pixels, elapsed) = finish_readback(device, display_pending)?;
-    readback_ms += elapsed;
-    readback_bytes += display_pixels.len() as u64;
+    let mut display_payloads = Vec::with_capacity(5);
+    for readback in display_pending {
+        let (pixels, elapsed) = finish_readback(device, readback)?;
+        readback_ms += elapsed;
+        readback_bytes += pixels.len() as u64;
+        display_payloads.push(pixels);
+    }
+    let display_pixels = Arc::clone(&display_payloads[3]);
     let combined_pixels = Arc::clone(&payloads[3]);
     let combined_tile = remember_rendered_tile(
         executor.source_texture_cache, plan, MaterialMapKind::EdgeMask, combined_pixels,
@@ -5476,6 +5576,33 @@ fn execute_edge_detail_gpu_tile(
             edge_detail_identity(plan, map, shader), Arc::clone(&payloads[index]),
         )?;
         intermediate_tiles.insert(label.into(), tile);
+    }
+    const DISPLAY_LABELS: [&str; 5] = [
+        "edge-detail.core.display",
+        "edge-detail.transition.display",
+        "edge-detail.fade.display",
+        "edge-detail.combined.display",
+        "edge-detail.height.display",
+    ];
+    const DISPLAY_IDENTITIES: [&str; 5] = [
+        "edge-detail-core-display-rgba8-v1",
+        "edge-detail-transition-display-rgba8-v1",
+        "edge-detail-fade-display-rgba8-v1",
+        "edge-detail-combined-display-rgba8-v1",
+        "edge-detail-height-display-rgba8-v1",
+    ];
+    for index in 0..5 {
+        let map = if index == 4 { MaterialMapKind::Height } else { MaterialMapKind::EdgeMask };
+        let mut identity = plan.tile_identity(map, DISPLAY_IDENTITIES[index]);
+        identity.pixel_format = crate::CompiledTilePixelFormat::Rgba8UnormLinear;
+        let tile = remember_rendered_tile_with_identity(
+            executor.source_texture_cache,
+            plan,
+            map,
+            identity,
+            Arc::clone(&display_payloads[index]),
+        )?;
+        intermediate_tiles.insert(DISPLAY_LABELS[index].into(), tile);
     }
     let mut map_tiles = BTreeMap::new();
     map_tiles.insert(MaterialMapKind::EdgeMask, Arc::clone(&combined_tile));
@@ -5530,6 +5657,20 @@ fn execute_edge_detail_gpu_tile(
         .into_iter()
         .collect::<Vec<_>>()
         .join("|");
+    let intent_identities = edge_regions
+        .iter()
+        .map(|(_, edge)| edge.intent_identity.0.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|");
+    let algorithm_identities = edge_regions
+        .iter()
+        .map(|(_, edge)| format!("{}@{}", edge.algorithm_id, edge.algorithm_version))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|");
     let lod_fallbacks = edge_regions
         .iter()
         .filter_map(|(region, edge)| edge.lod_fallback.as_ref().map(|fallback| (region, fallback)))
@@ -5560,9 +5701,9 @@ fn execute_edge_detail_gpu_tile(
         })
         .collect::<Vec<_>>()
         .join("|");
-    let telemetry = vec![
+    let mut telemetry = vec![
         format!(
-            "executor=gpu; backend={}; plan_hash={}; requested_map=EdgeMask; logical_passes={}; executed_gpu_passes=stage15-profile,edge-detail-mvp-v2,scalar-display-rgba8; shader_identity=edge-detail-mvp-v2; mask_format=R32Float; display_format=Rgba8UnormLinear; height_format=R32Float; final_tile_cache=miss; edge_detail_cache={}; dispatches={}; command_count={}; command_bytes={}; resident_bytes={}; required_halo_px={}; source_cache_hits={}; source_upload_bytes={}; dispatch_ms={}; readback_ms={}; smooth_intermediate_pixels={smooth_values}; render_ms={}",
+            "executor=gpu; backend={}; plan_hash={}; requested_map=EdgeMask; logical_passes={}; executed_gpu_passes=stage15-profile,edge-detail-mvp-v3,scalar-display-rgba8; shader_identity=edge-detail-mvp-v3; mask_format=R32Float; display_format=Rgba8UnormLinear; height_format=R32Float; final_tile_cache=miss; edge_detail_cache={}; dispatches={}; command_count={}; command_bytes={}; resident_bytes={}; required_halo_px={}; source_cache_hits={}; source_upload_bytes={}; dispatch_ms={}; readback_ms={}; smooth_intermediate_pixels={smooth_values}; render_ms={}",
             state.capabilities().backend, plan.final_plan_hash.0,
             logical_passes_for_map(plan, MaterialMapKind::EdgeMask),
             if stats.cache_hit { "CacheHit" } else { "CacheMiss" },
@@ -5572,7 +5713,8 @@ fn execute_edge_detail_gpu_tile(
             started.elapsed().as_millis(),
         ),
         format!(
-            "requested_map_dependencies=EdgeMask<-Stage15Sdf|Stage15Semantics|EdgeDetailCombined; edge_detail_mask_identity={}; scope={scope}; region_ids={region_ids}; stage15_sdf_identity={}:{}; stage15_semantics_identity={}:{}; selected_source_routes={source_routes}; selected_source_identities={source_identities}; lod_fallbacks={lod_fallbacks}; output_identities={output_identities}; edge_detail_outputs=core|transition|fade|combined|signed-physical-height; declared_halo_px={}; resident_bytes={}; dispatch_ms={}; cache_result={}",
+            "requested_map_dependencies=EdgeMask<-Stage15Sdf|Stage15Semantics|EdgeDetailCombined; edge_detail_intent_identities={intent_identities}; edge_detail_plan_identity={}; edge_detail_algorithm_identities={algorithm_identities}; edge_detail_mask_identity={}; scope={scope}; region_ids={region_ids}; stage15_sdf_identity={}:{}; stage15_semantics_identity={}:{}; selected_source_routes={source_routes}; selected_source_identities={source_identities}; lod_fallbacks={lod_fallbacks}; output_identities={output_identities}; edge_detail_outputs=core|transition|fade|combined|signed-physical-height; declared_halo_px={}; resident_bytes={}; dispatch_ms={}; cache_result={}",
+            edge_detail_plan_identity(plan),
             edge_detail_plan_identity(plan),
             sdf_identity.structural_plan_id.0,
             sdf_identity.shader_version,
@@ -5584,6 +5726,13 @@ fn execute_edge_detail_gpu_tile(
             if stats.cache_hit { "CacheHit" } else { "CacheMiss" },
         ),
     ];
+    if let Some(evidence) = edge_detail_execution_evidence(
+        plan, MaterialMapKind::EdgeMask,
+        if stats.cache_hit { "CacheHit" } else { "CacheMiss" },
+        stats.dispatch_ms, stats.resident_bytes,
+    ) {
+        telemetry.push(evidence);
+    }
     Ok(AtlasRenderExecutorOutput::FinalAtlas(AtlasFinalAtlasOutput {
         map_tiles: map_tiles.clone(),
         display_tiles,
@@ -5801,15 +5950,37 @@ fn execute_r32float_material_tile(
     )?;
     let edge_composition = compose_edge_detail_map(
         executor, plan, input, device, queue, requested_map, &output_view,
-        wgpu::TextureFormat::R32Float, false, cancellation, is_current,
+        wgpu::TextureFormat::R32Float, false, 0, cancellation, is_current,
     )?;
     let edge_composition_executed = edge_composition.is_some();
     let edge_composition_ms = edge_composition.as_ref().map_or(0, |value| value.2.dispatch_ms);
+    let edge_evidence_stats = edge_composition.as_ref().map(|value| (
+        value.2.cache_hit, value.2.dispatch_ms, value.2.resident_bytes,
+    ));
     let published_texture = edge_composition.as_ref().map_or(&output_texture, |value| &value.0);
     let published_view = edge_composition.as_ref().map_or(&output_view, |value| &value.1);
     let composed_display = if edge_composition.is_some() {
         Some(scalar_display_from_composed_map(
             executor, plan, device, queue, requested_map, published_view, tile.width, tile.height,
+            false,
+        )?)
+    } else {
+        None
+    };
+    let edge_contribution = if edge_composition.is_some()
+        && matches!(requested_map, MaterialMapKind::Roughness | MaterialMapKind::Metallic)
+    {
+        compose_edge_detail_map(
+            executor, plan, input, device, queue, requested_map, &output_view,
+            wgpu::TextureFormat::R32Float, false, 1, cancellation, is_current,
+        )?
+    } else {
+        None
+    };
+    let contribution_display = if let Some((_, contribution_view, _)) = &edge_contribution {
+        Some(scalar_display_from_composed_map(
+            executor, plan, device, queue, requested_map, contribution_view,
+            tile.width, tile.height, true,
         )?)
     } else {
         None
@@ -5836,6 +6007,12 @@ fn execute_r32float_material_tile(
         tile.height,
         4,
     )?;
+    let contribution_display_pending = contribution_display.as_ref().map(|value| {
+        schedule_readback(
+            device, executor.source_texture_cache, &mut encoder, &value.0,
+            tile.width, tile.height, 4,
+        )
+    }).transpose()?;
     queue.submit(Some(encoder.finish()));
     if requested_map == MaterialMapKind::Height {
         let (cache_texture, cache_view) = match edge_composition {
@@ -5860,6 +6037,10 @@ fn execute_r32float_material_tile(
     }
     let (pixels, readback_ms) = finish_readback(device, pending)?;
     let (display_pixels, display_readback_ms) = finish_readback(device, display_pending)?;
+    let contribution_display_pixels = contribution_display_pending
+        .map(|pending| finish_readback(device, pending))
+        .transpose()?
+        .map(|value| value.0);
     let readback_bytes = u64::try_from(pixels.len())
         .map_err(|_| AtlasRenderExecutionError::Gpu("readback payload overflow".into()))?;
     let display_readback_bytes = u64::try_from(display_pixels.len())
@@ -5927,6 +6108,15 @@ fn execute_r32float_material_tile(
             _ => "RegisteredSource",
         };
         telemetry.push(format!("requested_map_dependencies={requested_map:?}<-{dependencies}; edge_detail_mask_identity={}", edge_detail_plan_identity(plan)));
+        if let Some((cache_hit, edge_dispatch_ms, edge_resident_bytes)) = edge_evidence_stats
+            && let Some(evidence) = edge_detail_execution_evidence(
+                plan, requested_map,
+                if cache_hit { "CacheHit" } else { "CacheMiss" },
+                edge_dispatch_ms, edge_resident_bytes,
+            )
+        {
+            telemetry.push(evidence);
+        }
     }
     telemetry.push(format!(
         "profile_pass_dispatches={}; profile_cache_hit={}; profile_commands={}; profile_command_bytes={}; profile_resident_bytes={}; profile_required_halo={}; profile_dispatch_ms={}",
@@ -5955,11 +6145,32 @@ fn execute_r32float_material_tile(
     map_tiles.insert(requested_map, Arc::clone(&rendered_tile));
     let mut display_tiles = BTreeMap::new();
     display_tiles.insert(requested_map, Arc::clone(&display_tile));
+    let mut intermediate_tiles = BTreeMap::new();
+    if let Some(contribution_pixels) = contribution_display_pixels {
+        let (label, shader) = match requested_map {
+            MaterialMapKind::Roughness => (
+                "edge-detail.roughness-contribution.display",
+                "edge-detail-roughness-contribution-display-rgba8-v1",
+            ),
+            MaterialMapKind::Metallic => (
+                "edge-detail.metallic-contribution.display",
+                "edge-detail-metallic-contribution-display-rgba8-v1",
+            ),
+            _ => unreachable!("contribution display is only created for scalar Edge Detail maps"),
+        };
+        let mut contribution_identity = plan.tile_identity(requested_map, shader);
+        contribution_identity.pixel_format = crate::CompiledTilePixelFormat::Rgba8UnormLinear;
+        let contribution_tile = remember_rendered_tile_with_identity(
+            executor.source_texture_cache, plan, requested_map, contribution_identity,
+            contribution_pixels,
+        )?;
+        intermediate_tiles.insert(label.into(), contribution_tile);
+    }
     Ok(AtlasRenderExecutorOutput::FinalAtlas(
         AtlasFinalAtlasOutput {
             map_tiles: map_tiles.clone(),
             display_tiles,
-            intermediate_tiles: BTreeMap::new(),
+            intermediate_tiles,
             base_color_rgba8: Arc::clone(&display_pixels),
             interactive_tile: display_tile,
             tile_timings: tile_timings_for(
@@ -6762,7 +6973,7 @@ fn execute_height_normal_gpu(
     let height_composition = if cached_height_texture.is_none() {
         compose_edge_detail_map(
             executor, plan, input, device, queue, MaterialMapKind::Height, &height_view,
-            wgpu::TextureFormat::R32Float, false, cancellation, is_current,
+            wgpu::TextureFormat::R32Float, false, 0, cancellation, is_current,
         )?
     } else {
         None
@@ -6770,17 +6981,20 @@ fn execute_height_normal_gpu(
     let normal_height_composition = if let Some(cached_height) = &cached_height_texture {
         compose_edge_detail_map(
             executor, plan, input, device, queue, MaterialMapKind::Normal,
-            &cached_height.view, wgpu::TextureFormat::R32Float, true,
+            &cached_height.view, wgpu::TextureFormat::R32Float, true, 0,
             cancellation, is_current,
         )?
     } else {
         compose_edge_detail_map(
             executor, plan, input, device, queue, MaterialMapKind::Normal, &height_view,
-            wgpu::TextureFormat::R32Float, false, cancellation, is_current,
+            wgpu::TextureFormat::R32Float, false, 0, cancellation, is_current,
         )?
     };
     let height_composition_ms = height_composition.as_ref().map_or(0, |value| value.2.dispatch_ms)
         .saturating_add(normal_height_composition.as_ref().map_or(0, |value| value.2.dispatch_ms));
+    let normal_edge_evidence_stats = normal_height_composition.as_ref()
+        .or(height_composition.as_ref())
+        .map(|value| (value.2.cache_hit, value.2.dispatch_ms, value.2.resident_bytes));
     let live_final_height_view = cached_height_texture.as_ref().map_or_else(
         || height_composition.as_ref().map_or(&height_view, |value| &value.1),
         |cached| &cached.view,
@@ -6789,7 +7003,7 @@ fn execute_height_normal_gpu(
     let composed_height_display = if publish_height && height_composition.is_some() {
         Some(scalar_display_from_composed_map(
             executor, plan, device, queue, MaterialMapKind::Height, live_final_height_view,
-            tile.width, tile.height,
+            tile.width, tile.height, false,
         )?)
     } else {
         None
@@ -7179,6 +7393,15 @@ fn execute_height_normal_gpu(
     ));
     if !edge_detail_plan_identity(plan).is_empty() {
         telemetry.push(format!("requested_map_dependencies=Normal<-FinalPhysicalHeight(MaterialHeight|Stage15Height|Stage16DetailHeight|EdgeDetailHeight)|ImportedTangentNormal; edge_detail_mask_identity={}; normal_composition=RNM; gradient=physical-Scharr; edge_detail_composition_ms={height_composition_ms}", edge_detail_plan_identity(plan)));
+        if let Some((cache_hit, edge_dispatch_ms, edge_resident_bytes)) = normal_edge_evidence_stats
+            && let Some(evidence) = edge_detail_execution_evidence(
+                plan, MaterialMapKind::Normal,
+                if cache_hit { "CacheHit" } else { "CacheMiss" },
+                edge_dispatch_ms, edge_resident_bytes,
+            )
+        {
+            telemetry.push(evidence);
+        }
     }
     if publish_height {
         telemetry.push(
@@ -13399,7 +13622,7 @@ mod tests {
         assert_eq!(global_stats.command_count, 3);
         let combined = read_cached_profile_field(
             &handle, &cache, &multi, MaterialMapKind::EdgeMask,
-            "edge-detail-combined-r32float-v2",
+            "edge-detail-combined-r32float-v3",
         );
         for x in [1, 16, 31, 32, 47, 63, 67, 80, 92] {
             let nonzero = (0..64).any(|y| r32_pixel(&combined, 96, x, y) > 0.0);
@@ -13486,7 +13709,7 @@ mod tests {
             ).expect("source-aware Edge Detail execution");
             let bytes = read_cached_profile_field(
                 &handle, &cache, plan, MaterialMapKind::EdgeMask,
-                "edge-detail-combined-r32float-v2",
+                "edge-detail-combined-r32float-v3",
             );
             (bytes, stats)
         };
@@ -13573,6 +13796,164 @@ mod tests {
             "constant-gray high-pass must not alter Edge Detail or bleed at bounds",
         );
         assert!(gray_stats.source_upload_bytes > 0 || gray_stats.source_cache_hits > 0);
+
+        // An albedo-only material must still become a complete surface: linear
+        // Base Color luminance contributes physical Height across the interior,
+        // and the final Normal is derived after Edge Detail is added on top.
+        let luminance_pixels = (0..64 * 64)
+            .map(|index| {
+                let x = index % 64;
+                let value = if x < 32 { 0.80 } else { 0.20 };
+                LinearColor { rgb: [value, value, value], alpha: 1.0 }
+            })
+            .collect::<Vec<_>>();
+        let luminance_plane = ImagePlane::from_row_major(64, 64, 64, &luminance_pixels).unwrap();
+        let luminance_domain = Arc::new(PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(b"base-color-relief-domain"),
+            ContentDigest::sha256(b"base-color-relief-prepared"),
+            vec![PreparedExemplarChannel::BaseColor {
+                plane: luminance_plane,
+                alpha_mode: hot_trimmer_image_io::ResolvedAlphaMode::Straight,
+            }],
+        ).unwrap());
+        let mut luminance_plan = rectangular_plan(64, 64, [0.064, 0.064]);
+        luminance_plan.ordered_regions[0]
+            .sampling_plan
+            .source_pixels_per_physical_unit = 1000.0;
+        luminance_plan.requested_maps = vec![
+            MaterialMapKind::BaseColor,
+            MaterialMapKind::Height,
+            MaterialMapKind::Normal,
+        ];
+        let luminance_identity = luminance_plan.ordered_sources[0].digest.clone();
+        attach_source_edge(
+            &mut luminance_plan,
+            hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::HighPassedLinearLuminance,
+            Some(luminance_identity),
+        );
+        let luminance_input = AtlasRenderExecutionInput {
+            prepared_sources: vec![AtlasPreparedSource {
+                source_set_id: luminance_plan.ordered_sources[0].source_set_id,
+                source_id: luminance_plan.ordered_sources[0].source_id.clone(),
+                channel_role: MaterialChannelRole::BaseColor,
+                domain: luminance_domain,
+            }],
+            source_frame_cache: None,
+        };
+        let luminance_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let luminance_executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &luminance_cache,
+        };
+        let luminance_output = luminance_executor.execute(
+            &luminance_plan,
+            &luminance_input,
+            &cancellation,
+            &|| true,
+        ).expect("Base Color relief GPU publication");
+        let luminance_output = luminance_output.as_final_atlas().expect("Base Color relief final atlas");
+        let luminance_height = luminance_output.map_tiles
+            .get(&MaterialMapKind::Height).expect("Base Color relief Height").pixels();
+        let interior_heights = (16..48)
+            .map(|x| r32_pixel(luminance_height, 64, x, 32).to_bits())
+            .collect::<BTreeSet<_>>();
+        assert!(interior_heights.len() >= 2,
+            "Base Color luminance did not contribute full-surface physical Height");
+        let luminance_normal = luminance_output.map_tiles
+            .get(&MaterialMapKind::Normal).expect("Base Color relief Normal").pixels();
+        let interior_normal_columns = (16..48).filter(|x| {
+            let offset = ((*x + 32 * 64) * 4) as usize;
+            let pixel = &luminance_normal[offset..offset + 4];
+            (i16::from(pixel[0]) - 128).abs() > 2 || (i16::from(pixel[1]) - 128).abs() > 2
+        }).count();
+        assert!(interior_normal_columns > 0,
+            "final Normal omitted Base Color relief beneath Edge Detail");
+
+        // ED-4 visual closure uses the real multi-map GPU publication. These bounded
+        // artifacts are intentionally stable and small enough for direct human review.
+        let mut golden_plan = gray_plan.clone();
+        golden_plan.requested_maps = vec![
+            MaterialMapKind::EdgeMask,
+            MaterialMapKind::Height,
+            MaterialMapKind::Normal,
+            MaterialMapKind::BaseColor,
+        ];
+        golden_plan.final_plan_hash = ContentDigest(String::new());
+        golden_plan = golden_plan.finalize().expect("ED-4 golden map-set plan");
+        let golden_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let golden_executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &golden_cache,
+        };
+        let golden_output = golden_executor.execute(
+            &golden_plan,
+            &gray_input,
+            &cancellation,
+            &|| true,
+        ).expect("ED-4 real GPU golden publication");
+        let golden_output = golden_output.as_final_atlas().expect("GPU final atlas");
+        let golden_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/edge-detail-goldens");
+        std::fs::create_dir_all(&golden_dir).expect("create ED-4 golden directory");
+        let scalar_rgba = |bytes: &[u8], signed: bool| {
+            let values = bytes.chunks_exact(4)
+                .map(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let scale = if signed {
+                values.iter().fold(0.0_f32, |maximum, value| maximum.max(value.abs())).max(1.0e-8)
+            } else { 1.0 };
+            values.into_iter().flat_map(|value| {
+                let normalized = if signed { 0.5 + value / (2.0 * scale) } else { value };
+                let byte = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
+                [byte, byte, byte, 255]
+            }).collect::<Vec<_>>()
+        };
+        let save_rgba = |name: &str, rgba: Vec<u8>| {
+            image::RgbaImage::from_raw(64, 64, rgba)
+                .expect("bounded ED-4 golden dimensions")
+                .save(golden_dir.join(name))
+                .expect("write ED-4 golden PNG");
+        };
+        let combined_pixels = read_cached_profile_field(
+            &handle,
+            &golden_cache,
+            &golden_plan,
+            MaterialMapKind::EdgeMask,
+            "edge-detail-combined-r32float-v3",
+        );
+        let edge_height_pixels = read_cached_profile_field(
+            &handle,
+            &golden_cache,
+            &golden_plan,
+            MaterialMapKind::Height,
+            "edge-detail-surface-and-edge-height-r32float-v3",
+        );
+        let normal_tile = golden_output.map_tiles
+            .get(&MaterialMapKind::Normal).expect("final Normal publication");
+        let base_color_tile = golden_output.map_tiles
+            .get(&MaterialMapKind::BaseColor).expect("final Base Color publication");
+        save_rgba("ed4-combined-edge-mask-64.png", scalar_rgba(&combined_pixels, false));
+        save_rgba("ed4-edge-height-64.png", scalar_rgba(&edge_height_pixels, true));
+        save_rgba("ed4-final-normal-64.png", normal_tile.pixels().to_vec());
+        save_rgba("ed4-final-base-color-64.png", base_color_tile.pixels().to_vec());
+        let combined_values = combined_pixels.chunks_exact(4)
+            .map(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(combined_values.iter().filter(|value| **value > 0.02 && **value < 0.98).count() > 64,
+            "golden Edge Mask must contain a visibly smooth population of intermediate values");
+        let distinct_cross_section = (0..20).map(|x| {
+            r32_pixel(&combined_pixels, 64, x, 32).to_bits()
+        }).collect::<BTreeSet<_>>();
+        assert!(distinct_cross_section.len() >= 5,
+            "golden cross-section must be rounded, not a long constant pixel bar");
+        for pixel in normal_tile.pixels().chunks_exact(4).filter(|pixel| pixel[3] != 0) {
+            let decoded = [pixel[0] as f32 / 127.5 - 1.0, pixel[1] as f32 / 127.5 - 1.0, pixel[2] as f32 / 127.5 - 1.0];
+            let length = decoded.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!(length.is_finite() && (length - 1.0).abs() < 0.04,
+                "golden Normal must decode to a finite approximately unit vector");
+        }
+        assert!(base_color_tile.pixels().chunks_exact(4).any(|pixel| pixel[0] != 128 || pixel[1] != 128 || pixel[2] != 128),
+            "golden Base Color must visibly include the Edge Detail response");
 
         let height_values = (0..64 * 64)
             .map(|index| LinearScalar(((index % 64) as f32 / 63.0).clamp(0.0, 1.0)))

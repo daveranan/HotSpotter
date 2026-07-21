@@ -3,6 +3,8 @@
 /.idea/
 /.vscode/
 *.log
+*.py[cod]
+__pycache__/
 npm-debug.log*
 .DS_Store
 Thumbs.db

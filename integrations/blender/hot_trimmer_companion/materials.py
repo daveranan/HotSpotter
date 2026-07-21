@@ -144,4 +144,10 @@ def create_or_update_material(manifest, bpy):
         _remove_named(nodes, ("HT height Texture", "HT Bump"))
         for existing in tuple(principled.inputs["Normal"].links):
             links.remove(existing)
+    base_color_texture = textures.get("basecolor")
+    if base_color_texture is not None:
+        for node in nodes:
+            node.select = False
+        base_color_texture.select = True
+        nodes.active = base_color_texture
     return material

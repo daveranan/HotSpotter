@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type {
   CompiledMapView,
+  CommandFailure,
   EdgeDetailIntentV1,
   FeedbackComparisonMode,
   FeedbackContributionView,
@@ -11,24 +12,27 @@ import type {
   IntermediateAtlasProjection,
   ProjectProjection,
 } from "@hot-trimmer/ipc-contracts";
-import { occupancyRelationFromValue, occupancyRelations, sanitizeEdgeDetailIntent, updateFeedbackOperationIntent } from "./feedback-workbench-contract";
+import { EDGE_DETAIL_PRESETS, type EdgeDetailPresetName, type EdgeDetailPresetSelection, edgeDetailIntentFromPreset, edgeDetailPresetForIntent, occupancyRelationFromValue, occupancyRelations, sanitizeEdgeDetailIntent, updateFeedbackOperationIntent } from "./feedback-workbench-contract";
 
 export const FEEDBACK_WORKBENCH_VERSION = "20A.1" as const;
 
 export function defaultEdgeWearIntent(): EdgeDetailIntentV1 {
   return {
-    schemaVersion: 1, enabled: true, wearAmount: 0.55, intensity: 0.8,
-    edgeWidthM: 0.004, bevelRadiusM: 0.0025, edgeSoftness: 0.3,
-    breakupAmount: 0.7, breakupScaleM: 0.012, microDetailAmount: 0.25,
-    microDetailScaleM: 0.002, seed: 201516, sourceHeightInfluence: 0.65,
-    sourceLuminanceInfluence: 0.2, heightAmplitudeM: -0.00035,
-    normalDetailStrength: 1, hueShiftDegrees: 0, saturationMultiplier: 0.55,
-    valueMultiplier: 1.12, roughnessOffset: 0.18,
-    exposedMetalEnabled: false, metallicOffset: 0,
+    schemaVersion: 1, enabled: true, ...EDGE_DETAIL_PRESETS["Soft Worn Edge"],
   };
 }
 
 export const contributionViews: readonly { value: FeedbackContributionView; label: string; map: CompiledMapView | null }[] = [
+  { value: "edgeDetailCoreMask", label: "Edge Detail · Core mask", map: "edgeMask" },
+  { value: "edgeDetailTransitionMask", label: "Edge Detail · Transition mask", map: "edgeMask" },
+  { value: "edgeDetailFadeMask", label: "Edge Detail · Fade mask", map: "edgeMask" },
+  { value: "edgeDetailCombinedMask", label: "Edge Detail · Combined Edge Mask", map: "edgeMask" },
+  { value: "edgeDetailHeightContribution", label: "Edge Detail · Height contribution", map: "height" },
+  { value: "edgeDetailFinalHeight", label: "Edge Detail · Final Height", map: "height" },
+  { value: "edgeDetailFinalNormal", label: "Edge Detail · Final Normal", map: "normal" },
+  { value: "edgeDetailBaseColorContribution", label: "Edge Detail · Base Color contribution", map: "baseColor" },
+  { value: "edgeDetailRoughnessContribution", label: "Edge Detail · Roughness contribution", map: "roughness" },
+  { value: "edgeDetailMetallicContribution", label: "Edge Detail · Metallic contribution", map: "metallic" },
   { value: "stage15Occupancy", label: "Stage 15 · raw occupancy", map: "ambientOcclusion" },
   { value: "stage15Height", label: "Stage 15 · raw physical Height", map: "height" },
   { value: "stage15ProfileRoute", label: "Stage 15 QA · profile route / occupancy", map: null },
@@ -97,9 +101,11 @@ export interface FeedbackWorkbenchProps {
   comparisonMode: FeedbackComparisonMode;
   activeTool: "select" | "profile" | "stamp" | "stroke";
   commandBusy: boolean;
+  edgeDetailError: CommandFailure | null;
   onSelectRegion: (id: string) => void;
   onSelectOperation: (id: string | null) => void;
   onView: (view: FeedbackContributionView) => void;
+  onInspectView: (view: FeedbackContributionView) => void;
   onProfile: (profile: FeedbackPreviewProfile) => void;
   onComparisonMode: (mode: FeedbackComparisonMode) => void;
   onActiveTool: (tool: FeedbackWorkbenchProps["activeTool"]) => void;
@@ -110,15 +116,159 @@ export interface FeedbackWorkbenchProps {
   onRedo: () => void;
 }
 
+export interface ProcessingSidebarProps {
+  project: ProjectProjection | null;
+  artifact: IntermediateAtlasProjection | null;
+  selectedRegionId: string | null;
+  commandBusy: boolean;
+  edgeDetailError: CommandFailure | null;
+  activeTab: "layers" | "outputs";
+  onActiveTab: (tab: "layers" | "outputs") => void;
+  onCommand: (command: FeedbackWorkbenchCommand) => Promise<void>;
+  onRender: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
+}
+
+type EdgeNumberKey = Exclude<{
+  [K in keyof EdgeDetailIntentV1]: EdgeDetailIntentV1[K] extends number ? K : never
+}[keyof EdgeDetailIntentV1], undefined>;
+
+const primaryEdgeFields: readonly { key: EdgeNumberKey; label: string; minimum?: number; maximum?: number; step: number; millimeters?: boolean }[] = [
+  { key: "wearAmount", label: "Wear Amount", minimum: 0, maximum: 1, step: 0.01 },
+  { key: "intensity", label: "Intensity", minimum: 0, maximum: 1, step: 0.01 },
+  { key: "edgeWidthM", label: "Edge Width", minimum: 0.01, step: 0.1, millimeters: true },
+  { key: "bevelRadiusM", label: "Bevel Radius", minimum: 0, step: 0.1, millimeters: true },
+  { key: "breakupAmount", label: "Breakup", minimum: 0, maximum: 1, step: 0.01 },
+  { key: "heightAmplitudeM", label: "Height", step: 0.05, millimeters: true },
+];
+
+function ProcessingNumberField(props: {
+  field: typeof primaryEdgeFields[number];
+  value: number;
+  onDraft: (value: number) => void;
+  onCommit: () => void;
+}) {
+  const displayValue = props.field.millimeters ? props.value * 1000 : props.value;
+  const [text, setText] = useState(String(displayValue));
+  useEffect(() => setText(String(displayValue)), [displayValue]);
+  const accept = (raw: string) => {
+    setText(raw);
+    const parsed = Number(raw);
+    if (!raw.trim() || !Number.isFinite(parsed)) return;
+    if (props.field.minimum !== undefined && parsed < props.field.minimum) return;
+    if (props.field.maximum !== undefined && parsed > props.field.maximum) return;
+    props.onDraft(props.field.millimeters ? parsed / 1000 : parsed);
+  };
+  const finish = () => props.onCommit();
+  return <label className="processing-number-field">
+    <span>{props.field.label}{props.field.millimeters ? <small>mm</small> : null}</span>
+    <input
+      aria-label={`${props.field.label}${props.field.millimeters ? " in millimeters" : ""}`}
+      type="number"
+      min={props.field.minimum}
+      max={props.field.maximum}
+      step={props.field.step}
+      value={text}
+      onChange={(event) => accept(event.currentTarget.value)}
+      onBlur={finish}
+      onPointerUp={finish}
+      onKeyUp={(event) => { if (event.key === "Enter" || event.key.startsWith("Arrow")) finish(); }}
+    />
+  </label>;
+}
+
+export function ProcessingSidebar(props: ProcessingSidebarProps) {
+  const persisted = props.project?.document?.edgeDetail;
+  // Preset defaults are editor starting values, not evidence of an authored layer.
+  const committed = persisted ?? { ...defaultEdgeWearIntent(), enabled: false };
+  const [draft, setDraft] = useState<EdgeDetailIntentV1>(committed);
+  const [preset, setPreset] = useState<EdgeDetailPresetSelection>(() => edgeDetailPresetForIntent(committed));
+  useEffect(() => {
+    setDraft(committed);
+    setPreset(edgeDetailPresetForIntent(committed));
+  }, [props.project?.id, props.project?.document?.documentRevision]);
+  const updateDraft = (next: EdgeDetailIntentV1) => {
+    setDraft(next);
+    setPreset(edgeDetailPresetForIntent(next));
+  };
+  const applyDraft = () => {
+    const next = sanitizeEdgeDetailIntent({ ...draft, enabled: true });
+    if (props.commandBusy || !props.project?.document) return;
+    updateDraft(next);
+    void props.onCommand({ type: "set_edge_detail", intent: next });
+  };
+  const disableAppliedLayer = () => {
+    if (!persisted?.enabled || props.commandBusy || !props.project?.document) return;
+    const next = sanitizeEdgeDetailIntent({ ...persisted, enabled: false });
+    void props.onCommand({ type: "set_edge_detail", intent: next });
+  };
+  const stageDraft = (intent: EdgeDetailIntentV1) => {
+    const next = sanitizeEdgeDetailIntent(intent);
+    updateDraft(next);
+  };
+  const targetRegion = committed.targetRegion
+    ? props.project?.document?.topology.regions.find((region) => region.id === committed.targetRegion)
+    : null;
+  const targetLabel = targetRegion ? `${targetRegion.displayName} · ${targetRegion.id}` : "All regions";
+  const revision = props.project?.document?.documentRevision;
+  const artifactCurrent = revision !== undefined && props.artifact?.documentRevision === revision;
+  const dirty = JSON.stringify(sanitizeEdgeDetailIntent(draft)) !== JSON.stringify(committed);
+  const applied = !!persisted?.enabled;
+  const publishDraft = () => {
+    if (applied && !dirty) {
+      if (!artifactCurrent) props.onRender();
+      return;
+    }
+    applyDraft();
+  };
+  const outputs: readonly [string, CompiledMapView][] = [
+    ["Base Color", "baseColor"], ["Edge Mask", "edgeMask"], ["Height", "height"], ["Normal", "normal"],
+    ["Roughness", "roughness"], ["Metallic", "metallic"], ["AO", "ambientOcclusion"],
+  ];
+  return <aside className="processing-sidebar" aria-label="Processing controls">
+    <div className="processing-sidebar-tabs" role="tablist">
+      <button role="tab" aria-selected={props.activeTab === "layers"} className={props.activeTab === "layers" ? "active" : ""} onClick={() => props.onActiveTab("layers")}>Layers</button>
+      <button role="tab" aria-selected={props.activeTab === "outputs"} className={props.activeTab === "outputs" ? "active" : ""} onClick={() => props.onActiveTab("outputs")}>Outputs</button>
+    </div>
+    {props.activeTab === "layers" ? <div className="processing-layers">
+      <div className="layer-target"><span>Active target</span><strong>{targetLabel}</strong></div>
+      <ol className="processing-layer-list">
+        <li className="selected expanded">
+          <header><button><span>1</span><strong>Edge Detail</strong></button><strong className={`layer-enabled-state ${applied ? "enabled" : "disabled"}`}>{applied ? "ON" : "OFF"}</strong></header>
+          <div className="edge-detail-editor">
+            <section className={`edge-detail-activation ${applied ? "enabled" : "disabled"}`}><div><strong>{!applied ? "Edge Detail is not applied" : dirty ? "Edge Detail has unapplied changes" : artifactCurrent ? "Edge Detail is applied" : "Rendering applied Edge Detail"}</strong><p>{applied ? `The applied layer targets ${targetLabel}. ${dirty ? "Apply Changes to publish the editor values." : artifactCurrent ? "Edge Mask, Height, and Normal contributions match this document revision." : "The last valid atlas remains visible while this revision renders."}` : "Choose the target and settings below, then apply the layer to generate its map contributions."}</p></div>{applied ? <button onClick={disableAppliedLayer} disabled={props.commandBusy}>Disable</button> : null}</section>
+            <label>Target<select value={draft.targetRegion ?? "all"} onChange={(event) => stageDraft({ ...draft, enabled: true, targetRegion: event.currentTarget.value === "all" ? undefined : event.currentTarget.value })}><option value="all">All regions</option>{props.selectedRegionId ? <option value={props.selectedRegionId}>Selected region · {props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId)?.displayName ?? props.selectedRegionId}</option> : null}{props.project?.document?.topology.regions.filter((region) => region.id !== props.selectedRegionId).map((region) => <option key={region.id} value={region.id}>{region.displayName} · {region.id}</option>)}</select></label>
+            <label>Preset<select value={preset} onChange={(event) => { if (event.currentTarget.value === "Custom") return; stageDraft(edgeDetailIntentFromPreset(event.currentTarget.value as EdgeDetailPresetName, { ...draft, enabled: true })); }}><option>Custom</option>{Object.keys(EDGE_DETAIL_PRESETS).map((name) => <option key={name}>{name}</option>)}</select><small>Preset and control changes remain staged until you apply them.</small></label>
+            <div className="processing-primary-controls">{primaryEdgeFields.map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key] as number} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}</div>
+            <details><summary>Color response</summary><div className="processing-primary-controls">
+              {([{ key: "hueShiftDegrees", label: "Hue", step: 1, minimum: -180, maximum: 180 }, { key: "saturationMultiplier", label: "Saturation (1 = unchanged)", step: 0.01, minimum: 0, maximum: 2 }, { key: "valueMultiplier", label: "Value (1 = unchanged)", step: 0.01, minimum: 0, maximum: 3 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
+            </div></details>
+            <details><summary>Surface response</summary><div className="processing-primary-controls">
+              {([{ key: "roughnessOffset", label: "Roughness offset", step: 0.01, minimum: -1, maximum: 1 }, { key: "normalDetailStrength", label: "Normal detail", step: 0.01, minimum: 0, maximum: 2 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
+              <label className="metal-intent"><input type="checkbox" checked={draft.exposedMetalEnabled} onChange={(event) => stageDraft({ ...draft, enabled: true, exposedMetalEnabled: event.currentTarget.checked, metallicOffset: event.currentTarget.checked ? draft.metallicOffset : 0 })} /> Exposed metal</label>
+            </div></details>
+            <details><summary>Advanced</summary><div className="processing-primary-controls">
+              {([{ key: "edgeSoftness", label: "Edge Softness", step: 0.01, minimum: 0, maximum: 1 }, { key: "breakupScaleM", label: "Breakup Scale", step: 0.1, minimum: 0.01, millimeters: true }, { key: "microDetailAmount", label: "Microdetail Amount", step: 0.01, minimum: 0, maximum: 1 }, { key: "microDetailScaleM", label: "Microdetail Scale", step: 0.1, minimum: 0.01, millimeters: true }, { key: "sourceHeightInfluence", label: "Source Height", step: 0.01, minimum: 0, maximum: 1 }, { key: "sourceLuminanceInfluence", label: "Base Color bump", step: 0.01, minimum: 0, maximum: 1 }, { key: "seed", label: "Seed", step: 1, minimum: 0, maximum: 4294967295 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
+            </div></details>
+            <div className="edge-detail-apply-row"><button className="primary" onClick={publishDraft} disabled={props.commandBusy || !props.project?.document || (applied && !dirty && artifactCurrent)}>{props.commandBusy ? "Applying…" : !applied ? "Apply Edge Detail" : dirty ? "Apply Changes" : artifactCurrent ? "Applied" : "Render Edge Detail"}</button><span>{dirty ? "Unapplied changes" : applied ? artifactCurrent ? `Applied · revision ${revision}` : "Applied · preview is stale" : "Not applied"}</span></div>
+            {props.edgeDetailError ? <p className="typed-state failed" role="alert"><strong>{props.edgeDetailError.code}</strong> · {props.edgeDetailError.message}</p> : null}
+          </div>
+        </li>
+      </ol>
+      <div className="undo-row"><button disabled={!props.project?.canUndoDocument} onClick={props.onUndo}>Undo</button><button disabled={!props.project?.canRedoDocument} onClick={props.onRedo}>Redo</button></div>
+    </div> : <div className="processing-outputs">
+      <p>Generated map set · document revision {revision ?? "—"}</p>
+      <ul>{outputs.map(([label, map]) => { const ready = artifactCurrent && !!props.artifact && (!!props.artifact.maps[map] || !!props.artifact.tileManifests?.[map] || (props.artifact.tileManifest?.manifest.map === map)); return <li key={map}><span>{label}</span><strong className={ready ? "ready" : "pending"}>{ready ? "Ready" : "Not ready"}</strong></li>; })}</ul>
+      <fieldset><legend>Export all maps</legend><label>Resolution <output>{props.project?.document?.renderSettings.outputSize.width ?? 2048}px</output></label><label>Format <output>.hottrim package</output></label><small>Export renders every enabled output for this revision. Edge Mask is included whenever Edge Detail is enabled.</small></fieldset>
+    </div>}
+  </aside>;
+}
+
 export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
   const selectedRegion = props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId);
   const compiled = props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegionId);
   const [profileIntent, setProfileIntent] = useState<FeedbackProfileIntent>(() => defaultFeedbackProfile());
-  const [edgeWear, setEdgeWear] = useState<EdgeDetailIntentV1>(() => props.project?.document?.edgeDetail ?? defaultEdgeWearIntent());
-  const [edgeWearNotice, setEdgeWearNotice] = useState<string | null>(null);
-  useEffect(() => {
-    setEdgeWear(props.project?.document?.edgeDetail ?? defaultEdgeWearIntent());
-  }, [props.project?.id, props.project?.document?.documentRevision]);
   const records = props.project?.feedbackAuthoring.records ?? [];
   const selectedRecord = records.find((record) => record.operationId === props.selectedOperationId);
   const assets = props.project?.materialSources.flatMap((sourceSet) =>
@@ -219,29 +369,9 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
     await props.onCommand({ type: "upsert_detail", operationId: selectedRecord.operationId, enabled: selectedRecord.enabled, intent: { kind: "definition", value: { ...definition, ...patch } } });
   }
 
-  async function applyEdgeWear() {
-    const sanitized = sanitizeEdgeDetailIntent(edgeWear);
-    const wasClamped = JSON.stringify(sanitized) !== JSON.stringify(edgeWear);
-    setEdgeWear(sanitized);
-    setEdgeWearNotice(wasClamped
-      ? "Invalid values were corrected before applying the Edge Detail V1 ranges."
-      : null);
-    await props.onCommand({ type: "set_edge_detail", intent: sanitized });
-  }
-
-  return <aside className="feedback-workbench" aria-label="Profile & Detail Contributions">
-    <header><div><strong>Profile &amp; Detail Contributions</strong><small>Prompt 20A · raw compiler contributions, not a finished PBR material</small></div><button disabled={!!props.project?.document || !!props.project?.materialSources.length} onClick={props.onCreateSample}>Create bundled feedback sample</button><span className="non-destructive-badge">Non-destructive · no mesh silhouette change</span></header>
+  return <aside className="feedback-workbench" aria-label="Debug diagnostics and fixtures">
+    <header><div><strong>Debug · Profile &amp; Detail Contributions</strong><small>Raw contribution, publication, cache, residency, dispatch, and stage evidence</small></div><button disabled={!!props.project?.document || !!props.project?.materialSources.length} onClick={props.onCreateSample}>Debug / Fixtures · Create bundled sample</button></header>
     <div className="feedback-grid">
-      <section className="edge-wear-column"><h3>Ordered material layers</h3>
-        <ol className="layer-card-list"><li className="layer-card selected"><header><strong>Edge Wear</strong><span>GPU · physical</span><input aria-label="Edge Wear enabled" type="checkbox" checked={edgeWear.enabled} onChange={(event) => setEdgeWear({ ...edgeWear, enabled: event.currentTarget.checked })} /></header>
-          <label>Target<select value={edgeWear.targetRegion ?? "global"} onChange={(event) => setEdgeWear({ ...edgeWear, targetRegion: event.currentTarget.value === "global" ? undefined : event.currentTarget.value })}><option value="global">Global</option>{props.project?.document?.topology.regions.map((region) => <option key={region.id} value={region.id}>{region.displayName}</option>)}</select></label>
-          <div className="physical-controls"><label>Wear Amount<input type="number" min="0" max="1" step="0.05" value={edgeWear.wearAmount} onChange={(event) => setEdgeWear({ ...edgeWear, wearAmount: Number(event.currentTarget.value) })} /></label><label>Intensity<input type="number" min="0" max="1" step="0.05" value={edgeWear.intensity} onChange={(event) => setEdgeWear({ ...edgeWear, intensity: Number(event.currentTarget.value) })} /></label><label>Edge width m<input type="number" min="0.00001" step="0.0005" value={edgeWear.edgeWidthM} onChange={(event) => setEdgeWear({ ...edgeWear, edgeWidthM: Number(event.currentTarget.value) })} /></label><label>Bevel radius m<input type="number" min="0" step="0.0005" value={edgeWear.bevelRadiusM} onChange={(event) => setEdgeWear({ ...edgeWear, bevelRadiusM: Number(event.currentTarget.value) })} /></label><label>Breakup<input type="number" min="0" max="1" step="0.05" value={edgeWear.breakupAmount} onChange={(event) => setEdgeWear({ ...edgeWear, breakupAmount: Number(event.currentTarget.value) })} /></label><label>Breakup scale m<input type="number" min="0.00001" step="0.001" value={edgeWear.breakupScaleM} onChange={(event) => setEdgeWear({ ...edgeWear, breakupScaleM: Number(event.currentTarget.value) })} /></label><label>Seed<input type="number" min="0" max="4294967295" step="1" value={edgeWear.seed} onChange={(event) => setEdgeWear({ ...edgeWear, seed: Number(event.currentTarget.value) })} /></label><label>Height m<input type="number" step="0.00005" value={edgeWear.heightAmplitudeM} onChange={(event) => setEdgeWear({ ...edgeWear, heightAmplitudeM: Number(event.currentTarget.value) })} /></label><label>Hue °<input type="number" min="-180" max="180" step="1" value={edgeWear.hueShiftDegrees} onChange={(event) => setEdgeWear({ ...edgeWear, hueShiftDegrees: Number(event.currentTarget.value) })} /></label><label>Saturation ×<input type="number" min="0" max="2" step="0.05" value={edgeWear.saturationMultiplier} onChange={(event) => setEdgeWear({ ...edgeWear, saturationMultiplier: Number(event.currentTarget.value) })} /></label><label>Value ×<input type="number" min="0" max="3" step="0.05" value={edgeWear.valueMultiplier} onChange={(event) => setEdgeWear({ ...edgeWear, valueMultiplier: Number(event.currentTarget.value) })} /></label><label>Roughness<input type="number" min="-1" max="1" step="0.05" value={edgeWear.roughnessOffset} onChange={(event) => setEdgeWear({ ...edgeWear, roughnessOffset: Number(event.currentTarget.value) })} /></label></div>
-          <label className="metal-intent"><input type="checkbox" checked={edgeWear.exposedMetalEnabled} onChange={(event) => setEdgeWear({ ...edgeWear, exposedMetalEnabled: event.currentTarget.checked, metallicOffset: event.currentTarget.checked ? edgeWear.metallicOffset : 0 })} /> Exposed metal (explicit)</label>{edgeWear.exposedMetalEnabled ? <label>Metallic offset<input type="number" min="0" max="1" step="0.05" value={edgeWear.metallicOffset} onChange={(event) => setEdgeWear({ ...edgeWear, metallicOffset: Number(event.currentTarget.value) })} /></label> : null}
-          <button disabled={props.commandBusy || !props.project?.document} onClick={() => void applyEdgeWear()}>Apply Edge Wear</button>
-          {edgeWearNotice ? <p className="typed-state" role="status">{edgeWearNotice}</p> : null}
-          <div className="map-inspection" role="group" aria-label="Edge Wear map inspection"><button onClick={() => props.onView("stage16BaseColor")}>Base Color</button><button onClick={() => props.onView("stage16RegisteredMask")}>Mask</button><button onClick={() => props.onView("stage16Height")}>Height</button><button onClick={() => props.onView("stage16VectorNormal")}>Normal</button><button onClick={() => props.onView("stage16ScalarRoughness")}>Roughness</button></div>
-        </li></ol>
-      </section>
       <section><h3>Target &amp; Stage 15 profile</h3>
         <label>Hotspot / region<select value={props.selectedRegionId ?? ""} onChange={(event) => props.onSelectRegion(event.currentTarget.value)}><option value="" disabled>Select a region</option>{props.project?.document?.topology.regions.map((region) => <option key={region.id} value={region.id}>{region.displayName} · {region.role}</option>)}</select></label>
         <label>Structural profile<select value={profileIntent.program} onChange={(event) => changeProgram(event.currentTarget.value as FeedbackProfileIntent["program"])}>{availablePrograms.map((program) => <option key={program} value={program}>{program.replaceAll("_", " ")}</option>)}</select></label>
@@ -267,7 +397,7 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
       <section><h3>Raw contribution / compiler QA</h3>
         <label>Visible view<select value={props.view} onChange={(event) => props.onView(event.currentTarget.value as FeedbackContributionView)}>{contributionViews.map((view) => <option key={view.value} value={view.value}>{view.label}</option>)}</select></label>
         <div className="physical-controls"><label>Review<select value={props.profile} onChange={(event) => props.onProfile(event.currentTarget.value as FeedbackPreviewProfile)}><option value="preview1024">1K</option><option value="preview2048">2K</option><option value="preview4096">4K</option><option value="preview8192">8K</option></select></label><label>Comparison<select value={props.comparisonMode} onChange={(event) => props.onComparisonMode(event.currentTarget.value as FeedbackComparisonMode)}><option value="after">After</option><option value="before">Before (display-only)</option><option value="selectedOperationIsolation">Selected operation isolation</option></select></label></div>
-        <button disabled={!viewDependency || !props.project?.document} onClick={props.onRequestVisibleView}>{viewDependency ? `Request current GPU ${viewDependency} tile` : "Metadata QA · zero pixel dispatch"}</button>
+        <button disabled={!viewDependency || !props.project?.document} onClick={() => props.onRequestVisibleView()}>{viewDependency ? `Request current GPU ${viewDependency} tile` : "Metadata QA · zero pixel dispatch"}</button>
         <p className="qa-note">Pixels come only from the persisted compiler’s requested GPU tile. Route, occupancy, LOD, fallback, scope, and asset-resolution text comes from compiled metadata.</p>
         <dl className="stage-availability">{installedSummary.map(([stage, state]) => <React.Fragment key={stage}><dt>Stage {stage}</dt><dd className={`typed-state ${state === "NotInstalled" ? "unavailable" : ""}`}>{state}{state === "NotInstalled" ? " / Unavailable" : ""}</dd></React.Fragment>)}</dl>
       </section>

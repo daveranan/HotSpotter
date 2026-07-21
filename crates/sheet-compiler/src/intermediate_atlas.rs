@@ -128,6 +128,8 @@ pub struct IntermediateAtlasArtifact {
     /// Paintable GPU display publications for material maps. Typed working
     /// resources remain in `rendered_tiles`.
     pub rendered_display_tiles: BTreeMap<MaterialMapKind, Arc<crate::GpuAtlasRenderedTile>>,
+    /// Named paintable/raw GPU intermediates for explicit inspection routes.
+    pub rendered_intermediate_tiles: BTreeMap<String, Arc<crate::GpuAtlasRenderedTile>>,
     pub pending: Vec<&'static str>,
 }
 
@@ -451,6 +453,7 @@ pub(crate) fn compose_intermediate_atlas(
         rendered_tiles: BTreeMap::new(),
         rendered_tile_timings: BTreeMap::new(),
         rendered_display_tiles: BTreeMap::new(),
+        rendered_intermediate_tiles: BTreeMap::new(),
         pending: vec![
             "profiles",
             "semantic details",

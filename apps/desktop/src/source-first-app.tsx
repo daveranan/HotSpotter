@@ -59,12 +59,15 @@ import { GpuTiledPreviewPainter, gpuTiledPreviewMapMatches, shouldDisplayGpuTile
 import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
 import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
 import { canInteractWithPatch, compiledMapViewForSourceChannel, sourceChannelForCompiledMapView, sourceSetIdForRegion } from "./workbench-interactions";
-import { FeedbackWorkbench } from "./feedback-workbench";
+import { FeedbackWorkbench, ProcessingSidebar } from "./feedback-workbench";
+import { MaterialPreviewCanvas, materialPreviewReady } from "./material-preview";
 import {
   feedbackExecutionMatchesRequest,
+  edgeDetailInspectionForView,
   feedbackEvidenceForRequest,
   feedbackPixelRequestIdentity,
   feedbackPreviewRegionAfterCommand,
+  feedbackRequestIsCurrent,
   feedbackViewAfterCommand,
   selectFeedbackRegionWithoutPixelWork,
   selectedOperationAfterCommand,
@@ -76,6 +79,8 @@ import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
 const gridResolutionOptions = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256] as const;
+type WorkspaceMode = "authoring" | "processing";
+type AuthoringPane = "workbench" | "hotspotSheet";
 
 // Recipe fields are all primitive or fixed-order records; this canonical fingerprint is the
 // exact candidate identity accepted by the preview/accept gate.
@@ -122,6 +127,16 @@ function requestedMaterialMapsForView(view: CompiledMapView): readonly SourceFra
   return [materialMapForView(view)];
 }
 
+export const processingPreviewMaterialMaps: readonly SourceFramePreviewMaterialMap[] = [
+  "base_color",
+  "normal",
+  "height",
+  "roughness",
+  "metallic",
+  "ambient_occlusion",
+  "edge_mask",
+];
+
 const exportableMaterialMaps: readonly SourceFramePreviewMaterialMap[] = [
   "base_color",
   "height",
@@ -129,6 +144,7 @@ const exportableMaterialMaps: readonly SourceFramePreviewMaterialMap[] = [
   "roughness",
   "metallic",
   "ambient_occlusion",
+  "edge_mask",
   "region_id",
 ];
 
@@ -137,7 +153,7 @@ function requestedMaterialMapsForExport(project: ProjectProjection | null): read
   if (!channels) return ["base_color"];
   const requested = exportableMaterialMaps.filter((map) => channels[map]?.enabled);
   if (project?.document?.edgeDetail?.enabled) {
-    for (const map of ["base_color", "height", "normal", "roughness", "metallic"] as const) {
+    for (const map of ["base_color", "height", "normal", "roughness", "metallic", "edge_mask"] as const) {
       if (!requested.includes(map)) requested.push(map);
     }
   }
@@ -307,7 +323,7 @@ function isInteractivePreviewProfile(value: string | null): value is Interactive
     || value === "preview8192";
 }
 
-function automaticPreviewKey(revision: number, profile: PreviewProfile, view: CompiledMapView): string {
+function automaticPreviewKey(revision: number, profile: PreviewProfile, view: CompiledMapView | "materialSet"): string {
   return `${revision}:${profile}:${view}`;
 }
 
@@ -390,9 +406,11 @@ function App() {
   const [preparedPatchPreviews, setPreparedPatchPreviews] = useState<Record<string, PreparedPatchPreviewProjection>>({});
   const [draftPatchPreview, setDraftPatchPreview] = useState<{ patchId: string; geometry: PatchGeometry } | null>(null);
   const [patchTool, setPatchTool] = useState<"rectangle" | "four-point" | null>(null);
-  const [sourceWorkbenchOpen, setSourceWorkbenchOpen] = useState(true);
-  const [hotspotSheetOpen, setHotspotSheetOpen] = useState(true);
-  const [feedbackWorkbenchOpen, setFeedbackWorkbenchOpen] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("authoring");
+  const [authoringPanes, setAuthoringPanes] = useState<ReadonlySet<AuthoringPane>>(() => new Set(["workbench", "hotspotSheet"]));
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [processingSidebarTab, setProcessingSidebarTab] = useState<"layers" | "outputs">("layers");
+  const [processingRequestedMap, setProcessingRequestedMap] = useState<CompiledMapView>("baseColor");
   const [feedbackView, setFeedbackView] = useState<FeedbackContributionView>("stage15Height");
   const [feedbackProfile, setFeedbackProfile] = useState<FeedbackPreviewProfile>("preview2048");
   const [feedbackComparisonMode, setFeedbackComparisonMode] = useState<FeedbackComparisonMode>("after");
@@ -402,6 +420,7 @@ function App() {
   const [feedbackCommandBusy, setFeedbackCommandBusy] = useState(false);
   const [feedbackLastCommandResult, setFeedbackLastCommandResult] = useState<string | null>(null);
   const [feedbackError, setFeedbackError] = useState<CommandFailure | null>(null);
+  const [edgeDetailError, setEdgeDetailError] = useState<CommandFailure | null>(null);
   const [feedbackExecution, setFeedbackExecution] = useState<FeedbackPreviewExecution | null>(null);
   const [sourceSheetShare, setSourceSheetShare] = useState(() => {
     const saved = Number(localStorage.getItem("hot-trimmer.source-sheet-share.v1") ?? "0.46");
@@ -410,12 +429,12 @@ function App() {
   const started = useRef(false);
   const documentHistoryBusy = useRef(false);
   const previewDraftId = useRef(0);
-  const feedbackCommandPreviewRevision = useRef<number | null>(null);
   const dirtyPreviewRegion = useRef<string | null>(null);
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
   const lastAutomaticPreviewKey = useRef<string | null>(null);
   const pendingAutomaticPreviewKey = useRef<string | null>(null);
   const patchPreviewRequestId = useRef(0);
+  const radialCommitId = useRef(0);
   const previewPublishStartedAt = useRef<number | null>(null);
   const projectRef = useRef<ProjectProjection | null>(null);
   const mapViewRef = useRef<CompiledMapView>("baseColor");
@@ -501,8 +520,11 @@ function App() {
   const buildState = buildStatus(project, artifact, activity, problem, stale);
   const paneMode = paneLayoutMode(workbenchWidth);
   const sourceFrameLayout = !!project?.document?.sourceFrame;
-  const showLibrary = sourceWorkbenchOpen && !feedbackWorkbenchOpen && (paneMode === "full" || paneMode === "without-inspector");
-  const showSourceWorkspace = sourceWorkbenchOpen && !feedbackWorkbenchOpen && paneMode !== "sheet-only";
+  const processingOpen = workspaceMode === "processing";
+  const sourceWorkbenchOpen = workspaceMode === "authoring" && authoringPanes.has("workbench");
+  const hotspotSheetOpen = workspaceMode === "authoring" && authoringPanes.has("hotspotSheet");
+  const showLibrary = sourceWorkbenchOpen && (paneMode === "full" || paneMode === "without-inspector");
+  const showSourceWorkspace = sourceWorkbenchOpen && paneMode !== "sheet-only";
   // The Layout sidebar is the single region inspector. Keep the former context
   // inspector out of the pane layout so it cannot duplicate map or region controls.
   const showInspector = false;
@@ -511,7 +533,7 @@ function App() {
   if (showSourceWorkspace && hotspotSheetOpen) visibleTracks.push(`minmax(280px, ${sourceSheetShare}fr)`, `minmax(320px, ${1 - sourceSheetShare}fr)`);
   else if (showSourceWorkspace || hotspotSheetOpen) visibleTracks.push("minmax(0, 1fr)");
   if (showInspector) visibleTracks.push(`${panes.inspector}px`);
-  const workbenchColumns = feedbackWorkbenchOpen
+  const workbenchColumns = processingOpen
     ? "minmax(0, 1fr) minmax(360px, 430px)"
     : visibleTracks.length ? visibleTracks.join(" 6px ") : "minmax(0, 1fr)";
 
@@ -526,7 +548,7 @@ function App() {
   }, [currentTopologyHash]);
 
   useEffect(() => {
-    if (!native || !project?.document || feedbackWorkbenchOpen) return;
+    if (!native || !project?.document || processingOpen) return;
     const key = automaticPreviewKey(project.document.documentRevision, interactivePreviewProfile, mapView);
     if (suppressAutomaticPreviewRevision.current === project.document.documentRevision) {
       suppressAutomaticPreviewRevision.current = null;
@@ -538,7 +560,7 @@ function App() {
     // Persisted appearance edits are not transient crop requests. The compiler's content
     // hashes reuse every unchanged region while the request remains contract-valid.
     void requestPreview(undefined, undefined, interactivePreviewProfile, project.document.documentRevision, false, true);
-  }, [native, project?.document?.documentRevision, interactivePreviewProfile, mapView, feedbackWorkbenchOpen]);
+  }, [native, project?.document?.documentRevision, interactivePreviewProfile, mapView, processingOpen]);
 
   useEffect(() => {
     const controller = transientPreviewController.current;
@@ -617,20 +639,16 @@ function App() {
 
   useEffect(() => {
     const revision = project?.document?.documentRevision;
-    const previewRegionId = selectedRegionId
-      ?? (feedbackPreviewAllRegions ? project?.document?.topology.regions[0]?.id ?? null : null);
-    if (!feedbackWorkbenchOpen || !previewRegionId || revision === undefined) return;
-    if (feedbackCommandPreviewRevision.current === revision) {
-      feedbackCommandPreviewRevision.current = null;
-      return;
-    }
-    if (!visibleMapDependency(feedbackView)) {
-      setFeedbackExecution(null);
-      setPreviewClientTelemetry([`feedback_view=${feedbackView}`, `requested_revision=${revision}`, "pixel_dispatch=0", "request_outcome=metadata_only"]);
-      return;
-    }
-    void requestFeedbackTile(revision, previewRegionId, feedbackPreviewAllRegions);
-  }, [feedbackWorkbenchOpen, project?.document?.documentRevision, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId, feedbackProfile]);
+    if (!processingOpen || revision === undefined) return;
+    const key = automaticPreviewKey(revision, interactivePreviewProfile, "materialSet");
+    if (lastAutomaticPreviewKey.current === key || pendingAutomaticPreviewKey.current === key) return;
+    pendingAutomaticPreviewKey.current = key;
+    setFeedbackExecution(null);
+    setEdgeDetailError(null);
+    void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true, processingRequestedMap);
+    // Processing commands publish their own replacement. A document revision
+    // effect here would race that explicit request and supersede both outputs.
+  }, [processingOpen, interactivePreviewProfile]);
 
   useEffect(() => {
     const content = selectedBinding?.content;
@@ -963,6 +981,7 @@ function App() {
     if (!native || !project?.document || feedbackCommandBusy) return;
     setFeedbackCommandBusy(true);
     setFeedbackError(null);
+    if (commandValue.type === "set_edge_detail") setEdgeDetailError(null);
     setProblem(null);
     try {
       const result = await invoke<FeedbackWorkbenchCommandResult>("apply_feedback_workbench_command", {
@@ -976,26 +995,33 @@ function App() {
       const previewAllRegions = commandValue.type === "set_edge_detail" && !commandValue.intent.targetRegion;
       setFeedbackPreviewAllRegions(previewAllRegions);
       if (!previewAllRegions && previewRegionId !== selectedRegionId) setSelectedRegionId(previewRegionId);
-      const nextFeedbackView = feedbackViewAfterCommand(commandValue, feedbackView);
+      const processingEdgeCommand = processingOpen && commandValue.type === "set_edge_detail";
+      const nextFeedbackView = processingEdgeCommand ? feedbackView : feedbackViewAfterCommand(commandValue, feedbackView);
       if (nextFeedbackView !== feedbackView) setFeedbackView(nextFeedbackView);
+      // The explicit Processing preview starts before React effects run. Keep
+      // the imperative revision source synchronized with the command result so
+      // a supersession retry cannot fall back to the preceding revision.
+      projectRef.current = result.project;
       setProject(result.project);
+      if (commandValue.type === "set_edge_detail") setEdgeDetailError(null);
       setFeedbackLastCommandResult(`${commandValue.type}:${result.committedIdentity}:${result.status}`);
       setFeedbackSelectedOperationId((current) => selectedOperationAfterCommand(commandValue, current, result.committedIdentity));
       const dependency = visibleMapDependency(nextFeedbackView);
-      if (dependency) {
+      if (!processingEdgeCommand && dependency) {
         setMapViewState(dependency);
         mapViewRef.current = dependency;
       }
       if (commandValue.type === "set_edge_detail" && previewRegionId) {
         const revision = result.project.document?.documentRevision;
         if (revision !== undefined) {
-          feedbackCommandPreviewRevision.current = revision;
-          await requestFeedbackTile(revision, previewRegionId, previewAllRegions, nextFeedbackView);
+          if (processingEdgeCommand) await requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, false, processingRequestedMap);
+          else await requestFeedbackTile(revision, previewRegionId, previewAllRegions, nextFeedbackView);
         }
       }
     } catch (reason) {
       const commandFailure = failure(reason);
       setFeedbackError(commandFailure);
+      if (commandValue.type === "set_edge_detail") setEdgeDetailError(commandFailure);
       setProblem(commandFailure);
       setFeedbackLastCommandResult(`${commandValue.type}:failed:${commandFailure.code}`);
     } finally {
@@ -1003,15 +1029,27 @@ function App() {
     }
   }
 
-  function requestFeedbackVisibleView() {
-    const dependency = visibleMapDependency(feedbackView);
+  function requestFeedbackVisibleView(requestedView = feedbackView) {
+    const dependency = visibleMapDependency(requestedView);
     const revision = project?.document?.documentRevision;
     if (!dependency || revision === undefined) return;
+    const inspection = edgeDetailInspectionForView(requestedView);
+    if (inspection && !project?.document?.edgeDetail?.enabled) {
+      setEdgeDetailError({
+        code: "edge_detail_not_applied",
+        message: "Enable Edge Detail before inspecting its generated fields.",
+        recovery: "Choose a preset or edit a control; the live editor commits at the next editing boundary.",
+      });
+      return;
+    }
     setMapViewState(dependency);
     mapViewRef.current = dependency;
+    setFeedbackView(requestedView);
+    const edgeAllRegions = !!inspection && !project?.document?.edgeDetail?.targetRegion;
     const previewRegionId = selectedRegionId
-      ?? (feedbackPreviewAllRegions ? project?.document?.topology.regions[0]?.id ?? null : null);
-    if (previewRegionId) void requestFeedbackTile(revision, previewRegionId, feedbackPreviewAllRegions);
+      ?? project?.document?.edgeDetail?.targetRegion
+      ?? ((feedbackPreviewAllRegions || edgeAllRegions) ? project?.document?.topology.regions[0]?.id ?? null : null);
+    if (previewRegionId) void requestFeedbackTile(revision, previewRegionId, feedbackPreviewAllRegions || edgeAllRegions, requestedView);
   }
 
   async function requestFeedbackTile(
@@ -1023,6 +1061,7 @@ function App() {
   ) {
     const dependency = visibleMapDependency(requestedView);
     if (!native || !dependency) return;
+    const edgeDetailInspection = edgeDetailInspectionForView(requestedView);
     const profile = requestedProfile === "preview1024" ? "refinement1024" : requestedProfile;
     const generation = ++previewDraftId.current;
     const startedAt = performance.now();
@@ -1039,9 +1078,10 @@ function App() {
     setFeedbackExecution(null);
     setPreviewProgress({ requestId: generation, phase: "compiling", profile, requestedRevision: revision, requestedMap: dependency, startedAt, targetDimensions, feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
     setFeedbackError(null);
+    if (edgeDetailInspection) setEdgeDetailError(null);
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_stage_15_16_feedback", {
-        request: { ...protocol, commandVersion: 1, revision, generation, regionId, allRegions, view: requestedView, profile, comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId ?? undefined },
+        request: { ...protocol, commandVersion: 1, revision, generation, regionId, allRegions, view: requestedView, profile, comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId ?? undefined, edgeDetailInspection: edgeDetailInspection ?? undefined },
       });
       if (generation !== previewDraftId.current) return;
       if (!next.feedbackExecution || next.feedbackExecution.clientGeneration !== generation || !feedbackExecutionMatchesRequest(next.feedbackExecution, requestDescriptor)) {
@@ -1049,18 +1089,25 @@ function App() {
       }
       setArtifact(next);
       setFeedbackExecution(next.feedbackExecution);
+      setFeedbackError(null);
+      if (edgeDetailInspection) setEdgeDetailError(null);
       setProblem(null);
       if (next.project) setProject(next.project);
       setPreview(null);
       setPreviewProgress({ requestId: generation, phase: "received", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published", feedbackRequestIdentity: next.feedbackExecution.requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
       setPreviewClientTelemetry([`request_identity=${next.feedbackExecution.requestIdentity}`, `feedback_view=${next.feedbackExecution.view}`, `profile=${next.feedbackExecution.profile}`, `requested_revision=${next.feedbackExecution.revision}`, `requested_map=${next.feedbackExecution.requestedMap}`, `artifact_revision=${next.documentRevision}`, `request_outcome=${next.feedbackExecution.outcome}`, `cache_reused=${next.feedbackExecution.cacheReused}`]);
     } catch (reason) {
+      // A superseded native job may settle after a newer request has already
+      // published. It must not erase that exact execution evidence or surface a
+      // stale cancellation beside the layer.
+      if (!feedbackRequestIsCurrent(generation, previewDraftId.current)) return;
       const commandFailure = failure(reason);
       const superseded = commandFailure.code === "operation_cancelled";
       setFeedbackExecution(null);
       setFeedbackError(commandFailure);
+      if (edgeDetailInspection) setEdgeDetailError(commandFailure);
       if (!superseded) setProblem(commandFailure);
-      if (generation === previewDraftId.current) setPreviewProgress({ requestId: generation, phase: "failed", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, terminalOutcome: superseded ? "superseded" : "failed", feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
+      setPreviewProgress({ requestId: generation, phase: "failed", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, terminalOutcome: superseded ? "superseded" : "failed", feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
       setPreviewClientTelemetry([`request_identity=${requestIdentity}`, `feedback_view=${requestedView}`, `requested_revision=${revision}`, `requested_map=${dependency}`, `request_outcome=${superseded ? "superseded" : "failed"}`, `problem=${commandFailure.code}`]);
     }
   }
@@ -1262,12 +1309,16 @@ function App() {
     }
   }
 
-  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true, automatic = false, requestedMapOverride?: CompiledMapView) {
+  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true, automatic = false, requestedMapOverride?: CompiledMapView, supersessionRetry = 0): Promise<void> {
     const requestedRevision = revision ?? project?.document?.documentRevision;
     if (!native || requestedRevision === undefined) return;
     const requestedMapView = requestedMapOverride ?? mapViewRef.current;
-    const requestedMaps = requestedMaterialMapsForView(requestedMapView);
-    const automaticKey = automatic ? automaticPreviewKey(requestedRevision, profile, requestedMapView) : null;
+    const requestedMaps = processingOpen
+      ? processingPreviewMaterialMaps
+      : requestedMaterialMapsForView(requestedMapView);
+    const automaticKey = automatic
+      ? automaticPreviewKey(requestedRevision, profile, processingOpen ? "materialSet" : requestedMapView)
+      : null;
     const viewIntent: "completeDraft512" | "completeRefinement1024" | "exactViewport" | "exactSelectedRegion" | undefined = profile === "draft512"
       ? "completeDraft512"
       : profile === "refinement1024"
@@ -1306,6 +1357,10 @@ function App() {
         pendingAutomaticPreviewKey.current = null;
       }
       if (draftId === previewDraftId.current) {
+        if (processingOpen && requestedMapOverride) {
+          setMapViewState(requestedMapOverride);
+          mapViewRef.current = requestedMapOverride;
+        }
         setPreviewProgress({ requestId: draftId, phase: "received", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current, elapsedMs: performance.now() - previewPublishStartedAt.current, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published" });
         setArtifact(next);
         setPreview(null);
@@ -1336,11 +1391,21 @@ function App() {
         // ask for the settled latest revision instead.
         setPreviewClientTelemetry([`profile=${profile}`, `requested_revision=${requestedRevision}`, `requested_map=${requestedMapView}`, `request_outcome=superseded`]);
         setPreviewProgress({ requestId: draftId, phase: "failed", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs, terminalOutcome: "superseded" });
-        const latestRevision = projectRef.current?.document?.documentRevision;
-        if (latestRevision !== undefined && latestRevision !== requestedRevision) {
-          const latestKey = automaticPreviewKey(latestRevision, profile, mapViewRef.current);
+        const observedRevision = projectRef.current?.document?.documentRevision;
+        const latestRevision = observedRevision === undefined
+          ? requestedRevision
+          : Math.max(requestedRevision, observedRevision);
+        // Native revision handoff can supersede either the explicit Apply
+        // request or its automatic equivalent. Await one replacement request
+        // here so publication cannot depend on a fire-and-forget timer.
+        if (supersessionRetry === 0) {
+          const latestKey = automaticPreviewKey(latestRevision, profile, processingOpen ? "materialSet" : requestedMapView);
           pendingAutomaticPreviewKey.current = latestKey;
-          window.setTimeout(() => void requestPreview(regionId, projection, profile, latestRevision, scheduleRefinement, true), 0);
+          // Let already-queued revision/map effects enter the native latest-wins
+          // service first. The one replacement below then owns the settled burst
+          // instead of being immediately superseded by that queued work.
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 180));
+          return requestPreview(regionId, projection, profile, latestRevision, scheduleRefinement, true, requestedMapView, 1);
         }
       }
     }
@@ -1351,19 +1416,7 @@ function App() {
     if (!native || revision === undefined || activity !== "idle") return;
     setActivity("compiling");
     try {
-      const feedbackRegionId = selectedRegionId
-        ?? (feedbackPreviewAllRegions ? project?.document?.topology.regions[0]?.id ?? null : null);
-      if (feedbackWorkbenchOpen && feedbackRegionId && visibleMapDependency(feedbackView)) {
-        await requestFeedbackTile(
-          revision,
-          feedbackRegionId,
-          feedbackPreviewAllRegions,
-          feedbackView,
-          "authoritative",
-        );
-      } else {
-        await requestPreview(undefined, undefined, "authoritative", revision, false);
-      }
+      await requestPreview(undefined, undefined, processingOpen ? interactivePreviewProfile : "authoritative", revision, false, false, processingOpen ? processingRequestedMap : mapViewRef.current);
     }
     finally { setActivity("idle"); }
   }
@@ -1607,7 +1660,7 @@ function App() {
       const owner = patch && project?.materialSources.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
       if (patch && owner) {
         setSelectedSourceSetId(owner.id); selectSourceChannel("base_color"); setActivePatchId(patch.id);
-        setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
+        setRegionPatchEditId(regionId); setWorkspaceMode("authoring"); setAuthoringPanes((current) => new Set([...current, "workbench"])); setPatchTool(null);
       }
       return;
     }
@@ -1643,7 +1696,7 @@ function App() {
       });
       await assignPatchToRegion(patchId, regionId);
       setSelectedSourceSetId(owner.id); selectSourceChannel("base_color"); setActivePatchId(patchId);
-      setRegionPatchEditId(regionId); setSourceWorkbenchOpen(true); setPatchTool(null);
+      setRegionPatchEditId(regionId); setWorkspaceMode("authoring"); setAuthoringPanes((current) => new Set([...current, "workbench"])); setPatchTool(null);
     } catch (reason) { patchFallbackContent.current.delete(patchId); setProblem(failure(reason)); }
   }
 
@@ -1847,19 +1900,26 @@ function App() {
   }
 
   async function setRegionRadial(regionId: string, radial: NonNullable<RegionMapping["radial"]>) {
+    const commitId = ++radialCommitId.current;
     dirtyPreviewRegion.current = regionId;
+    setActivity("editing");
     try {
       const next = await applyCommand({ type: "set_region_radial", regionId, radial });
+      // Numeric inputs can commit faster than native document commands settle.
+      // Only the newest radial intent may update the client or publish pixels.
+      if (commitId !== radialCommitId.current) return;
       const revision = next.document!.documentRevision;
       // Source-side radial gestures bypass the Layout command helper, so publish their
       // persisted revision explicitly. Keep the previous artifact visible until the
       // selected preview size is ready rather than flashing a lower-quality square pass.
       pendingAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile, mapView);
       dirtyPreviewRegion.current = null;
+      projectRef.current = next;
       setProject(next);
-      void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true);
+      await requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true);
     }
     catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
+    finally { if (commitId === radialCommitId.current) setActivity("idle"); }
   }
 
   function chooseSource(sourceSetId: string, channel: SourceChannel) {
@@ -1890,9 +1950,26 @@ function App() {
   }
 
   function selectCompiledMapView(view: CompiledMapView) {
+    if (processingOpen) {
+      setProcessingRequestedMap(view);
+      setMapViewState(view);
+      mapViewRef.current = view;
+      return;
+    }
     setMapViewState(view);
+    mapViewRef.current = view;
+    setProcessingRequestedMap(view);
     const channel = sourceChannelForCompiledMapView(view);
     if (channel) setSelectedChannel(channel);
+  }
+
+  function toggleAuthoringPane(pane: AuthoringPane) {
+    if (workspaceMode === "processing") { setWorkspaceMode("authoring"); return; }
+    setAuthoringPanes((current) => {
+      const next = new Set(current);
+      if (next.has(pane) && next.size > 1) next.delete(pane); else next.add(pane);
+      return next;
+    });
   }
 
   function selectPatchAndLinkedRegion(patchId: string, sourceSetId?: string) {
@@ -1939,14 +2016,15 @@ function App() {
           }} /> : <strong onDoubleClick={() => { setDraftName(project?.name ?? "Untitled"); setRenaming(true); }}>{project?.name ?? "Untitled"}</strong>}
           <span>{project?.isDraft ? "Draft" : project?.dirty ? "Unsaved" : "Saved"}</span>
         </div>
-        <nav className="workflow" aria-label="Workbench tabs">
-          <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} aria-pressed={sourceWorkbenchOpen} onClick={() => setSourceWorkbenchOpen((open) => !open)}>Workbench</button>
-          <button className={`mode ${hotspotSheetOpen ? "active" : ""}`} aria-pressed={hotspotSheetOpen} onClick={() => setHotspotSheetOpen((open) => !open)}>Hotspot Sheet</button>
-          <button className={`mode ${feedbackWorkbenchOpen ? "active" : ""}`} aria-pressed={feedbackWorkbenchOpen} onClick={() => setFeedbackWorkbenchOpen((open) => { const next = !open; if (next) { setSourceWorkbenchOpen(false); setHotspotSheetOpen(true); } return next; })} title="Ordered GPU material layers and map inspection.">Layers &amp; Maps</button>
+        <nav className="workflow" aria-label="Creative workspaces">
+          <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} aria-pressed={sourceWorkbenchOpen} onClick={() => toggleAuthoringPane("workbench")}>Workbench</button>
+          <button className={`mode ${hotspotSheetOpen ? "active" : ""}`} aria-pressed={hotspotSheetOpen} onClick={() => toggleAuthoringPane("hotspotSheet")}>Hotspot Sheet</button>
+          <button className={`mode ${processingOpen ? "active" : ""}`} aria-pressed={processingOpen} onClick={() => setWorkspaceMode("processing")}>Processing</button>
         </nav>
         <span className="window-drag-space" data-tauri-drag-region />
         <div className="publish-actions">
-          <button onClick={() => void exportMaterialMaps()} disabled={!native || !project?.document || activity !== "idle"} title="Export the current material map through the native streaming encoder.">Export</button>
+          <button className={debugOpen ? "active" : ""} aria-expanded={debugOpen} aria-controls="debug-drawer" onClick={() => setDebugOpen((open) => !open)}>Debug</button>
+          <button onClick={() => void exportMaterialMaps()} disabled={!native || !project?.document || activity !== "idle"} title="Render and package every enabled material-map output for the current document revision.">Export All Maps</button>
           <button disabled title="Send to Blender requires publish and companion commands.">Send to Blender</button>
         </div>
         {native ? <div className="window-controls" aria-label="Window controls">
@@ -1956,7 +2034,7 @@ function App() {
         </div> : null}
       </header>
 
-      <section ref={workbenchRef} className={`workbench pane-layout-${paneMode} ${sourceFrameLayout ? "source-frame-layout" : ""}`} style={{ gridTemplateColumns: workbenchColumns }}>
+      <section ref={workbenchRef} className={`workbench workspace-${workspaceMode} pane-layout-${paneMode} ${sourceFrameLayout ? "source-frame-layout" : ""}`} style={{ gridTemplateColumns: workbenchColumns }}>
         {showLibrary ? <SourceLibrary
           project={project}
           activeSourceSetId={activeSourceSetId}
@@ -2040,7 +2118,7 @@ function App() {
           {regionPatchEditId ? <div className="region-edit-toast" role="status" aria-live="polite"><strong>Editing region source</strong><span>Preview stays pinned until the selected size is ready.</span><button onClick={exitRegionPatchEdit}>Cancel</button><button onClick={exitRegionPatchEdit}>Done</button></div> : null}
         </section> : null}
         {showSourceWorkspace && hotspotSheetOpen ? <PaneSplitter kind="source-sheet" proportional libraryVisible={showLibrary} inspectorVisible={showInspector} onSourceShareChange={setSourceSheetShare} paneDrag={paneDrag} setPanes={setPanes} workbenchRef={workbenchRef} /> : null}
-        {hotspotSheetOpen ? <SheetWorkbench
+        {(hotspotSheetOpen || processingOpen) ? <SheetWorkbench
           project={project}
           artifact={artifact}
           preview={preview}
@@ -2048,11 +2126,12 @@ function App() {
           preparedPatchPreviews={preparedPatchPreviews}
           activePatchId={activePatchId}
           mapView={mapView}
+          processingRequestedMap={processingRequestedMap}
           setMapView={selectCompiledMapView}
           selectedRegionId={selectedRegionId}
           setSelectedRegionId={(id) => { setSelectedRegionId(id); if (!id) { setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSourceFrameEditing(false); } }}
           sourceFrameEditing={sourceFrameEditing}
-          onEditSourceFrame={() => { const frame = project?.document?.sourceFrame; if (!frame) return; setSelectedRegionId(null); setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSelectedSourceSetId(frame.sourceSetId); selectSourceChannel("base_color"); setSourceWorkbenchOpen(true); setSourceFrameEditing(true); }}
+          onEditSourceFrame={() => { const frame = project?.document?.sourceFrame; if (!frame) return; setSelectedRegionId(null); setActivePatchId(null); setRegionPatchEditId(null); setDraftPatchPreview(null); setSelectedSourceSetId(frame.sourceSetId); selectSourceChannel("base_color"); setWorkspaceMode("authoring"); setAuthoringPanes((current) => new Set([...current, "workbench"])); setSourceFrameEditing(true); }}
           buildState={buildState}
           problem={problem}
           templateId={templateId}
@@ -2082,8 +2161,9 @@ function App() {
            onLayoutCommand={editSourceFrameLayout}
            onUndo={() => void history(false)}
            onRedo={() => void history(true)}
+           presentation={processingOpen ? "processing" : "layout"}
            previewClientTelemetry={previewClientTelemetry}
-           feedbackDebug={feedbackWorkbenchOpen ? {
+           feedbackDebug={debugOpen ? {
              view: feedbackView,
              profile: feedbackProfile,
              comparisonMode: feedbackComparisonMode,
@@ -2095,7 +2175,7 @@ function App() {
              allRegions: feedbackPreviewAllRegions,
            } : null}
            onPreviewPaint={(dimensions) => {
-             if (feedbackWorkbenchOpen && dimensions.generation !== undefined && dimensions.generation !== feedbackExecution?.publishedGeneration) return;
+             if (previewProgress?.feedbackRequestIdentity && dimensions.generation !== undefined && dimensions.generation !== feedbackExecution?.publishedGeneration) return;
              if (previewPublishStartedAt.current !== null) {
                setPreviewProgress((current) => current ? { ...current, phase: "painted", elapsedMs: performance.now() - current.startedAt, dimensions } : current);
                setPreviewClientTelemetry((current) => [
@@ -2129,7 +2209,22 @@ function App() {
           onSetRegionContent={(regionId, content) => void assignContentToRegion(regionId, content)}
           onSetRegionBehavior={(regionId, behavior) => void setRegionBehavior(regionId, behavior)}
         /> : null}
-        {feedbackWorkbenchOpen ? <FeedbackWorkbench
+        {processingOpen ? <ProcessingSidebar
+          project={project}
+          artifact={artifact}
+          selectedRegionId={selectedRegionId}
+          commandBusy={feedbackCommandBusy}
+          edgeDetailError={edgeDetailError}
+          activeTab={processingSidebarTab}
+          onActiveTab={setProcessingSidebarTab}
+          onCommand={applyFeedbackCommand}
+          onRender={() => void renderFullResolutionPreview()}
+          onUndo={() => void history(false)}
+          onRedo={() => void history(true)}
+        /> : null}
+        {debugOpen ? <div id="debug-drawer" className="debug-drawer" role="dialog" aria-label="Debug and fixtures">
+          <button className="debug-drawer-close" onClick={() => setDebugOpen(false)}>Close Debug</button>
+          <FeedbackWorkbench
           project={project}
           artifact={artifact}
           selectedRegionId={selectedRegionId}
@@ -2139,9 +2234,11 @@ function App() {
           comparisonMode={feedbackComparisonMode}
           activeTool={feedbackActiveTool}
           commandBusy={feedbackCommandBusy}
+          edgeDetailError={edgeDetailError}
           onSelectRegion={selectFeedbackRegion}
           onSelectOperation={setFeedbackSelectedOperationId}
           onView={setFeedbackView}
+          onInspectView={requestFeedbackVisibleView}
           onProfile={setFeedbackProfile}
           onComparisonMode={setFeedbackComparisonMode}
           onActiveTool={setFeedbackActiveTool}
@@ -2150,7 +2247,8 @@ function App() {
           onCreateSample={() => void createFeedbackSample()}
           onUndo={() => void history(false)}
           onRedo={() => void history(true)}
-        /> : null}
+          />
+        </div> : null}
       </section>
       <footer className="statusbar">
         <span>{project?.name ?? "Untitled"}</span>
@@ -2970,7 +3068,7 @@ function PatchPreview(props: { preview: PreviewSheetProjection; region: Resolved
   </aside>;
 }
 
-function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; mapView: CompiledMapView; onPaint: (dimensions: { width: number; height: number; generation?: number }) => void; onDebugSummary: (summary: GpuTiledPreviewPaintSummary | null) => void }) {
+function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; mapView: CompiledMapView; retainPayload?: boolean; onPaint: (dimensions: { width: number; height: number; generation?: number }) => void; onDebugSummary: (summary: GpuTiledPreviewPaintSummary | null) => void }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const painter = useRef(new GpuTiledPreviewPainter());
   const onPaint = useRef(props.onPaint);
@@ -2987,11 +3085,11 @@ function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; m
     void painter.current.paint(surface, publication, {
       getPayload: (request) => invoke<Uint8Array>("get_gpu_tiled_preview_payload", { request }),
       releasePayload: async (request) => { await invoke("release_gpu_tiled_preview_payload", { request }); },
-    }, IPC_PROTOCOL_VERSION).then((painted) => {
+    }, IPC_PROTOCOL_VERSION, !props.retainPayload).then((painted) => {
       props.onDebugSummary(painter.current.lastSummary());
       if (painted) onPaint.current({ width: props.artifact.width, height: props.artifact.height, generation: manifest.generation });
     });
-  }, [manifest?.generation, manifest?.opaqueHandle, manifest?.map, props.artifact.height, props.artifact.width, props.mapView, publication, props.onDebugSummary]);
+  }, [manifest?.generation, manifest?.opaqueHandle, manifest?.map, props.artifact.height, props.artifact.width, props.mapView, props.retainPayload, publication, props.onDebugSummary]);
 
   return <canvas
     ref={canvasRef}
@@ -3138,6 +3236,7 @@ function SheetWorkbench(props: {
   preparedPatchPreviews: Readonly<Record<string, PreparedPatchPreviewProjection>>;
   activePatchId: string | null;
   mapView: CompiledMapView;
+  processingRequestedMap: CompiledMapView;
   setMapView: (view: CompiledMapView) => void;
   selectedRegionId: string | null;
   setSelectedRegionId: (id: string | null) => void;
@@ -3172,6 +3271,7 @@ function SheetWorkbench(props: {
   onLayoutCommand: (command: TrimSheetDocumentCommand) => Promise<ProjectProjection | null>;
   onUndo: () => void;
   onRedo: () => void;
+  presentation: "layout" | "processing";
   previewClientTelemetry: readonly string[];
   feedbackDebug: null | {
     view: FeedbackContributionView;
@@ -3186,6 +3286,8 @@ function SheetWorkbench(props: {
   };
   onPreviewPaint: (dimensions: { width: number; height: number; generation?: number }) => void;
 }) {
+  const processing = props.presentation === "processing";
+  const authoringOverlaysVisible = !processing;
   const artifact = props.artifact;
   const topologyHash = props.project?.document ? hashBytes(props.project.document.topology.topologyHash) : null;
   const validPreview = props.preview
@@ -3217,6 +3319,7 @@ function SheetWorkbench(props: {
   const [gridVisible, setGridVisible] = useState(true);
   const [gridOpacity, setGridOpacity] = useState(10);
   const [textureVisible, setTextureVisible] = useState(true);
+  const [processingMaterialView, setProcessingMaterialView] = useState(true);
   const [regionFillVisible, setRegionFillVisible] = useState(true);
   const [regionBordersVisible, setRegionBordersVisible] = useState(true);
   const [edgeEligibilityVisible, setEdgeEligibilityVisible] = useState(false);
@@ -3229,6 +3332,12 @@ function SheetWorkbench(props: {
   const nativePresetLibraryAvailable = useRef(true);
   const [resizeDraft, setResizeDraft] = useState<{ pointerId: number; regionId: string; handle: ResizeHandle; origin: LogicalRect; rect: LogicalRect } | null>(null);
   const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startCellX: number; startCellY: number; endCellX: number; endCellY: number } | null>(null);
+  useEffect(() => { if (processing) setProcessingMaterialView(true); }, [processing]);
+  useEffect(() => {
+    if (processing && props.interactivePreviewProfile === "preview8192") {
+      props.setInteractivePreviewProfile("preview4096");
+    }
+  }, [processing, props.interactivePreviewProfile]);
   const sheetRef = useRef<HTMLDivElement>(null);
   const displayRegions = sheet?.regions ?? [];
   const selectedLayoutRegion = props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId);
@@ -3261,10 +3370,16 @@ function SheetWorkbench(props: {
     && gpuPaintSummary.payloadNonZeroRgb === 0;
   const continuousTexture = null;
   const displayGpuTiles = !!activeTilePublication && shouldDisplayGpuTiledPreview(activeTileManifest?.map, props.mapView, hasTransientSourceFallback);
-  const editorHasImage = !!continuousTexture || displayGpuTiles || !!imageUrl;
+  const litMaterialReady = processing
+    && materialPreviewReady(props.artifact, props.project?.document?.documentRevision);
+  const editorHasImage = processingMaterialView && processing
+    ? litMaterialReady
+    : !!continuousTexture || displayGpuTiles || !!imageUrl;
   const previewInFlight = props.previewProgress?.phase === "compiling" || props.previewProgress?.phase === "received";
   const previewPixelsProblem = !!sheet && !editorHasImage && !previewInFlight
-    ? "The compiled preview published metadata, but no paintable tile was available for this map view."
+    ? processingMaterialView && processing
+      ? "The complete Base Color, Normal, Height, Roughness, Metallic, and AO set is not ready for material preview. Click Refresh to render it."
+      : "The compiled preview published metadata, but no paintable tile was available for this map view."
     : null;
   const workpieceSize = sheet
     ? { width: sheet.width, height: sheet.height }
@@ -3607,13 +3722,17 @@ function SheetWorkbench(props: {
         ? "Full-resolution preview superseded"
         : "Full-resolution preview failed"
     : null;
-  return <section className="sheet-workbench">
+  return <section className={`sheet-workbench ${processing ? "processing-canvas" : "layout-canvas"}`}>
     <header className="sheet-header">
-      <div><strong>HOTSPOT SHEET</strong></div>
+      <div><strong>{processing ? "PROCESSING" : "HOTSPOT SHEET"}</strong></div>
       <span className={`build-status ${props.problem ? "error" : props.artifact ? "ready" : ""}`}>{props.buildState}</span>
     </header>
+    {processing ? <div className="processing-toolbar">
+      <div className="processing-map-tabs" role="tablist" aria-label="Material maps"><button role="tab" aria-selected={processingMaterialView} className={processingMaterialView ? "active" : ""} onClick={() => setProcessingMaterialView(true)} title="Real-time lit preview composed from the current material maps.">Material</button>{([['baseColor','Base Color'],['normal','Normal'],['height','Height'],['roughness','Roughness'],['metallic','Metallic'],['ambientOcclusion','AO'],['edgeMask','Edge Mask']] as const).map(([view, label]) => <button key={view} role="tab" aria-selected={!processingMaterialView && props.processingRequestedMap === view} className={!processingMaterialView && props.processingRequestedMap === view ? "active" : ""} onClick={() => { setProcessingMaterialView(false); props.setMapView(view); }}>{label}</button>)}</div>
+      <div className="processing-inspection-controls"><select aria-label="Before or After" value={props.feedbackDebug?.comparisonMode ?? "after"} disabled><option value="before">Before</option><option value="after">After</option></select><select aria-label="Preview resolution" title="Interactive complete-material previews are capped at 4K; Export All Maps uses the project output resolution." value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as InteractivePreviewProfile)}><option value="refinement1024">1K</option><option value="preview2048">2K</option><option value="preview4096">4K</option></select><button onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle"}>Refresh All Maps</button></div>
+    </div> : null}
     <section className="layout-stage">
-    <aside className="layout-sidebar" aria-label="Layout controls">
+    {!processing ? <aside className="layout-sidebar" aria-label="Layout controls">
       <header><span>LAYOUT</span><strong className={`layout-state ${candidateState.toLowerCase().replaceAll(" ", "-")}`}>{candidateState}</strong></header>
       {props.project?.document?.sourceFrame ? <fieldset className="trim-sheet-source-settings"><legend>Trim-sheet source</legend><p>Controls the source frame used by the entire authored layout.</p><button className={`source-frame-layout-action ${props.sourceFrameEditing ? "active" : ""}`} onClick={props.onEditSourceFrame}>{props.sourceFrameEditing ? "Editing entire trim-sheet source" : "Edit entire trim-sheet source position"}</button></fieldset> : null}
       <div className="layout-tool-row" role="toolbar" aria-label="Atlas editing tools"><button className={layoutTool === "select" ? "active" : ""} onClick={() => { setLayoutTool("select"); setDrawDraft(null); }}>Select / resize</button><button className={layoutTool === "draw" ? "active" : ""} onClick={() => { setLayoutTool("draw"); setLayoutMenu(null); }}>Draw region</button></div>
@@ -3720,7 +3839,7 @@ function SheetWorkbench(props: {
         <button onClick={() => props.selectedRegionId && props.onLayoutCommand({ type: "split_source_frame_region", regionId: props.selectedRegionId, axis: "horizontal" })} disabled={!props.selectedRegionId || props.candidatePreviewing || props.activity !== "idle"}>Split horizontally</button>
         <button onClick={() => props.selectedRegionId && props.onLayoutCommand({ type: "split_source_frame_region", regionId: props.selectedRegionId, axis: "vertical" })} disabled={!props.selectedRegionId || props.candidatePreviewing || props.activity !== "idle"}>Split vertically</button>
       </section>
-    </aside>
+    </aside> : null}
     <section
       ref={viewport.containerRef}
       className="sheet-canvas"
@@ -3754,11 +3873,11 @@ function SheetWorkbench(props: {
           } else if (!(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
         }}
       >
-        {textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && displayGpuTiles && artifact ? <GpuTiledPreviewCanvas artifact={artifact} mapView={props.mapView} onPaint={props.onPreviewPaint} onDebugSummary={setGpuPaintSummary} /> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
-        {pendingPatchRegions.map(({ region, patchPreview }) => <div key={`assigned-${region.regionId}`} className="assigned-patch-preview" style={gridRectOverlayStyle(region.gridRect!, displayedGrid)}><img src={patchPreview.dataUrl} alt={`Immediate assigned patch preview for ${region.displayName}`} /></div>)}
-        {layoutTool === "draw" && hoverSnap && !drawDraft ? <div className="draw-hover-cell" style={gridRectOverlayStyle({ x: hoverSnap.cellX, y: hoverSnap.cellY, width: 1, height: 1 }, displayedGrid)}><div className="draw-snap-crosshair"><span>cell {hoverSnap.cellX}, {hoverSnap.cellY}</span></div></div> : null}
-        {(sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}
-        <div className={`overlays ${layoutTool === "draw" ? "drawing" : ""}`}>{displayRegions.map((region) => <button key={region.regionId}
+        {processing && processingMaterialView && artifact ? <MaterialPreviewCanvas artifact={artifact} onPaint={props.onPreviewPaint} /> : textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && displayGpuTiles && artifact ? <GpuTiledPreviewCanvas artifact={artifact} mapView={props.mapView} retainPayload={processing} onPaint={props.onPreviewPaint} onDebugSummary={setGpuPaintSummary} /> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
+        {authoringOverlaysVisible ? pendingPatchRegions.map(({ region, patchPreview }) => <div key={`assigned-${region.regionId}`} className="assigned-patch-preview" style={gridRectOverlayStyle(region.gridRect!, displayedGrid)}><img src={patchPreview.dataUrl} alt={`Immediate assigned patch preview for ${region.displayName}`} /></div>) : null}
+        {authoringOverlaysVisible && layoutTool === "draw" && hoverSnap && !drawDraft ? <div className="draw-hover-cell" style={gridRectOverlayStyle({ x: hoverSnap.cellX, y: hoverSnap.cellY, width: 1, height: 1 }, displayedGrid)}><div className="draw-snap-crosshair"><span>cell {hoverSnap.cellX}, {hoverSnap.cellY}</span></div></div> : null}
+        {authoringOverlaysVisible && (sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}
+        {authoringOverlaysVisible ? <div className={`overlays ${layoutTool === "draw" ? "drawing" : ""}`}>{displayRegions.map((region) => <button key={region.regionId}
           data-region-id={region.regionId}
           data-selection-surface="atlas"
           aria-label={`${region.displayName}${region.gridRect ? `, x ${region.gridRect.x}, y ${region.gridRect.y}, ${region.gridRect.width} by ${region.gridRect.height}` : ""}`}
@@ -3767,7 +3886,7 @@ function SheetWorkbench(props: {
           style={overlayStyle(region, sheet, viewport.view.scale, regionFillVisible ? 0.2 : 0, regionBordersVisible ? 0.92 : 0)}
           onClick={(event) => { event.stopPropagation(); if (!props.candidatePreviewing && layoutTool !== "draw") props.setSelectedRegionId(region.regionId); }}
           onContextMenu={(event) => { event.preventDefault(); if (props.candidatePreviewing) return; event.stopPropagation(); props.setSelectedRegionId(region.regionId); setLayoutMenu({ regionId: region.regionId, x: Math.min(event.clientX, window.innerWidth - 196), y: Math.min(event.clientY, window.innerHeight - 156) }); }}
-        >{(() => { const behavior = props.project?.document?.regionBindings[region.regionId]?.mapping.behavior ?? region.behavior; return <><span className="region-label">{region.displayName}</span><RegionBehaviorCue behavior={behavior} />{edgeEligibilityVisible ? <span className="edge-eligibility-overlay" aria-label={`Eligible edges: ${Object.entries(behavior.edgeEligibility).filter(([, value]) => value).map(([key]) => key).join(", ") || "none"}`}>{Object.entries(behavior.edgeEligibility).map(([edge, eligible]) => <i key={edge} className={`${edge} ${eligible ? "eligible" : "continuous"}`} />)}</span> : null}</>; })()}{region.regionId === props.selectedRegionId && region.gridRect && layoutTool === "select" && !props.candidatePreviewing ? resizeHandles.map((handle) => <i key={handle} className={`selection-handle ${handle}`} aria-label={`Resize ${handle}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); setResizeDraft({ pointerId: event.pointerId, regionId: region.regionId, handle, origin: region.gridRect!, rect: region.gridRect! }); }} />) : null}</button>)}</div>
+        >{(() => { const behavior = props.project?.document?.regionBindings[region.regionId]?.mapping.behavior ?? region.behavior; return <><span className="region-label">{region.displayName}</span><RegionBehaviorCue behavior={behavior} />{edgeEligibilityVisible ? <span className="edge-eligibility-overlay" aria-label={`Eligible edges: ${Object.entries(behavior.edgeEligibility).filter(([, value]) => value).map(([key]) => key).join(", ") || "none"}`}>{Object.entries(behavior.edgeEligibility).map(([edge, eligible]) => <i key={edge} className={`${edge} ${eligible ? "eligible" : "continuous"}`} />)}</span> : null}</>; })()}{region.regionId === props.selectedRegionId && region.gridRect && layoutTool === "select" && !props.candidatePreviewing ? resizeHandles.map((handle) => <i key={handle} className={`selection-handle ${handle}`} aria-label={`Resize ${handle}`} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); setResizeDraft({ pointerId: event.pointerId, regionId: region.regionId, handle, origin: region.gridRect!, rect: region.gridRect! }); }} />) : null}</button>)}</div> : null}
         {drawRect && drawRect.width > 0 && drawRect.height > 0 ? <div className="draw-region-preview" style={gridRectOverlayStyle(drawRect, displayedGrid)}><span>{drawRect.x}, {drawRect.y} · {drawRect.width} × {drawRect.height}</span></div> : null}
         {resizeTransfers.map((transfer, index) => { const owner = displayRegions.find((region) => region.regionId === transfer.toId); const from = displayRegions.find((region) => region.regionId === transfer.fromId); return <div key={`${transfer.fromId}-${transfer.toId}-${index}`} className={`ownership-transfer ${transfer.toId === resizeDraft?.regionId ? "gained" : "released"}`} style={{ ...gridRectOverlayStyle(transfer.rect, displayedGrid), borderColor: owner ? `rgb(${owner.idColor.join(" ")})` : undefined, backgroundColor: owner ? `rgb(${owner.idColor.join(" ")} / .38)` : undefined }}><span>{from?.displayName ?? "Region"} → {owner?.displayName ?? "Region"}</span></div>; })}
         {resizeDraft && !sameGridRect(resizeDraft.origin, resizeDraft.rect) ? <div className="resize-region-preview" style={gridRectOverlayStyle(resizeDraft.rect, displayedGrid)}><span>{resizeDraft.rect.x}, {resizeDraft.rect.y} / {resizeDraft.rect.width} x {resizeDraft.rect.height}</span></div> : null}
@@ -3798,7 +3917,7 @@ function SheetWorkbench(props: {
     </section>
     <footer className="artifact-footer">
       <PreviewProgressStatus progress={props.previewProgress} elapsedMs={props.previewElapsedMs} />
-      {props.artifact ? <><span>{props.artifact.width} x {props.artifact.height}</span>
+      {processing ? props.artifact ? <><span>{props.artifact.width} × {props.artifact.height}</span><span>{processingMaterialView ? "material" : props.mapView}</span><span>{props.artifact.documentRevision === props.project?.document?.documentRevision ? "Current" : "Updating"}</span></> : <span>No preview rendered</span> : props.artifact ? <><span>{props.artifact.width} x {props.artifact.height}</span>
       <span>{props.artifact.regions.length} regions</span>
       <span>{props.artifact.label}</span>
       <span>incomplete after Stage {props.artifact.incompleteAfterStage} · non-exportable</span>
@@ -3820,13 +3939,16 @@ function PreviewProgressStatus(props: { progress: PreviewProgress | null; elapse
   const elapsed = Math.round((progress.phase === "compiling" ? props.elapsedMs : progress.elapsedMs ?? 0) / 100) / 10;
   const dimensions = progress.dimensions ? ` · ${progress.dimensions.width}×${progress.dimensions.height}` : "";
   const target = progress.targetDimensions ? ` · target ${progress.targetDimensions.width}×${progress.targetDimensions.height}` : "";
+  const superseded = progress.terminalOutcome === "superseded";
   const label = progress.phase === "compiling" ? `Rendering / encoding preview${target} · ${elapsed.toFixed(1)}s`
     : progress.phase === "received" ? `Preview received, decoding${dimensions} · ${elapsed.toFixed(1)}s`
       : progress.phase === "painted" ? `Preview ready${dimensions} · ${elapsed.toFixed(1)}s`
-        : `Preview failed · ${elapsed.toFixed(1)}s`;
-  return <div className={`preview-progress ${progress.phase}`}><span>{label}</span>{progress.phase === "painted"
+        : superseded ? `Preview superseded · ${elapsed.toFixed(1)}s`
+          : `Preview failed · ${elapsed.toFixed(1)}s`;
+  return <div className={`preview-progress ${progress.phase}${superseded ? " superseded" : ""}`}><span>{label}</span>{progress.phase === "painted"
     ? <progress value={1} max={1} aria-label="Preview complete" />
-    : progress.phase === "failed" ? <progress value={0} max={1} aria-label="Preview failed" />
+    : superseded ? <progress value={1} max={1} aria-label="Preview superseded" />
+      : progress.phase === "failed" ? <progress value={0} max={1} aria-label="Preview failed" />
       : <progress aria-label="Preview compiling" />}</div>;
 }
 

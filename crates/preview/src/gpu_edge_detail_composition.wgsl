@@ -6,7 +6,7 @@ struct CompositionHeader {
     tile_x: u32,
     tile_y: u32,
     base_height_is_physical: u32,
-    _pad_u0: u32,
+    inspection_mode: u32,
 };
 
 struct EdgeDetailCommand {
@@ -97,7 +97,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 var composed = mix(linear, fade_rgb, fade);
                 composed = mix(composed, transition_rgb, transition);
                 composed = mix(composed, core_rgb, core);
-                result = vec4<f32>(linear_to_srgb(composed.r), linear_to_srgb(composed.g), linear_to_srgb(composed.b), base.a);
+                if (header.inspection_mode == 1u) {
+                    // Signed linear-light contribution, centered at neutral gray.
+                    result = vec4<f32>(clamp(vec3<f32>(0.5) + (composed - linear) * 0.5, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+                } else {
+                    result = vec4<f32>(linear_to_srgb(composed.r), linear_to_srgb(composed.g), linear_to_srgb(composed.b), base.a);
+                }
             } else if (header.map_kind == 1u || header.map_kind == 2u) {
                 // This is the authoritative signed physical intermediate. Range
                 // conversion belongs only to the separate display publication.
@@ -119,10 +124,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 result = vec4<f32>(physical_height_m);
             } else if (header.map_kind == 3u) {
                 let roughness = clamp(base.r + mask * cmd.roughness_offset, 0.0, 1.0);
-                result = vec4<f32>(roughness);
-            } else if (header.map_kind == 5u && cmd.exposed_metal_enabled != 0u) {
-                let metallic = clamp(base.r + mask * cmd.metallic_offset, 0.0, 1.0);
-                result = vec4<f32>(metallic);
+                result = vec4<f32>(select(roughness, roughness - base.r, header.inspection_mode == 1u));
+            } else if (header.map_kind == 5u) {
+                if (cmd.exposed_metal_enabled != 0u) {
+                    let metallic = clamp(base.r + mask * cmd.metallic_offset, 0.0, 1.0);
+                    result = vec4<f32>(select(metallic, metallic - base.r, header.inspection_mode == 1u));
+                } else if (header.inspection_mode != 0u) {
+                    // The final disabled-metal route remains the untouched base map,
+                    // while its contribution inspection truthfully publishes zero.
+                    result = vec4<f32>(0.0);
+                }
             }
         }
     }

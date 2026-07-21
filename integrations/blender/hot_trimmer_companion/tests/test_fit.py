@@ -40,6 +40,23 @@ class ManifestAndMatchingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "normalized"):
                 load_manifest(path)
 
+    def test_exported_package_directory_resolves_canonical_manifest(self):
+        with tempfile.TemporaryDirectory(suffix=".hottrim") as directory:
+            package = Path(directory)
+            manifest_path = package / "manifest.hottrim.json"
+            manifest_path.write_text((FIXTURES / "behavioral.hottrim.json").read_text(encoding="utf-8"), encoding="utf-8")
+            manifest = load_manifest(package)
+            self.assertEqual(manifest["_manifest_path"], manifest_path.resolve())
+            self.assertEqual(manifest["_package_path"], package.resolve())
+
+    def test_parent_with_one_exported_package_resolves_without_recursive_guessing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            package = parent / "Fixture.hottrim"
+            package.mkdir()
+            (package / "manifest.hottrim.json").write_text((FIXTURES / "behavioral.hottrim.json").read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertEqual(load_manifest(parent)["_package_path"], package.resolve())
+
     def test_rectangular_matching_is_aspect_first_and_slot_id_stable(self):
         descriptor = IslandDescriptor((0.0, 0.0, 2.0, 1.0), 2.0, 2.0, 2.0, "U", True, 0.4)
         ordered = choose_slot(descriptor, reversed(slots(self.manifest)))

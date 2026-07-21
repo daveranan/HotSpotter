@@ -936,9 +936,22 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     );
 
     assert!(output.map_tiles.contains_key(&MaterialMapKind::EdgeMask));
-    for label in ["edge-detail.core", "edge-detail.transition", "edge-detail.fade", "edge-detail.combined", "edge-detail.height"] {
+    for label in ["edge-detail.core", "edge-detail.transition", "edge-detail.fade", "edge-detail.combined", "edge-detail.height",
+        "edge-detail.core.display", "edge-detail.transition.display", "edge-detail.fade.display",
+        "edge-detail.combined.display", "edge-detail.height.display"] {
         assert!(output.intermediate_tiles.contains_key(label), "missing inspectable {label}");
     }
+    let core_pixels = output.intermediate_tiles["edge-detail.core.display"].pixels();
+    let transition_pixels = output.intermediate_tiles["edge-detail.transition.display"].pixels();
+    let fade_pixels = output.intermediate_tiles["edge-detail.fade.display"].pixels();
+    assert!(core_pixels != transition_pixels || transition_pixels != fade_pixels,
+        "Core, Transition, and Fade inspection routes published identical pixels");
+    let inspection_shaders = ["edge-detail.core.display", "edge-detail.transition.display", "edge-detail.fade.display",
+        "edge-detail.combined.display", "edge-detail.height.display"].map(|label| {
+            output.intermediate_tiles[label].manifest.identity.shader_version.clone()
+        });
+    assert_eq!(inspection_shaders.iter().collect::<std::collections::BTreeSet<_>>().len(), 5,
+        "inspection routes did not publish distinct manifest identities");
 
     let edge_mask = output.map_tiles.get(&MaterialMapKind::EdgeMask).unwrap();
     assert_eq!(
@@ -967,7 +980,7 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     assert!(output.telemetry.iter().any(|line| {
         line.contains("requested_map=EdgeMask")
             && line.contains("logical_passes=stage15-sdf,stage15-semantics,edge-detail-masks,publish")
-            && line.contains("executed_gpu_passes=stage15-profile,edge-detail-mvp-v2")
+            && line.contains("executed_gpu_passes=stage15-profile,edge-detail-mvp-v3")
     }));
 
     let authoritative_identity = plan.ordered_regions[0].edge_detail.as_ref().unwrap().cache_identity.0.clone();
@@ -980,7 +993,25 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
         assert!(published.telemetry.iter().any(|line| {
             line.contains("edge_detail_mask_identity=") && line.contains(&authoritative_identity)
         }), "{map:?} did not report the authoritative Edge Detail identity");
+        assert!(published.telemetry.iter().any(|line| {
+            line.contains("edge_detail_execution_evidence=")
+                && line.contains(&format!("requested_map:{map:?}"))
+                && line.contains("stage15_sdf:")
+                && line.contains("cache_outcome:")
+        }), "{map:?} did not report typed Edge Detail execution evidence: {:#?}", published.telemetry);
         publications.insert(map, published);
+    }
+    for (map, label) in [
+        (MaterialMapKind::BaseColor, "edge-detail.base-color-contribution.display"),
+        (MaterialMapKind::Roughness, "edge-detail.roughness-contribution.display"),
+        (MaterialMapKind::Metallic, "edge-detail.metallic-contribution.display"),
+    ] {
+        let tile = publications[&map].intermediate_tiles.get(label)
+            .unwrap_or_else(|| panic!("{map:?} contribution inspection tile was not published"));
+        assert_eq!(tile.manifest.pixel_format,
+            hot_trimmer_sheet_compiler::CompiledTilePixelFormat::Rgba8UnormLinear);
+        assert_ne!(tile.manifest.identity.shader_version,
+            publications[&map].interactive_tile.manifest.identity.shader_version);
     }
 
     let final_height = publications[&MaterialMapKind::Height].map_tiles[&MaterialMapKind::Height].pixels();
@@ -1050,7 +1081,7 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
         let without_intent = execute_edge_detail_map(&disabled, &domain, map);
         let disabled_output = execute_edge_detail_map(&disabled_intent, &domain, map);
         assert_eq!(disabled_output.map_tiles[&map].pixels(), without_intent.map_tiles[&map].pixels(), "disabled Edge Detail changed {map:?}");
-        assert!(disabled_output.telemetry.iter().all(|line| !line.contains("edge-detail-composition-v2") && !line.contains("edge-detail-mvp-v2")), "disabled Edge Detail dispatched work for {map:?}: {:#?}", disabled_output.telemetry);
+        assert!(disabled_output.telemetry.iter().all(|line| !line.contains("edge-detail-composition-v2") && !line.contains("edge-detail-mvp-v3")), "disabled Edge Detail dispatched work for {map:?}: {:#?}", disabled_output.telemetry);
     }
 
     let zero_intensity = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
@@ -1138,6 +1169,13 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
         &normal_request,
         prepared_sources_for_plan(&normal_request, Arc::clone(&domain)),
         &cache,
+    );
+    assert!(
+        cached_normal.telemetry.iter().any(|line| {
+            line.contains("intermediate_cache=final-height:persistent-gpu-resource-hit")
+        }),
+        "cached Normal fixture did not exercise the persistent final-Height cache path: {:#?}",
+        cached_normal.telemetry,
     );
     let fresh_normal = execute_final_atlas(
         &normal_request,

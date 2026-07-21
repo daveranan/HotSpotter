@@ -1,6 +1,7 @@
 import type {
   CompiledMapView,
   EdgeDetailIntentV1,
+  EdgeDetailInspectionField,
   FeedbackComparisonMode,
   FeedbackContributionView,
   FeedbackDetailIntent,
@@ -15,16 +16,64 @@ import type {
 const finiteOr = (value: number, fallback: number) => Number.isFinite(value) ? value : fallback;
 const clamp = (value: number, minimum: number, maximum: number) => Math.min(maximum, Math.max(minimum, value));
 
+const SOFT_WORN_EDGE = Object.freeze({
+  wearAmount: 0.5, intensity: 0.72, edgeWidthM: 0.006, bevelRadiusM: 0.004,
+  edgeSoftness: 0.2, breakupAmount: 0.78, breakupScaleM: 0.012,
+  microDetailAmount: 0.35, microDetailScaleM: 0.0015, seed: 201516,
+  sourceHeightInfluence: 0.55, sourceLuminanceInfluence: 0.16,
+  heightAmplitudeM: -0.0008, normalDetailStrength: 1.1, hueShiftDegrees: 0,
+  saturationMultiplier: 0.96, valueMultiplier: 1.03, roughnessOffset: 0.1,
+  exposedMetalEnabled: false, metallicOffset: 0,
+} satisfies Partial<EdgeDetailIntentV1>);
+
+export const EDGE_DETAIL_PRESETS = Object.freeze({
+  "Soft Worn Edge": SOFT_WORN_EDGE,
+  "Chipped Paint": {
+    ...SOFT_WORN_EDGE,
+    wearAmount: 0.72, intensity: 0.92, edgeWidthM: 0.003, bevelRadiusM: 0.0014,
+    edgeSoftness: 0.18, breakupAmount: 0.9, breakupScaleM: 0.012,
+    microDetailAmount: 0.6, microDetailScaleM: 0.0012, heightAmplitudeM: -0.00055,
+    saturationMultiplier: 0.82, valueMultiplier: 1.06, roughnessOffset: 0.22,
+  },
+  "Heavy Erosion": {
+    ...SOFT_WORN_EDGE,
+    wearAmount: 0.9, intensity: 1, edgeWidthM: 0.008, bevelRadiusM: 0.0045,
+    edgeSoftness: 0.52, breakupAmount: 0.82, breakupScaleM: 0.02,
+    microDetailAmount: 0.72, microDetailScaleM: 0.0035, heightAmplitudeM: -0.0012,
+    sourceHeightInfluence: 0.8, saturationMultiplier: 0.9, valueMultiplier: 0.88, roughnessOffset: 0.34,
+  },
+  "Clean Bevel": {
+    ...SOFT_WORN_EDGE,
+    wearAmount: 1, intensity: 0.72, edgeWidthM: 0.003, bevelRadiusM: 0.003,
+    edgeSoftness: 0.2, breakupAmount: 0, microDetailAmount: 0,
+    sourceHeightInfluence: 0, sourceLuminanceInfluence: 0, heightAmplitudeM: 0.0003,
+    saturationMultiplier: 1, valueMultiplier: 1.04, roughnessOffset: 0.04,
+  },
+} satisfies Readonly<Record<string, Partial<EdgeDetailIntentV1>>>);
+
+export type EdgeDetailPresetName = keyof typeof EDGE_DETAIL_PRESETS;
+export type EdgeDetailPresetSelection = EdgeDetailPresetName | "Custom";
+
+const presetFields = Object.keys(SOFT_WORN_EDGE) as readonly (keyof typeof SOFT_WORN_EDGE)[];
+
+export function edgeDetailPresetForIntent(intent: EdgeDetailIntentV1): EdgeDetailPresetSelection {
+  for (const name of Object.keys(EDGE_DETAIL_PRESETS) as EdgeDetailPresetName[]) {
+    const preset = EDGE_DETAIL_PRESETS[name];
+    if (presetFields.every((field) => intent[field] === preset[field])) return name;
+  }
+  return "Custom";
+}
+
+export function edgeDetailIntentFromPreset(
+  name: EdgeDetailPresetName,
+  current: EdgeDetailIntentV1,
+): EdgeDetailIntentV1 {
+  return sanitizeEdgeDetailIntent({ ...current, ...EDGE_DETAIL_PRESETS[name] });
+}
+
 export function sanitizeEdgeDetailIntent(intent: EdgeDetailIntentV1): EdgeDetailIntentV1 {
   const defaults: EdgeDetailIntentV1 = {
-    schemaVersion: 1, enabled: true, wearAmount: 0.55, intensity: 0.8,
-    edgeWidthM: 0.004, bevelRadiusM: 0.0025, edgeSoftness: 0.3,
-    breakupAmount: 0.7, breakupScaleM: 0.012, microDetailAmount: 0.25,
-    microDetailScaleM: 0.002, seed: 201516, sourceHeightInfluence: 0.65,
-    sourceLuminanceInfluence: 0.2, heightAmplitudeM: -0.00035,
-    normalDetailStrength: 1, hueShiftDegrees: 0, saturationMultiplier: 0.55,
-    valueMultiplier: 1.12, roughnessOffset: 0.18, exposedMetalEnabled: false,
-    metallicOffset: 0,
+    schemaVersion: 1, enabled: true, ...SOFT_WORN_EDGE,
   };
   const exposedMetalEnabled = !!intent.exposedMetalEnabled;
   return {
@@ -60,6 +109,16 @@ export const FEEDBACK_COMMAND_VERSION = 1 as const;
 export const STAGE_15_20_DEBUG_SCHEMA_VERSION = 1 as const;
 
 export const contributionDependencies: Readonly<Record<FeedbackContributionView, CompiledMapView | null>> = {
+  edgeDetailCoreMask: "edgeMask",
+  edgeDetailTransitionMask: "edgeMask",
+  edgeDetailFadeMask: "edgeMask",
+  edgeDetailCombinedMask: "edgeMask",
+  edgeDetailHeightContribution: "height",
+  edgeDetailFinalHeight: "height",
+  edgeDetailFinalNormal: "normal",
+  edgeDetailBaseColorContribution: "baseColor",
+  edgeDetailRoughnessContribution: "roughness",
+  edgeDetailMetallicContribution: "metallic",
   stage15Occupancy: "ambientOcclusion",
   stage15Height: "height",
   stage15ProfileRoute: null,
@@ -83,6 +142,22 @@ export const contributionDependencies: Readonly<Record<FeedbackContributionView,
 
 export function visibleMapDependency(view: FeedbackContributionView): CompiledMapView | null {
   return contributionDependencies[view];
+}
+
+export function edgeDetailInspectionForView(view: FeedbackContributionView): EdgeDetailInspectionField | null {
+  switch (view) {
+    case "edgeDetailCoreMask": return "coreMask";
+    case "edgeDetailTransitionMask": return "transitionMask";
+    case "edgeDetailFadeMask": return "fadeMask";
+    case "edgeDetailCombinedMask": return "combinedMask";
+    case "edgeDetailHeightContribution": return "heightContribution";
+    case "edgeDetailFinalHeight": return "finalHeight";
+    case "edgeDetailFinalNormal": return "finalNormal";
+    case "edgeDetailBaseColorContribution": return "baseColorContribution";
+    case "edgeDetailRoughnessContribution": return "roughnessContribution";
+    case "edgeDetailMetallicContribution": return "metallicContribution";
+    default: return null;
+  }
 }
 
 export function sourceFrameMaterialMapForCompiledView(view: CompiledMapView): SourceFramePreviewMaterialMap {
@@ -188,6 +263,10 @@ export function feedbackExecutionMatchesRequest(
     && (execution.selectedOperationId ?? null) === request.selectedOperationId;
 }
 
+export function feedbackRequestIsCurrent(requestGeneration: number, currentGeneration: number): boolean {
+  return requestGeneration === currentGeneration;
+}
+
 export function feedbackEvidenceForRequest<T extends { manifest: { generation: number } }>(
   request: FeedbackPixelRequestIdentity | null,
   execution: FeedbackPreviewExecution | null | undefined,
@@ -229,8 +308,7 @@ export function feedbackViewAfterCommand(
   command: FeedbackWorkbenchCommand,
   currentView: FeedbackContributionView,
 ): FeedbackContributionView {
-  // ED-2 publishes the combined mask and signed Height; ED-3 owns final composition.
-  return command.type === "set_edge_detail" ? "stage16RegisteredMask" : currentView;
+  return command.type === "set_edge_detail" ? "edgeDetailCombinedMask" : currentView;
 }
 
 export function updateFeedbackOperationIntent(
