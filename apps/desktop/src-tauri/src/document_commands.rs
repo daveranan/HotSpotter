@@ -4647,26 +4647,44 @@ fn native_export_slot_manifest(
             kind: if is_radial {
                 UvFitKind::Radial
             } else {
-                UvFitKind::Rectangular
+                match region.uv_fit.kind {
+                    hot_trimmer_domain::UvFitKind::Rectangular => UvFitKind::Rectangular,
+                    hot_trimmer_domain::UvFitKind::Radial => UvFitKind::Radial,
+                    hot_trimmer_domain::UvFitKind::Strip
+                    | hot_trimmer_domain::UvFitKind::Unique
+                    | hot_trimmer_domain::UvFitKind::Cap => UvFitKind::Rectangular,
+                }
             },
             fit_axis: if is_radial {
                 FitAxis::None
             } else {
-                FitAxis::Automatic
+                match region.uv_fit.fit_axis {
+                    hot_trimmer_domain::FitAxis::Automatic => FitAxis::Automatic,
+                    hot_trimmer_domain::FitAxis::None => FitAxis::None,
+                    hot_trimmer_domain::FitAxis::Horizontal
+                    | hot_trimmer_domain::FitAxis::Vertical => FitAxis::Automatic,
+                }
             },
-            keep_proportion: true,
+            keep_proportion: region.uv_fit.keep_proportion,
             allowed_rotations: if is_radial {
                 vec![0]
             } else {
-                vec![0, 90, 180, 270]
+                region
+                    .uv_fit
+                    .allowed_rotations
+                    .iter()
+                    .map(|rotation| match rotation {
+                        hot_trimmer_domain::QuarterTurn::Zero => 0,
+                        hot_trimmer_domain::QuarterTurn::Ninety => 90,
+                        hot_trimmer_domain::QuarterTurn::OneEighty => 180,
+                        hot_trimmer_domain::QuarterTurn::TwoSeventy => 270,
+                    })
+                    .collect()
             },
-            mirror_allowed: !is_radial,
-            classification_tags: vec![format!("{:?}", region.structural_profile)],
+            mirror_allowed: !is_radial && region.uv_fit.mirror_allowed,
+            classification_tags: region.uv_fit.classification_tags.clone(),
         },
-        world_size_meters: [
-            f64::from(region.allocation_rect.width),
-            f64::from(region.allocation_rect.height),
-        ],
+        world_size_meters: region.uv_fit.world_size_meters,
         variation_group: region.material_group.clone(),
         enabled: region.enabled,
         region_id_color: region.id_color.0,
@@ -7005,6 +7023,11 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         );
         let radial_region = document.topology.regions[0].id;
         let loop_region = document.topology.regions[1].id;
+        document.topology.regions[1].uv_fit.world_size_meters = [2.5, 0.25];
+        document.topology.regions[1].uv_fit.classification_tags =
+            vec!["AUTHORED_LAYOUT".into(), "STRIP".into()];
+        document.topology.regions[1].uv_fit.allowed_rotations =
+            vec![QuarterTurn::Zero, QuarterTurn::OneEighty];
         let mut radial = RegionBehavior::new(ManualRegionRole::Radial);
         radial.radial.as_mut().unwrap().center_x = 0.25;
         radial.radial.as_mut().unwrap().center_y = 0.75;
@@ -7051,6 +7074,12 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         assert_eq!(loop_slot.sampling.as_deref(), Some("loop_xy"));
         assert_eq!(loop_slot.repeat_period_pixels, Some([7, 11]));
         assert_eq!(loop_slot.orientation.as_deref(), Some("ninety"));
+        assert_eq!(loop_slot.world_size_meters, [2.5, 0.25]);
+        assert_eq!(
+            loop_slot.uv_fit.classification_tags,
+            ["AUTHORED_LAYOUT", "STRIP"]
+        );
+        assert_eq!(loop_slot.uv_fit.allowed_rotations, [0, 180]);
         fs::remove_dir_all(root).unwrap();
     }
 

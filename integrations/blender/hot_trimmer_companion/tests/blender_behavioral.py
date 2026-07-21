@@ -1,6 +1,5 @@
 """Real headless-Blender acceptance fixture for Prompt 20B."""
 
-import base64
 import json
 import math
 from pathlib import Path
@@ -8,6 +7,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import zlib
 
 import bmesh
 import bpy
@@ -21,7 +21,16 @@ sys.path.insert(0, str(INTEGRATIONS))
 import hot_trimmer_companion
 
 
-PNG_1X1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3pAAAAAASUVORK5CYII=")
+def png_chunk(kind, payload):
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+
+PNG_1X1 = (
+    b"\x89PNG\r\n\x1a\n"
+    + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    + png_chunk(b"IDAT", zlib.compress(b"\x00\x80\x80\x80\xff"))
+    + png_chunk(b"IEND", b"")
+)
 ROLE_FILES = {
     "baseColor": ("Base Color", "base-color.png", "sRGB"),
     "roughness": ("Roughness", "roughness.png", "Non-Color"),
@@ -178,6 +187,8 @@ def run():
         require(tuple(face.select for face in bm.faces) == selected_faces_before, "face selection was not preserved")
         bpy.ops.object.mode_set(mode="OBJECT")
         assignments = json.loads(mesh["ht_assignments"])
+        require(all(record.get("algorithmVersion") == 2 for record in assignments.values()), "assignment algorithm version was not persisted")
+        require(all(record.get("templateSnapshotHash") == "fixture-snapshot-hash" for record in assignments.values()), "assignment template snapshot was not persisted")
         require(assignments["0"]["slotId"] == "rect_wide", "wide island did not choose expected manifest slot")
         require(assignments["1"]["slotId"] == "rect_tall", "tall island did not choose expected manifest slot")
         material_index = next(index for index, candidate in enumerate(mesh.materials) if candidate == material)
@@ -206,6 +217,33 @@ def run():
         bpy.ops.object.mode_set(mode="OBJECT")
         require(uv_bytes(mesh) == first_uv_bytes, "second identical run was not byte-stable")
         require(mesh["ht_assignments"] == first_assignments, "second identical assignment was not stable")
+
+        stale = json.loads(mesh["ht_assignments"])
+        for record in stale.values():
+            record["algorithmVersion"] = 1
+        mesh["ht_assignments"] = json.dumps(stale, sort_keys=True, separators=(",", ":"))
+        for face_index in (0, 1):
+            polygon = mesh.polygons[face_index]
+            coordinates = [tuple(mesh.uv_layers.active.data[index].uv) for index in polygon.loop_indices]
+            center = tuple(sum(point[axis] for point in coordinates) / len(coordinates) for axis in (0, 1))
+            for loop_index, point in zip(polygon.loop_indices, coordinates):
+                mesh.uv_layers.active.data[loop_index].uv = (
+                    center[0] + (point[0] - center[0]) * 0.1,
+                    center[1] + (point[1] - center[1]) * 0.1,
+                )
+        stale_uv_bytes = uv_bytes(mesh)
+        bpy.ops.object.mode_set(mode="EDIT")
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+        for face in bm.faces:
+            face.select_set(face.index < 2)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        result = bpy.ops.hottrimmer.fit_selected(classification="AUTO")
+        require(result == {"FINISHED"}, "stale rectangular assignment was not rebuilt")
+        require(rect.mode == "EDIT", "stale assignment rebuild did not preserve edit mode")
+        bpy.ops.object.mode_set(mode="OBJECT")
+        require(uv_bytes(mesh) != stale_uv_bytes, "stale rectangular assignment reused its shrunken UV footprint")
+        require(all(record.get("algorithmVersion") == 2 for record in json.loads(mesh["ht_assignments"]).values()), "stale assignment version was not replaced")
 
         for obj in bpy.context.selected_objects:
             obj.select_set(False)
@@ -243,6 +281,7 @@ def run():
         require(uv_bytes(radial.data) != radial_before, "radial operator did not author final UVs")
 
         saved_rect_uvs = uv_bytes(mesh)
+        saved_rect_assignments = mesh["ht_assignments"]
         saved_radial_uvs = uv_bytes(radial.data)
         blend_path = temp / "prompt-20b.blend"
         bpy.ops.wm.save_as_mainfile(filepath=str(blend_path))
@@ -250,7 +289,7 @@ def run():
         mesh = bpy.data.meshes["HT Rectangular Fixture Mesh"]
         radial_mesh = bpy.data.meshes["HT Radial Fixture Mesh"]
         require(uv_bytes(mesh) == saved_rect_uvs and uv_bytes(radial_mesh) == saved_radial_uvs, "UVs did not survive save/reopen")
-        require(json.loads(mesh["ht_assignments"])["0"]["slotId"] == "rect_wide", "assignment metadata did not survive save/reopen")
+        require(mesh["ht_assignments"] == saved_rect_assignments, "assignment metadata did not survive save/reopen")
         require(json.loads(radial_mesh["ht_assignments"])["0"]["classification"] == "radial", "radial classification did not survive save/reopen")
 
         material = bpy.data.materials["Hot Trimmer Fixture"]

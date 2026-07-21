@@ -30,6 +30,8 @@ CLASSIFICATION_ITEMS = (
     ("RADIAL", "Radial", "Use only radial hotspots for an already circular UV island"),
 )
 
+ASSIGNMENT_ALGORITHM_VERSION = 2
+
 
 def _result(context, message):
     context.scene["ht_last_result"] = message
@@ -146,7 +148,16 @@ def _assignment_map(mesh):
     return value if isinstance(value, dict) else {}
 
 
-def _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, compatibility_key):
+def _assignment_is_current(record, manifest):
+    return (
+        isinstance(record, dict)
+        and record.get("compatibilityKey") == manifest["compatibilityKey"]
+        and record.get("templateSnapshotHash") == manifest["templateSnapshotHash"]
+        and record.get("algorithmVersion") == ASSIGNMENT_ALGORITHM_VERSION
+    )
+
+
+def _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, manifest):
     mesh = obj.data
     points = []
     uv_area = 0.0
@@ -177,7 +188,14 @@ def _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, compa
                 boundary_degrees[(vertex_index, round(uv[0], 7), round(uv[1], 7))] = boundary_degrees.get((vertex_index, round(uv[0], 7), round(uv[1], 7)), 0) + 1
     boundary_closed = bool(boundary_degrees) and all(degree == 2 for degree in boundary_degrees.values())
     records = [assignments.get(str(face_index)) for face_index in island]
-    existing = records[0] if records and records[0] and all(record == records[0] for record in records) and records[0].get("compatibilityKey") == compatibility_key else None
+    existing = (
+        records[0]
+        if records
+        and records[0]
+        and all(record == records[0] for record in records)
+        and _assignment_is_current(records[0], manifest)
+        else None
+    )
     return IslandDescriptor(
         uv_bounds=uv_bounds,
         uv_aspect=width / height,
@@ -421,11 +439,18 @@ class HOTTRIM_OT_fit_selected(Operator):
             for obj, face_indices in targets.items():
                 mesh = obj.data
                 uv_layer = mesh.uv_layers.active
+                prior_assignments = _assignment_map(mesh)
+                stale_rectangular_assignment = any(
+                    (record := prior_assignments.get(str(face_index)))
+                    and record.get("classification") != "radial"
+                    and not _assignment_is_current(record, manifest)
+                    for face_index in face_indices
+                )
                 if classification == "RADIAL" and not _has_usable_uvs(mesh, uv_layer, face_indices):
                     raise ValueError(f"{obj.name}: unsupported radial topology")
                 if uv_layer is None:
                     uv_layer = mesh.uv_layers.new(name="HotTrimmerUV")
-                if not _has_usable_uvs(mesh, uv_layer, face_indices):
+                if stale_rectangular_assignment or not _has_usable_uvs(mesh, uv_layer, face_indices):
                     _unwrap_object(context, obj, face_indices)
                     uv_layer = mesh.uv_layers.active
                     if not _has_usable_uvs(mesh, uv_layer, face_indices):
@@ -441,7 +466,7 @@ class HOTTRIM_OT_fit_selected(Operator):
                 assignments = _assignment_map(mesh)
                 islands, edge_faces, adjacency = _form_islands(mesh, uv_layer, face_indices)
                 for island in islands:
-                    descriptor, existing = _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, manifest["compatibilityKey"])
+                    descriptor, existing = _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, manifest)
                     points = [tuple(uv_layer.data[loop_index].uv) for face_index in island for loop_index in mesh.polygons[face_index].loop_indices]
                     if existing:
                         assigned_slot = next((slot for slot in slots(manifest) if slot.slot_id == existing.get("slotId") and slot.enabled), None)
@@ -462,6 +487,8 @@ class HOTTRIM_OT_fit_selected(Operator):
                         "mirror": match.mirror,
                         "classification": match.classification,
                         "compatibilityKey": manifest["compatibilityKey"],
+                        "templateSnapshotHash": manifest["templateSnapshotHash"],
+                        "algorithmVersion": ASSIGNMENT_ALGORITHM_VERSION,
                     }
                     plans.append((obj, island, match, fitted, record))
 
@@ -509,7 +536,7 @@ class HOTTRIM_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Add-on 0.2.7")
+        layout.label(text="Add-on 0.2.8")
         layout.operator(HOTTRIM_OT_import_package.bl_idname, text="Import Package", icon="FILE_FOLDER")
         path = context.scene.get("ht_manifest_path")
         if path:

@@ -65,6 +65,17 @@ class ManifestAndMatchingTests(unittest.TestCase):
         repeated = choose_slot(descriptor, slots(self.manifest))
         self.assertEqual((ordered.slot.slot_id, ordered.rotation), (repeated.slot.slot_id, repeated.rotation))
 
+    def test_equal_aspect_matching_uses_normalized_island_area_before_world_area(self):
+        rectangular = list(slots(self.manifest)[:2])
+        wide, tall = rectangular
+        # Make two equal-aspect candidates whose legacy physical sizes would
+        # otherwise force selection of the smaller rectangle.
+        object.__setattr__(tall, "normalized_hotspot_rect", {"x": 0.55, "y": 0.05, "width": 0.2, "height": 0.1})
+        object.__setattr__(tall, "world_size_meters", (0.01, 0.005))
+        descriptor = IslandDescriptor((0.0, 0.0, 0.4, 0.2), 2.0, 0.08, 0.00005, "U", True, 0.4)
+        match = choose_slot(descriptor, reversed(rectangular), "RECTANGULAR")
+        self.assertEqual(match.slot.slot_id, wide.slot_id)
+
     def test_rectangular_transform_is_uniform_and_bounded(self):
         descriptor = IslandDescriptor((0.0, 0.0, 2.0, 1.0), 2.0, 2.0, 2.0, "U", True, 0.4)
         match = choose_slot(descriptor, slots(self.manifest))

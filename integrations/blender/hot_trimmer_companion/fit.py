@@ -112,12 +112,19 @@ def choose_slot(descriptor, available_slots, override="AUTO", requested_slot_id=
     for slot in candidates:
         rect = slot.normalized_hotspot_rect
         target_aspect = rect["width"] / rect["height"]
+        target_uv_area = rect["width"] * rect["height"]
         target_world_area = slot.world_size_meters[0] * slot.world_size_meters[1]
         for rotation in slot.allowed_rotations:
             effective_aspect = target_aspect if rotation % 180 == 0 else 1.0 / target_aspect
             aspect_cost = abs(math.log(max(descriptor.uv_aspect, EPSILON) / max(effective_aspect, EPSILON)))
+            uv_area_cost = abs(math.log(max(descriptor.uv_area, EPSILON) / max(target_uv_area, EPSILON)))
             world_cost = abs(math.log(max(descriptor.world_area, EPSILON) / max(target_world_area, EPSILON)))
-            scored.append(((aspect_cost, world_cost, slot.slot_id, rotation), slot, rotation))
+            # Shape is the primary compatibility signal.  For equally shaped
+            # atlas regions, match the island's current normalized footprint
+            # before consulting authored physical scale.  This prevents a
+            # malformed or legacy world-size value from forcing every island
+            # into the smallest same-aspect trim cell.
+            scored.append(((aspect_cost, uv_area_cost, world_cost, slot.slot_id, rotation), slot, rotation))
     _, selected, rotation = min(scored, key=lambda item: item[0])
     return Match(selected, rotation, False, classification)
 

@@ -251,7 +251,10 @@ test("mvp-edge-wear Processing switches retained map publications, keeps the pri
   assert.match(shell, /Preview superseded/);
   assert.match(shell, /supersessionRetry === 0/);
   assert.match(shell, /window\.setTimeout\(resolve, 180\)/);
-  assert.match(shell, /return requestPreview\(regionId, projection, profile, latestRevision, scheduleRefinement, true, requestedMapView, 1\)/);
+  assert.match(shell, /if \(draftId !== previewDraftId\.current\)/);
+  assert.match(shell, /pendingAutomaticPreviewKey\.current === latestKey/);
+  assert.match(shell, /const settledRevision = Math\.max\(/);
+  assert.match(shell, /return requestPreview\(regionId, projection, profile, settledRevision, scheduleRefinement, true, requestedMapView, 1\)/);
   assert.match(shell, /projectRef\.current = result\.project/);
   assert.match(shell, /Math\.max\(requestedRevision, observedRevision\)/);
   assert.match(shell, /onRender=\{\(\) => void renderFullResolutionPreview\(\)\}/);

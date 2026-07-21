@@ -1406,7 +1406,22 @@ function App() {
           // service first. The one replacement below then owns the settled burst
           // instead of being immediately superseded by that queued work.
           await new Promise<void>((resolve) => window.setTimeout(resolve, 180));
-          return requestPreview(regionId, projection, profile, latestRevision, scheduleRefinement, true, requestedMapView, 1);
+          // A command may have started its authoritative replacement during the
+          // handoff delay. Never let this older recovery retry cancel that work.
+          if (draftId !== previewDraftId.current) {
+            if (pendingAutomaticPreviewKey.current === latestKey) pendingAutomaticPreviewKey.current = null;
+            return;
+          }
+          const settledRevision = Math.max(
+            latestRevision,
+            projectRef.current?.document?.documentRevision ?? latestRevision,
+          );
+          pendingAutomaticPreviewKey.current = automaticPreviewKey(
+            settledRevision,
+            profile,
+            processingOpen ? "materialSet" : requestedMapView,
+          );
+          return requestPreview(regionId, projection, profile, settledRevision, scheduleRefinement, true, requestedMapView, 1);
         }
       }
     }
