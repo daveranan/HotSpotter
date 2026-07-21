@@ -117,6 +117,16 @@ impl GpuAtlasRenderedTile {
         Arc::clone(&self.pixels)
     }
 
+    /// Rebinds cache-reused pixels to the current native publication generation.
+    /// Pixel identity and payload remain unchanged; only cancellation/publication
+    /// lineage and the cache-owned opaque handle are refreshed.
+    #[must_use]
+    pub fn for_publication_generation(&self, generation: u64) -> Self {
+        let mut identity = self.manifest.identity.clone();
+        identity.generation = generation;
+        self.with_publication_identity(identity, generation)
+    }
+
     #[must_use]
     fn with_publication_identity(
         &self,

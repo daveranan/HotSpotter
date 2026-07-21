@@ -1514,6 +1514,12 @@ Scope — previews and QA:
 - Support 1K/2K/4K/8K review, before/after and selected-operation isolation, cache-hit visibility, and a clear distinction
   among current, compiling, cancelled, superseded, failed, missing-asset, deferred-only, and skipped-because-unused
   states. Never publish a stale generation as current.
+- Keep hotspot/region selection independent from the active contribution/QA map and source-inspector channel. Selecting
+  a region changes only selection overlays and inspector metadata: it must preserve the current map, must not force Base
+  Color/Diffuse, and must schedule zero compile, render, upload, publication, or readback work.
+- Retain current published contribution/QA tiles by exact document revision, preview profile, map/view, tile, halo,
+  format, and generation identity. Switching back to an already-current view reuses its publication immediately;
+  selection overlays do not invalidate pixel artifacts.
 - Show Stages 18, 17, 19, and final 20 as explicit NotInstalled/Unavailable stages in this early workbench. Do not add
   guessed weathering, PBR composition, finishing, final-material, export, or Blender behavior to fill those gaps.
 
@@ -1569,6 +1575,9 @@ Acceptance:
   cancellations, and superseded generations are visible typed states rather than blank previews or silent success.
 - Repeating an identical visible request reports cache reuse and zero avoidable stamp upload/dispatch work. Unrequested
   Stage 15/16 contribution and QA passes dispatch zero work.
+- A region remains selected while switching among all installed contribution/QA maps. Clicking a region in Normal,
+  Height, mask, scalar, color, or ID view never switches to Diffuse and produces no preview request; returning to a
+  current cached view performs no compiler/GPU work.
 - The copied Stage 15-20 payload is available on success and failure, is deterministic apart from explicitly identified
   timings/runtime adapter data, contains enough identities and route evidence to reproduce the selected view, marks
   unfinished stages NotInstalled, and contains no source pixels, encoded assets, secrets, or absolute user paths.
@@ -1584,6 +1593,8 @@ Stop conditions:
   coordinates as physical authority.
 - Stop if a QA/preview image is computed in React/TypeScript or on the production CPU instead of requested through the
   accepted GPU tile path.
+- Stop if selecting a region changes the active map/source channel, clears a current publication, or triggers compiler/
+  GPU work.
 - Stop if telemetry requires SQL/log-file inspection, omits exact stage availability/cache/error state, leaks source
   pixels or private paths, or cannot be copied from a failed preview.
 - Stop if Prompt 20A replaces the existing source-first shell or creates a renderer, cache, exporter, or debug schema
@@ -1847,6 +1858,81 @@ Scope — desktop workflow:
   grooves, lips, seams, relief, and shading detail, but Hot Trimmer must never claim an atlas-allocation border has
   physically beveled the mesh.
 
+Scope — persistent selection and per-region PBR controls:
+- Preserve hotspot/region selection across Base Color, Height, Normal, Roughness, Metallic, AO, Specular, Opacity,
+  Edge Mask, Region ID, Material ID, every QA view, and compatible 3D previews. Selecting a region must never change the
+  active map, force Diffuse/Base Color, change the selected source channel, or schedule compiler/GPU work.
+- Keep current map/QA publications cached by exact document revision, preview profile, map/view, tile, halo, format,
+  generation, and dependency identity. Switching to an already-current view is immediate; keep the last valid pixels
+  pinned while a genuinely stale dependency refines. Selection and inspector navigation are overlay/metadata changes,
+  not appearance invalidations.
+- Define a typed, versioned per-region PBR tuning intent with material-level defaults plus explicit inherit/override/
+  reset behavior. Persist it through normal document commands with undo/redo and show provenance for every effective
+  value. The frontend does not edit pixels or derive final map values.
+- Expose physical Height amplitude/scale in meaningful units; generated-from-Height normal influence; imported-normal
+  influence; Stage 16 detail-normal influence; Roughness estimated base/bias/range; AO/cavity strength and physical
+  radii; opacity where legal; and explicit material class/Material-ID-driven metal intent. Use bounded material-class
+  ranges and visible validation/fallback diagnostics.
+- A friendly "Generated normal strength" control may drive the typed physical Height/derivative contribution, but it
+  must not multiply encoded normal RGB. Imported and authored normal contributions use vector-correct composition and
+  retain their convention. Show which part of the final normal came from Height, imported normals, details, and effects.
+- Expose Stage 17's "Generate missing maps" policy per material and optionally per region. Prefer imported registered
+  maps; otherwise allow the installed classical or local learned route for Height, Normal, and Roughness with explicit
+  Estimated provenance, provider/version, confidence, range, and fallback. Generate AO/cavity from physical Height.
+- Never infer Metallic merely from Base Color. Metallic remains zero unless imported, explicitly classified/labeled,
+  selected by an exact Material ID rule, or changed by a legal exposed-metal effect. Make this restriction visible in
+  the UI instead of presenting a misleading generic metallic-generation slider.
+- Invalidate only the affected region and exact dependent maps: Height tuning may invalidate Height, generated Normal,
+  and AO; imported/detail normal influence invalidates Normal only; Roughness tuning invalidates Roughness only; an
+  explicit metal rule invalidates Metallic and its true dependents. Unrelated maps, regions, plans, and tiles remain
+  reusable.
+
+Scope — packed scalar-map import and channel extraction:
+- Define typed, versioned `PackedChannelLayout`, `PackedChannelBinding`, and `ChannelSwizzle` contracts for immutable
+  packed source containers. Include named ARM/ORM (R=AO/Occlusion, G=Roughness, B=Metallic), RMA, and MRA presets plus a
+  custom R/G/B/A mapping. Provider naming is a hint only; always show the resolved component mapping before commit.
+- Make packed-map expansion part of the normal `Add maps...` file-picker and drag/drop workflow, not a separate advanced
+  tool and not three manual slot assignments. Recognize common filename/provider labels such as ARM, ORM,
+  AO-Rough-Metal, OcclusionRoughnessMetallic, RMA, and MRA; group the packed file with the selected material set; and
+  pre-populate every semantic child channel from the matching preset.
+- For a confidently recognized ARM/ORM file, one `Add maps...` action must propose R=AO, G=Roughness, and B=Metallic and
+  register all three together after one compact confirmation. The reviewer may inspect or correct the mapping, but must
+  not click AO, Roughness, and Metallic slots individually. Remember an explicit provider/layout choice for subsequent
+  imports without overriding contradictory filenames or metadata.
+- Commit packed-source storage plus all accepted semantic bindings as one validated atomic project command and one undo/
+  redo step. A failure in any requested binding publishes none of them; cancellation never leaves a partially populated
+  material set.
+- Let each component map to a legal linear scalar/mask semantic such as AO, Roughness, Metallic, Height, Specular,
+  Opacity, or Edge Mask, or be ignored/filled by an explicit constant. Support an explicit invert transform for
+  Smoothness/Glossiness-to-Roughness and display the resulting semantic preview. Do not reinterpret packed components
+  as Base Color, tangent normals, or categorical IDs through this generic scalar path.
+- Store or reference the encoded packed asset once under its immutable digest. Register semantic child views that point
+  to the same source asset, component, transform, orientation, dimensions, and registration identity; do not duplicate
+  encoded files or make users extract separate images. Decode/upload once through the accepted image/GPU source cache
+  and expose independent semantic channels to downstream stages.
+- Treat the packed file as an input container, never as internal material truth. After registration, Stage 14-20 plans
+  consume separate typed AO/Roughness/Metallic/etc. channel views with shared correspondence. Packed RGB order must not
+  leak into shaders, PBR composition, QA, manifests, or Blender logic.
+- Treat packed data channels as linear regardless of container metadata. Preserve qualified EXR precision and PNG bit
+  depth where supported. Allow JPEG only with a visible lossy-data warning and provenance because compression can alter
+  scalar values and contaminate neighboring channels; prefer lossless PNG/EXR when the provider offers them.
+- Preview each extracted channel independently before commit, including component name, inversion, value range,
+  dimensions, orientation, digest, and registration alignment. Reject unsupported channel counts, inconsistent
+  dimensions/orientation, non-finite values, or mappings that assign one component ambiguously.
+- If standalone and packed sources both provide the same semantic channel, show both provenances and require an
+  explicit precedence/replacement decision. Never silently replace an imported standalone map or create two active
+  authorities for one material channel.
+- Allow remapping/swizzling the immutable packed source without reimporting its bytes. Changing a binding invalidates
+  only that semantic channel and its exact descendants. Save/reopen preserves layout preset/custom mapping, component,
+  inversion, constants, digest, precedence, and registration identity.
+- Separately support manifest-described ARM/ORM/custom packing as an export view when requested. Export packing combines
+  authoritative semantic channels at publication time and never replaces their separate internal identities.
+- Extend "Copy Stage 15-20 telemetry + debug" with active map and region-selection state, zero-work selection evidence,
+  current/reused publication keys, effective per-region PBR tuning/provenance, packed source digest/layout/component/
+  swizzle/inversion/precedence, filename/provider inference rule and confidence, automatic versus user-corrected mapping,
+  atomic command result, decode/upload/cache route, precision/lossy warnings, and exact invalidated descendants. Do not
+  include encoded pixels or absolute provider/user paths.
+
 Scope — preview/export:
 - Preview Plane, Cube, Cylinder, Beveled Block, Wall Module, Archway, Radial Disc, and Mechanical Prop, including
   several authored hotspot-UV fixtures. Preview consumes exported-equivalent GPU tile/map handles and conventions.
@@ -1877,6 +1963,21 @@ Scope — Blender companion:
 
 Acceptance:
 - The universal corpus can be compiled through the UI without material-specific workflows.
+- Region selection works in every map/QA/compatible 3D view without changing the active map or source channel and
+  produces zero compiler/GPU work. Returning to a current cached map is immediate and preserves the selected region.
+- Per-region Height/generated-normal/imported-normal/detail-normal/Roughness/AO and explicit metal intent survive
+  save/reopen, report effective inherited/overridden provenance, use vector/physical semantics, and invalidate only the
+  exact affected region and dependent maps.
+- Base-Color-only fixtures can publish explicitly Estimated Height, Normal, Roughness, and AO through installed Stage 17
+  routes while Metallic remains zero until imported or enabled by explicit legal intent.
+- ARM/ORM, RMA, MRA, and custom RGBA fixtures register correct independent semantic channels with byte/float oracle
+  agreement, shared correspondence, one immutable encoded source, save/reopen stability, remappable swizzles, and exact
+  descendant invalidation. JPEG fixtures show a lossy-data warning; PNG/EXR precision and provenance remain visible.
+- Selecting a conventionally named ARM/ORM file through `Add maps...` populates AO, Roughness, and Metallic together in
+  one confirmed atomic action and one undo step, with no per-channel slot clicks and no partial state after failure or
+  cancellation. Ambiguous names open the same pre-populated mapping review instead of silently guessing.
+- Standalone-versus-packed duplicate channels require an explicit precedence decision, and import/export manifests
+  retain source digest, packing layout, component, inversion, precision, and semantic channel lineage.
 - QA views are authoritative and explain every important crop/effect/fallback decision.
 - Preview/export agree within channel tolerances.
 - Blender fixtures map rectangular, strip, and radial semantics without non-uniform UV distortion; locks survive
@@ -1897,6 +1998,15 @@ npm run check:algorithm-stage-20
 
 Stop conditions:
 - Stop if enabled UI controls are not command-backed.
+- Stop if selecting a region forces Diffuse/Base Color, changes the source channel, clears a current map, or schedules
+  compilation/rendering/readback.
+- Stop if "Normal Strength" multiplies encoded normal RGB, per-region controls bypass physical/vector composition, or
+  Base Color silently creates Metallic without explicit legal intent.
+- Stop if ARM/ORM naming is trusted without a visible component layout, packed data receives color management, JPEG
+  loss is hidden, semantic channels remain dependent on packed RGB order downstream, encoded sources are duplicated per
+  extracted channel, or standalone/packed precedence is chosen silently.
+- Stop if a recognized packed map requires separate AO/Roughness/Metallic imports, produces more than one undo step, or
+  can leave only some extracted channels registered.
 - Stop if preview has a shortcut renderer different from final/export.
 - Stop if Blender only calculates fit values without authoring and validating UV/material state.
 - Stop if interactive splats are stored as flattened preview pixels or if screen coordinates become authoritative.

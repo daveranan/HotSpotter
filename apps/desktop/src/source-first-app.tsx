@@ -43,6 +43,15 @@ import {
   type PartitionRecipe,
   type Stage14SlotProjection,
   type TrimSheetDocumentCommand,
+  type FeedbackComparisonMode,
+  type FeedbackContributionView,
+  type FeedbackExecutionState,
+  type FeedbackPreviewProfile,
+  type FeedbackPreviewExecution,
+  type FeedbackWorkbenchCommand,
+  type FeedbackWorkbenchCommandResult,
+  type Stage15To20DebugPayload,
+  type Stage15To20DebugRequest,
 } from "@hot-trimmer/ipc-contracts";
 import { assignSourceFiles } from "./source-assignment";
 import { adjustCrop, anchoredZoom, clamp01, constrainAspectBounds, fitSourceFrame, fitView, gridRectToPreviewBounds, mapQuadToUnitSquare, mapUnitSquareToQuad, movePatch, normalizePatchToRectangle, patchBounds, patchPointerAngle, preserveViewAcrossContentResize, resizeAspectLocked, resizePatch, resizePanes, rotatePatch, type CanvasView, type CropDragAction, type PaneDragKind, type PaneState, type PatchResizeHandle } from "./source-workbench-geometry";
@@ -50,6 +59,17 @@ import { GpuTiledPreviewPainter, gpuTiledPreviewMapMatches, shouldDisplayGpuTile
 import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, selectedLayoutTemplate, type LayoutTemplateId } from "./hierarchical-layout-templates";
 import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
 import { canInteractWithPatch, compiledMapViewForSourceChannel, sourceChannelForCompiledMapView, sourceSetIdForRegion } from "./workbench-interactions";
+import { FeedbackWorkbench } from "./feedback-workbench";
+import {
+  feedbackExecutionMatchesRequest,
+  feedbackEvidenceForRequest,
+  feedbackPixelRequestIdentity,
+  selectFeedbackRegionWithoutPixelWork,
+  selectedOperationAfterCommand,
+  sourceFrameMaterialMapForCompiledView,
+  visibleMapDependency,
+  type FeedbackPixelRequestIdentity,
+} from "./feedback-workbench-contract";
 import "./document-app.css";
 
 const protocol = { protocolVersion: IPC_PROTOCOL_VERSION };
@@ -94,30 +114,10 @@ const mapViews: readonly [CompiledMapView, string][] = [
   ["materialId", "Material ID"],
 ];
 
-function materialMapForView(view: CompiledMapView): SourceFramePreviewMaterialMap | null {
-  switch (view) {
-    case "baseColor":
-      return "base_color";
-    case "normal":
-      return "normal";
-    case "height":
-      return "height";
-    case "roughness":
-      return "roughness";
-    case "metallic":
-      return "metallic";
-    case "ambientOcclusion":
-      return "ambient_occlusion";
-    case "regionId":
-      return "region_id";
-    case "materialId":
-      return null;
-  }
-}
+const materialMapForView = sourceFrameMaterialMapForCompiledView;
 
 function requestedMaterialMapsForView(view: CompiledMapView): readonly SourceFramePreviewMaterialMap[] {
-  const map = materialMapForView(view);
-  return map ? [map] : ["base_color"];
+  return [materialMapForView(view)];
 }
 
 const exportableMaterialMaps: readonly SourceFramePreviewMaterialMap[] = [
@@ -148,7 +148,7 @@ function artifactMapAvailable(artifact: IntermediateAtlasProjection | null | und
 }
 
 function materialMapRouteAvailable(view: CompiledMapView): boolean {
-  return materialMapForView(view) !== null && view !== "materialId";
+  return materialMapForView(view).length > 0;
 }
 
 const materialBehaviorOptions: readonly [MaterialBehaviorClass, string][] = [
@@ -326,6 +326,11 @@ type PreviewProgress = {
   targetDimensions?: { width: number; height: number };
   dimensions?: { width: number; height: number };
   terminalOutcome?: "published" | "failed" | "superseded";
+  feedbackRequestIdentity?: string;
+  feedbackRegionId?: string;
+  feedbackView?: FeedbackContributionView;
+  feedbackComparisonMode?: FeedbackComparisonMode;
+  feedbackSelectedOperationId?: string | null;
 };
 
 function App() {
@@ -380,6 +385,16 @@ function App() {
   const [patchTool, setPatchTool] = useState<"rectangle" | "four-point" | null>(null);
   const [sourceWorkbenchOpen, setSourceWorkbenchOpen] = useState(true);
   const [hotspotSheetOpen, setHotspotSheetOpen] = useState(true);
+  const [feedbackWorkbenchOpen, setFeedbackWorkbenchOpen] = useState(false);
+  const [feedbackView, setFeedbackView] = useState<FeedbackContributionView>("stage15Height");
+  const [feedbackProfile, setFeedbackProfile] = useState<FeedbackPreviewProfile>("preview2048");
+  const [feedbackComparisonMode, setFeedbackComparisonMode] = useState<FeedbackComparisonMode>("after");
+  const [feedbackActiveTool, setFeedbackActiveTool] = useState<"select" | "profile" | "stamp" | "stroke">("select");
+  const [feedbackSelectedOperationId, setFeedbackSelectedOperationId] = useState<string | null>(null);
+  const [feedbackCommandBusy, setFeedbackCommandBusy] = useState(false);
+  const [feedbackLastCommandResult, setFeedbackLastCommandResult] = useState<string | null>(null);
+  const [feedbackError, setFeedbackError] = useState<CommandFailure | null>(null);
+  const [feedbackExecution, setFeedbackExecution] = useState<FeedbackPreviewExecution | null>(null);
   const [sourceSheetShare, setSourceSheetShare] = useState(() => {
     const saved = Number(localStorage.getItem("hot-trimmer.source-sheet-share.v1") ?? "0.46");
     return Number.isFinite(saved) ? Math.max(0.2, Math.min(0.8, saved)) : 0.46;
@@ -500,7 +515,7 @@ function App() {
   }, [currentTopologyHash]);
 
   useEffect(() => {
-    if (!native || !project?.document) return;
+    if (!native || !project?.document || feedbackWorkbenchOpen) return;
     const key = automaticPreviewKey(project.document.documentRevision, interactivePreviewProfile, mapView);
     if (suppressAutomaticPreviewRevision.current === project.document.documentRevision) {
       suppressAutomaticPreviewRevision.current = null;
@@ -512,7 +527,7 @@ function App() {
     // Persisted appearance edits are not transient crop requests. The compiler's content
     // hashes reuse every unchanged region while the request remains contract-valid.
     void requestPreview(undefined, undefined, interactivePreviewProfile, project.document.documentRevision, false, true);
-  }, [native, project?.document?.documentRevision, interactivePreviewProfile, mapView]);
+  }, [native, project?.document?.documentRevision, interactivePreviewProfile, mapView, feedbackWorkbenchOpen]);
 
   useEffect(() => {
     const controller = transientPreviewController.current;
@@ -590,16 +605,27 @@ function App() {
   useEffect(() => { localStorage.setItem("hot-trimmer.source-sheet-share.v1", String(sourceSheetShare)); }, [sourceSheetShare]);
 
   useEffect(() => {
+    const revision = project?.document?.documentRevision;
+    if (!feedbackWorkbenchOpen || !selectedRegionId || revision === undefined) return;
+    if (!visibleMapDependency(feedbackView)) {
+      setFeedbackExecution(null);
+      setPreviewClientTelemetry([`feedback_view=${feedbackView}`, `requested_revision=${revision}`, "pixel_dispatch=0", "request_outcome=metadata_only"]);
+      return;
+    }
+    void requestFeedbackTile(revision, selectedRegionId);
+  }, [feedbackWorkbenchOpen, project?.document?.documentRevision, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId, feedbackProfile]);
+
+  useEffect(() => {
     const content = selectedBinding?.content;
     if (!content) return;
     if (content.type === "material_source") {
-      setSelectedSourceSetId(content.id); selectSourceChannel("base_color"); setActivePatchId(null);
+      setSelectedSourceSetId(content.id); setActivePatchId(null);
     } else if (content.type === "patch") {
       const patch = project?.patches.find((value) => value.id === content.id);
       const owner = patch && project?.materialSources.find((set) => set.registeredChannels?.channels.some((source) => source.id === patch.sourceId));
-      if (owner) { setSelectedSourceSetId(owner.id); selectSourceChannel("base_color"); setActivePatchId(content.id); }
+      if (owner) { setSelectedSourceSetId(owner.id); setActivePatchId(content.id); }
     } else if (content.type === "inherit_primary_material" && project?.document?.primaryMaterial) {
-      setSelectedSourceSetId(project.document.primaryMaterial); selectSourceChannel("base_color"); setActivePatchId(null);
+      setSelectedSourceSetId(project.document.primaryMaterial); setActivePatchId(null);
     }
   }, [selectedRegionId]);
 
@@ -916,6 +942,111 @@ function App() {
     });
   }
 
+  async function applyFeedbackCommand(commandValue: FeedbackWorkbenchCommand): Promise<void> {
+    if (!native || !project?.document || feedbackCommandBusy) return;
+    setFeedbackCommandBusy(true);
+    setFeedbackError(null);
+    try {
+      const result = await invoke<FeedbackWorkbenchCommandResult>("apply_feedback_workbench_command", {
+        request: { ...protocol, commandVersion: 1, command: commandValue },
+      });
+      setProject(result.project);
+      setFeedbackLastCommandResult(`${commandValue.type}:${result.committedIdentity}:${result.status}`);
+      setFeedbackSelectedOperationId((current) => selectedOperationAfterCommand(commandValue, current, result.committedIdentity));
+      const dependency = visibleMapDependency(feedbackView);
+      if (dependency) {
+        setMapViewState(dependency);
+        mapViewRef.current = dependency;
+      }
+    } catch (reason) {
+      const commandFailure = failure(reason);
+      setFeedbackError(commandFailure);
+      setProblem(commandFailure);
+      setFeedbackLastCommandResult(`${commandValue.type}:failed:${commandFailure.code}`);
+    } finally {
+      setFeedbackCommandBusy(false);
+    }
+  }
+
+  function requestFeedbackVisibleView() {
+    const dependency = visibleMapDependency(feedbackView);
+    const revision = project?.document?.documentRevision;
+    if (!dependency || revision === undefined) return;
+    setMapViewState(dependency);
+    mapViewRef.current = dependency;
+    if (selectedRegionId) void requestFeedbackTile(revision, selectedRegionId);
+  }
+
+  async function requestFeedbackTile(revision: number, regionId: string) {
+    const dependency = visibleMapDependency(feedbackView);
+    if (!native || !dependency) return;
+    const profile = feedbackProfile === "preview1024" ? "refinement1024" : feedbackProfile;
+    const generation = ++previewDraftId.current;
+    const startedAt = performance.now();
+    previewPublishStartedAt.current = startedAt;
+    const targetDimensions = previewProfileDimensions(profile);
+    const requestDescriptor: FeedbackPixelRequestIdentity = {
+      revision, regionId, view: feedbackView, map: dependency, profile: feedbackProfile,
+      comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId,
+    };
+    const requestIdentity = feedbackPixelRequestIdentity(requestDescriptor);
+    setFeedbackExecution(null);
+    setPreviewProgress({ requestId: generation, phase: "compiling", profile, requestedRevision: revision, requestedMap: dependency, startedAt, targetDimensions, feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId });
+    setFeedbackError(null);
+    try {
+      const next = await invoke<IntermediateAtlasProjection>("preview_stage_15_16_feedback", {
+        request: { ...protocol, commandVersion: 1, revision, generation, regionId, view: feedbackView, profile, comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId ?? undefined },
+      });
+      if (generation !== previewDraftId.current) return;
+      if (!next.feedbackExecution || next.feedbackExecution.clientGeneration !== generation || !feedbackExecutionMatchesRequest(next.feedbackExecution, requestDescriptor)) {
+        throw new Error("The native preview result did not identify the exact current feedback request.");
+      }
+      setArtifact(next);
+      setFeedbackExecution(next.feedbackExecution);
+      if (next.project) setProject(next.project);
+      setPreview(null);
+      setPreviewProgress({ requestId: generation, phase: "received", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published", feedbackRequestIdentity: next.feedbackExecution.requestIdentity, feedbackRegionId: regionId, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId });
+      setPreviewClientTelemetry([`request_identity=${next.feedbackExecution.requestIdentity}`, `feedback_view=${next.feedbackExecution.view}`, `profile=${next.feedbackExecution.profile}`, `requested_revision=${next.feedbackExecution.revision}`, `requested_map=${next.feedbackExecution.requestedMap}`, `artifact_revision=${next.documentRevision}`, `request_outcome=${next.feedbackExecution.outcome}`, `cache_reused=${next.feedbackExecution.cacheReused}`]);
+    } catch (reason) {
+      const commandFailure = failure(reason);
+      const superseded = commandFailure.code === "operation_cancelled";
+      setFeedbackExecution(null);
+      setFeedbackError(commandFailure);
+      if (!superseded) setProblem(commandFailure);
+      if (generation === previewDraftId.current) setPreviewProgress({ requestId: generation, phase: "failed", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, terminalOutcome: superseded ? "superseded" : "failed", feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId });
+      setPreviewClientTelemetry([`request_identity=${requestIdentity}`, `feedback_view=${feedbackView}`, `requested_revision=${revision}`, `requested_map=${dependency}`, `request_outcome=${superseded ? "superseded" : "failed"}`, `problem=${commandFailure.code}`]);
+    }
+  }
+
+  function selectFeedbackRegion(regionId: string) {
+    const transition = selectFeedbackRegionWithoutPixelWork({ selectedRegionId, activeMap: mapView, publication: artifact }, regionId);
+    setSelectedRegionId(transition.selectedRegionId);
+  }
+
+  async function createFeedbackSample() {
+    if (!native || feedbackCommandBusy) return;
+    setFeedbackCommandBusy(true);
+    setFeedbackError(null);
+    try {
+      const next = await invoke<ProjectProjection>("create_stage_15_16_feedback_sample", { request: protocol });
+      setProject(next);
+      const regionId = next.document?.topology.regions[0]?.id ?? null;
+      setSelectedRegionId(regionId);
+      setFeedbackSelectedOperationId(next.feedbackAuthoring.records.find((record) => record.intent.kind === "operation")?.operationId ?? null);
+      setFeedbackLastCommandResult("create_feedback_sample:executed");
+      if (next.document && regionId) {
+        setMapViewState("height");
+        mapViewRef.current = "height";
+      }
+    } catch (reason) {
+      const commandFailure = failure(reason);
+      setFeedbackError(commandFailure);
+      setProblem(commandFailure);
+    } finally {
+      setFeedbackCommandBusy(false);
+    }
+  }
+
   async function build() {
     if (!project || !primaryMaterial || activity !== "idle") return;
     if (!project.document) {
@@ -1082,10 +1213,10 @@ function App() {
     }
   }
 
-  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true, automatic = false) {
+  async function requestPreview(regionId?: string, projection?: CropProjection, profile: PreviewProfile = "draft512", revision?: number, scheduleRefinement = true, automatic = false, requestedMapOverride?: CompiledMapView) {
     const requestedRevision = revision ?? project?.document?.documentRevision;
     if (!native || requestedRevision === undefined) return;
-    const requestedMapView = mapViewRef.current;
+    const requestedMapView = requestedMapOverride ?? mapViewRef.current;
     const requestedMaps = requestedMaterialMapsForView(requestedMapView);
     const automaticKey = automatic ? automaticPreviewKey(requestedRevision, profile, requestedMapView) : null;
     const viewIntent: "completeDraft512" | "completeRefinement1024" | "exactViewport" | "exactSelectedRegion" | undefined = profile === "draft512"
@@ -1748,7 +1879,7 @@ function App() {
         <nav className="workflow" aria-label="Workbench tabs">
           <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} aria-pressed={sourceWorkbenchOpen} onClick={() => setSourceWorkbenchOpen((open) => !open)}>Workbench</button>
           <button className={`mode ${hotspotSheetOpen ? "active" : ""}`} aria-pressed={hotspotSheetOpen} onClick={() => setHotspotSheetOpen((open) => !open)}>Hotspot Sheet</button>
-          <button className="mode" disabled title="Layer and map editing has no document command in this slice.">Layers & Maps</button>
+          <button className={`mode ${feedbackWorkbenchOpen ? "active" : ""}`} aria-pressed={feedbackWorkbenchOpen} onClick={() => setFeedbackWorkbenchOpen((open) => !open)} title="Typed Stage 15/16 authoring and raw contribution QA only.">Layers &amp; Maps</button>
         </nav>
         <span className="window-drag-space" data-tauri-drag-region />
         <div className="publish-actions">
@@ -1889,7 +2020,18 @@ function App() {
            onUndo={() => void history(false)}
            onRedo={() => void history(true)}
            previewClientTelemetry={previewClientTelemetry}
+           feedbackDebug={feedbackWorkbenchOpen ? {
+             view: feedbackView,
+             profile: feedbackProfile,
+             comparisonMode: feedbackComparisonMode,
+             selectedOperationId: feedbackSelectedOperationId,
+             activeTool: feedbackActiveTool,
+             lastCommandResult: feedbackLastCommandResult,
+             error: feedbackError,
+             execution: feedbackExecution,
+           } : null}
            onPreviewPaint={(dimensions) => {
+             if (feedbackWorkbenchOpen && dimensions.generation !== undefined && dimensions.generation !== feedbackExecution?.publishedGeneration) return;
              if (previewPublishStartedAt.current !== null) {
                setPreviewProgress((current) => current ? { ...current, phase: "painted", elapsedMs: performance.now() - current.startedAt, dimensions } : current);
                setPreviewClientTelemetry((current) => [
@@ -1924,6 +2066,28 @@ function App() {
           onSetRegionBehavior={(regionId, behavior) => void setRegionBehavior(regionId, behavior)}
         /> : null}
       </section>
+      {feedbackWorkbenchOpen ? <FeedbackWorkbench
+        project={project}
+        artifact={artifact}
+        selectedRegionId={selectedRegionId}
+        selectedOperationId={feedbackSelectedOperationId}
+        view={feedbackView}
+        profile={feedbackProfile}
+        comparisonMode={feedbackComparisonMode}
+        activeTool={feedbackActiveTool}
+        commandBusy={feedbackCommandBusy}
+        onSelectRegion={selectFeedbackRegion}
+        onSelectOperation={setFeedbackSelectedOperationId}
+        onView={setFeedbackView}
+        onProfile={setFeedbackProfile}
+        onComparisonMode={setFeedbackComparisonMode}
+        onActiveTool={setFeedbackActiveTool}
+        onCommand={applyFeedbackCommand}
+        onRequestVisibleView={requestFeedbackVisibleView}
+        onCreateSample={() => void createFeedbackSample()}
+        onUndo={() => void history(false)}
+        onRedo={() => void history(true)}
+      /> : null}
       <footer className="statusbar">
         <span>{project?.name ?? "Untitled"}</span>
         <span>{buildState}</span>
@@ -2742,7 +2906,7 @@ function PatchPreview(props: { preview: PreviewSheetProjection; region: Resolved
   </aside>;
 }
 
-function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; mapView: CompiledMapView; onPaint: (dimensions: { width: number; height: number }) => void; onDebugSummary: (summary: GpuTiledPreviewPaintSummary | null) => void }) {
+function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; mapView: CompiledMapView; onPaint: (dimensions: { width: number; height: number; generation?: number }) => void; onDebugSummary: (summary: GpuTiledPreviewPaintSummary | null) => void }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const painter = useRef(new GpuTiledPreviewPainter());
   const onPaint = useRef(props.onPaint);
@@ -2761,7 +2925,7 @@ function GpuTiledPreviewCanvas(props: { artifact: IntermediateAtlasProjection; m
       releasePayload: async (request) => { await invoke("release_gpu_tiled_preview_payload", { request }); },
     }, IPC_PROTOCOL_VERSION).then((painted) => {
       props.onDebugSummary(painter.current.lastSummary());
-      if (painted) onPaint.current({ width: props.artifact.width, height: props.artifact.height });
+      if (painted) onPaint.current({ width: props.artifact.width, height: props.artifact.height, generation: manifest.generation });
     });
   }, [manifest?.generation, manifest?.opaqueHandle, manifest?.map, props.artifact.height, props.artifact.width, props.mapView, publication, props.onDebugSummary]);
 
@@ -2945,7 +3109,17 @@ function SheetWorkbench(props: {
   onUndo: () => void;
   onRedo: () => void;
   previewClientTelemetry: readonly string[];
-  onPreviewPaint: (dimensions: { width: number; height: number }) => void;
+  feedbackDebug: null | {
+    view: FeedbackContributionView;
+    profile: FeedbackPreviewProfile;
+    comparisonMode: FeedbackComparisonMode;
+    selectedOperationId: string | null;
+    activeTool: "select" | "profile" | "stamp" | "stroke";
+    lastCommandResult: string | null;
+    error: CommandFailure | null;
+    execution: FeedbackPreviewExecution | null;
+  };
+  onPreviewPaint: (dimensions: { width: number; height: number; generation?: number }) => void;
 }) {
   const artifact = props.artifact;
   const topologyHash = props.project?.document ? hashBytes(props.project.document.topology.topologyHash) : null;
@@ -3180,6 +3354,76 @@ function SheetWorkbench(props: {
     const canvas = sheetRef.current?.querySelector<HTMLCanvasElement>('canvas[data-gpu-preview-canvas="true"]') ?? null;
     const manifest = activeTileManifest;
     const telemetry = [...(props.artifact?.telemetry ?? []), ...props.previewClientTelemetry];
+    if (props.feedbackDebug && props.project?.document) {
+      const dependency = visibleMapDependency(props.feedbackDebug.view);
+      const currentRequest: FeedbackPixelRequestIdentity | null = dependency && props.selectedRegionId ? {
+        revision: props.project.document.documentRevision,
+        regionId: props.selectedRegionId,
+        view: props.feedbackDebug.view,
+        map: dependency,
+        profile: props.feedbackDebug.profile,
+        comparisonMode: props.feedbackDebug.comparisonMode,
+        selectedOperationId: props.feedbackDebug.selectedOperationId,
+      } : null;
+      const currentRequestIdentity = currentRequest ? feedbackPixelRequestIdentity(currentRequest) : null;
+      const evidence = feedbackEvidenceForRequest(currentRequest, props.feedbackDebug.execution, activeTilePublication);
+      const exactExecution = evidence.exactRequestEvidence;
+      const progressIsCurrent = !!currentRequestIdentity && props.previewProgress?.feedbackRequestIdentity === currentRequestIdentity;
+      const evidenceTile = evidence.tile;
+      const evidencePaint = evidenceTile && gpuPaintSummary?.generation === evidenceTile.manifest.generation
+        ? gpuPaintSummary
+        : undefined;
+      const previewState: FeedbackExecutionState = !dependency ? "InstalledNotRequested"
+        : exactExecution ? props.feedbackDebug.execution!.outcome
+          : progressIsCurrent && (props.previewProgress?.phase === "compiling" || props.previewProgress?.phase === "received") ? "Requested"
+            : progressIsCurrent && props.previewProgress?.terminalOutcome === "superseded" ? "Superseded"
+              : progressIsCurrent && props.feedbackDebug.error?.code === "operation_cancelled" ? "Cancelled"
+                : progressIsCurrent && (props.feedbackDebug.error || props.previewProgress?.phase === "failed") ? "Failed"
+                  : "InstalledNotRequested";
+      const requestIdentity = exactExecution ? props.feedbackDebug.execution!.requestIdentity
+        : currentRequestIdentity ?? JSON.stringify(["stage15-16-feedback-metadata-v1", props.project.document.documentRevision, props.selectedRegionId, props.feedbackDebug.view, props.feedbackDebug.profile, props.feedbackDebug.comparisonMode, props.feedbackDebug.selectedOperationId]);
+      const pixelDispatchCount = !dependency ? 0 : exactExecution || progressIsCurrent ? 1 : 0;
+      const selectedInspection = props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegionId);
+      const request: Stage15To20DebugRequest = {
+        ...protocol,
+        schemaVersion: 1,
+        selectedRegionId: props.selectedRegionId ?? undefined,
+        requestedView: props.feedbackDebug.view,
+        previewProfile: props.feedbackDebug.profile,
+        comparisonMode: props.feedbackDebug.comparisonMode,
+        selectedOperationId: props.feedbackDebug.selectedOperationId ?? undefined,
+        activeTool: props.feedbackDebug.activeTool,
+        previewState,
+        requestIdentity,
+        pixelDispatchCount,
+        executionOutcome: previewState,
+        previewError: props.feedbackDebug.error ?? undefined,
+        lastCommandResult: props.feedbackDebug.lastCommandResult ?? undefined,
+        paintSummary: evidencePaint,
+        tile: evidenceTile,
+        compiledInspection: selectedInspection ? { compiledProfile: selectedInspection.compiledProfile, compiledDetails: selectedInspection.compiledDetails } : undefined,
+        workbenchState: {
+          dirty: props.project.dirty,
+          undoAvailable: props.project.canUndoDocument,
+          redoAvailable: props.project.canRedoDocument,
+          selectedOperationId: props.feedbackDebug.selectedOperationId,
+          draftOperationId: null,
+          committedOperationIds: props.project.feedbackAuthoring.records.map((record) => record.operationId),
+          comparisonMode: props.feedbackDebug.comparisonMode,
+          displayGates: { sheetMatchesDocument, artifactRevisionMatchesDocument, displayGpuTiles, gpuTilePaintedBlank, rawManifestMapMatchesMapView: tiledManifestMatchesMap, exactRequestEvidence: exactExecution, pixelDispatch: dependency ? (progressIsCurrent || exactExecution ? 1 : 0) : 0 },
+        },
+        boundedTelemetry: exactExecution ? telemetry : props.previewClientTelemetry,
+      };
+      try {
+        const debug = await invoke<Stage15To20DebugPayload>("stage_15_20_debug_payload", { request });
+        await writeClipboardText([debug.summary, JSON.stringify({ schema: debug.schema, schemaVersion: debug.schemaVersion, ...(debug.payload as Record<string, unknown>) }, null, 2)].join("\n\n"));
+        setDebugCopyStatus("copied");
+        window.setTimeout(() => setDebugCopyStatus("idle"), 1600);
+      } catch {
+        setDebugCopyStatus("failed");
+      }
+      return;
+    }
     const debug = {
       capturedAt: new Date().toISOString(),
       activity: props.activity,
@@ -3492,12 +3736,12 @@ function SheetWorkbench(props: {
       <span>incomplete after Stage {props.artifact.incompleteAfterStage} · non-exportable</span>
       <span>pending: {props.artifact.pending.join(", ")}</span>
       <button className="copy-debug-button" onClick={() => void copyPreviewDebugInfo()} title="Copy preview telemetry, tile manifest, display gates, and canvas pixel summary. Shortcut: F2.">
-        {debugCopyStatus === "copied" ? "Copied debug" : debugCopyStatus === "failed" ? "Copy failed" : "Copy telemetry + debug"}
+        {debugCopyStatus === "copied" ? "Copied debug" : debugCopyStatus === "failed" ? "Copy failed" : props.feedbackDebug ? "Copy Stage 15-20 telemetry + debug" : "Copy telemetry + debug"}
       </button>
       {props.artifact.telemetry.length > 0 || props.previewClientTelemetry.length > 0 ? <details className="preview-telemetry">
         <summary>Preview telemetry</summary>
         <pre>{[...props.artifact.telemetry, ...props.previewClientTelemetry].join("\n")}</pre>
-      </details> : null}</> : <span>No preview rendered</span>}
+      </details> : null}</> : <><span>No preview rendered</span>{props.feedbackDebug ? <button className="copy-debug-button" onClick={() => void copyPreviewDebugInfo()} title="Copy Stage 15-20 telemetry and typed error state. Shortcut: F2.">{debugCopyStatus === "copied" ? "Copied debug" : debugCopyStatus === "failed" ? "Copy failed" : "Copy Stage 15-20 telemetry + debug"}</button> : null}</>}
     </footer>
   </section>;
 }

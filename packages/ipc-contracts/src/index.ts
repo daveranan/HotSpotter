@@ -1,7 +1,7 @@
 export * from "./document-contracts";
 
 export namespace RemovedLegacy {
-export const IPC_PROTOCOL_VERSION = 1 as const;
+export const IPC_PROTOCOL_VERSION = 2 as const;
 
 export interface FoundationStatusRequest {
   protocolVersion: typeof IPC_PROTOCOL_VERSION;

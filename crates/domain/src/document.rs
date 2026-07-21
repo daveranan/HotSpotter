@@ -1045,9 +1045,20 @@ impl TrimSheetDocument {
             let canonical_snapshot = template
                 .snapshot()
                 .map_err(|_| TrimSheetDocumentError::InvalidTemplateSnapshot)?;
+            let mut expected_regions = regions_from_template(&template)?;
+            for expected in &mut expected_regions {
+                if let Some(authored) = self
+                    .topology
+                    .regions
+                    .iter()
+                    .find(|region| region.id == expected.id)
+                {
+                    expected.structural_profile = authored.structural_profile;
+                }
+            }
             if &canonical_snapshot != snapshot
                 || self.topology.compatibility_key != template.identity.compatibility_key
-                || self.topology.regions != regions_from_template(&template)?
+                || self.topology.regions != expected_regions
             {
                 return Err(TrimSheetDocumentError::TemplateTopologyMutation);
             }
@@ -1185,6 +1196,18 @@ impl TrimSheetDocument {
             {
                 return Err(TrimSheetDocumentError::InvalidTreatment(treatment.id));
             }
+        }
+        let mut decoration_keys = BTreeSet::new();
+        if self.decorations.len() > 4_096
+            || self.decorations.iter().any(|decoration| {
+                decoration.decoration_key.trim().is_empty()
+                    || decoration.decoration_key.len() > 512
+                    || decoration.value.is_empty()
+                    || decoration.value.len() > 1_048_576
+                    || !decoration_keys.insert(decoration.decoration_key.as_str())
+            })
+        {
+            return Err(TrimSheetDocumentError::InvalidDecoration);
         }
         if !self.render_settings.output_size.is_nonzero()
             || self.render_settings.atlas_padding_px > 4_096
@@ -1762,6 +1785,99 @@ impl TrimSheetDocument {
                 };
                 mapping.radial = behavior.radial;
                 mapping.behavior = behavior;
+            }
+            TrimSheetDocumentCommand::SetRegionStructuralProfile {
+                region_id,
+                structural_profile,
+            } => {
+                next.topology
+                    .regions
+                    .iter_mut()
+                    .find(|region| region.id == *region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
+                    .structural_profile = *structural_profile;
+                // Structural profile is appearance intent. Standard topology validation
+                // intentionally pins allocation geometry, not the selected profile.
+                next.topology.topology_hash = hash_serializable(&next.topology.topology_hash_inputs())?;
+            }
+            TrimSheetDocumentCommand::SetFeedbackProfile {
+                region_id,
+                structural_profile,
+                compiled_request,
+            } => {
+                next.topology
+                    .regions
+                    .iter_mut()
+                    .find(|region| region.id == *region_id)
+                    .ok_or(TrimSheetDocumentError::MissingRegionBinding(*region_id))?
+                    .structural_profile = *structural_profile;
+                next.topology.topology_hash = hash_serializable(&next.topology.topology_hash_inputs())?;
+                let key = format!("stage15.profile.request.{region_id}");
+                if let Some(existing) = next
+                    .decorations
+                    .iter_mut()
+                    .find(|candidate| candidate.decoration_key == key)
+                {
+                    existing.value = compiled_request.clone();
+                } else {
+                    next.decorations.push(DecorationBinding {
+                        decoration_key: key,
+                        value: compiled_request.clone(),
+                    });
+                }
+            }
+            TrimSheetDocumentCommand::UpsertDecoration { decoration } => {
+                if decoration.decoration_key.trim().is_empty() || decoration.value.is_empty() {
+                    return Err(TrimSheetDocumentError::InvalidDecoration);
+                }
+                if let Some(existing) = next
+                    .decorations
+                    .iter_mut()
+                    .find(|candidate| candidate.decoration_key == decoration.decoration_key)
+                {
+                    *existing = decoration.clone();
+                } else {
+                    next.decorations.push(decoration.clone());
+                }
+            }
+            TrimSheetDocumentCommand::DeleteDecoration { decoration_key } => {
+                let before = next.decorations.len();
+                next.decorations
+                    .retain(|candidate| candidate.decoration_key != *decoration_key);
+                if next.decorations.len() == before {
+                    return Err(TrimSheetDocumentError::InvalidDecoration);
+                }
+            }
+            TrimSheetDocumentCommand::ReplaceDecoration {
+                old_decoration_key,
+                decoration,
+            } => {
+                if decoration.decoration_key.trim().is_empty() || decoration.value.is_empty() {
+                    return Err(TrimSheetDocumentError::InvalidDecoration);
+                }
+                let existing = next
+                    .decorations
+                    .iter_mut()
+                    .find(|candidate| candidate.decoration_key == *old_decoration_key)
+                    .ok_or(TrimSheetDocumentError::InvalidDecoration)?;
+                *existing = decoration.clone();
+            }
+            TrimSheetDocumentCommand::ReorderDecorations { decoration_keys } => {
+                if decoration_keys.len() != next.decorations.len()
+                    || decoration_keys.iter().collect::<BTreeSet<_>>().len()
+                        != decoration_keys.len()
+                {
+                    return Err(TrimSheetDocumentError::InvalidDecoration);
+                }
+                let mut by_key = next
+                    .decorations
+                    .drain(..)
+                    .map(|decoration| (decoration.decoration_key.clone(), decoration))
+                    .collect::<BTreeMap<_, _>>();
+                next.decorations = decoration_keys
+                    .iter()
+                    .map(|key| by_key.remove(key).ok_or(TrimSheetDocumentError::InvalidDecoration))
+                    .collect::<Result<Vec<_>, _>>()?;
             }
             TrimSheetDocumentCommand::SetSheetFraming { framing } => {
                 next.sheet_framing = framing.clone();
@@ -2704,6 +2820,30 @@ pub enum TrimSheetDocumentCommand {
         region_id: RegionId,
         behavior: RegionBehavior,
     },
+    SetRegionStructuralProfile {
+        region_id: RegionId,
+        structural_profile: StructuralProfile,
+    },
+    /// Atomic Stage 15 authoring command. `compiled_request` is produced only by
+    /// the typed native IPC boundary; the UI never authors decoration JSON/keys.
+    SetFeedbackProfile {
+        region_id: RegionId,
+        structural_profile: StructuralProfile,
+        compiled_request: String,
+    },
+    UpsertDecoration {
+        decoration: DecorationBinding,
+    },
+    DeleteDecoration {
+        decoration_key: String,
+    },
+    ReplaceDecoration {
+        old_decoration_key: String,
+        decoration: DecorationBinding,
+    },
+    ReorderDecorations {
+        decoration_keys: Vec<String>,
+    },
     SetSheetFraming {
         framing: SheetFraming,
     },
@@ -3589,6 +3729,8 @@ pub enum TrimSheetDocumentError {
     InvalidWarp { region_id: RegionId, index: usize },
     #[error("treatment layer is duplicated or invalid: {0}")]
     InvalidTreatment(LayerId),
+    #[error("decoration binding is missing, duplicated, or exceeds bounded storage")]
+    InvalidDecoration,
     #[error("render settings are invalid")]
     InvalidRenderSettings,
     #[error("generator provenance is invalid")]

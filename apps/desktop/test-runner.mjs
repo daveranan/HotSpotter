@@ -6,6 +6,7 @@ const suites = {
   "manual-layout-presets": "src/manual-layout-presets.test.ts",
   "multi-source-patch-assignment": "src/multi-source-patch-assignment.test.ts",
   "workbench-interactions": "src/workbench-interactions.test.ts",
+  "stage15-20-feedback": "src/stage15-20-feedback.test.ts",
 };
 const requested = process.argv.slice(2);
 const files = requested.length
@@ -15,6 +16,10 @@ const result = spawnSync(process.execPath, ["--test", ...files], { stdio: "inher
 if ((result.status ?? 1) !== 0) process.exit(result.status ?? 1);
 if (requested.includes("multi-source-patch-assignment")) {
   const native = spawnSync("cargo", ["test", "-p", "hot-trimmer-sheet-compiler", "multi_source_patch_assignment"], { stdio: "inherit", cwd: new URL("../..", import.meta.url) });
+  process.exit(native.status ?? 1);
+}
+if (requested.includes("stage15-20-feedback")) {
+  const native = spawnSync("cargo", ["test", "-p", "hot-trimmer-desktop", "algorithm_stage_20a_feedback_workbench"], { stdio: "inherit", cwd: new URL("../..", import.meta.url) });
   process.exit(native.status ?? 1);
 }
 process.exit(0);

@@ -229,6 +229,7 @@ export interface TrimSheetDocument {
   };
   primaryMaterial: string | null;
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
+  decorations: readonly { decorationKey: string; value: string }[];
   regionBindings: Record<string, RegionBinding>;
   renderSettings: {
     outputSize: PixelSize;
@@ -379,6 +380,7 @@ export interface ProjectProjection {
   canRedoDocument: boolean;
   canUndoPatch: boolean;
   canRedoPatch: boolean;
+  feedbackAuthoring: { commandVersion: 1; records: readonly { operationId: string; enabled: boolean; intent: FeedbackDetailIntent }[] };
 }
 
 export interface PatchGeometry { corners: readonly [NormalizedPoint, NormalizedPoint, NormalizedPoint, NormalizedPoint]; assistanceMask?: readonly NormalizedPoint[] }
@@ -428,7 +430,7 @@ export interface ResolvedRegion {
 
 export type CompiledMapView =
   | "baseColor" | "normal" | "height" | "roughness" | "metallic"
-  | "ambientOcclusion" | "regionId" | "materialId";
+  | "ambientOcclusion" | "regionId" | "materialId" | "edgeMask";
 
 export interface CompiledSheetProjection {
   documentRevision: number;
@@ -475,7 +477,129 @@ export interface Stage14SlotProjection {
   edgeEligibility: EdgeEligibility;
   periodPixels?: readonly [number, number];
   addressMode: "clamp" | "repeat_x" | "repeat_y" | "repeat_xy";
+  compiledProfile?: CompiledProfileProjection;
+  compiledDetails?: CompiledDetailSetProjection;
 }
+
+export type FeedbackExecutionState =
+  | "InstalledNotRequested" | "Requested" | "Executed" | "CacheHit"
+  | "SkippedBecauseUnused" | "DeferredOnly" | "Failed" | "Cancelled"
+  | "Superseded" | "NotInstalled";
+
+export type FeedbackContributionView =
+  | "stage15Occupancy" | "stage15Height" | "stage15ProfileRoute" | "stage15Lod" | "stage15Fallback"
+  | "stage16RegisteredMask" | "stage16Height" | "stage16VectorNormal" | "stage16ScalarRoughness"
+  | "stage16ScalarMetallic" | "stage16ScalarAmbientOcclusion" | "stage16BaseColor"
+  | "stage16MaterialId" | "stage16MaterialIdValidity" | "stage16Route" | "stage16Occupancy"
+  | "stage16Lod" | "stage16Scope" | "stage16AssetResolution";
+
+export type FeedbackPreviewProfile = "preview1024" | "preview2048" | "preview4096" | "preview8192";
+export type FeedbackComparisonMode = "after" | "before" | "selectedOperationIsolation";
+
+export interface FeedbackProfileIntent {
+  program: "flat" | "convex_bevel" | "concave_groove" | "rounded_bevel" | "panel_frame" | "radial_disc" | "annulus";
+  firstWidth: { unit: "meters" | "relative_minor"; value: number };
+  secondWidth: { unit: "meters" | "relative_minor"; value: number };
+  minimumFlatCenter: { unit: "meters" | "relative_minor"; value: number };
+  amplitude: { unit: "meters" | "relative_minor"; value: number };
+  angleDegrees: number;
+  innerRadius: { unit: "meters" | "relative_minor"; value: number };
+  outerRadius: { unit: "meters" | "relative_minor"; value: number };
+  legalityPolicy: "clamp" | "fully_rounded" | "merge_opposing" | "normal_only" | "disabled" | "incompatible";
+  lodPolicy: "auto";
+  maximumSupersampling: number;
+  seed: number;
+  customCurve: readonly never[];
+}
+
+export interface CompiledProfileProjection extends FeedbackProfileIntent {
+  requestedProgram: FeedbackProfileIntent["program"];
+  sdf: "rectangle" | "disc" | "annulus";
+  firstWidthM: number;
+  secondWidthM: number;
+  minimumFlatCenterM: number;
+  amplitudeM: number;
+  innerRadiusM: number;
+  outerRadiusM: number;
+  slotSizeM: readonly [number, number];
+  pixelsPerMeter: readonly [number, number];
+  lod: "full_height" | "simplified_height" | "normal_only" | "roughness_only" | "disabled";
+  supersampling: number;
+  evaluator: "analytic_sdf" | "analytic_radial_sdf" | "piecewise_linear_curve";
+  fallback: string;
+  fallbackReason?: string;
+  occupancy: Record<string, boolean>;
+  requiredHaloPx: number;
+  algorithmId: string;
+  algorithmVersion: string;
+  diagnostics: readonly string[];
+  cacheIdentity: string;
+}
+
+export interface StampAssetRef { assetId: string; version: string; digest: string; kind: string }
+export interface DetailChannelContribution { channel: string; amount: number; blend: "replace" | "add" | "multiply" | "max"; materialId?: number; metallicExplicit: boolean }
+export interface StampOperationIntent {
+  asset: StampAssetRef; scope: "material_reusable_atlas" | "asset_specific_deferred"; targetRegion: string;
+  physicalPositionM: readonly [number, number]; physicalSizeM: readonly [number, number]; pivot: readonly [number, number];
+  rotationDegrees: number; mirror: readonly [boolean, boolean]; opacity: number; blend: "replace" | "add" | "multiply" | "max";
+  clipping: "contain" | "cover" | "repeat" | "fail_if_oversized"; seed: number; spacingM: readonly [number, number];
+  scatter: number; jitterM: readonly [number, number]; layerOrder: number;
+  occupancy: "above_profile" | "below_profile" | "avoid_raised" | "only_flat_center" | "ignore";
+  channels: readonly DetailChannelContribution[];
+}
+export interface DetailDefinitionIntent {
+  name: string; family: string; physicalSize: readonly [number, number]; scaleSpace: string; compatibleRoles: readonly string[];
+  orientation: string; explicitRotationDegrees: number; aspectLimits: readonly [number, number]; minimumPixels: readonly [number, number];
+  repeatPeriodM?: readonly [number, number]; fitPolicy: string; mappingMode: string; channels: readonly DetailChannelContribution[];
+  fallback: string; provenance: string; seed: number; requiredSources: readonly StampAssetRef[]; requiredHaloPx: number; dependencies: readonly string[];
+}
+export type FeedbackDetailIntent =
+  | { kind: "definition"; value: DetailDefinitionIntent }
+  | { kind: "operation"; value: StampOperationIntent }
+  | { kind: "stroke"; value: { operation: StampOperationIntent; physicalSamplesM: readonly (readonly [number, number])[] } };
+export interface CompiledDetailSetProjection { stageResult: unknown; details: readonly unknown[]; routeQa: readonly string[]; occupancyQa: readonly string[] }
+
+export type FeedbackWorkbenchCommand =
+  | { type: "set_profile"; regionId: string; requested: FeedbackProfileIntent }
+  | { type: "upsert_detail"; operationId?: string; enabled: boolean; intent: FeedbackDetailIntent }
+  | { type: "duplicate_detail"; operationId: string }
+  | { type: "set_detail_enabled"; operationId: string; enabled: boolean }
+  | { type: "delete_detail"; operationId: string }
+  | { type: "reorder_details"; operationIds: readonly string[] };
+export interface FeedbackWorkbenchCommandRequest { protocolVersion: number; commandVersion: 1; command: FeedbackWorkbenchCommand }
+export interface FeedbackWorkbenchCommandResult { commandVersion: 1; committedIdentity: string; project: ProjectProjection; status: "executed" }
+export interface FeedbackQaTileRequest {
+  protocolVersion: number; commandVersion: 1; revision: number; generation: number; regionId: string;
+  view: FeedbackContributionView; profile: "refinement1024" | "preview2048" | "preview4096" | "preview8192";
+  comparisonMode: FeedbackComparisonMode; selectedOperationId?: string;
+}
+
+export interface FeedbackPreviewExecution {
+  requestIdentity: string;
+  clientGeneration: number;
+  publishedGeneration: number;
+  revision: number;
+  regionId: string;
+  view: FeedbackContributionView;
+  requestedMap: CompiledMapView;
+  profile: "refinement1024" | "preview2048" | "preview4096" | "preview8192";
+  comparisonMode: FeedbackComparisonMode;
+  selectedOperationId?: string;
+  outcome: "Executed" | "CacheHit";
+  cacheReused: boolean;
+}
+
+export interface Stage15To20DebugRequest {
+  protocolVersion: number; schemaVersion: 1; selectedRegionId?: string; requestedView: FeedbackContributionView;
+  previewProfile: FeedbackPreviewProfile; comparisonMode: FeedbackComparisonMode; selectedOperationId?: string;
+  activeTool: "select" | "profile" | "stamp" | "stroke"; previewState: FeedbackExecutionState;
+  requestIdentity: string; pixelDispatchCount: number; executionOutcome: FeedbackExecutionState;
+  previewError?: CommandFailure; lastCommandResult?: string; paintSummary?: unknown; tile?: GpuTiledPreviewPublication;
+  boundedTelemetry: readonly string[];
+  compiledInspection?: unknown;
+  workbenchState?: unknown;
+}
+export interface Stage15To20DebugPayload { schema: "hot-trimmer.stage15-20-feedback"; schemaVersion: 1; summary: string; payload: unknown }
 
 export interface IntermediateAtlasProjection {
   label: "Intermediate Stage 14 material-placement preview";
@@ -493,6 +617,7 @@ export interface IntermediateAtlasProjection {
   maps: Partial<Record<CompiledMapView, string>>;
   tileManifest?: GpuTiledPreviewPublication;
   tileManifests?: Partial<Record<CompiledMapView, GpuTiledPreviewPublication>>;
+  feedbackExecution?: FeedbackPreviewExecution;
   regionIdLookup: readonly RegionIdLookupEntry[];
   regions: readonly ResolvedRegion[];
   unavailableChannels: readonly string[];
@@ -554,6 +679,7 @@ export type SourceFramePreviewMaterialMap =
   | "roughness"
   | "metallic"
   | "ambient_occlusion"
+  | "edge_mask"
   | "region_id"
   | "material_id";
 

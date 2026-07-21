@@ -84,6 +84,11 @@ pub struct IntermediateSlotInspection {
     pub edge_eligibility: EdgeEligibility,
     pub period_pixels: Option<[u32; 2]>,
     pub address_mode: &'static str,
+    /// Authoritative Stage 15 plan compiled on the persisted spine. This is
+    /// metadata for inspection; pixels continue to come from GPU tile publications.
+    pub compiled_profile: Option<hot_trimmer_effect_compiler::CompiledProfile>,
+    /// Authoritative Stage 16 plan compiled on the persisted spine.
+    pub compiled_details: Option<hot_trimmer_effect_compiler::CompiledDetailSet>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -391,6 +396,8 @@ pub(crate) fn compose_intermediate_atlas(
                 RegionSampling::LoopY => "repeat_y",
                 RegionSampling::LoopXy => "repeat_xy",
             },
+            compiled_profile: None,
+            compiled_details: None,
         });
     }
     if cancelled() {

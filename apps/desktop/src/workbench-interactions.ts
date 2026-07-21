@@ -26,6 +26,7 @@ export function sourceChannelForCompiledMapView(view: CompiledMapView): SourceCh
     case "ambientOcclusion": return "ambient_occlusion";
     case "materialId": return "material_id";
     case "regionId": return null;
+    case "edgeMask": return null;
   }
 }
 

@@ -21,7 +21,8 @@ use hot_trimmer_domain::{
     OrientedPixelSize, OriginalAssetProvenance, OutputSpecHeader, PartitionRecipe, PatchCommand,
     PatchGeometry, PatchId, PixelBounds, Projection, RegionId, RegisteredChannel,
     RegisteredChannelSet, RevisionAuthority, SourceId, SourceOwnershipIntent, SourceSetId,
-    TrimSheetDocument, TrimSheetDocumentCommand, UserFacingError,
+    DecorationBinding, StructuralProfile, TemplateSlotRole, TrimSheetDocument,
+    TrimSheetDocumentCommand, UserFacingError,
 };
 use hot_trimmer_export::{
     ExportMemoryBudgets, ExportProgress, FitAxis, HOTTRIM_MANIFEST_FILE_NAME, HottrimManifest,
@@ -314,6 +315,22 @@ pub struct ProjectProjection {
     can_redo_document: bool,
     can_undo_patch: bool,
     can_redo_patch: bool,
+    feedback_authoring: FeedbackAuthoringProjection,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackAuthoringProjection {
+    command_version: u16,
+    records: Vec<FeedbackDetailRecordProjection>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackDetailRecordProjection {
+    operation_id: String,
+    enabled: bool,
+    intent: FeedbackDetailIntent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +464,101 @@ pub struct SourceFramePartitionRequest {
 pub struct DocumentCommandRequest {
     protocol_version: u16,
     command: TrimSheetDocumentCommand,
+}
+
+pub const FEEDBACK_COMMAND_VERSION: u16 = 1;
+pub const STAGE_15_20_DEBUG_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackWorkbenchCommandRequest {
+    protocol_version: u16,
+    command_version: u16,
+    command: FeedbackWorkbenchCommand,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum FeedbackWorkbenchCommand {
+    SetProfile {
+        region_id: RegionId,
+        requested: hot_trimmer_effect_compiler::RequestedProfile,
+    },
+    UpsertDetail {
+        operation_id: Option<String>,
+        enabled: bool,
+        intent: FeedbackDetailIntent,
+    },
+    DuplicateDetail { operation_id: String },
+    SetDetailEnabled { operation_id: String, enabled: bool },
+    DeleteDetail { operation_id: String },
+    ReorderDetails { operation_ids: Vec<String> },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum FeedbackDetailIntent {
+    Definition(hot_trimmer_effect_compiler::DetailDefinition),
+    Operation(hot_trimmer_effect_compiler::StampOperation),
+    Stroke(hot_trimmer_effect_compiler::StampStroke),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackWorkbenchCommandResult {
+    command_version: u16,
+    committed_identity: String,
+    project: ProjectProjection,
+    status: &'static str,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum FeedbackExecutionState {
+    InstalledNotRequested,
+    Requested,
+    Executed,
+    CacheHit,
+    SkippedBecauseUnused,
+    DeferredOnly,
+    Failed,
+    Cancelled,
+    Superseded,
+    NotInstalled,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stage15To20DebugRequest {
+    protocol_version: u16,
+    schema_version: u16,
+    selected_region_id: Option<String>,
+    requested_view: String,
+    preview_profile: String,
+    comparison_mode: String,
+    selected_operation_id: Option<String>,
+    active_tool: String,
+    preview_state: FeedbackExecutionState,
+    request_identity: String,
+    pixel_dispatch_count: u32,
+    execution_outcome: FeedbackExecutionState,
+    preview_error: Option<UserFacingError>,
+    last_command_result: Option<String>,
+    paint_summary: Option<serde_json::Value>,
+    tile: Option<serde_json::Value>,
+    compiled_inspection: Option<serde_json::Value>,
+    workbench_state: Option<serde_json::Value>,
+    #[serde(default)]
+    bounded_telemetry: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stage15To20DebugPayload {
+    schema: &'static str,
+    schema_version: u16,
+    summary: String,
+    payload: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -626,6 +738,76 @@ pub struct Stage14PreviewRequest {
     /// It is never stored until the matching AcceptSourceFramePartition command is issued.
     #[serde(default)]
     candidate_recipe: Option<PartitionRecipe>,
+    #[serde(default)]
+    feedback_view: Option<FeedbackContributionView>,
+    #[serde(default)]
+    feedback_comparison_mode: Option<FeedbackComparisonMode>,
+    #[serde(default)]
+    feedback_selected_operation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FeedbackContributionView {
+    Stage15Occupancy,
+    Stage15Height,
+    Stage15ProfileRoute,
+    Stage15Lod,
+    Stage15Fallback,
+    Stage16RegisteredMask,
+    Stage16Height,
+    Stage16VectorNormal,
+    Stage16ScalarRoughness,
+    Stage16ScalarMetallic,
+    Stage16ScalarAmbientOcclusion,
+    Stage16BaseColor,
+    Stage16MaterialId,
+    Stage16MaterialIdValidity,
+    Stage16Route,
+    Stage16Occupancy,
+    Stage16Lod,
+    Stage16Scope,
+    Stage16AssetResolution,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FeedbackComparisonMode {
+    After,
+    Before,
+    SelectedOperationIsolation,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackQaTileRequest {
+    protocol_version: u16,
+    command_version: u16,
+    revision: u64,
+    generation: u64,
+    region_id: RegionId,
+    view: FeedbackContributionView,
+    profile: PreviewProfile,
+    comparison_mode: FeedbackComparisonMode,
+    selected_operation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackPreviewExecution {
+    request_identity: String,
+    client_generation: u64,
+    published_generation: u64,
+    revision: u64,
+    region_id: RegionId,
+    view: FeedbackContributionView,
+    requested_map: &'static str,
+    profile: PreviewProfile,
+    comparison_mode: FeedbackComparisonMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_operation_id: Option<String>,
+    outcome: FeedbackExecutionState,
+    cache_reused: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -745,7 +927,7 @@ fn compiled_view_intent(
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewProfile {
     Draft512,
@@ -806,6 +988,8 @@ pub struct Stage14SlotProjection {
     edge_eligibility: hot_trimmer_domain::EdgeEligibility,
     period_pixels: Option<[u32; 2]>,
     address_mode: String,
+    compiled_profile: Option<hot_trimmer_effect_compiler::CompiledProfile>,
+    compiled_details: Option<hot_trimmer_effect_compiler::CompiledDetailSet>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -827,6 +1011,8 @@ pub struct IntermediateAtlasProjection {
     #[serde(skip_serializing_if = "Option::is_none")]
     tile_manifest: Option<GpuTiledPreviewPublication>,
     tile_manifests: BTreeMap<String, GpuTiledPreviewPublication>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feedback_execution: Option<FeedbackPreviewExecution>,
     region_id_lookup: Vec<hot_trimmer_sheet_compiler::CompiledCompactRegionIdLookup>,
     regions: Vec<ResolvedRegion>,
     unavailable_channels: Vec<String>,
@@ -1262,6 +1448,226 @@ pub fn create_source_frame_document(
 }
 
 #[tauri::command]
+pub fn create_stage_15_16_feedback_sample(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
+) -> Result<ProjectProjection, UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    create_stage_15_16_feedback_sample_impl(&mut session, preview_service.inner().as_ref())
+}
+
+fn create_stage_15_16_feedback_sample_impl(
+    session: &mut ProjectSession,
+    preview_service: &PreviewService,
+) -> Result<ProjectProjection, UserFacingError> {
+    let existing = session
+        .store
+        .as_ref()
+        .ok_or_else(no_project)?
+        .summary()
+        .map_err(store_error)?;
+    if existing.document.is_some() || !existing.sources.is_empty() {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "Create the bundled feedback sample in a new empty draft.",
+        ));
+    }
+    let mut rgba = Vec::with_capacity(64 * 64 * 4);
+    for y in 0..64_u32 {
+        for x in 0..64_u32 {
+            let checker = ((x / 8) + (y / 8)) % 2;
+            let border = x % 16 < 2 || y % 16 < 2;
+            rgba.extend_from_slice(if border {
+                &[62, 76, 86, 255]
+            } else if checker == 0 {
+                &[154, 126, 92, 255]
+            } else {
+                &[112, 91, 68, 255]
+            });
+        }
+    }
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(&rgba, 64, 64, ColorType::Rgba8.into())
+        .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+    let inspected = inspect_bytes_with_policy(
+        png,
+        DecodeLimits::default(),
+        ColorPolicy::ConvertToSrgb,
+    )
+    .map_err(image_error)?;
+    let source_set_id = Uuid::parse_str("20152016-0000-4000-8000-000000000001")
+        .expect("feedback sample source UUID");
+    let mut input = source_input(
+        Path::new("feedback-sample-stage15-16.png"),
+        SourceOwnership::OwnedCopy,
+        &inspected,
+    );
+    input.id = "20152016-0000-4000-8000-000000000010".parse().expect("feedback Base Color source UUID");
+    let asset_digest = input.sha256.clone();
+    let store = session.store.as_mut().ok_or_else(no_project)?;
+    store
+        .replace_registered_source_in_set(
+            source_set_id,
+            &input,
+            ChannelRegistration {
+                role: MaterialChannelRole::BaseColor,
+                interpretation: MaterialChannelRole::BaseColor.required_interpretation(),
+                normal_convention: NormalConvention::NotApplicable,
+                assignment_provenance: AssignmentProvenance::UserAssigned,
+                confidence_milli: 1000,
+            },
+        )
+        .map_err(|failure| source_registration_error(failure, SourceChannel::BaseColor))?;
+    for (role, channel, source_id) in [
+        (MaterialChannelRole::Height, SourceChannel::Height, "20152016-0000-4000-8000-000000000011"),
+        (MaterialChannelRole::MaterialId, SourceChannel::MaterialId, "20152016-0000-4000-8000-000000000012"),
+        (MaterialChannelRole::EdgeMask, SourceChannel::EdgeMask, "20152016-0000-4000-8000-000000000013"),
+    ] {
+        let mut channel_input = input.clone();
+        channel_input.id = source_id.parse().expect("feedback registered-channel source UUID");
+        store
+            .replace_registered_source_in_set(
+                source_set_id,
+                &channel_input,
+                ChannelRegistration {
+                    role,
+                    interpretation: role.required_interpretation(),
+                    normal_convention: NormalConvention::NotApplicable,
+                    assignment_provenance: AssignmentProvenance::UserAssigned,
+                    confidence_milli: 1000,
+                },
+            )
+            .map_err(|failure| source_registration_error(failure, channel))?;
+    }
+    store.refresh_document_assets().map_err(store_error)?;
+    store.create_source_frame_document().map_err(store_error)?;
+    store.rename_project("Stage 15-16 Feedback Sample").map_err(store_error)?;
+    let sample_summary = store.summary().map_err(store_error)?;
+    let asset_version = sample_summary
+        .source_sets
+        .iter()
+        .find(|source_set| source_set.id.to_string() == source_set_id.to_string())
+        .ok_or_else(|| error(ErrorCode::ProjectInvalid, "The feedback sample source set is missing."))?
+        .source_revision
+        .to_string();
+    let document = sample_summary
+        .document
+        .ok_or_else(no_project)?;
+    let region = document
+        .topology
+        .regions
+        .first()
+        .ok_or_else(|| error(ErrorCode::ProjectInvalid, "The feedback sample has no regions."))?;
+    let requested = hot_trimmer_effect_compiler::RequestedProfile {
+        program: hot_trimmer_effect_compiler::ProfileProgram::ConvexBevel,
+        first_width: hot_trimmer_effect_compiler::ProfileLength::Meters(0.004),
+        second_width: hot_trimmer_effect_compiler::ProfileLength::Meters(0.004),
+        minimum_flat_center: hot_trimmer_effect_compiler::ProfileLength::Meters(0.001),
+        amplitude: hot_trimmer_effect_compiler::ProfileLength::Meters(0.002),
+        angle_degrees: 45.0,
+        inner_radius: hot_trimmer_effect_compiler::ProfileLength::Meters(0.0),
+        outer_radius: hot_trimmer_effect_compiler::ProfileLength::Meters(0.0),
+        legality_policy: hot_trimmer_effect_compiler::ProfileLegalityPolicy::Clamp,
+        lod_policy: hot_trimmer_effect_compiler::ProfileLodPolicy::Auto,
+        maximum_supersampling: 8,
+        seed: 201_520,
+        custom_curve: Vec::new(),
+    };
+    store
+        .execute_document_command(&TrimSheetDocumentCommand::SetFeedbackProfile {
+            region_id: region.id,
+            structural_profile: StructuralProfile::Bevel,
+            compiled_request: serde_json::to_string(&requested)
+                .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?,
+        })
+        .map_err(store_error)?;
+    let asset = hot_trimmer_effect_compiler::StampAssetRef {
+        asset_id: source_set_id.to_string(),
+        version: asset_version,
+        digest: hot_trimmer_domain::ContentDigest(asset_digest),
+        kind: "registered_stamp_channels".into(),
+    };
+    let definition = hot_trimmer_effect_compiler::DetailDefinition {
+        name: region.id.to_string(),
+        family: hot_trimmer_effect_compiler::DetailFamily::PanelStamp,
+        physical_size: [0.03, 0.03],
+        scale_space: hot_trimmer_effect_compiler::EffectScaleSpace::World,
+        compatible_roles: vec![region.role],
+        orientation: hot_trimmer_effect_compiler::DetailOrientation::Slot,
+        explicit_rotation_degrees: 0.0,
+        aspect_limits: [0.25, 4.0],
+        minimum_pixels: [2, 2],
+        repeat_period_m: None,
+        fit_policy: hot_trimmer_effect_compiler::DetailFitPolicy::Contain,
+        mapping_mode: hot_trimmer_effect_compiler::DetailMappingMode::Planar,
+        channels: vec![hot_trimmer_effect_compiler::DetailChannelContribution {
+            channel: MaterialChannelRole::Height,
+            amount: 0.0015,
+            blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+            material_id: None,
+            metallic_explicit: false,
+        }],
+        fallback: hot_trimmer_effect_compiler::DetailFallback::NormalOnly,
+        provenance: "bundled Prompt 20A deterministic feedback sample".into(),
+        seed: 201_516,
+        required_sources: vec![asset.clone()],
+        required_halo_px: 2,
+        dependencies: Vec::new(),
+    };
+    let operation = hot_trimmer_effect_compiler::StampOperation {
+        asset,
+        scope: hot_trimmer_effect_compiler::StampScope::MaterialReusableAtlas,
+        target_region: region.id.to_string(),
+        physical_position_m: [0.05, 0.05],
+        physical_size_m: [0.03, 0.03],
+        pivot: [0.5, 0.5],
+        rotation_degrees: 15.0,
+        mirror: [false, false],
+        opacity: 1.0,
+        blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+        clipping: hot_trimmer_effect_compiler::DetailFitPolicy::Contain,
+        seed: 201_520,
+        spacing_m: [0.04, 0.04],
+        scatter: 0.0,
+        jitter_m: [0.0, 0.0],
+        layer_order: 0,
+        occupancy: hot_trimmer_effect_compiler::OccupancyRelation::OnlyFlatCenter,
+        channels: vec![
+            hot_trimmer_effect_compiler::DetailChannelContribution {
+                channel: MaterialChannelRole::Height,
+                amount: 0.0015,
+                blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+                material_id: None,
+                metallic_explicit: false,
+            },
+            hot_trimmer_effect_compiler::DetailChannelContribution {
+                channel: MaterialChannelRole::MaterialId,
+                amount: 1.0,
+                blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+                material_id: Some(0),
+                metallic_explicit: false,
+            },
+        ],
+    };
+    for (id, intent) in [
+        ("20152016-0000-4000-8000-000000000002", FeedbackDetailIntent::Definition(definition)),
+        ("20152016-0000-4000-8000-000000000003", FeedbackDetailIntent::Operation(operation)),
+    ] {
+        store
+            .execute_document_command(&TrimSheetDocumentCommand::UpsertDecoration {
+                decoration: feedback_decoration(id, true, &intent)?,
+            })
+            .map_err(store_error)?;
+    }
+    session.mark_mutated();
+    preview_service.reset();
+    project_projection(session)
+}
+
+#[tauri::command]
 pub fn regenerate_source_frame_partition(
     request: SourceFramePartitionRequest,
     session: State<'_, SharedProjectSession>,
@@ -1317,6 +1723,513 @@ pub fn apply_document_command(
     session.mark_mutated();
     project_projection(&session)
 }
+
+#[tauri::command]
+pub fn apply_feedback_workbench_command(
+    request: FeedbackWorkbenchCommandRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<FeedbackWorkbenchCommandResult, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    if request.command_version != FEEDBACK_COMMAND_VERSION {
+        return Err(error(
+            ErrorCode::ProtocolMismatch,
+            "The Profile & Detail Contributions command version is stale or unknown.",
+        ));
+    }
+    let mut session = session.lock().map_err(|_| poisoned())?;
+    let summary = session
+        .store
+        .as_ref()
+        .ok_or_else(no_project)?
+        .summary()
+        .map_err(store_error)?;
+    let document = summary.document.as_ref().ok_or_else(no_project)?;
+    let (domain_command, committed_identity) = match request.command {
+        FeedbackWorkbenchCommand::SetProfile {
+            region_id,
+            requested,
+        } => {
+            let region = document
+                .topology
+                .regions
+                .iter()
+                .find(|region| region.id == region_id)
+                .ok_or_else(|| error(ErrorCode::InvalidInput, "The selected region no longer exists."))?;
+            let structural_profile = structural_profile_for_feedback(requested.program, region.role)?;
+            let compiled_request = serde_json::to_string(&requested)
+                .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+            let identity = hot_trimmer_domain::ContentDigest::sha256(compiled_request.as_bytes()).0;
+            (
+                TrimSheetDocumentCommand::SetFeedbackProfile {
+                    region_id,
+                    structural_profile,
+                    compiled_request,
+                },
+                identity,
+            )
+        }
+        FeedbackWorkbenchCommand::UpsertDetail {
+            operation_id,
+            enabled,
+            intent,
+        } => {
+            validate_feedback_detail_target(document, &intent)?;
+            let operation_id = operation_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            validate_feedback_operation_id(&operation_id)?;
+            let decoration = feedback_decoration(&operation_id, enabled, &intent)?;
+            (
+                TrimSheetDocumentCommand::UpsertDecoration { decoration },
+                operation_id,
+            )
+        }
+        FeedbackWorkbenchCommand::DuplicateDetail { operation_id } => {
+            validate_feedback_operation_id(&operation_id)?;
+            let existing = find_feedback_decoration(document, &operation_id)?;
+            let intent = parse_feedback_detail(existing)?;
+            let duplicate_id = Uuid::new_v4().to_string();
+            let decoration = feedback_decoration(
+                &duplicate_id,
+                !existing.decoration_key.starts_with("stage16.disabled."),
+                &intent,
+            )?;
+            (
+                TrimSheetDocumentCommand::UpsertDecoration { decoration },
+                duplicate_id,
+            )
+        }
+        FeedbackWorkbenchCommand::SetDetailEnabled {
+            operation_id,
+            enabled,
+        } => {
+            validate_feedback_operation_id(&operation_id)?;
+            let existing = find_feedback_decoration(document, &operation_id)?;
+            let intent = parse_feedback_detail(existing)?;
+            let replacement = feedback_decoration(&operation_id, enabled, &intent)?;
+            (
+                TrimSheetDocumentCommand::ReplaceDecoration {
+                    old_decoration_key: existing.decoration_key.clone(),
+                    decoration: replacement,
+                },
+                operation_id,
+            )
+        }
+        FeedbackWorkbenchCommand::DeleteDetail { operation_id } => {
+            validate_feedback_operation_id(&operation_id)?;
+            let existing = find_feedback_decoration(document, &operation_id)?;
+            (
+                TrimSheetDocumentCommand::DeleteDecoration {
+                    decoration_key: existing.decoration_key.clone(),
+                },
+                operation_id,
+            )
+        }
+        FeedbackWorkbenchCommand::ReorderDetails { operation_ids } => {
+            let detail_bindings = document
+                .decorations
+                .iter()
+                .filter(|decoration| is_feedback_detail_key(&decoration.decoration_key))
+                .collect::<Vec<_>>();
+            if operation_ids.len() != detail_bindings.len()
+                || operation_ids.iter().collect::<BTreeSet<_>>().len() != operation_ids.len()
+            {
+                return Err(error(ErrorCode::InvalidInput, "The detail order is stale."));
+            }
+            let mut ordered = document
+                .decorations
+                .iter()
+                .filter(|decoration| !is_feedback_detail_key(&decoration.decoration_key))
+                .map(|decoration| decoration.decoration_key.clone())
+                .collect::<Vec<_>>();
+            for operation_id in &operation_ids {
+                validate_feedback_operation_id(operation_id)?;
+                ordered.push(find_feedback_decoration(document, operation_id)?.decoration_key.clone());
+            }
+            (
+                TrimSheetDocumentCommand::ReorderDecorations {
+                    decoration_keys: ordered,
+                },
+                hot_trimmer_domain::ContentDigest::sha256(operation_ids.join("|").as_bytes()).0,
+            )
+        }
+    };
+    session
+        .store
+        .as_mut()
+        .ok_or_else(no_project)?
+        .execute_document_command(&domain_command)
+        .map_err(store_error)?;
+    session.mark_mutated();
+    Ok(FeedbackWorkbenchCommandResult {
+        command_version: FEEDBACK_COMMAND_VERSION,
+        committed_identity,
+        project: project_projection(&session)?,
+        status: "executed",
+    })
+}
+
+fn structural_profile_for_feedback(
+    program: hot_trimmer_effect_compiler::ProfileProgram,
+    role: TemplateSlotRole,
+) -> Result<StructuralProfile, UserFacingError> {
+    use hot_trimmer_effect_compiler::ProfileProgram;
+    let radial = matches!(program, ProfileProgram::RadialDisc | ProfileProgram::Annulus);
+    if radial != matches!(role, TemplateSlotRole::Radial) && program != ProfileProgram::Flat {
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "That structural profile is not legal for the selected slot role.",
+        ));
+    }
+    match program {
+        ProfileProgram::Flat => Ok(StructuralProfile::Flat),
+        ProfileProgram::ConvexBevel => Ok(StructuralProfile::Bevel),
+        ProfileProgram::ConcaveGroove => Ok(StructuralProfile::Groove),
+        ProfileProgram::RoundedBevel => Ok(StructuralProfile::RoundedBevel),
+        ProfileProgram::PanelFrame => Ok(StructuralProfile::PanelFrame),
+        ProfileProgram::RadialDisc => Ok(StructuralProfile::RadialDisc),
+        ProfileProgram::Annulus => Ok(StructuralProfile::Annulus),
+        _ => Err(error(
+            ErrorCode::InvalidInput,
+            "Prompt 20A exposes only Flat, Bevel, Rounded Bevel, Groove, Panel Frame, Radial Disc, and Annulus.",
+        )),
+    }
+}
+
+fn validate_feedback_detail_target(
+    document: &TrimSheetDocument,
+    intent: &FeedbackDetailIntent,
+) -> Result<(), UserFacingError> {
+    let target = match intent {
+        FeedbackDetailIntent::Definition(value) => value.name.as_str(),
+        FeedbackDetailIntent::Operation(value) => value.target_region.as_str(),
+        FeedbackDetailIntent::Stroke(value) => value.operation.target_region.as_str(),
+    };
+    let target = target
+        .parse::<RegionId>()
+        .map_err(|_| error(ErrorCode::InvalidInput, "Detail target must be a stable physical region identity."))?;
+    if !document.topology.regions.iter().any(|region| region.id == target) {
+        return Err(error(ErrorCode::InvalidInput, "The detail target region no longer exists."));
+    }
+    Ok(())
+}
+
+fn validate_feedback_operation_id(value: &str) -> Result<(), UserFacingError> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| error(ErrorCode::InvalidInput, "The detail operation identity is malformed."))
+}
+
+fn feedback_decoration(
+    operation_id: &str,
+    enabled: bool,
+    intent: &FeedbackDetailIntent,
+) -> Result<DecorationBinding, UserFacingError> {
+    let target = match intent {
+        FeedbackDetailIntent::Definition(value) => value.name.as_str(),
+        FeedbackDetailIntent::Operation(value) => value.target_region.as_str(),
+        FeedbackDetailIntent::Stroke(value) => value.operation.target_region.as_str(),
+    };
+    let kind = match intent {
+        FeedbackDetailIntent::Definition(_) => "detail.definition",
+        FeedbackDetailIntent::Operation(_) => "stamp.operation",
+        FeedbackDetailIntent::Stroke(_) => "stamp.stroke",
+    };
+    let prefix = if enabled { "stage16" } else { "stage16.disabled" };
+    let value = match intent {
+        FeedbackDetailIntent::Definition(value) => serde_json::to_string(value),
+        FeedbackDetailIntent::Operation(value) => serde_json::to_string(value),
+        FeedbackDetailIntent::Stroke(value) => serde_json::to_string(value),
+    }
+    .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+    Ok(DecorationBinding {
+        decoration_key: format!("{prefix}.{kind}.{operation_id}.{target}"),
+        value,
+    })
+}
+
+fn is_feedback_detail_key(key: &str) -> bool {
+    key.starts_with("stage16.detail.definition.")
+        || key.starts_with("stage16.stamp.operation.")
+        || key.starts_with("stage16.stamp.stroke.")
+        || key.starts_with("stage16.disabled.detail.definition.")
+        || key.starts_with("stage16.disabled.stamp.operation.")
+        || key.starts_with("stage16.disabled.stamp.stroke.")
+}
+
+fn rewrite_feedback_raw_field(
+    document: &mut TrimSheetDocument,
+    view: FeedbackContributionView,
+) -> Result<(), UserFacingError> {
+    for binding in &mut document.decorations {
+        if binding.decoration_key.contains(".detail.definition.") {
+            let mut definition: hot_trimmer_effect_compiler::DetailDefinition = serde_json::from_str(&binding.value)
+                .map_err(|failure| error(ErrorCode::InvalidInput, &format!("The persisted detail definition is malformed: {failure}")))?;
+            rewrite_feedback_channels(&mut definition.channels, view);
+            binding.value = serde_json::to_string(&definition).map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+        } else if binding.decoration_key.contains(".stamp.operation.") {
+            let mut operation: hot_trimmer_effect_compiler::StampOperation = serde_json::from_str(&binding.value)
+                .map_err(|failure| error(ErrorCode::InvalidInput, &format!("The persisted stamp operation is malformed: {failure}")))?;
+            rewrite_feedback_operation_field(&mut operation, view);
+            binding.value = serde_json::to_string(&operation).map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+        } else if binding.decoration_key.contains(".stamp.stroke.") {
+            let mut stroke: hot_trimmer_effect_compiler::StampStroke = serde_json::from_str(&binding.value)
+                .map_err(|failure| error(ErrorCode::InvalidInput, &format!("The persisted stamp stroke is malformed: {failure}")))?;
+            rewrite_feedback_operation_field(&mut stroke.operation, view);
+            binding.value = serde_json::to_string(&stroke).map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_feedback_operation_field(
+    operation: &mut hot_trimmer_effect_compiler::StampOperation,
+    view: FeedbackContributionView,
+) {
+    rewrite_feedback_channels(&mut operation.channels, view);
+}
+
+fn rewrite_feedback_channels(
+    channels: &mut Vec<hot_trimmer_effect_compiler::DetailChannelContribution>,
+    view: FeedbackContributionView,
+) {
+    use FeedbackContributionView as View;
+    if matches!(view, View::Stage16RegisteredMask) {
+        channels.retain(|channel| channel.channel == MaterialChannelRole::Height);
+        for channel in channels {
+            channel.channel = MaterialChannelRole::EdgeMask;
+            channel.amount = 1.0;
+            channel.blend = hot_trimmer_effect_compiler::StampBlendPolicy::Replace;
+        }
+    } else if matches!(view, View::Stage16MaterialIdValidity) {
+        channels.retain(|channel| channel.channel == MaterialChannelRole::MaterialId);
+        for channel in channels {
+            channel.amount = 1.0;
+            channel.material_id = Some(255);
+            channel.blend = hot_trimmer_effect_compiler::StampBlendPolicy::Replace;
+        }
+    }
+}
+
+fn find_feedback_decoration<'a>(
+    document: &'a TrimSheetDocument,
+    operation_id: &str,
+) -> Result<&'a DecorationBinding, UserFacingError> {
+    let needle = format!(".{operation_id}.");
+    document
+        .decorations
+        .iter()
+        .find(|decoration| is_feedback_detail_key(&decoration.decoration_key) && decoration.decoration_key.contains(&needle))
+        .ok_or_else(|| error(ErrorCode::InvalidInput, "The detail operation no longer exists."))
+}
+
+fn parse_feedback_detail(binding: &DecorationBinding) -> Result<FeedbackDetailIntent, UserFacingError> {
+    let parse = |failure: serde_json::Error| error(ErrorCode::InvalidInput, &format!("The persisted detail intent is malformed: {failure}"));
+    if binding.decoration_key.contains(".detail.definition.") {
+        serde_json::from_str(&binding.value).map(FeedbackDetailIntent::Definition).map_err(parse)
+    } else if binding.decoration_key.contains(".stamp.operation.") {
+        serde_json::from_str(&binding.value).map(FeedbackDetailIntent::Operation).map_err(parse)
+    } else {
+        serde_json::from_str(&binding.value).map(FeedbackDetailIntent::Stroke).map_err(parse)
+    }
+}
+
+#[tauri::command]
+pub fn stage_15_20_debug_payload(
+    request: Stage15To20DebugRequest,
+    session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
+) -> Result<Stage15To20DebugPayload, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    if request.schema_version != STAGE_15_20_DEBUG_SCHEMA_VERSION {
+        return Err(error(
+            ErrorCode::ProtocolMismatch,
+            "The Stage 15-20 debug payload schema is stale or unknown.",
+        ));
+    }
+    let session = session.lock().map_err(|_| poisoned())?;
+    let summary = session
+        .store
+        .as_ref()
+        .ok_or_else(no_project)?
+        .summary()
+        .map_err(store_error)?;
+    let document = summary.document.as_ref().ok_or_else(no_project)?;
+    let appearance_hash = hash_hex(
+        document
+            .appearance_hash()
+            .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?,
+    );
+    let safe_telemetry = request
+        .bounded_telemetry
+        .into_iter()
+        .rev()
+        .take(32)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|line| sanitize_debug_string(&line))
+        .collect::<Vec<_>>();
+    let stage16_count = document
+        .decorations
+        .iter()
+        .filter(|decoration| is_feedback_detail_key(&decoration.decoration_key))
+        .count();
+    let compiled_profile = request.compiled_inspection.as_ref().and_then(|value| value.get("compiledProfile"));
+    let compiled_details = request.compiled_inspection.as_ref().and_then(|value| value.get("compiledDetails"));
+    let cache_hit = matches!(&request.execution_outcome, FeedbackExecutionState::CacheHit);
+    // The client carries the outcome of the versioned native request.  Do not
+    // infer this from a display-view name: a Stage 16 request may evaluate the
+    // Stage 15 occupancy dependency, and cache / cancellation outcomes apply
+    // to that actual execution route.
+    let stage15_state = if compiled_profile.is_some() {
+        request.preview_state.clone()
+    } else {
+        FeedbackExecutionState::InstalledNotRequested
+    };
+    let stage16_state = if stage16_count == 0 {
+        FeedbackExecutionState::SkippedBecauseUnused
+    } else if compiled_details.is_some() {
+        request.preview_state.clone()
+    } else {
+        FeedbackExecutionState::InstalledNotRequested
+    };
+    let tile_evidence = request.tile.clone();
+    let execution_evidence = serde_json::json!({
+        "requestIdentity": request.request_identity.clone(),
+        "outcome": request.execution_outcome.clone(),
+        "dispatch": { "count": request.pixel_dispatch_count, "records": safe_telemetry.iter().filter(|line| line.contains("dispatch")).cloned().collect::<Vec<_>>() },
+        "cache": { "hit": cache_hit, "records": safe_telemetry.iter().filter(|line| line.to_ascii_lowercase().contains("cache")).cloned().collect::<Vec<_>>() },
+        "timings": tile_evidence.as_ref().and_then(|value| value.get("telemetry")).cloned(),
+        "upload": safe_telemetry.iter().filter(|line| line.to_ascii_lowercase().contains("upload")).cloned().collect::<Vec<_>>(),
+        "residency": safe_telemetry.iter().filter(|line| line.to_ascii_lowercase().contains("residen")).cloned().collect::<Vec<_>>(),
+        "pins": safe_telemetry.iter().filter(|line| line.to_ascii_lowercase().contains("pin")).cloned().collect::<Vec<_>>(),
+        "formats": tile_evidence.as_ref().and_then(|value| value.pointer("/manifest/format")).cloned(),
+        "shaderIdentities": safe_telemetry.iter().filter(|line| line.to_ascii_lowercase().contains("shader")).cloned().collect::<Vec<_>>(),
+        "readback": tile_evidence.as_ref().and_then(|value| value.get("telemetry")).cloned(),
+        "cpuRaster": { "profile": 0, "detailMaskSdfStamp": 0, "evidence": "GPU tile publication path; no CPU raster fallback installed" },
+    });
+    let project_label = Path::new(&summary.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("feedback-project")
+        .to_owned();
+    let payload = serde_json::json!({
+        "app": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "build": option_env!("HOT_TRIMMER_BUILD_ID").unwrap_or("development"),
+            "protocolVersion": IPC_PROTOCOL_VERSION,
+            "schemaVersion": STAGE_15_20_DEBUG_SCHEMA_VERSION,
+        },
+        "gpu": {
+            "capabilityGeneration": preview_service.gpu_capabilities.generation(),
+            "adapterBackendCapabilities": safe_telemetry.iter().find(|line| line.contains("gpu_")).cloned(),
+        },
+        "identity": {
+            "projectId": summary.id.to_string(),
+            "projectLabel": project_label,
+            "documentId": document.id.to_string(),
+            "documentRevision": document.document_revision,
+            "topologyRevision": document.topology_revision,
+            "appearanceRevision": document.appearance_revision,
+            "topologyHash": hash_hex(document.topology.topology_hash),
+            "appearanceHash": appearance_hash,
+        },
+        "selection": {
+            "regionId": request.selected_region_id,
+            "physicalScale": request.compiled_inspection.as_ref().and_then(|value| value.get("compiledProfile")).and_then(|value| value.get("slotSizeM")).cloned(),
+        },
+        "request": {
+            "identity": request.request_identity,
+            "view": request.requested_view,
+            "profile": request.preview_profile,
+            "comparisonMode": request.comparison_mode,
+            "selectedOperationId": request.selected_operation_id,
+        },
+        "tilePublication": request.tile.and_then(|value| sanitize_debug_value(value, None)),
+        "executionEvidence": execution_evidence,
+        "stages": {
+            "15": { "state": stage15_state, "inspection": compiled_profile.cloned().and_then(|value| sanitize_debug_value(value, None)), "cpuProfileRasterCounters": { "count": 0, "route": "gpu" } },
+            "16": { "state": stage16_state, "intentCount": stage16_count, "inspection": compiled_details.cloned().and_then(|value| sanitize_debug_value(value, None)), "cpuDetailMaskSdfStampRasterCounters": { "count": 0, "route": "gpu" } },
+            "18": { "state": FeedbackExecutionState::NotInstalled, "installedVersion": serde_json::Value::Null },
+            "17": { "state": FeedbackExecutionState::NotInstalled, "installedVersion": serde_json::Value::Null },
+            "19": { "state": FeedbackExecutionState::NotInstalled, "installedVersion": serde_json::Value::Null },
+            "20": { "state": FeedbackExecutionState::NotInstalled, "installedVersion": serde_json::Value::Null },
+        },
+        "workbench20A": {
+            "version": "20A.1",
+            "schemaVersion": STAGE_15_20_DEBUG_SCHEMA_VERSION,
+            "activeTool": request.active_tool,
+            "lastTypedCommandResult": request.last_command_result.map(|value| sanitize_debug_string(&value)),
+            "authoringPreviewError": request.preview_error,
+            "state": request.workbench_state.and_then(|value| sanitize_debug_value(value, None)),
+        },
+        "previewClient": request.paint_summary.and_then(|value| sanitize_debug_value(value, None)),
+        "boundedTelemetry": safe_telemetry,
+    });
+    let summary_text = format!(
+        "Profile & Detail Contributions | view={} | region={} | Stage 15={stage15_state:?} | Stage 16={stage16_state:?} | Stages 18/17/19/20=NotInstalled",
+        request.requested_view,
+        request.selected_region_id.as_deref().unwrap_or("none"),
+    );
+    Ok(Stage15To20DebugPayload {
+        schema: "hot-trimmer.stage15-20-feedback",
+        schema_version: STAGE_15_20_DEBUG_SCHEMA_VERSION,
+        summary: summary_text,
+        payload,
+    })
+}
+
+fn sanitize_debug_string(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("data:image")
+        || lower.contains("base64")
+        || lower.contains("clipboard")
+        || lower.contains("credential")
+        || lower.contains("environment variable")
+        || value.contains(":\\")
+        || value.starts_with('/')
+        || lower.contains("/users/")
+    {
+        "[redacted prohibited debug value]".into()
+    } else {
+        value.chars().take(2_048).collect()
+    }
+}
+
+fn sanitize_debug_value(value: serde_json::Value, key: Option<&str>) -> Option<serde_json::Value> {
+    let forbidden_key = key.is_some_and(|key| {
+        let key = key.to_ascii_lowercase();
+        key.contains("pixel")
+            || key.contains("encoded")
+            || key.contains("clipboard")
+            || key.contains("credential")
+            || key.contains("environment")
+            || key == "path"
+            || key.ends_with("path")
+            || key == "bytes"
+            || key.ends_with("bytes")
+    });
+    if forbidden_key {
+        return None;
+    }
+    match value {
+        serde_json::Value::String(value) => Some(serde_json::Value::String(sanitize_debug_string(&value))),
+        serde_json::Value::Array(values) => Some(serde_json::Value::Array(
+            values
+                .into_iter()
+                .take(256)
+                .filter_map(|value| sanitize_debug_value(value, None))
+                .collect(),
+        )),
+        serde_json::Value::Object(values) => Some(serde_json::Value::Object(
+            values
+                .into_iter()
+                .filter_map(|(key, value)| sanitize_debug_value(value, Some(&key)).map(|value| (key, value)))
+                .collect(),
+        )),
+        other => Some(other),
+    }
+}
+
 
 #[tauri::command]
 pub fn apply_patch_command(
@@ -1714,6 +2627,85 @@ pub async fn preview_through_stage_14(
             &format!("Stage 14 preview worker failed: {join}"),
         )
     })?
+}
+
+#[tauri::command]
+pub async fn preview_stage_15_16_feedback(
+    request: FeedbackQaTileRequest,
+    session: State<'_, SharedProjectSession>,
+    preview_service: State<'_, SharedPreviewService>,
+) -> Result<IntermediateAtlasProjection, UserFacingError> {
+    validate_protocol(request.protocol_version)?;
+    if request.command_version != FEEDBACK_COMMAND_VERSION {
+        return Err(error(
+            ErrorCode::ProtocolMismatch,
+            "The Stage 15/16 QA request version is stale or unknown.",
+        ));
+    }
+    let map = feedback_map_for_view(request.view)?.ok_or_else(|| error(
+        ErrorCode::InvalidInput,
+        "This compiler QA view is metadata-only and intentionally dispatches zero pixel work.",
+    ))?;
+    let request_identity = feedback_preview_cache_identity(&request, map)?;
+    preview_through_stage_14(
+        Stage14PreviewRequest {
+            protocol_version: request.protocol_version,
+            revision: request.revision,
+            region_id: Some(request.region_id),
+            transient_projection: None,
+            draft_id: Some(request.generation),
+            input_hash: Some(request_identity),
+            profile: request.profile,
+            view_intent: Some(PreviewViewIntent::ExactSelectedRegion),
+            viewport_rect: None,
+            requested_maps: vec![map],
+            candidate_recipe: None,
+            feedback_view: Some(request.view),
+            feedback_comparison_mode: Some(request.comparison_mode),
+            feedback_selected_operation_id: request.selected_operation_id,
+        },
+        session,
+        preview_service,
+    )
+    .await
+}
+
+fn feedback_map_for_view(
+    view: FeedbackContributionView,
+) -> Result<Option<MaterialMapKind>, UserFacingError> {
+    use FeedbackContributionView as View;
+    Ok(Some(match view {
+        View::Stage15Occupancy => MaterialMapKind::AmbientOcclusion,
+        View::Stage15Height | View::Stage16Height => MaterialMapKind::Height,
+        View::Stage16RegisteredMask => MaterialMapKind::EdgeMask,
+        View::Stage16VectorNormal => MaterialMapKind::Normal,
+        View::Stage16ScalarRoughness => MaterialMapKind::Roughness,
+        View::Stage16ScalarMetallic => MaterialMapKind::Metallic,
+        View::Stage16ScalarAmbientOcclusion => MaterialMapKind::AmbientOcclusion,
+        View::Stage16BaseColor => MaterialMapKind::BaseColor,
+        View::Stage16MaterialId | View::Stage16MaterialIdValidity => MaterialMapKind::MaterialId,
+        View::Stage15ProfileRoute | View::Stage15Lod | View::Stage15Fallback
+        | View::Stage16Route | View::Stage16Occupancy | View::Stage16Lod
+        | View::Stage16Scope | View::Stage16AssetResolution => return Ok(None),
+    }))
+}
+
+fn feedback_preview_cache_identity(
+    request: &FeedbackQaTileRequest,
+    map: MaterialMapKind,
+) -> Result<String, UserFacingError> {
+    let payload = serde_json::to_vec(&(
+        "stage15-16-feedback-v1",
+        request.revision,
+        request.region_id,
+        request.view,
+        map,
+        request.profile,
+        request.comparison_mode,
+        request.selected_operation_id.as_deref(),
+    ))
+    .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?;
+    Ok(ContentDigest::sha256(&payload).0)
 }
 
 #[tauri::command]
@@ -3702,6 +4694,55 @@ fn build_stage_14_preview(
             "A newer document revision superseded this preview.",
         ));
     }
+    if let Some(view) = request.feedback_view {
+        let document = summary.document.as_mut().expect("accepted document was present");
+        let selected_needle = request
+            .feedback_selected_operation_id
+            .as_deref()
+            .map(|id| format!(".{id}."));
+        let stage15_view = matches!(view, FeedbackContributionView::Stage15Occupancy | FeedbackContributionView::Stage15Height);
+        let stage16_pixel_view = matches!(view,
+            FeedbackContributionView::Stage16RegisteredMask
+            | FeedbackContributionView::Stage16Height
+            | FeedbackContributionView::Stage16VectorNormal
+            | FeedbackContributionView::Stage16ScalarRoughness
+            | FeedbackContributionView::Stage16ScalarMetallic
+            | FeedbackContributionView::Stage16ScalarAmbientOcclusion
+            | FeedbackContributionView::Stage16BaseColor
+            | FeedbackContributionView::Stage16MaterialId
+            | FeedbackContributionView::Stage16MaterialIdValidity);
+        if stage15_view || matches!(request.feedback_comparison_mode, Some(FeedbackComparisonMode::Before)) {
+            document.decorations.retain(|binding| !is_feedback_detail_key(&binding.decoration_key));
+        } else if matches!(request.feedback_comparison_mode, Some(FeedbackComparisonMode::SelectedOperationIsolation)) {
+            let needle = selected_needle.ok_or_else(|| error(ErrorCode::InvalidInput, "Selected-operation isolation requires a selected operation."))?;
+            document.decorations.retain(|binding| {
+                !is_feedback_detail_key(&binding.decoration_key)
+                    || binding.decoration_key.contains(".detail.definition.")
+                    || binding.decoration_key.contains(&needle)
+            });
+        }
+        if stage16_pixel_view {
+            document.decorations.retain(|binding| !binding.decoration_key.starts_with("stage15.profile.request."));
+            if let Some(region_id) = request.region_id {
+                let document_revision = document.document_revision;
+                let appearance_revision = document.appearance_revision;
+                let topology_revision = document.topology_revision;
+                let mut flattened = document
+                    .apply_command(&TrimSheetDocumentCommand::SetRegionStructuralProfile {
+                        region_id,
+                        structural_profile: StructuralProfile::Flat,
+                    })
+                    .map_err(|failure| error(ErrorCode::LayoutInvalid, &failure.to_string()))?;
+                // This is a transient QA clone, not a persisted authoring command. Preserve
+                // the accepted revision while retaining the domain-owned refreshed hash.
+                flattened.document_revision = document_revision;
+                flattened.appearance_revision = appearance_revision;
+                flattened.topology_revision = topology_revision;
+                *document = flattened;
+            }
+            rewrite_feedback_raw_field(document, view)?;
+        }
+    }
     if request.transient_projection.is_some() && request.region_id.is_none() {
         return Err(error(
             ErrorCode::InvalidInput,
@@ -3842,6 +4883,7 @@ fn build_stage_14_preview(
     let mut tile_manifest = None;
     let mut tile_manifests = BTreeMap::new();
     if let Some(rendered_tile) = artifact.rendered_tile.clone() {
+        let rendered_tile = rendered_tile.for_publication_generation(job);
         let publication = publish_gpu_tiled_preview(
             preview_service,
             rendered_tile.manifest.clone(),
@@ -3855,6 +4897,7 @@ fn build_stage_14_preview(
             if *map == rendered_tile.manifest.map {
                 continue;
             }
+            let tile = tile.for_publication_generation(job);
             let publication =
                 publish_gpu_tiled_preview(preview_service, tile.manifest.clone(), tile.payload())?;
             tile_manifests.insert(material_map_view_key(*map).to_string(), publication);
@@ -3950,6 +4993,8 @@ fn build_stage_14_preview(
                 edge_eligibility: slot.edge_eligibility,
                 period_pixels: slot.period_pixels,
                 address_mode: slot.address_mode.into(),
+                compiled_profile: slot.compiled_profile.clone(),
+                compiled_details: slot.compiled_details.clone(),
             })
         })
         .collect::<Result<Vec<_>, UserFacingError>>()?;
@@ -3966,6 +5011,32 @@ fn build_stage_14_preview(
     } else {
         None
     };
+    let feedback_execution = request.feedback_view.map(|view| {
+        let map = request.requested_maps[0];
+        let requested_map = material_map_view_key(map);
+        let publication = tile_manifests
+            .get(requested_map)
+            .or(tile_manifest.as_ref())
+            .expect("feedback pixel requests publish their requested GPU tile");
+        let cache_reused = artifact
+            .telemetry
+            .iter()
+            .any(|entry| entry.contains("composed_cache=hit"));
+        FeedbackPreviewExecution {
+            request_identity: request.input_hash.clone().expect("feedback requests carry an exact identity"),
+            client_generation: request.draft_id.unwrap_or(job),
+            published_generation: publication.manifest.generation,
+            revision: request.revision,
+            region_id: request.region_id.expect("feedback requests target one region"),
+            view,
+            requested_map,
+            profile: request.profile,
+            comparison_mode: request.feedback_comparison_mode.expect("feedback requests carry comparison mode"),
+            selected_operation_id: request.feedback_selected_operation_id.clone(),
+            outcome: if cache_reused { FeedbackExecutionState::CacheHit } else { FeedbackExecutionState::Executed },
+            cache_reused,
+        }
+    });
     Ok(IntermediateAtlasProjection {
         label: artifact.label,
         non_exportable: true,
@@ -3986,6 +5057,7 @@ fn build_stage_14_preview(
         maps,
         tile_manifest,
         tile_manifests,
+        feedback_execution,
         region_id_lookup: artifact.region_id_lookup,
         regions: artifact.regions,
         unavailable_channels: artifact
@@ -4359,6 +5431,7 @@ fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, Use
             })
         })
         .collect::<Result<Vec<_>, UserFacingError>>()?;
+    let feedback_authoring = feedback_authoring_projection(summary.document.as_ref())?;
     Ok(ProjectProjection {
         id: summary.id.to_string(),
         name: summary.name,
@@ -4374,6 +5447,37 @@ fn project_projection(session: &ProjectSession) -> Result<ProjectProjection, Use
         can_redo_document: store.can_redo_document_command(),
         can_undo_patch: store.can_undo_patch_command(),
         can_redo_patch: store.can_redo_patch_command(),
+        feedback_authoring,
+    })
+}
+
+fn feedback_authoring_projection(
+    document: Option<&TrimSheetDocument>,
+) -> Result<FeedbackAuthoringProjection, UserFacingError> {
+    let mut records = Vec::new();
+    if let Some(document) = document {
+        for binding in document
+            .decorations
+            .iter()
+            .filter(|binding| is_feedback_detail_key(&binding.decoration_key))
+        {
+            let operation_id = binding
+                .decoration_key
+                .rsplit('.')
+                .nth(1)
+                .ok_or_else(|| error(ErrorCode::ProjectInvalid, "A persisted detail identity is malformed."))?
+                .to_owned();
+            validate_feedback_operation_id(&operation_id)?;
+            records.push(FeedbackDetailRecordProjection {
+                operation_id,
+                enabled: !binding.decoration_key.starts_with("stage16.disabled."),
+                intent: parse_feedback_detail(binding)?,
+            });
+        }
+    }
+    Ok(FeedbackAuthoringProjection {
+        command_version: FEEDBACK_COMMAND_VERSION,
+        records,
     })
 }
 
@@ -4698,6 +5802,295 @@ const fn color_policy(channel: SourceChannel) -> ColorPolicy {
 
 fn hash_hex(hash: hot_trimmer_domain::DocumentHash) -> String {
     hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod algorithm_stage_20a_feedback_workbench_tests {
+    use super::*;
+
+    fn test_session(root: &Path) -> ProjectSession {
+        fs::create_dir_all(root).expect("test root");
+        ProjectSession {
+            store: Some(ProjectStore::create(&root.join("feedback.hottrimmer"), "Untitled").expect("empty draft")),
+            dirty: false,
+            is_draft: true,
+            baseline: None,
+            app_data_dir: root.join("app"),
+            recovery_dir: root.join("recovery"),
+            draft_dir: root.join("draft"),
+            source_projection_cache: Mutex::new(HashMap::new()),
+            preview_prepared_sources: HashMap::new(),
+            prepared_exemplars: PreparedExemplarCache::default(),
+            source_analysis_cache: SourceAnalysisCache::default(),
+            scale_orientation_cache: ScaleOrientationCache::default(),
+        }
+    }
+
+    fn feedback_request(
+        revision: u64,
+        region_id: RegionId,
+        comparison_mode: FeedbackComparisonMode,
+        selected_operation_id: Option<&str>,
+    ) -> FeedbackQaTileRequest {
+        FeedbackQaTileRequest {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            command_version: FEEDBACK_COMMAND_VERSION,
+            revision,
+            generation: 77,
+            region_id,
+            view: FeedbackContributionView::Stage16RegisteredMask,
+            profile: PreviewProfile::Refinement1024,
+            comparison_mode,
+            selected_operation_id: selected_operation_id.map(str::to_owned),
+        }
+    }
+
+    fn solid_png(pixel: [u8; 4]) -> Vec<u8> {
+        let rgba = pixel.repeat(16);
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, 4, 4, ColorType::Rgba8.into())
+            .expect("test PNG");
+        png
+    }
+
+    fn run_feedback_preview(
+        session: &SharedProjectSession,
+        service: &PreviewService,
+        request: &FeedbackQaTileRequest,
+    ) -> Result<IntermediateAtlasProjection, UserFacingError> {
+        let map = feedback_map_for_view(request.view)?.expect("pixel view");
+        let identity = feedback_preview_cache_identity(request, map)?;
+        let job = service.latest_draft_id.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        build_stage_14_preview(
+            session,
+            service,
+            Stage14PreviewRequest {
+                protocol_version: request.protocol_version,
+                revision: request.revision,
+                region_id: Some(request.region_id),
+                transient_projection: None,
+                draft_id: Some(request.generation),
+                input_hash: Some(identity),
+                profile: request.profile,
+                view_intent: Some(PreviewViewIntent::ExactSelectedRegion),
+                viewport_rect: None,
+                requested_maps: vec![map],
+                candidate_recipe: None,
+                feedback_view: Some(request.view),
+                feedback_comparison_mode: Some(request.comparison_mode),
+                feedback_selected_operation_id: request.selected_operation_id.clone(),
+            },
+            job,
+        )
+    }
+
+    #[test]
+    fn algorithm_stage_20a_feedback_workbench_contract() {
+        assert_eq!(FEEDBACK_COMMAND_VERSION, 1);
+        assert_eq!(STAGE_15_20_DEBUG_SCHEMA_VERSION, 1);
+        assert_eq!(
+            structural_profile_for_feedback(
+                hot_trimmer_effect_compiler::ProfileProgram::ConvexBevel,
+                TemplateSlotRole::Planar,
+            )
+            .expect("planar bevel"),
+            StructuralProfile::Bevel,
+        );
+        assert!(
+            structural_profile_for_feedback(
+                hot_trimmer_effect_compiler::ProfileProgram::Annulus,
+                TemplateSlotRole::Planar,
+            )
+            .is_err(),
+            "illegal role/profile pairs must remain typed failures",
+        );
+        assert_eq!(
+            sanitize_debug_string(r"C:\Users\person\private.png"),
+            "[redacted prohibited debug value]",
+        );
+        assert_eq!(
+            sanitize_debug_string("stage16_cache_hit=true"),
+            "stage16_cache_hit=true",
+        );
+        let states = [
+            FeedbackExecutionState::InstalledNotRequested,
+            FeedbackExecutionState::Requested,
+            FeedbackExecutionState::Executed,
+            FeedbackExecutionState::CacheHit,
+            FeedbackExecutionState::SkippedBecauseUnused,
+            FeedbackExecutionState::DeferredOnly,
+            FeedbackExecutionState::Failed,
+            FeedbackExecutionState::Cancelled,
+            FeedbackExecutionState::Superseded,
+            FeedbackExecutionState::NotInstalled,
+        ];
+        assert_eq!(states.len(), 10, "absence is represented by an explicit state");
+    }
+
+    #[test]
+    fn algorithm_stage_20a_feedback_workbench_server_owns_decoration_keys() {
+        let intent = FeedbackDetailIntent::Operation(hot_trimmer_effect_compiler::StampOperation {
+            asset: hot_trimmer_effect_compiler::StampAssetRef {
+                asset_id: "asset".into(),
+                version: "1".into(),
+                digest: hot_trimmer_domain::ContentDigest("a".repeat(64)),
+                kind: "registered_stamp_channels".into(),
+            },
+            scope: hot_trimmer_effect_compiler::StampScope::AssetSpecificDeferred,
+            target_region: "20152016-0000-4000-8000-000000000004".into(),
+            physical_position_m: [0.1, 0.2],
+            physical_size_m: [0.03, 0.04],
+            pivot: [0.5, 0.5],
+            rotation_degrees: 30.0,
+            mirror: [false, true],
+            opacity: 0.75,
+            blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+            clipping: hot_trimmer_effect_compiler::DetailFitPolicy::Contain,
+            seed: 20,
+            spacing_m: [0.01, 0.01],
+            scatter: 0.1,
+            jitter_m: [0.001, 0.002],
+            layer_order: 3,
+            occupancy: hot_trimmer_effect_compiler::OccupancyRelation::OnlyFlatCenter,
+            channels: Vec::new(),
+        });
+        let decoration = feedback_decoration(
+            "20152016-0000-4000-8000-000000000005",
+            false,
+            &intent,
+        )
+        .expect("typed decoration");
+        assert!(decoration.decoration_key.starts_with("stage16.disabled.stamp.operation."));
+        assert!(!decoration.value.contains("decoration_key"));
+        assert!(matches!(parse_feedback_detail(&decoration), Ok(FeedbackDetailIntent::Operation(_))));
+    }
+
+    #[test]
+    fn algorithm_stage_20a_feedback_workbench_sample_channels_are_distinct_and_content_addressed() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-feedback-sample-{}", Uuid::new_v4()));
+        let mut session = test_session(&root);
+        let service = PreviewService::default();
+        let projection = create_stage_15_16_feedback_sample_impl(&mut session, &service)
+            .expect("bundled sample must be creatable from an empty draft");
+        let material = projection.material_sources.iter()
+            .find(|material| material.registered_channels.is_some())
+            .expect("sample material source set");
+        let channels = &material.registered_channels.as_ref().expect("registered channels").channels;
+        let required = [SourceChannel::BaseColor, SourceChannel::Height, SourceChannel::MaterialId]
+            .map(|role| channels.iter().find(|channel| channel.channel == role).expect("required sample channel"));
+        assert_eq!(required.iter().map(|channel| channel.id.as_str()).collect::<BTreeSet<_>>().len(), 3);
+        assert_eq!(required.iter().map(|channel| channel.original.immutable_digest.as_str()).collect::<BTreeSet<_>>().len(), 1);
+        let records = &projection.feedback_authoring.records;
+        let asset = records.iter().find_map(|record| match &record.intent {
+            FeedbackDetailIntent::Operation(operation) => Some(&operation.asset),
+            _ => None,
+        }).expect("sample operation asset");
+        assert_eq!(asset.asset_id, material.id);
+        assert_eq!(asset.version, material.source_revision.to_string());
+        assert_eq!(asset.digest.0, required[0].original.immutable_digest);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn algorithm_stage_20a_feedback_workbench_request_identity_and_real_cache_reuse() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-feedback-cache-{}", Uuid::new_v4()));
+        let mut project_session = test_session(&root);
+        let service = PreviewService::default();
+        let projection = create_stage_15_16_feedback_sample_impl(&mut project_session, &service).expect("sample");
+        let document = projection.document.as_ref().expect("sample document");
+        let region_id = document.topology.regions[0].id;
+        let operation_id = projection.feedback_authoring.records.iter()
+            .find(|record| matches!(&record.intent, FeedbackDetailIntent::Operation(_)))
+            .expect("sample operation").operation_id.clone();
+        let before = feedback_request(document.document_revision, region_id, FeedbackComparisonMode::Before, None);
+        let after = feedback_request(document.document_revision, region_id, FeedbackComparisonMode::After, None);
+        assert_ne!(
+            feedback_preview_cache_identity(&before, MaterialMapKind::EdgeMask).unwrap(),
+            feedback_preview_cache_identity(&after, MaterialMapKind::EdgeMask).unwrap(),
+        );
+        let isolated_a = feedback_request(document.document_revision, region_id, FeedbackComparisonMode::SelectedOperationIsolation, Some(&operation_id));
+        let isolated_b = feedback_request(document.document_revision, region_id, FeedbackComparisonMode::SelectedOperationIsolation, Some("20152016-0000-4000-8000-000000000099"));
+        assert_ne!(
+            feedback_preview_cache_identity(&isolated_a, MaterialMapKind::EdgeMask).unwrap(),
+            feedback_preview_cache_identity(&isolated_b, MaterialMapKind::EdgeMask).unwrap(),
+        );
+        assert_eq!(
+            feedback_preview_cache_identity(&isolated_a, MaterialMapKind::EdgeMask).unwrap(),
+            feedback_preview_cache_identity(&isolated_a, MaterialMapKind::EdgeMask).unwrap(),
+        );
+        let session = Arc::new(Mutex::new(project_session));
+        let first = run_feedback_preview(&session, &service, &isolated_a).expect("first isolated GPU request");
+        let repeated = run_feedback_preview(&session, &service, &isolated_a).expect("identical isolated GPU request");
+        let first_execution = first.feedback_execution.expect("first execution identity");
+        let repeated_execution = repeated.feedback_execution.expect("repeated execution identity");
+        assert_eq!(first_execution.request_identity, repeated_execution.request_identity);
+        assert!(repeated_execution.cache_reused);
+        assert!(matches!(repeated_execution.outcome, FeedbackExecutionState::CacheHit));
+        let published = repeated.tile_manifests.get("edgeMask").or(repeated.tile_manifest.as_ref()).expect("edge-mask tile");
+        assert_eq!(repeated_execution.published_generation, published.manifest.generation);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn algorithm_stage_20a_feedback_workbench_mask_route_and_occupancy_are_typed() {
+        assert_eq!(feedback_map_for_view(FeedbackContributionView::Stage16RegisteredMask).unwrap(), Some(MaterialMapKind::EdgeMask));
+        let mut channels = vec![hot_trimmer_effect_compiler::DetailChannelContribution {
+            channel: MaterialChannelRole::Height,
+            amount: 0.25,
+            blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+            material_id: None,
+            metallic_explicit: false,
+        }];
+        rewrite_feedback_channels(&mut channels, FeedbackContributionView::Stage16RegisteredMask);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].channel, MaterialChannelRole::EdgeMask);
+        assert!(channels.iter().all(|channel| channel.channel != MaterialChannelRole::BaseColor));
+        for value in ["above_profile", "below_profile", "avoid_raised", "only_flat_center", "ignore"] {
+            assert!(serde_json::from_str::<hot_trimmer_effect_compiler::OccupancyRelation>(&format!("\"{value}\"")).is_ok());
+        }
+        assert!(serde_json::from_str::<hot_trimmer_effect_compiler::OccupancyRelation>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn algorithm_stage_20a_feedback_workbench_normal_convention_survives_projection_and_preparation() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-feedback-normal-{}", Uuid::new_v4()));
+        let mut session = test_session(&root);
+        let source_set_id = Uuid::new_v4();
+        let base_bytes = solid_png([128, 128, 128, 255]);
+        let normal_bytes = solid_png([128, 64, 255, 255]);
+        let base_inspected = inspect_bytes_with_policy(base_bytes, DecodeLimits::default(), ColorPolicy::ConvertToSrgb).unwrap();
+        let normal_inspected = inspect_bytes_with_policy(normal_bytes, DecodeLimits::default(), ColorPolicy::PreserveLinearData).unwrap();
+        let base = source_input(Path::new("normal-test-base.png"), SourceOwnership::OwnedCopy, &base_inspected);
+        let normal = source_input(Path::new("normal-test-directx.png"), SourceOwnership::OwnedCopy, &normal_inspected);
+        let store = session.store.as_mut().expect("store");
+        store.replace_registered_source_in_set(source_set_id, &base, ChannelRegistration {
+            role: MaterialChannelRole::BaseColor,
+            interpretation: MaterialChannelRole::BaseColor.required_interpretation(),
+            normal_convention: NormalConvention::NotApplicable,
+            assignment_provenance: AssignmentProvenance::UserAssigned,
+            confidence_milli: 1000,
+        }).unwrap();
+        store.replace_registered_source_in_set(source_set_id, &normal, ChannelRegistration {
+            role: MaterialChannelRole::Normal,
+            interpretation: MaterialChannelRole::Normal.required_interpretation(),
+            normal_convention: NormalConvention::DirectX,
+            assignment_provenance: AssignmentProvenance::UserAssigned,
+            confidence_milli: 1000,
+        }).unwrap();
+        let summary = store.summary().unwrap();
+        let stored_normal = summary.sources.iter().find(|source| source.channel == SourceChannel::Normal).unwrap();
+        assert_eq!(session.source_projection_cached(stored_normal).unwrap().normal_convention, NormalConvention::DirectX);
+        let (registered, encoded) = preview_registered_channel_set(&session, &summary.sources, source_set_id).unwrap();
+        assert_eq!(registered.channels.iter().find(|channel| channel.registration.role == MaterialChannelRole::Normal).unwrap().registration.normal_convention, NormalConvention::DirectX);
+        let prepared = prepare_registered_channel_set(&registered, &encoded, &NormalizationSettings::default(), &CancellationToken::new()).unwrap();
+        let prepared_normal = prepared.channels.iter().find_map(|channel| match channel {
+            hot_trimmer_image_io::PreparedChannel::Normal { source_convention, canonical_convention, .. } => Some((*source_convention, *canonical_convention)),
+            _ => None,
+        }).expect("prepared normal channel");
+        assert_eq!(prepared_normal, (NormalConvention::DirectX, NormalConvention::OpenGl));
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(any())]
@@ -5662,6 +7055,9 @@ mod persisted_algorithm_stage_14_preview_a_tests {
                 viewport_rect: None,
                 requested_maps: Vec::new(),
                 candidate_recipe: None,
+                feedback_view: None,
+                feedback_comparison_mode: None,
+                feedback_selected_operation_id: None,
             },
             job,
         )

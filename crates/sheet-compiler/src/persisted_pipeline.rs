@@ -203,6 +203,47 @@ fn compile_persisted_details_for_region(
     .map_err(|error| format!("Stage 16 detail compilation failed: {error}"))
 }
 
+fn compile_persisted_profile_for_region(
+    decorations: &[hot_trimmer_domain::DecorationBinding],
+    region_id: RegionId,
+    fallback_intent: hot_trimmer_domain::StructuralProfile,
+    slot_size_m: [f64; 2],
+    destination_pixels: [u32; 2],
+    capacity: &hot_trimmer_effect_compiler::EffectCapacity,
+    upstream_identity: &ContentDigest,
+    seed: u64,
+) -> Result<hot_trimmer_effect_compiler::CompiledProfile, String> {
+    let key = format!("stage15.profile.request.{region_id}");
+    if let Some(binding) = decorations
+        .iter()
+        .find(|binding| binding.decoration_key == key)
+    {
+        let requested: hot_trimmer_effect_compiler::RequestedProfile =
+            serde_json::from_str(&binding.value).map_err(|error| {
+                format!("Stage 15 requested profile for {region_id} is malformed: {error}")
+            })?;
+        return hot_trimmer_effect_compiler::compile_profile(
+            hot_trimmer_effect_compiler::ProfileCompileRequest {
+                requested: &requested,
+                slot_size_m,
+                destination_pixels,
+                capacity,
+                upstream_identity,
+            },
+        )
+        .map_err(|error| format!("Stage 15 profile compilation failed: {error}"));
+    }
+    hot_trimmer_effect_compiler::compile_structural_intent(
+        fallback_intent,
+        slot_size_m,
+        destination_pixels,
+        capacity,
+        upstream_identity,
+        seed,
+    )
+    .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))
+}
+
 fn stage16_stamp_asset_domains(
     project: &ProjectSummary,
     decorations: &[hot_trimmer_domain::DecorationBinding],
@@ -1633,15 +1674,16 @@ fn compile_source_frame(
             source_to_region_transform,
             radial_parameters: behavior.radial,
             structural_profile: region.structural_profile,
-            compiled_profile: compile_structural_intent(
+            compiled_profile: compile_persisted_profile_for_region(
+                &document.decorations,
+                region.id,
                 region.structural_profile,
                 sampling_plan.slot_physical_size,
                 [allocation.width, allocation.height],
                 &conservative_profile_capacity(sampling_plan.slot_physical_size),
                 &render_cache_key,
                 sampling_plan.candidate.seed,
-            )
-            .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))?,
+            )?,
             compiled_details: compile_persisted_details_for_region(
                 &document.decorations,
                 region.id,
@@ -2099,6 +2141,16 @@ fn compile_source_frame(
             0,
         ),
     };
+    for slot in &mut artifact.slots {
+        if let Some(region) = source_frame_atlas_plan
+            .ordered_regions
+            .iter()
+            .find(|region| region.region_id == slot.region_id)
+        {
+            slot.compiled_profile = Some(region.compiled_profile.clone());
+            slot.compiled_details = Some(region.compiled_details.clone());
+        }
+    }
     artifact.pending.retain(|pending| *pending != "profiles");
     artifact.pending.insert(
         0,
@@ -2382,7 +2434,9 @@ fn fixed_template_compiled_atlas_plan(
             source_to_region_transform: binding.mapping.transform,
             radial_parameters: binding.mapping.behavior.radial,
             structural_profile: region.structural_profile,
-            compiled_profile: compile_structural_intent(
+            compiled_profile: compile_persisted_profile_for_region(
+                &document.decorations,
+                region.id,
                 region.structural_profile,
                 sampling_plan.slot_physical_size,
                 [slot.allocation.width, slot.allocation.height],
@@ -2393,8 +2447,7 @@ fn fixed_template_compiled_atlas_plan(
                     .effect_capacity,
                 &render_cache_key,
                 sampling_plan.candidate.seed,
-            )
-            .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))?,
+            )?,
             compiled_details: compile_persisted_details_for_region(
                 &document.decorations,
                 region.id,
@@ -2757,6 +2810,16 @@ fn final_atlas_artifact_from_gpu(
                 RegionSampling::LoopY => "repeat_y",
                 RegionSampling::LoopXy => "repeat_xy",
             },
+            compiled_profile: compiled_plan
+                .ordered_regions
+                .iter()
+                .find(|command| command.region_id == region.id)
+                .map(|command| command.compiled_profile.clone()),
+            compiled_details: compiled_plan
+                .ordered_regions
+                .iter()
+                .find(|command| command.region_id == region.id)
+                .map(|command| command.compiled_details.clone()),
         });
     }
     let all_importable = [

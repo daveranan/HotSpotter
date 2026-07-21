@@ -1697,6 +1697,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hot-trimmer-domain",
+ "hot-trimmer-effect-compiler",
  "hot-trimmer-export",
  "hot-trimmer-geometry",
  "hot-trimmer-image-io",
