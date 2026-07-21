@@ -790,6 +790,7 @@ enum GpuAtlasPipelineKind {
     RegionIdR32Uint,
     RegionIdDisplayRgba8,
     StructuralProfile,
+    SemanticDetail,
 }
 
 #[derive(Default)]
@@ -1326,8 +1327,59 @@ struct GpuProfileCommand {
     _pad_float: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct GpuDetailCommand {
+    family: u32,
+    lod: u32,
+    mapping_mode: u32,
+    channel_bits: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_width: u32,
+    dst_height: u32,
+    seed: u32,
+    layer_order: i32,
+    occupancy_relation: u32,
+    blend: u32,
+    material_id: u32,
+    mirror_bits: u32,
+    clipping: u32,
+    asset_key: u32,
+    asset_layer: u32,
+    asset_scalar_layer: u32,
+    asset_normal_layer: u32,
+    asset_material_id_layer: u32,
+    asset_mask_layer: u32,
+    asset_width: u32,
+    asset_height: u32,
+    slot_width_m: f32,
+    slot_height_m: f32,
+    pixels_per_meter_x: f32,
+    pixels_per_meter_y: f32,
+    size_x_m: f32,
+    size_y_m: f32,
+    position_x_m: f32,
+    position_y_m: f32,
+    pivot_x: f32,
+    pivot_y: f32,
+    period_x_m: f32,
+    period_y_m: f32,
+    scatter: f32,
+    jitter_x_m: f32,
+    jitter_y_m: f32,
+    rotation_sin: f32,
+    rotation_cos: f32,
+    opacity: f32,
+    height_amount: f32,
+    normal_amount: f32,
+    scalar_amount: f32,
+    color_amount: f32,
+}
+
 const GPU_PROFILE_HEADER_BYTES: usize = 32;
 const GPU_PROFILE_COMMAND_BYTES: usize = 96;
+const GPU_DETAIL_COMMAND_BYTES: usize = 180;
 
 const GPU_HEADER_BYTES: usize = 88;
 const GPU_COMMAND_BYTES: usize = 176;
@@ -2550,13 +2602,11 @@ fn validate_gpu_material_map(map: MaterialMapKind) -> Result<(), AtlasRenderExec
         | MaterialMapKind::Roughness
         | MaterialMapKind::Metallic
         | MaterialMapKind::AmbientOcclusion
-        | MaterialMapKind::RegionId => Ok(()),
-        MaterialMapKind::Specular
-        | MaterialMapKind::Opacity
+        | MaterialMapKind::RegionId
         | MaterialMapKind::EdgeMask
-        | MaterialMapKind::MaterialId => Err(AtlasRenderExecutionError::InvalidInput(format!(
-            "GPU material map {map:?} is unavailable in the current material contract"
-        ))),
+        | MaterialMapKind::MaterialId
+        | MaterialMapKind::Specular
+        | MaterialMapKind::Opacity => Ok(()),
     }
 }
 
@@ -3113,6 +3163,15 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         if requested_map == MaterialMapKind::RegionId {
             return execute_region_id_gpu_tile(self, plan, cancellation, is_current);
         }
+        if requested_map == MaterialMapKind::MaterialId {
+            return execute_detail_material_id_gpu_tile(
+                self,
+                plan,
+                input,
+                cancellation,
+                is_current,
+            );
+        }
         if requested_map == MaterialMapKind::Normal {
             return Ok(AtlasRenderExecutorOutput::FinalAtlas(
                 execute_height_normal_gpu(self, plan, input, false, cancellation, is_current)?,
@@ -3124,6 +3183,9 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 | MaterialMapKind::Roughness
                 | MaterialMapKind::Metallic
                 | MaterialMapKind::AmbientOcclusion
+                | MaterialMapKind::Specular
+                | MaterialMapKind::Opacity
+                | MaterialMapKind::EdgeMask
         ) {
             return execute_r32float_material_tile(
                 self,
@@ -3162,6 +3224,18 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
         }
         let device = state.device();
         let queue = state.queue();
+        let profile_stats =
+            execute_or_load_profile_fields(self, plan, device, queue, cancellation, is_current)?;
+        let detail_stats = execute_or_load_detail_fields(
+            self,
+            plan,
+            Some(input),
+            Some(requested_map),
+            device,
+            queue,
+            cancellation,
+            is_current,
+        )?;
         let pipeline_started = Instant::now();
         let (pipeline, pipeline_cache_hit) = pipeline(
             device,
@@ -3406,6 +3480,28 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             plan.final_plan_hash.0,
             u32::from(pipeline_cache_hit)
         )];
+        telemetry.push(format!(
+            "profile_pass_dispatches={}; profile_cache_hit={}; profile_commands={}; profile_command_bytes={}; profile_resident_bytes={}; profile_required_halo={}; profile_dispatch_ms={}",
+            profile_stats.dispatches,
+            profile_stats.cache_hit,
+            profile_stats.command_count,
+            profile_stats.command_bytes,
+            profile_stats.resident_bytes,
+            profile_stats.required_halo_px,
+            profile_stats.dispatch_ms,
+        ));
+        telemetry.push(format!(
+            "detail_pass_dispatches={}; detail_cache_hit={}; detail_commands={}; detail_command_bytes={}; detail_resident_bytes={}; detail_asset_resident_bytes={}; detail_asset_upload_bytes={}; detail_required_halo={}; detail_dispatch_ms={}",
+            detail_stats.dispatches,
+            detail_stats.cache_hit,
+            detail_stats.command_count,
+            detail_stats.command_bytes,
+            detail_stats.resident_bytes,
+            detail_stats.asset_resident_bytes,
+            detail_stats.asset_upload_bytes,
+            detail_stats.required_halo_px,
+            detail_stats.dispatch_ms,
+        ));
         if let Some(timing) = timing {
             telemetry.extend(timing.finish(device)?);
         }
@@ -3423,9 +3519,9 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                 pipeline_cache_hits: u32::from(pipeline_cache_hit),
                 upload_bytes,
                 upload_ms,
-                command_count,
-                command_bytes,
-                dispatch_ms,
+                command_count: command_count.saturating_add(detail_stats.command_count),
+                command_bytes: command_bytes.saturating_add(detail_stats.command_bytes),
+                dispatch_ms: dispatch_ms.saturating_add(detail_stats.dispatch_ms),
                 readback_bytes,
                 readback_ms,
                 telemetry,
@@ -3504,6 +3600,23 @@ fn pipeline(
             storage_texture_layout_entry(6, wgpu::TextureFormat::R32Float),
             readonly_storage_layout_entry(7, 8),
         ],
+        GpuAtlasPipelineKind::SemanticDetail => vec![
+            uniform_layout_entry(0, GPU_PROFILE_HEADER_BYTES as u64),
+            readonly_storage_layout_entry(1, GPU_DETAIL_COMMAND_BYTES as u64),
+            storage_texture_layout_entry(2, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(3, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(4, wgpu::TextureFormat::Rgba8Unorm),
+            storage_texture_layout_entry(5, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(6, wgpu::TextureFormat::Rgba8Unorm),
+            storage_texture_layout_entry(7, wgpu::TextureFormat::R32Uint),
+            storage_texture_layout_entry(8, wgpu::TextureFormat::R32Uint),
+            texture_array_layout_entry(9),
+            texture_array_layout_entry(10),
+            texture_array_layout_entry(11),
+            uint_texture_array_layout_entry(12),
+            texture_array_layout_entry(13),
+            texture_layout_entry(14),
+        ],
     };
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(match kind {
@@ -3516,6 +3629,7 @@ fn pipeline(
                 "hot-trimmer-region-id-display-bind-layout"
             }
             GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-bind-layout",
+            GpuAtlasPipelineKind::SemanticDetail => "hot-trimmer-semantic-detail-bind-layout",
         }),
         entries: &entries,
     });
@@ -3538,6 +3652,9 @@ fn pipeline(
         GpuAtlasPipelineKind::StructuralProfile => {
             hot_trimmer_preview::STRUCTURAL_PROFILE_ATLAS_WGSL.into()
         }
+        GpuAtlasPipelineKind::SemanticDetail => {
+            hot_trimmer_preview::SEMANTIC_DETAIL_ATLAS_WGSL.into()
+        }
     };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(match kind {
@@ -3548,6 +3665,7 @@ fn pipeline(
             GpuAtlasPipelineKind::RegionIdR32Uint => "hot-trimmer-region-id-wgsl",
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-wgsl",
             GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-wgsl",
+            GpuAtlasPipelineKind::SemanticDetail => "hot-trimmer-semantic-detail-wgsl",
         }),
         source: wgpu::ShaderSource::Wgsl(shader_source),
     });
@@ -3565,6 +3683,7 @@ fn pipeline(
             GpuAtlasPipelineKind::RegionIdR32Uint => "hot-trimmer-region-id-pipeline",
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-pipeline",
             GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-pipeline",
+            GpuAtlasPipelineKind::SemanticDetail => "hot-trimmer-semantic-detail-pipeline",
         }),
         layout: Some(&pipeline_layout),
         module: &shader,
@@ -3691,6 +3810,19 @@ fn uint_texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Uint,
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn uint_texture_array_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Uint,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         },
         count: None,
@@ -3871,6 +4003,19 @@ struct GpuProfileDispatchStats {
     dispatch_ms: u128,
 }
 
+#[derive(Default)]
+struct GpuDetailDispatchStats {
+    cache_hit: bool,
+    dispatches: u32,
+    command_count: u32,
+    command_bytes: u64,
+    resident_bytes: u64,
+    asset_resident_bytes: u64,
+    asset_upload_bytes: u64,
+    required_halo_px: u32,
+    dispatch_ms: u128,
+}
+
 const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
     (MaterialMapKind::Height, "stage15-profile-height-v1"),
     (MaterialMapKind::Roughness, "stage15-profile-sdf-v1"),
@@ -3881,6 +4026,103 @@ const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
     (MaterialMapKind::Metallic, "stage15-profile-derivative-x-v1"),
     (MaterialMapKind::Opacity, "stage15-profile-derivative-y-v1"),
 ];
+
+#[derive(Clone, Copy)]
+struct DetailFieldSpec {
+    map: MaterialMapKind,
+    shader: &'static str,
+    field_index: usize,
+    format: wgpu::TextureFormat,
+    pixel_format: crate::CompiledTilePixelFormat,
+}
+
+const DETAIL_FIELD_MASK: usize = 0;
+const DETAIL_FIELD_HEIGHT: usize = 1;
+const DETAIL_FIELD_NORMAL_INPUT: usize = 2;
+const DETAIL_FIELD_SCALAR: usize = 3;
+const DETAIL_FIELD_COLOR: usize = 4;
+const DETAIL_FIELD_MATERIAL_ID: usize = 5;
+const DETAIL_FIELD_MATERIAL_ID_VALID: usize = 6;
+const DETAIL_REQUEST_ALL_FIELDS: u32 = 99;
+
+const DETAIL_FIELD_SPECS: [DetailFieldSpec; 10] = [
+    DetailFieldSpec {
+        map: MaterialMapKind::BaseColor,
+        shader: "stage16-detail-base-color-rgba-v2",
+        field_index: DETAIL_FIELD_COLOR,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        pixel_format: crate::CompiledTilePixelFormat::Rgba8UnormSrgb,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::EdgeMask,
+        shader: "stage16-detail-mask-v1",
+        field_index: DETAIL_FIELD_MASK,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::Height,
+        shader: "stage16-detail-height-v1",
+        field_index: DETAIL_FIELD_HEIGHT,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::Normal,
+        shader: "stage16-detail-normal-rgba-v2",
+        field_index: DETAIL_FIELD_NORMAL_INPUT,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        pixel_format: crate::CompiledTilePixelFormat::Rgba8UnormLinear,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::Roughness,
+        shader: "stage16-detail-roughness-scalar-v1",
+        field_index: DETAIL_FIELD_SCALAR,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::Metallic,
+        shader: "stage16-detail-metallic-scalar-v1",
+        field_index: DETAIL_FIELD_SCALAR,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::AmbientOcclusion,
+        shader: "stage16-detail-ao-scalar-v1",
+        field_index: DETAIL_FIELD_SCALAR,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::Specular,
+        shader: "stage16-detail-specular-scalar-v1",
+        field_index: DETAIL_FIELD_SCALAR,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::Opacity,
+        shader: "stage16-detail-opacity-scalar-v1",
+        field_index: DETAIL_FIELD_SCALAR,
+        format: wgpu::TextureFormat::R32Float,
+        pixel_format: crate::CompiledTilePixelFormat::R32Float,
+    },
+    DetailFieldSpec {
+        map: MaterialMapKind::MaterialId,
+        shader: "stage16-detail-material-id-r32uint-v2",
+        field_index: DETAIL_FIELD_MATERIAL_ID,
+        format: wgpu::TextureFormat::R32Uint,
+        pixel_format: crate::CompiledTilePixelFormat::R32Uint,
+    },
+];
+
+struct DetailFieldIdentity {
+    field_index: usize,
+    identity: crate::CompiledAtlasTileIdentity,
+    format: wgpu::TextureFormat,
+}
 
 fn execute_or_load_profile_fields(
     executor: &GpuAtlasRenderExecutor<'_>,
@@ -4139,6 +4381,361 @@ fn execute_or_load_profile_fields(
     })
 }
 
+fn execute_or_load_detail_fields(
+    executor: &GpuAtlasRenderExecutor<'_>,
+    plan: &CompiledAtlasPlanV1,
+    input: Option<&AtlasRenderExecutionInput<'_>>,
+    requested_map: Option<MaterialMapKind>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cancellation: &CancellationToken,
+    is_current: &dyn Fn() -> bool,
+) -> Result<GpuDetailDispatchStats, AtlasRenderExecutionError> {
+    if cancellation.is_cancelled() {
+        return Err(AtlasRenderExecutionError::Cancelled);
+    }
+    if !is_current() {
+        return Err(AtlasRenderExecutionError::Superseded);
+    }
+    execute_or_load_profile_fields(executor, plan, device, queue, cancellation, is_current)?;
+    let command_count = detail_gpu_command_count(plan, requested_map);
+    let required_halo_px = plan
+        .ordered_regions
+        .iter()
+        .flat_map(|region| &region.compiled_details.details)
+        .map(|detail| detail.required_halo_px)
+        .max()
+        .unwrap_or(0);
+    if command_count == 0 {
+        return Ok(GpuDetailDispatchStats {
+            required_halo_px,
+            ..Default::default()
+        });
+    }
+    let tile = plan.tile_request.output_rect.0;
+    let bytes_per_field = u64::from(tile.width)
+        .saturating_mul(u64::from(tile.height))
+        .saturating_mul(4);
+    let requested_field = detail_requested_field(requested_map);
+    let field_resident_bytes = if requested_field == DETAIL_REQUEST_ALL_FIELDS {
+        bytes_per_field.saturating_mul(7)
+    } else {
+        if requested_field == DETAIL_FIELD_MATERIAL_ID as u32 {
+            bytes_per_field.saturating_mul(2).saturating_add(5 * 4)
+        } else {
+            bytes_per_field.saturating_add(6 * 4)
+        }
+    };
+    if field_resident_bytes
+        > GpuAtlasSourceTextureCache::budgets().gpu_output_intermediate_residency_bytes
+    {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "Stage 16 detail fields require {field_resident_bytes} bytes, exceeding the bounded GPU tile residency budget"
+        )));
+    }
+    let fields_to_cache = detail_fields_for_request(plan, requested_map);
+    if requested_map.is_some() && fields_to_cache.is_empty() {
+        return Err(AtlasRenderExecutionError::InvalidInput(format!(
+            "Stage 16 has no executable detail field for requested map {:?}",
+            requested_map.expect("checked")
+        )));
+    }
+    let field_indices = fields_to_cache
+        .iter()
+        .map(|field| field.field_index)
+        .collect::<BTreeSet<_>>();
+    let cached_count = executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .rendered_textures
+        .iter()
+        .filter(|texture| {
+            fields_to_cache.iter().any(|field| {
+                texture.pixel_identity == field.identity.pixel_identity()
+                    && texture.format == field.format
+                    && texture.width == tile.width
+                    && texture.height == tile.height
+            })
+        })
+        .count();
+    if cached_count == field_indices.len() {
+        return Ok(GpuDetailDispatchStats {
+            cache_hit: true,
+            resident_bytes: bytes_per_field.saturating_mul(field_indices.len() as u64),
+            required_halo_px,
+            ..Default::default()
+        });
+    }
+    let started = Instant::now();
+    let (detail_pipeline, _) = pipeline(
+        device,
+        executor.source_texture_cache,
+        GpuAtlasPipelineKind::SemanticDetail,
+    )?;
+    let mut commands = Vec::with_capacity(command_count);
+    for region in &plan.ordered_regions {
+        for detail in &region.compiled_details.details {
+            if !detail_contributes_to_requested_map(detail, requested_map) {
+                continue;
+            }
+            if detail_emits_procedural_default(detail) {
+                commands.push(pack_detail_command(
+                    region,
+                    detail,
+                    None,
+                    None,
+                    requested_map,
+                ));
+            }
+            for operation in &detail.reusable_atlas_operations {
+                commands.push(pack_detail_command(
+                    region,
+                    detail,
+                    Some(operation),
+                    None,
+                    requested_map,
+                ));
+            }
+            for stroke in &detail.strokes {
+                if stroke.operation.scope
+                    != hot_trimmer_effect_compiler::StampScope::MaterialReusableAtlas
+                {
+                    continue;
+                }
+                for sample in &stroke.physical_samples_m {
+                    commands.push(pack_detail_command(
+                        region,
+                        detail,
+                        Some(&stroke.operation),
+                        Some(*sample),
+                        requested_map,
+                    ));
+                }
+            }
+        }
+    }
+    commands.sort_by_key(|command| command.layer_order);
+    let asset_textures = detail_asset_textures(
+        device,
+        queue,
+        executor.source_texture_cache,
+        input,
+        plan,
+        &mut commands,
+        requested_map,
+    )?;
+    let occupancy_identity = plan.tile_identity(
+        MaterialMapKind::AmbientOcclusion,
+        "stage15-profile-semantics-v1",
+    );
+    let occupancy_texture = executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .cached_rendered_texture(&occupancy_identity)
+        .ok_or_else(|| {
+            AtlasRenderExecutionError::Gpu("Stage 15 occupancy field is missing".into())
+        })?;
+    let header = GpuProfileHeader {
+        output_width: plan.output_size.width,
+        output_height: plan.output_size.height,
+        tile_x: tile.x,
+        tile_y: tile.y,
+        tile_width: tile.width,
+        tile_height: tile.height,
+        command_count: commands.len() as u32,
+        _pad: requested_field,
+    };
+    let header_bytes = encode_profile_header(header);
+    let command_bytes = encode_detail_commands(&commands);
+    let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-detail-header"),
+        contents: &header_bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let command_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-detail-commands"),
+        contents: &command_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut fields = Vec::with_capacity(7);
+    let mut allocated_resident_bytes = 0_u64;
+    for (index, label, format) in [
+        (DETAIL_FIELD_MASK, "mask", wgpu::TextureFormat::R32Float),
+        (DETAIL_FIELD_HEIGHT, "height", wgpu::TextureFormat::R32Float),
+        (
+            DETAIL_FIELD_NORMAL_INPUT,
+            "normal-input",
+            // The semantic-detail shader publishes an RGBA tangent-space
+            // vector (including the authored alpha/validity component) at
+            // binding 4. Keep the working texture format in lock-step with
+            // that WGSL storage binding; an R32Float view is rejected by
+            // wgpu when the bind group is created.
+            wgpu::TextureFormat::Rgba8Unorm,
+        ),
+        (DETAIL_FIELD_SCALAR, "scalar", wgpu::TextureFormat::R32Float),
+        (DETAIL_FIELD_COLOR, "color", wgpu::TextureFormat::Rgba8Unorm),
+        (
+            DETAIL_FIELD_MATERIAL_ID,
+            "material-id",
+            wgpu::TextureFormat::R32Uint,
+        ),
+        (
+            DETAIL_FIELD_MATERIAL_ID_VALID,
+            "material-id-valid",
+            wgpu::TextureFormat::R32Uint,
+        ),
+    ] {
+        let is_requested = requested_field == DETAIL_REQUEST_ALL_FIELDS
+            || requested_field == index as u32
+            || (requested_field == DETAIL_FIELD_MATERIAL_ID as u32
+                && index == DETAIL_FIELD_MATERIAL_ID_VALID);
+        let field_width = if is_requested { tile.width } else { 1 };
+        let field_height = if is_requested { tile.height } else { 1 };
+        allocated_resident_bytes = allocated_resident_bytes.saturating_add(
+            u64::from(field_width)
+                .saturating_mul(u64::from(field_height))
+                .saturating_mul(4),
+        );
+        fields.push(create_working_texture(
+            device,
+            match label {
+                "mask" => "hot-trimmer-detail-mask",
+                "height" => "hot-trimmer-detail-height",
+                "normal-input" => "hot-trimmer-detail-normal",
+                "scalar" => "hot-trimmer-detail-scalar",
+                "color" => "hot-trimmer-detail-color",
+                "material-id" => "hot-trimmer-detail-material-id",
+                _ => "hot-trimmer-detail-material-id-valid",
+            },
+            field_width,
+            field_height,
+            format,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        ));
+    }
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hot-trimmer-detail-bind-group"),
+        layout: &detail_pipeline.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: header_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: command_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&fields[0].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&fields[1].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&fields[2].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&fields[3].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&fields[4].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&fields[5].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&fields[6].1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(asset_textures.color.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(asset_textures.scalar.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(asset_textures.normal.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(asset_textures.material_id.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(asset_textures.mask.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::TextureView(&occupancy_texture.view),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-detail-encoder"),
+    });
+    for (texture, _) in &fields {
+        encoder.clear_texture(texture, &wgpu::ImageSubresourceRange::default());
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("hot-trimmer-detail-dispatch"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&detail_pipeline.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(tile.width.div_ceil(16), tile.height.div_ceil(16), 1);
+    }
+    submit_encoder_and_wait(device, queue, encoder)?;
+    if cancellation.is_cancelled() {
+        return Err(AtlasRenderExecutionError::Cancelled);
+    }
+    if !is_current() {
+        return Err(AtlasRenderExecutionError::Superseded);
+    }
+    let mut cache = executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+    let mut fields = fields.into_iter().map(Some).collect::<Vec<_>>();
+    for field in fields_to_cache {
+        if let Some((texture, view)) = fields.get_mut(field.field_index).and_then(Option::take) {
+            cache.remember_rendered_texture(
+                field.identity,
+                texture,
+                view,
+                tile.width,
+                tile.height,
+                field.format,
+                bytes_per_field,
+            );
+        }
+    }
+    Ok(GpuDetailDispatchStats {
+        cache_hit: false,
+        dispatches: 1,
+        command_count: commands.len() as u32,
+        command_bytes: command_bytes.len() as u64,
+        resident_bytes: allocated_resident_bytes.saturating_add(asset_textures.resident_bytes),
+        asset_resident_bytes: asset_textures.resident_bytes,
+        asset_upload_bytes: asset_textures.upload_bytes,
+        required_halo_px,
+        dispatch_ms: started.elapsed().as_millis(),
+    })
+}
+
 fn execute_r32float_material_tile(
     executor: &GpuAtlasRenderExecutor<'_>,
     plan: &CompiledAtlasPlanV1,
@@ -4210,6 +4807,16 @@ fn execute_r32float_material_tile(
     let queue = state.queue();
     let profile_stats =
         execute_or_load_profile_fields(executor, plan, device, queue, cancellation, is_current)?;
+    let detail_stats = execute_or_load_detail_fields(
+        executor,
+        plan,
+        Some(input),
+        Some(requested_map),
+        device,
+        queue,
+        cancellation,
+        is_current,
+    )?;
     let pipeline_started = Instant::now();
     let (material_pipeline, pipeline_cache_hit) = pipeline(
         device,
@@ -4426,6 +5033,16 @@ fn execute_r32float_material_tile(
         profile_stats.required_halo_px,
         profile_stats.dispatch_ms,
     ));
+    telemetry.push(format!(
+        "detail_pass_dispatches={}; detail_cache_hit={}; detail_commands={}; detail_command_bytes={}; detail_resident_bytes={}; detail_required_halo={}; detail_dispatch_ms={}",
+        detail_stats.dispatches,
+        detail_stats.cache_hit,
+        detail_stats.command_count,
+        detail_stats.command_bytes,
+        detail_stats.resident_bytes,
+        detail_stats.required_halo_px,
+        detail_stats.dispatch_ms,
+    ));
     if let Some(timing) = timing {
         telemetry.extend(timing.finish(device)?);
     }
@@ -4458,14 +5075,183 @@ fn execute_r32float_material_tile(
             upload_ms: stats.upload_ms.saturating_add(display_stats.upload_ms),
             command_count: stats
                 .command_count
-                .saturating_add(display_stats.command_count),
+                .saturating_add(display_stats.command_count)
+                .saturating_add(detail_stats.command_count),
             command_bytes: stats
                 .command_bytes
-                .saturating_add(display_stats.command_bytes),
-            dispatch_ms: stats.dispatch_ms.saturating_add(display_stats.dispatch_ms),
+                .saturating_add(display_stats.command_bytes)
+                .saturating_add(detail_stats.command_bytes),
+            dispatch_ms: stats
+                .dispatch_ms
+                .saturating_add(display_stats.dispatch_ms)
+                .saturating_add(detail_stats.dispatch_ms),
             readback_bytes: readback_bytes.saturating_add(display_readback_bytes),
             readback_ms: readback_ms.saturating_add(display_readback_ms),
             telemetry,
+        },
+    ))
+}
+
+fn execute_detail_material_id_gpu_tile(
+    executor: &GpuAtlasRenderExecutor<'_>,
+    plan: &CompiledAtlasPlanV1,
+    input: &AtlasRenderExecutionInput<'_>,
+    cancellation: &CancellationToken,
+    is_current: &dyn Fn() -> bool,
+) -> Result<AtlasRenderExecutorOutput, AtlasRenderExecutionError> {
+    let requested_map = MaterialMapKind::MaterialId;
+    let identity = plan.tile_identity(requested_map, GPU_SHADER_VERSION);
+    if let Some(cached) = executor
+        .source_texture_cache
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.cached_tile(&identity, plan.tile_request.generation))
+    {
+        let (nontransparent, nonzero_rgb) =
+            payload_counts(cached.pixels(), cached.manifest.pixel_format);
+        let mut map_tiles = BTreeMap::new();
+        map_tiles.insert(requested_map, Arc::clone(&cached));
+        let mut display_tiles = BTreeMap::new();
+        display_tiles.insert(requested_map, Arc::clone(&cached));
+        return Ok(AtlasRenderExecutorOutput::FinalAtlas(
+            AtlasFinalAtlasOutput {
+                map_tiles: map_tiles.clone(),
+                display_tiles,
+                intermediate_tiles: BTreeMap::new(),
+                base_color_rgba8: cached.payload(),
+                interactive_tile: cached,
+                tile_timings: tile_timings_for(&map_tiles, 0, 0),
+                region_valid_pixel_counts: final_atlas_metadata(plan)?,
+                render_ms: 0,
+                source_cache_hits: 0,
+                pipeline_cache_hits: 0,
+                upload_bytes: 0,
+                upload_ms: 0,
+                command_count: 0,
+                command_bytes: 0,
+                dispatch_ms: 0,
+                readback_bytes: 0,
+                readback_ms: 0,
+                telemetry: vec![format!(
+                    "executor=gpu; plan_hash={}; requested_map=MaterialId; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}",
+                    plan.final_plan_hash.0,
+                    logical_passes_for_map(requested_map)
+                )],
+            },
+        ));
+    }
+    let started = Instant::now();
+    let state = executor
+        .service
+        .initialize()
+        .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
+    validate_tile_size(plan, state.capabilities())?;
+    require_format(state.capabilities(), "R32Float", true, true)?;
+    require_format(state.capabilities(), "R32Uint", false, true)?;
+    require_format(state.capabilities(), "R32Uint", true, false)?;
+    let device = state.device();
+    let queue = state.queue();
+    let detail_stats = execute_or_load_detail_fields(
+        executor,
+        plan,
+        Some(input),
+        Some(requested_map),
+        device,
+        queue,
+        cancellation,
+        is_current,
+    )?;
+    let mut detail_identity = plan.tile_identity(
+        MaterialMapKind::MaterialId,
+        "stage16-detail-material-id-r32uint-v2",
+    );
+    detail_identity.pixel_format = crate::CompiledTilePixelFormat::R32Uint;
+    let cached_texture = executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .cached_rendered_texture(&detail_identity)
+        .ok_or_else(|| {
+            AtlasRenderExecutionError::Gpu("Stage 16 Material ID detail field is missing".into())
+        })?;
+    let tile = plan.tile_request.output_rect.0;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-detail-material-id-readback"),
+    });
+    let pending = schedule_readback(
+        device,
+        executor.source_texture_cache,
+        &mut encoder,
+        &cached_texture._texture,
+        tile.width,
+        tile.height,
+        4,
+    )?;
+    queue.submit(Some(encoder.finish()));
+    let (pixels, readback_ms) = finish_readback(device, pending)?;
+    let readback_bytes = u64::try_from(pixels.len())
+        .map_err(|_| AtlasRenderExecutionError::Gpu("readback payload overflow".into()))?;
+    let rendered_tile = Arc::new(GpuAtlasRenderedTile {
+        manifest: crate::CompiledAtlasTileManifest {
+            identity,
+            map: requested_map,
+            mip_level: plan.tile_request.mip_level,
+            output_rect: plan.tile_request.output_rect,
+            valid_rect: plan.tile_request.valid_rect,
+            halo_px: plan.tile_request.halo_px,
+            generation: plan.tile_request.generation,
+            pixel_format: crate::CompiledTilePixelFormat::R32Uint,
+            width: tile.width,
+            height: tile.height,
+            row_stride: tile.width.saturating_mul(4),
+            opaque_handle: String::new(),
+        },
+        pixels: Arc::clone(&pixels),
+    });
+    executor
+        .source_texture_cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .remember_tile(Arc::clone(&rendered_tile));
+    let mut map_tiles = BTreeMap::new();
+    map_tiles.insert(requested_map, Arc::clone(&rendered_tile));
+    let mut display_tiles = BTreeMap::new();
+    display_tiles.insert(requested_map, Arc::clone(&rendered_tile));
+    let (nontransparent, nonzero_rgb) =
+        payload_counts(rendered_tile.pixels(), rendered_tile.manifest.pixel_format);
+    Ok(AtlasRenderExecutorOutput::FinalAtlas(
+        AtlasFinalAtlasOutput {
+            map_tiles: map_tiles.clone(),
+            display_tiles,
+            intermediate_tiles: BTreeMap::new(),
+            base_color_rgba8: rendered_tile.payload(),
+            interactive_tile: rendered_tile,
+            tile_timings: tile_timings_for(&map_tiles, detail_stats.dispatch_ms, readback_ms),
+            region_valid_pixel_counts: final_atlas_metadata(plan)?,
+            render_ms: started.elapsed().as_millis(),
+            source_cache_hits: 0,
+            pipeline_cache_hits: 0,
+            upload_bytes: 0,
+            upload_ms: 0,
+            command_count: detail_stats.command_count,
+            command_bytes: detail_stats.command_bytes,
+            dispatch_ms: detail_stats.dispatch_ms,
+            readback_bytes,
+            readback_ms,
+            telemetry: vec![format!(
+                "executor=gpu; backend={}; plan_hash={}; requested_map=MaterialId; logical_passes={}; executed_gpu_passes=semantic-detail-publish; pixel_format=R32Uint; final_tile_cache=miss; detail_cache_hit={}; detail_commands={}; detail_command_bytes={}; detail_resident_bytes={}; detail_asset_resident_bytes={}; detail_asset_upload_bytes={}; detail_dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; render_ms={}",
+                state.capabilities().backend,
+                plan.final_plan_hash.0,
+                logical_passes_for_map(requested_map),
+                detail_stats.cache_hit,
+                detail_stats.command_count,
+                detail_stats.command_bytes,
+                detail_stats.resident_bytes,
+                detail_stats.asset_resident_bytes,
+                detail_stats.asset_upload_bytes,
+                detail_stats.dispatch_ms,
+                started.elapsed().as_millis()
+            )],
         },
     ))
 }
@@ -4827,6 +5613,16 @@ fn execute_height_normal_gpu(
     let queue = state.queue();
     let profile_stats =
         execute_or_load_profile_fields(executor, plan, device, queue, cancellation, is_current)?;
+    let detail_stats = execute_or_load_detail_fields(
+        executor,
+        plan,
+        Some(input),
+        Some(MaterialMapKind::Normal),
+        device,
+        queue,
+        cancellation,
+        is_current,
+    )?;
     let pipeline_started = Instant::now();
     let has_authored_normal = plan
         .ordered_sources
@@ -5427,6 +6223,16 @@ fn execute_height_normal_gpu(
         profile_stats.required_halo_px,
         profile_stats.dispatch_ms,
     ));
+    telemetry.push(format!(
+        "detail_pass_dispatches={}; detail_cache_hit={}; detail_commands={}; detail_command_bytes={}; detail_resident_bytes={}; detail_required_halo={}; detail_dispatch_ms={}",
+        detail_stats.dispatches,
+        detail_stats.cache_hit,
+        detail_stats.command_count,
+        detail_stats.command_bytes,
+        detail_stats.resident_bytes,
+        detail_stats.required_halo_px,
+        detail_stats.dispatch_ms,
+    ));
     if publish_height {
         telemetry.push(
             "executor=gpu; dependency=Normal<-Height; final_height_publication=R32Float; intermediate_cache=final-height:live-gpu-readback"
@@ -5511,6 +6317,7 @@ fn execute_height_normal_gpu(
         command_count: height_stats
             .command_count
             .saturating_add(command_count)
+            .saturating_add(detail_stats.command_count)
             .saturating_add(
                 height_display_stats
                     .as_ref()
@@ -5524,6 +6331,7 @@ fn execute_height_normal_gpu(
         command_bytes: height_stats
             .command_bytes
             .saturating_add(command_buffer_bytes_len)
+            .saturating_add(detail_stats.command_bytes)
             .saturating_add(
                 height_display_stats
                     .as_ref()
@@ -5537,6 +6345,7 @@ fn execute_height_normal_gpu(
         dispatch_ms: height_stats
             .dispatch_ms
             .saturating_add(normal_dispatch_ms)
+            .saturating_add(detail_stats.dispatch_ms)
             .saturating_add(
                 height_display_stats
                     .as_ref()
@@ -7245,17 +8054,16 @@ fn source_texture_payload_mapped(
             })
         }
         PreparedExemplarChannel::MaterialId { plane } => {
-            let mut rgba = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
+            let mut r32 = Vec::with_capacity((u64::from(width) * u64::from(height) * 4) as usize);
             for local_y in 0..height {
                 for local_x in 0..width {
                     let (x, y) = source_xy(local_x, local_y);
-                    let bytes = plane.pixel(x, y).0.to_le_bytes();
-                    rgba.extend_from_slice(&[bytes[0], bytes[1], bytes[2], 255]);
+                    r32.extend_from_slice(&plane.pixel(x, y).0.to_le_bytes());
                 }
             }
             Ok(GpuSourceTexturePayload {
-                bytes: rgba,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                bytes: r32,
+                format: wgpu::TextureFormat::R32Uint,
                 bytes_per_pixel: 4,
             })
         }
@@ -7721,6 +8529,1052 @@ fn profile_sdf_code(sdf: hot_trimmer_effect_compiler::ProfileSdf) -> u32 {
     }
 }
 
+fn detail_family_code(family: hot_trimmer_effect_compiler::DetailFamily) -> u32 {
+    use hot_trimmer_effect_compiler::DetailFamily;
+    match family {
+        DetailFamily::RepeatingStrip => 0,
+        DetailFamily::UniqueDetail => 1,
+        DetailFamily::RadialDetail => 2,
+        DetailFamily::TrimCap => 3,
+        DetailFamily::BoltGroup => 4,
+        DetailFamily::Vent => 5,
+        DetailFamily::PanelStamp => 6,
+        DetailFamily::Groove => 7,
+        DetailFamily::Decal => 8,
+        DetailFamily::ProceduralMotif => 9,
+        DetailFamily::UserPatch => 10,
+    }
+}
+
+fn detail_lod_code(lod: hot_trimmer_effect_compiler::DetailLod) -> u32 {
+    use hot_trimmer_effect_compiler::DetailLod;
+    match lod {
+        DetailLod::Full => 0,
+        DetailLod::SimplifiedHeightNormal => 1,
+        DetailLod::NormalOnly => 2,
+        DetailLod::RoughnessColor => 3,
+        DetailLod::Disabled => 4,
+    }
+}
+
+fn detail_mapping_code(mode: hot_trimmer_effect_compiler::DetailMappingMode) -> u32 {
+    match mode {
+        hot_trimmer_effect_compiler::DetailMappingMode::Planar => 0,
+        hot_trimmer_effect_compiler::DetailMappingMode::PolarAuthored => 1,
+    }
+}
+
+fn occupancy_relation_code(relation: hot_trimmer_effect_compiler::OccupancyRelation) -> u32 {
+    use hot_trimmer_effect_compiler::OccupancyRelation;
+    match relation {
+        OccupancyRelation::AboveProfile => 0,
+        OccupancyRelation::BelowProfile => 1,
+        OccupancyRelation::AvoidRaised => 2,
+        OccupancyRelation::OnlyFlatCenter => 3,
+        OccupancyRelation::Ignore => 4,
+    }
+}
+
+fn detail_channel_bits(channels: &[hot_trimmer_effect_compiler::DetailChannelContribution]) -> u32 {
+    channels.iter().fold(0_u32, |bits, channel| {
+        bits | match channel.channel {
+            MaterialChannelRole::Height => 1,
+            MaterialChannelRole::Normal => 2,
+            MaterialChannelRole::Roughness
+            | MaterialChannelRole::Metallic
+            | MaterialChannelRole::AmbientOcclusion
+            | MaterialChannelRole::Specular
+            | MaterialChannelRole::Opacity => 4,
+            MaterialChannelRole::BaseColor => 8,
+            MaterialChannelRole::MaterialId | MaterialChannelRole::RegionId => 16,
+            MaterialChannelRole::EdgeMask => 32,
+        }
+    })
+}
+
+fn detail_gpu_command_count(
+    plan: &CompiledAtlasPlanV1,
+    requested_map: Option<MaterialMapKind>,
+) -> usize {
+    plan.ordered_regions
+        .iter()
+        .flat_map(|region| &region.compiled_details.details)
+        .filter(|detail| detail_contributes_to_requested_map(detail, requested_map))
+        .map(|detail| {
+            let procedural = usize::from(detail_emits_procedural_default(detail));
+            let operations = detail.reusable_atlas_operations.len();
+            let strokes = detail
+                .strokes
+                .iter()
+                .filter(|stroke| {
+                    stroke.operation.scope
+                        == hot_trimmer_effect_compiler::StampScope::MaterialReusableAtlas
+                })
+                .map(|stroke| stroke.physical_samples_m.len())
+                .sum::<usize>();
+            procedural + operations + strokes
+        })
+        .sum()
+}
+
+fn detail_emits_procedural_default(detail: &hot_trimmer_effect_compiler::CompiledDetail) -> bool {
+    // A definition with immutable source assets must be evaluated through the
+    // asset-backed path. Emitting the procedural fallback here would silently
+    // bypass persisted asset resolution (and later force a dummy texture path).
+    detail.definition.required_sources.is_empty()
+        && detail.reusable_atlas_operations.is_empty()
+        && detail.strokes.is_empty()
+        && detail.asset_specific_deferred_operations.is_empty()
+        && detail_allows_procedural_default(detail)
+}
+
+fn detail_fields_for_request(
+    plan: &CompiledAtlasPlanV1,
+    requested_map: Option<MaterialMapKind>,
+) -> Vec<DetailFieldIdentity> {
+    let mut fields = DETAIL_FIELD_SPECS
+        .iter()
+        .filter(|spec| {
+            requested_map.map_or(
+                matches!(
+                    spec.map,
+                    MaterialMapKind::BaseColor
+                        | MaterialMapKind::Normal
+                        | MaterialMapKind::EdgeMask
+                        | MaterialMapKind::Height
+                        | MaterialMapKind::Roughness
+                        | MaterialMapKind::Metallic
+                        | MaterialMapKind::AmbientOcclusion
+                        | MaterialMapKind::Specular
+                        | MaterialMapKind::Opacity
+                        | MaterialMapKind::MaterialId
+                ),
+                |requested| spec.map == requested,
+            )
+        })
+        .map(|spec| {
+            let mut identity = plan.tile_identity(spec.map, spec.shader);
+            identity.pixel_format = spec.pixel_format;
+            DetailFieldIdentity {
+                field_index: spec.field_index,
+                identity,
+                format: spec.format,
+            }
+        })
+        .collect::<Vec<_>>();
+    if requested_map.is_none_or(|map| map == MaterialMapKind::MaterialId) {
+        let mut identity = plan.tile_identity(
+            MaterialMapKind::MaterialId,
+            "stage16-detail-material-id-valid-r32uint-v1",
+        );
+        identity.pixel_format = crate::CompiledTilePixelFormat::R32Uint;
+        fields.push(DetailFieldIdentity {
+            field_index: DETAIL_FIELD_MATERIAL_ID_VALID,
+            identity,
+            format: wgpu::TextureFormat::R32Uint,
+        });
+    }
+    fields
+}
+
+fn detail_requested_field(requested_map: Option<MaterialMapKind>) -> u32 {
+    let Some(requested) = requested_map else {
+        return DETAIL_REQUEST_ALL_FIELDS;
+    };
+    DETAIL_FIELD_SPECS
+        .iter()
+        .find(|spec| spec.map == requested)
+        .map_or(DETAIL_REQUEST_ALL_FIELDS, |spec| spec.field_index as u32)
+}
+
+fn detail_allows_procedural_default(detail: &hot_trimmer_effect_compiler::CompiledDetail) -> bool {
+    use hot_trimmer_effect_compiler::DetailFamily;
+    matches!(
+        detail.resolved_family,
+        DetailFamily::RepeatingStrip
+            | DetailFamily::RadialDetail
+            | DetailFamily::TrimCap
+            | DetailFamily::BoltGroup
+            | DetailFamily::Vent
+            | DetailFamily::Groove
+            | DetailFamily::ProceduralMotif
+    )
+}
+
+enum DetailAssetTexture<'cache> {
+    Cached {
+        cached: Arc<GpuCachedSourceTexture>,
+        _lease: GpuSourceTextureLease<'cache>,
+    },
+    Transient {
+        _texture: wgpu::Texture,
+        view: wgpu::TextureView,
+    },
+}
+
+impl DetailAssetTexture<'_> {
+    fn view(&self) -> &wgpu::TextureView {
+        match self {
+            Self::Cached { cached, .. } => &cached.view,
+            Self::Transient { view, .. } => view,
+        }
+    }
+}
+
+struct DetailAssetTextures<'cache> {
+    color: DetailAssetTexture<'cache>,
+    scalar: DetailAssetTexture<'cache>,
+    normal: DetailAssetTexture<'cache>,
+    material_id: DetailAssetTexture<'cache>,
+    mask: DetailAssetTexture<'cache>,
+    resident_bytes: u64,
+    upload_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DetailAssetLayerTarget {
+    Color,
+    Scalar,
+    Normal,
+    MaterialId,
+    Mask,
+}
+
+fn detail_asset_textures<'cache>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &'cache Mutex<GpuAtlasSourceTextureCache>,
+    input: Option<&AtlasRenderExecutionInput<'_>>,
+    plan: &CompiledAtlasPlanV1,
+    commands: &mut [GpuDetailCommand],
+    requested_map: Option<MaterialMapKind>,
+) -> Result<DetailAssetTextures<'cache>, AtlasRenderExecutionError> {
+    let needed = commands
+        .iter()
+        .filter(|command| command.asset_key != 0)
+        .map(|command| command.asset_key)
+        .collect::<BTreeSet<_>>();
+    if needed.is_empty() {
+        return Ok(create_dummy_detail_asset_textures(device, queue));
+    }
+    let input = input.ok_or_else(|| {
+        AtlasRenderExecutionError::InvalidInput(
+            "Stage 16 asset-backed detail execution requires production prepared-source input"
+                .into(),
+        )
+    })?;
+    let assets_by_key = plan
+        .ordered_regions
+        .iter()
+        .flat_map(|region| &region.compiled_details.details)
+        .flat_map(|detail| {
+            detail
+                .definition
+                .required_sources
+                .iter()
+                .chain(
+                    detail
+                        .reusable_atlas_operations
+                        .iter()
+                        .map(|operation| &operation.asset),
+                )
+                .filter(|asset| needed.contains(&stable_u32_from_digest(&asset.digest)))
+        })
+        .fold(BTreeMap::new(), |mut assets, asset| {
+            assets
+                .entry(stable_u32_from_digest(&asset.digest))
+                .or_insert(asset);
+            assets
+        });
+    if assets_by_key.is_empty() {
+        return Err(AtlasRenderExecutionError::MissingPreparedSource {
+            source_set_id: SourceSetId::new(),
+            source_id: ContentDigest("missing-stage16-stamp-asset".into()),
+        });
+    }
+    let mut resident_bytes = 0_u64;
+    let mut upload_bytes = 0_u64;
+    let (color, allocation, uploaded) = detail_asset_texture_array_for_role(
+        device,
+        queue,
+        cache,
+        input,
+        &assets_by_key,
+        commands,
+        plan.normal_convention,
+        MaterialChannelRole::BaseColor,
+        DetailAssetLayerTarget::Color,
+        wgpu::TextureFormat::Rgba8Unorm,
+        [255, 255, 255, 255],
+    )?;
+    resident_bytes = resident_bytes.saturating_add(allocation);
+    upload_bytes = upload_bytes.saturating_add(uploaded);
+    let scalar_role = requested_map
+        .and_then(material_channel_role_for_map)
+        .filter(|role| {
+            matches!(
+                role,
+                MaterialChannelRole::Height
+                    | MaterialChannelRole::Roughness
+                    | MaterialChannelRole::Metallic
+                    | MaterialChannelRole::AmbientOcclusion
+                    | MaterialChannelRole::Specular
+                    | MaterialChannelRole::Opacity
+            )
+        })
+        .unwrap_or(MaterialChannelRole::Height);
+    let (scalar, allocation, uploaded) = detail_asset_texture_array_for_role(
+        device,
+        queue,
+        cache,
+        input,
+        &assets_by_key,
+        commands,
+        plan.normal_convention,
+        scalar_role,
+        DetailAssetLayerTarget::Scalar,
+        wgpu::TextureFormat::R32Float,
+        1.0_f32.to_le_bytes(),
+    )?;
+    resident_bytes = resident_bytes.saturating_add(allocation);
+    upload_bytes = upload_bytes.saturating_add(uploaded);
+    let (normal, allocation, uploaded) = detail_asset_texture_array_for_role(
+        device,
+        queue,
+        cache,
+        input,
+        &assets_by_key,
+        commands,
+        plan.normal_convention,
+        MaterialChannelRole::Normal,
+        DetailAssetLayerTarget::Normal,
+        wgpu::TextureFormat::Rgba8Unorm,
+        [128, 128, 255, 255],
+    )?;
+    resident_bytes = resident_bytes.saturating_add(allocation);
+    upload_bytes = upload_bytes.saturating_add(uploaded);
+    let (material_id, allocation, uploaded) = detail_asset_texture_array_for_role(
+        device,
+        queue,
+        cache,
+        input,
+        &assets_by_key,
+        commands,
+        plan.normal_convention,
+        MaterialChannelRole::MaterialId,
+        DetailAssetLayerTarget::MaterialId,
+        wgpu::TextureFormat::R32Uint,
+        0_u32.to_le_bytes(),
+    )?;
+    resident_bytes = resident_bytes.saturating_add(allocation);
+    upload_bytes = upload_bytes.saturating_add(uploaded);
+    let mask_role = requested_map
+        .and_then(material_channel_role_for_map)
+        .filter(|role| {
+            matches!(
+                role,
+                MaterialChannelRole::EdgeMask | MaterialChannelRole::Opacity
+            )
+        })
+        .unwrap_or(MaterialChannelRole::EdgeMask);
+    let (mask, allocation, uploaded) = detail_asset_texture_array_for_role(
+        device,
+        queue,
+        cache,
+        input,
+        &assets_by_key,
+        commands,
+        plan.normal_convention,
+        mask_role,
+        DetailAssetLayerTarget::Mask,
+        wgpu::TextureFormat::R32Float,
+        1.0_f32.to_le_bytes(),
+    )?;
+    resident_bytes = resident_bytes.saturating_add(allocation);
+    upload_bytes = upload_bytes.saturating_add(uploaded);
+    Ok(DetailAssetTextures {
+        color,
+        scalar,
+        normal,
+        material_id,
+        mask,
+        resident_bytes,
+        upload_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detail_asset_texture_array_for_role<'cache>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &'cache Mutex<GpuAtlasSourceTextureCache>,
+    input: &AtlasRenderExecutionInput<'_>,
+    assets_by_key: &BTreeMap<u32, &hot_trimmer_effect_compiler::StampAssetRef>,
+    commands: &mut [GpuDetailCommand],
+    normal_convention: crate::CompiledNormalConvention,
+    role: MaterialChannelRole,
+    target: DetailAssetLayerTarget,
+    format: wgpu::TextureFormat,
+    dummy_pixel: [u8; 4],
+) -> Result<(DetailAssetTexture<'cache>, u64, u64), AtlasRenderExecutionError> {
+    let needed = commands
+        .iter()
+        .filter(|command| command.asset_key != 0 && detail_command_needs_asset_role(command, role))
+        .map(|command| command.asset_key)
+        .collect::<BTreeSet<_>>();
+    if needed.is_empty() {
+        let (texture, view) = create_dummy_detail_asset_texture(
+            device,
+            queue,
+            format,
+            dummy_pixel,
+            "hot-trimmer-detail-dummy-role-asset",
+        );
+        return Ok((
+            DetailAssetTexture::Transient {
+                _texture: texture,
+                view,
+            },
+            0,
+            0,
+        ));
+    }
+    let mut prepared_assets = Vec::with_capacity(needed.len());
+    let mut array_width = 1_u32;
+    let mut array_height = 1_u32;
+    for asset_key in &needed {
+        let asset = assets_by_key.get(asset_key).ok_or_else(|| {
+            AtlasRenderExecutionError::MissingPreparedSource {
+                source_set_id: SourceSetId::new(),
+                source_id: ContentDigest("missing-stage16-stamp-asset".into()),
+            }
+        })?;
+        let prepared = input
+            .prepared_sources
+            .iter()
+            .find(|prepared| {
+                prepared.channel_role == role
+                    && (prepared.source_id == asset.digest
+                        || prepared.domain.prepared_source_digest == asset.digest
+                        || prepared.domain.cache_key == asset.digest)
+            })
+            .ok_or_else(|| AtlasRenderExecutionError::MissingPreparedSource {
+                source_set_id: SourceSetId::new(),
+                source_id: asset.digest.clone(),
+            })?;
+        array_width = array_width.max(prepared.domain.width);
+        array_height = array_height.max(prepared.domain.height);
+        prepared_assets.push((*asset_key, prepared));
+    }
+    let layer_count = u32::try_from(prepared_assets.len())
+        .map_err(|_| AtlasRenderExecutionError::Gpu("too many Stage 16 stamp assets".into()))?;
+    for (layer, (asset_key, prepared)) in prepared_assets.iter().enumerate() {
+        for command in commands
+            .iter_mut()
+            .filter(|command| command.asset_key == *asset_key)
+        {
+            match target {
+                DetailAssetLayerTarget::Color => command.asset_layer = layer as u32,
+                DetailAssetLayerTarget::Scalar => command.asset_scalar_layer = layer as u32,
+                DetailAssetLayerTarget::Normal => command.asset_normal_layer = layer as u32,
+                DetailAssetLayerTarget::MaterialId => {
+                    command.asset_material_id_layer = layer as u32;
+                }
+                DetailAssetLayerTarget::Mask => command.asset_mask_layer = layer as u32,
+            }
+            command.asset_width = prepared.domain.width;
+            command.asset_height = prepared.domain.height;
+        }
+    }
+    let key = detail_asset_array_cache_key(
+        &prepared_assets,
+        role,
+        target,
+        format,
+        normal_convention,
+        array_width,
+        array_height,
+    );
+    let mut cache_guard = cache
+        .lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+    cache_guard.clock = cache_guard.clock.saturating_add(1);
+    let clock = cache_guard.clock;
+    if let Some(cached) = cache_guard.sources.get(&key).cloned() {
+        *cache_guard.source_pins.entry(key.clone()).or_insert(0) += 1;
+        drop(cache_guard);
+        let resident_bytes = cached.byte_len;
+        return Ok((
+            DetailAssetTexture::Cached {
+                cached,
+                _lease: GpuSourceTextureLease {
+                    cache,
+                    key,
+                    active: true,
+                },
+            },
+            resident_bytes,
+            0,
+        ));
+    }
+    drop(cache_guard);
+    let array_bytes = u64::from(array_width)
+        .saturating_mul(u64::from(array_height))
+        .saturating_mul(u64::from(layer_count))
+        .saturating_mul(4);
+    // GpuCachedSourceTexture owns a validity texture for the material-source
+    // path. Detail arrays do not consume it, but account for the required 1x1
+    // cache-owned allocation exactly.
+    let resident_bytes = array_bytes.saturating_add(4);
+    if resident_bytes > GpuAtlasSourceTextureCache::budgets().gpu_source_residency_bytes {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "Stage 16 {role:?} asset array requires {resident_bytes} bytes, exceeding the GPU source residency budget"
+        )));
+    }
+    let reservation = reserve_source_texture_cache_space(
+        cache,
+        key.clone(),
+        resident_bytes,
+        array_width,
+        array_height,
+    )?;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hot-trimmer-detail-asset-role-array"),
+        size: wgpu::Extent3d {
+            width: array_width,
+            height: array_height,
+            depth_or_array_layers: layer_count,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut uploaded_bytes = 0_u64;
+    for (layer, (_, prepared)) in prepared_assets.iter().enumerate() {
+        let payload =
+            detail_asset_texture_payload(prepared.domain.as_ref(), role, normal_convention)?;
+        if payload.format != format {
+            return Err(AtlasRenderExecutionError::Gpu(format!(
+                "Stage 16 stamp asset {role:?} uploaded as {:?}, expected {format:?}",
+                payload.format
+            )));
+        }
+        uploaded_bytes = uploaded_bytes.saturating_add(payload.bytes.len() as u64);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &payload.bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(prepared.domain.width * payload.bytes_per_pixel),
+                rows_per_image: Some(prepared.domain.height),
+            },
+            wgpu::Extent3d {
+                width: prepared.domain.width,
+                height: prepared.domain.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-detail-asset-role-array-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(layer_count),
+        ..Default::default()
+    });
+    let validity_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hot-trimmer-detail-asset-cache-validity"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let validity_view = validity_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-detail-asset-cache-validity-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
+    let cached = Arc::new(GpuCachedSourceTexture {
+        _texture: texture,
+        view,
+        _validity_texture: validity_texture,
+        validity_view,
+        byte_len: resident_bytes,
+        layer_count,
+        last_used: clock,
+    });
+    let (cached, lease) = reservation.commit(key, cached)?;
+    let resident_bytes = cached.byte_len;
+    Ok((
+        DetailAssetTexture::Cached {
+            cached,
+            _lease: lease,
+        },
+        resident_bytes,
+        uploaded_bytes,
+    ))
+}
+
+fn detail_asset_array_cache_key(
+    prepared_assets: &[(u32, &AtlasPreparedSource)],
+    role: MaterialChannelRole,
+    target: DetailAssetLayerTarget,
+    format: wgpu::TextureFormat,
+    normal_convention: crate::CompiledNormalConvention,
+    width: u32,
+    height: u32,
+) -> GpuSourceTextureKey {
+    let mut fingerprint = format!(
+        "stage16-detail-asset-array-v1|role={role:?}|target={target:?}|format={format:?}|normal={normal_convention:?}|size={width}x{height}|layers={}|",
+        prepared_assets.len()
+    );
+    for (asset_key, prepared) in prepared_assets {
+        fingerprint.push_str(&format!(
+            "{asset_key}:{}:{}:{}:{}x{};",
+            prepared.source_set_id,
+            prepared.source_id.0,
+            prepared.domain.prepared_source_digest.0,
+            prepared.domain.width,
+            prepared.domain.height
+        ));
+    }
+    let digest = ContentDigest::sha256(fingerprint.as_bytes());
+    GpuSourceTextureKey {
+        source_set_id: prepared_assets[0].1.source_set_id,
+        source_id: digest.clone(),
+        digest,
+        origin_x: 0,
+        origin_y: 0,
+        width,
+        height,
+        decoded_format: format!("{format:?}"),
+        decoder_version: "stage16-detail-asset-array-v1".into(),
+        color_version: format!("registered-{normal_convention:?}"),
+        channel_role: role,
+        page_interior_width: width,
+        page_interior_height: height,
+        page_halo: 0,
+        page_mode: 2,
+        page_table_hash: prepared_assets.len() as u64,
+    }
+}
+
+fn detail_asset_texture_payload(
+    domain: &PreparedMaterialDomain,
+    role: MaterialChannelRole,
+    requested_convention: crate::CompiledNormalConvention,
+) -> Result<GpuSourceTexturePayload, AtlasRenderExecutionError> {
+    if role != MaterialChannelRole::Normal {
+        return source_texture_payload(domain, role);
+    }
+    let channel = domain
+        .registered_channels()
+        .iter()
+        .find(|channel| channel.role() == MaterialChannelRole::Normal)
+        .ok_or_else(|| {
+            AtlasRenderExecutionError::Gpu("prepared source has no Normal channel".into())
+        })?;
+    let PreparedExemplarChannel::Normal {
+        plane,
+        canonical_convention,
+        ..
+    } = channel
+    else {
+        return Err(AtlasRenderExecutionError::Gpu(
+            "registered Normal channel has the wrong payload type".into(),
+        ));
+    };
+    let requested_is_open_gl = requested_convention == crate::CompiledNormalConvention::OpenGl;
+    let canonical_is_open_gl =
+        *canonical_convention == hot_trimmer_domain::NormalConvention::OpenGl;
+    let flip_y = requested_is_open_gl != canonical_is_open_gl;
+    let mut rgba =
+        Vec::with_capacity((u64::from(domain.width) * u64::from(domain.height) * 4) as usize);
+    for y in 0..domain.height {
+        for x in 0..domain.width {
+            let value = plane.pixel(x, y);
+            rgba.extend_from_slice(&[
+                signed_unit(value.xyz[0]),
+                signed_unit(if flip_y { -value.xyz[1] } else { value.xyz[1] }),
+                signed_unit(value.xyz[2]),
+                unit(value.alpha),
+            ]);
+        }
+    }
+    Ok(GpuSourceTexturePayload {
+        bytes: rgba,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        bytes_per_pixel: 4,
+    })
+}
+
+fn create_dummy_detail_asset_textures(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> DetailAssetTextures<'static> {
+    let (color_texture, color_view) = create_dummy_detail_asset_texture(
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        [255, 255, 255, 255],
+        "hot-trimmer-detail-dummy-color-asset",
+    );
+    let (scalar_texture, scalar_view) = create_dummy_detail_asset_texture(
+        device,
+        queue,
+        wgpu::TextureFormat::R32Float,
+        1.0_f32.to_le_bytes(),
+        "hot-trimmer-detail-dummy-scalar-asset",
+    );
+    let (normal_texture, normal_view) = create_dummy_detail_asset_texture(
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        [128, 128, 255, 255],
+        "hot-trimmer-detail-dummy-normal-asset",
+    );
+    let (material_id_texture, material_id_view) = create_dummy_detail_asset_texture(
+        device,
+        queue,
+        wgpu::TextureFormat::R32Uint,
+        0_u32.to_le_bytes(),
+        "hot-trimmer-detail-dummy-material-id-asset",
+    );
+    let (mask_texture, mask_view) = create_dummy_detail_asset_texture(
+        device,
+        queue,
+        wgpu::TextureFormat::R32Float,
+        1.0_f32.to_le_bytes(),
+        "hot-trimmer-detail-dummy-mask-asset",
+    );
+    DetailAssetTextures {
+        color: DetailAssetTexture::Transient {
+            _texture: color_texture,
+            view: color_view,
+        },
+        scalar: DetailAssetTexture::Transient {
+            _texture: scalar_texture,
+            view: scalar_view,
+        },
+        normal: DetailAssetTexture::Transient {
+            _texture: normal_texture,
+            view: normal_view,
+        },
+        material_id: DetailAssetTexture::Transient {
+            _texture: material_id_texture,
+            view: material_id_view,
+        },
+        mask: DetailAssetTexture::Transient {
+            _texture: mask_texture,
+            view: mask_view,
+        },
+        resident_bytes: 0,
+        upload_bytes: 0,
+    }
+}
+
+fn create_dummy_detail_asset_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    pixel: [u8; 4],
+    label: &'static str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixel,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("hot-trimmer-detail-dummy-role-asset-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+fn detail_contributes_to_requested_map(
+    detail: &hot_trimmer_effect_compiler::CompiledDetail,
+    requested_map: Option<MaterialMapKind>,
+) -> bool {
+    let Some(map) = requested_map else {
+        return true;
+    };
+    detail
+        .definition
+        .channels
+        .iter()
+        .chain(
+            detail
+                .reusable_atlas_operations
+                .iter()
+                .flat_map(|operation| &operation.channels),
+        )
+        .chain(
+            detail
+                .strokes
+                .iter()
+                .filter(|stroke| {
+                    stroke.operation.scope
+                        == hot_trimmer_effect_compiler::StampScope::MaterialReusableAtlas
+                })
+                .flat_map(|stroke| &stroke.operation.channels),
+        )
+        .any(|channel| detail_channel_matches_map(channel.channel, map))
+}
+
+fn detail_channel_matches_map(channel: MaterialChannelRole, map: MaterialMapKind) -> bool {
+    matches!(
+        (channel, map),
+        (MaterialChannelRole::Height, MaterialMapKind::Height)
+            | (MaterialChannelRole::Normal, MaterialMapKind::Normal)
+            | (MaterialChannelRole::Roughness, MaterialMapKind::Roughness)
+            | (MaterialChannelRole::Metallic, MaterialMapKind::Metallic)
+            | (
+                MaterialChannelRole::AmbientOcclusion,
+                MaterialMapKind::AmbientOcclusion
+            )
+            | (MaterialChannelRole::Specular, MaterialMapKind::Specular)
+            | (MaterialChannelRole::Opacity, MaterialMapKind::Opacity)
+            | (MaterialChannelRole::BaseColor, MaterialMapKind::BaseColor)
+            | (MaterialChannelRole::MaterialId, MaterialMapKind::MaterialId)
+            | (MaterialChannelRole::RegionId, MaterialMapKind::RegionId)
+            | (MaterialChannelRole::EdgeMask, MaterialMapKind::EdgeMask)
+    )
+}
+
+fn material_channel_role_for_map(map: MaterialMapKind) -> Option<MaterialChannelRole> {
+    Some(match map {
+        MaterialMapKind::BaseColor => MaterialChannelRole::BaseColor,
+        MaterialMapKind::Height => MaterialChannelRole::Height,
+        MaterialMapKind::Normal => MaterialChannelRole::Normal,
+        MaterialMapKind::Roughness => MaterialChannelRole::Roughness,
+        MaterialMapKind::Metallic => MaterialChannelRole::Metallic,
+        MaterialMapKind::AmbientOcclusion => MaterialChannelRole::AmbientOcclusion,
+        MaterialMapKind::Specular => MaterialChannelRole::Specular,
+        MaterialMapKind::Opacity => MaterialChannelRole::Opacity,
+        MaterialMapKind::EdgeMask => MaterialChannelRole::EdgeMask,
+        MaterialMapKind::MaterialId => MaterialChannelRole::MaterialId,
+        MaterialMapKind::RegionId => return None,
+    })
+}
+
+fn detail_command_needs_asset_role(command: &GpuDetailCommand, role: MaterialChannelRole) -> bool {
+    if command.asset_key == 0 {
+        return false;
+    }
+    match role {
+        MaterialChannelRole::BaseColor => (command.channel_bits & 8) != 0,
+        MaterialChannelRole::Height => (command.channel_bits & 1) != 0,
+        MaterialChannelRole::Normal => (command.channel_bits & 2) != 0,
+        MaterialChannelRole::Roughness
+        | MaterialChannelRole::Metallic
+        | MaterialChannelRole::AmbientOcclusion
+        | MaterialChannelRole::Specular
+        | MaterialChannelRole::Opacity => (command.channel_bits & 4) != 0,
+        MaterialChannelRole::MaterialId => (command.channel_bits & 16) != 0,
+        MaterialChannelRole::EdgeMask => (command.channel_bits & 32) != 0,
+        MaterialChannelRole::RegionId => false,
+    }
+}
+
+fn pack_detail_command(
+    region: &CompiledRegionCommandV1,
+    detail: &hot_trimmer_effect_compiler::CompiledDetail,
+    operation: Option<&hot_trimmer_effect_compiler::StampOperation>,
+    stroke_sample_m: Option<[f64; 2]>,
+    requested_map: Option<MaterialMapKind>,
+) -> GpuDetailCommand {
+    let dst = region.destination_rect.0;
+    let period = operation
+        .map(|operation| operation.spacing_m)
+        .filter(|period| period.iter().all(|value| *value > 0.0))
+        .or(detail.repeat_period_m)
+        .unwrap_or(detail.physical_size_m);
+    let channels = detail.definition.channels.iter().chain(
+        operation
+            .into_iter()
+            .flat_map(|operation| &operation.channels),
+    );
+    let mut height_amount = 0.0_f32;
+    let mut normal_amount = 0.0_f32;
+    let mut scalar_amount = 0.0_f32;
+    let mut color_amount = 0.0_f32;
+    let mut material_id = 0_u32;
+    let mut channel_bits = 0_u32;
+    for channel in channels {
+        if !requested_map.is_none_or(|map| detail_channel_matches_map(channel.channel, map)) {
+            continue;
+        }
+        channel_bits |= detail_channel_bits(std::slice::from_ref(channel));
+        match channel.channel {
+            MaterialChannelRole::Height => height_amount += channel.amount as f32,
+            MaterialChannelRole::Normal => normal_amount += channel.amount as f32,
+            MaterialChannelRole::Roughness
+            | MaterialChannelRole::Metallic
+            | MaterialChannelRole::AmbientOcclusion
+            | MaterialChannelRole::Specular
+            | MaterialChannelRole::Opacity => scalar_amount += channel.amount as f32,
+            MaterialChannelRole::BaseColor => color_amount += channel.amount as f32,
+            MaterialChannelRole::MaterialId | MaterialChannelRole::RegionId => {
+                material_id = channel.material_id.unwrap_or(0);
+            }
+            MaterialChannelRole::EdgeMask => {}
+        }
+    }
+    let rotation = if detail.definition.orientation
+        == hot_trimmer_effect_compiler::DetailOrientation::ExplicitDegrees
+    {
+        detail.definition.explicit_rotation_degrees
+    } else {
+        operation.map_or(0.0, |op| op.rotation_degrees)
+    }
+    .to_radians();
+    let position = stroke_sample_m.unwrap_or_else(|| {
+        operation
+            .map(|operation| operation.physical_position_m)
+            .unwrap_or([0.0, 0.0])
+    });
+    let size = operation
+        .map(|operation| operation.physical_size_m)
+        .unwrap_or(detail.physical_size_m);
+    let mirror = operation.map_or([false, false], |operation| operation.mirror);
+    let asset_key = operation
+        .map(|operation| stable_u32_from_digest(&operation.asset.digest))
+        .or_else(|| {
+            detail
+                .definition
+                .required_sources
+                .first()
+                .map(|asset| stable_u32_from_digest(&asset.digest))
+        })
+        .unwrap_or(0);
+    GpuDetailCommand {
+        family: detail_family_code(detail.resolved_family),
+        lod: detail_lod_code(detail.lod),
+        mapping_mode: detail_mapping_code(detail.definition.mapping_mode),
+        channel_bits,
+        dst_x: dst.x,
+        dst_y: dst.y,
+        dst_width: dst.width,
+        dst_height: dst.height,
+        seed: operation.map_or(detail.definition.seed, |op| op.seed) as u32,
+        layer_order: operation.map_or(0, |op| op.layer_order),
+        occupancy_relation: operation.map_or(4, |op| occupancy_relation_code(op.occupancy)),
+        blend: operation.map_or(0, |op| stamp_blend_code(op.blend)),
+        material_id,
+        mirror_bits: u32::from(mirror[0]) | (u32::from(mirror[1]) << 1),
+        clipping: operation.map_or(detail_fit_code(detail.definition.fit_policy), |op| {
+            detail_fit_code(op.clipping)
+        }),
+        asset_key,
+        asset_layer: u32::MAX,
+        asset_scalar_layer: u32::MAX,
+        asset_normal_layer: u32::MAX,
+        asset_material_id_layer: u32::MAX,
+        asset_mask_layer: u32::MAX,
+        asset_width: 1,
+        asset_height: 1,
+        slot_width_m: detail.slot_size_m[0] as f32,
+        slot_height_m: detail.slot_size_m[1] as f32,
+        pixels_per_meter_x: detail.pixels_per_meter[0] as f32,
+        pixels_per_meter_y: detail.pixels_per_meter[1] as f32,
+        size_x_m: size[0] as f32,
+        size_y_m: size[1] as f32,
+        position_x_m: position[0] as f32,
+        position_y_m: position[1] as f32,
+        pivot_x: operation.map_or(0.5, |op| op.pivot[0]) as f32,
+        pivot_y: operation.map_or(0.5, |op| op.pivot[1]) as f32,
+        period_x_m: period[0] as f32,
+        period_y_m: period[1] as f32,
+        scatter: operation.map_or(0.0, |op| op.scatter) as f32,
+        jitter_x_m: operation.map_or(0.0, |op| op.jitter_m[0]) as f32,
+        jitter_y_m: operation.map_or(0.0, |op| op.jitter_m[1]) as f32,
+        rotation_sin: (rotation as f32).sin(),
+        rotation_cos: (rotation as f32).cos(),
+        opacity: operation.map_or(1.0, |op| op.opacity) as f32,
+        height_amount,
+        normal_amount,
+        scalar_amount,
+        color_amount,
+    }
+}
+
+fn stable_u32_from_digest(digest: &ContentDigest) -> u32 {
+    let bytes = digest.0.as_bytes();
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in bytes {
+        hash = (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn stamp_blend_code(blend: hot_trimmer_effect_compiler::StampBlendPolicy) -> u32 {
+    match blend {
+        hot_trimmer_effect_compiler::StampBlendPolicy::Replace => 0,
+        hot_trimmer_effect_compiler::StampBlendPolicy::Add => 1,
+        hot_trimmer_effect_compiler::StampBlendPolicy::Multiply => 2,
+        hot_trimmer_effect_compiler::StampBlendPolicy::Max => 3,
+    }
+}
+
+fn detail_fit_code(fit: hot_trimmer_effect_compiler::DetailFitPolicy) -> u32 {
+    match fit {
+        hot_trimmer_effect_compiler::DetailFitPolicy::Contain => 0,
+        hot_trimmer_effect_compiler::DetailFitPolicy::Cover => 1,
+        hot_trimmer_effect_compiler::DetailFitPolicy::Repeat => 2,
+        hot_trimmer_effect_compiler::DetailFitPolicy::FailIfOversized => 3,
+    }
+}
+
 fn encode_profile_header(header: GpuProfileHeader) -> [u8; GPU_PROFILE_HEADER_BYTES] {
     let mut bytes = [0_u8; GPU_PROFILE_HEADER_BYTES];
     for (index, value) in [
@@ -7738,6 +9592,71 @@ fn encode_profile_header(header: GpuProfileHeader) -> [u8; GPU_PROFILE_HEADER_BY
     {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
+    bytes
+}
+
+fn encode_detail_commands(commands: &[GpuDetailCommand]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(commands.len() * GPU_DETAIL_COMMAND_BYTES);
+    for command in commands {
+        for value in [
+            command.family,
+            command.lod,
+            command.mapping_mode,
+            command.channel_bits,
+            command.dst_x,
+            command.dst_y,
+            command.dst_width,
+            command.dst_height,
+            command.seed,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&command.layer_order.to_le_bytes());
+        for value in [
+            command.occupancy_relation,
+            command.blend,
+            command.material_id,
+            command.mirror_bits,
+            command.clipping,
+            command.asset_key,
+            command.asset_layer,
+            command.asset_scalar_layer,
+            command.asset_normal_layer,
+            command.asset_material_id_layer,
+            command.asset_mask_layer,
+            command.asset_width,
+            command.asset_height,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [
+            command.slot_width_m,
+            command.slot_height_m,
+            command.pixels_per_meter_x,
+            command.pixels_per_meter_y,
+            command.size_x_m,
+            command.size_y_m,
+            command.position_x_m,
+            command.position_y_m,
+            command.pivot_x,
+            command.pivot_y,
+            command.period_x_m,
+            command.period_y_m,
+            command.scatter,
+            command.jitter_x_m,
+            command.jitter_y_m,
+            command.rotation_sin,
+            command.rotation_cos,
+            command.opacity,
+            command.height_amount,
+            command.normal_amount,
+            command.scalar_amount,
+            command.color_amount,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(bytes.len(), commands.len() * GPU_DETAIL_COMMAND_BYTES);
     bytes
 }
 
@@ -7884,6 +9803,7 @@ mod tests {
         RadialMappingSettings, RegionContinuity, RegionSampling, SamplingMode, SamplingPolicy,
         StructuralProfile, TemplateSlotRole,
     };
+    use hot_trimmer_image_io::{CategoryId, LinearScalar, NormalAlphaPolicy, TangentNormal};
     use hot_trimmer_placement_solver::{
         CandidateDescriptors, CandidateFamily, CandidateRoute, CandidateTransform, CropCandidate,
         EligibilityEvidence, PositionStrategy, SliceGeometry, SourceCrop,
@@ -8085,6 +10005,7 @@ mod tests {
                     &ContentDigest::sha256(b"gpu-tiled-export-profile"),
                 )
                 .expect("profile fixture should compile"),
+                compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
                 continuity: RegionContinuity::None,
                 padding_px: 0,
                 edge_eligibility: EdgeEligibility::default(),
@@ -8176,6 +10097,11 @@ mod tests {
         f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
 
+    fn u32_pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> u32 {
+        let offset = ((y * width + x) * 4) as usize;
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
     fn run_single_profile_fixture(
         gpu: &hot_trimmer_preview::GpuCapabilityService,
         handle: &hot_trimmer_preview::GpuDeviceState,
@@ -8258,6 +10184,262 @@ mod tests {
                 "stage15-profile-derivative-y-v1",
             ),
         )
+    }
+
+    fn stage16_asset(label: &str) -> hot_trimmer_effect_compiler::StampAssetRef {
+        hot_trimmer_effect_compiler::StampAssetRef {
+            asset_id: format!("asset-{label}"),
+            version: "1.0.0".into(),
+            digest: ContentDigest::sha256(label.as_bytes()),
+            kind: "RegisteredStampChannels".into(),
+        }
+    }
+
+    fn stage16_prepared_asset(
+        label: &str,
+        index: usize,
+    ) -> (hot_trimmer_domain::SourceSetId, Arc<PreparedMaterialDomain>) {
+        let (width, height) = if index.is_multiple_of(2) {
+            (3, 2)
+        } else {
+            (5, 4)
+        };
+        let pixels = usize::try_from(width * height).unwrap();
+        let color = ImagePlane::from_row_major(
+            width,
+            height,
+            2,
+            &vec![
+                LinearColor {
+                    rgb: [0.0, 1.0, 0.5],
+                    alpha: 0.25,
+                };
+                pixels
+            ],
+        )
+        .unwrap();
+        let scalar =
+            ImagePlane::from_row_major(width, height, 2, &vec![LinearScalar(0.75); pixels])
+                .unwrap();
+        let normal = ImagePlane::from_row_major(
+            width,
+            height,
+            2,
+            &vec![
+                TangentNormal {
+                    xyz: [0.2, 0.3, 0.9],
+                    alpha: 0.75,
+                };
+                pixels
+            ],
+        )
+        .unwrap();
+        let material_id =
+            ImagePlane::from_row_major(width, height, 2, &vec![CategoryId(0); pixels]).unwrap();
+        let mask =
+            ImagePlane::from_row_major(width, height, 2, &vec![MaskValue(1.0); pixels]).unwrap();
+        let domain = PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(format!("stage16-domain-{label}").as_bytes()),
+            ContentDigest::sha256(format!("stage16-prepared-{label}").as_bytes()),
+            vec![
+                PreparedExemplarChannel::BaseColor {
+                    plane: color,
+                    alpha_mode: hot_trimmer_image_io::ResolvedAlphaMode::Straight,
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Height,
+                    plane: scalar.clone(),
+                },
+                PreparedExemplarChannel::Scalar {
+                    role: MaterialChannelRole::Roughness,
+                    plane: scalar,
+                },
+                PreparedExemplarChannel::Normal {
+                    plane: normal,
+                    source_convention: hot_trimmer_domain::NormalConvention::DirectX,
+                    canonical_convention: hot_trimmer_domain::NormalConvention::DirectX,
+                    alpha_policy: NormalAlphaPolicy::Preserve,
+                },
+                PreparedExemplarChannel::MaterialId { plane: material_id },
+                PreparedExemplarChannel::Mask {
+                    role: MaterialChannelRole::EdgeMask,
+                    plane: mask,
+                },
+            ],
+        )
+        .unwrap();
+        (
+            hot_trimmer_domain::SourceSetId::from_bytes([index as u8 + 1; 16]),
+            Arc::new(domain),
+        )
+    }
+
+    fn stage16_detail(
+        family: hot_trimmer_effect_compiler::DetailFamily,
+        name: &str,
+        size: [f64; 2],
+        period: Option<[f64; 2]>,
+    ) -> hot_trimmer_effect_compiler::DetailDefinition {
+        hot_trimmer_effect_compiler::DetailDefinition {
+            name: name.into(),
+            family,
+            physical_size: size,
+            scale_space: hot_trimmer_effect_compiler::EffectScaleSpace::World,
+            compatible_roles: vec![
+                TemplateSlotRole::Planar,
+                TemplateSlotRole::RepeatingStrip,
+                TemplateSlotRole::UniqueDetail,
+                TemplateSlotRole::Radial,
+                TemplateSlotRole::TrimCap,
+            ],
+            orientation: hot_trimmer_effect_compiler::DetailOrientation::Slot,
+            explicit_rotation_degrees: 0.0,
+            aspect_limits: [0.05, 20.0],
+            minimum_pixels: [1, 1],
+            repeat_period_m: period,
+            fit_policy: hot_trimmer_effect_compiler::DetailFitPolicy::FailIfOversized,
+            mapping_mode: if family == hot_trimmer_effect_compiler::DetailFamily::RadialDetail {
+                hot_trimmer_effect_compiler::DetailMappingMode::Planar
+            } else {
+                hot_trimmer_effect_compiler::DetailMappingMode::Planar
+            },
+            channels: vec![
+                hot_trimmer_effect_compiler::DetailChannelContribution {
+                    channel: MaterialChannelRole::Height,
+                    amount: 0.25,
+                    blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+                    material_id: None,
+                    metallic_explicit: false,
+                },
+                hot_trimmer_effect_compiler::DetailChannelContribution {
+                    channel: MaterialChannelRole::MaterialId,
+                    amount: 1.0,
+                    blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+                    material_id: Some(0),
+                    metallic_explicit: false,
+                },
+                hot_trimmer_effect_compiler::DetailChannelContribution {
+                    channel: MaterialChannelRole::BaseColor,
+                    amount: 1.0,
+                    blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+                    material_id: None,
+                    metallic_explicit: false,
+                },
+                hot_trimmer_effect_compiler::DetailChannelContribution {
+                    channel: MaterialChannelRole::Normal,
+                    amount: 1.0,
+                    blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+                    material_id: None,
+                    metallic_explicit: false,
+                },
+                hot_trimmer_effect_compiler::DetailChannelContribution {
+                    channel: MaterialChannelRole::EdgeMask,
+                    amount: 1.0,
+                    blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+                    material_id: None,
+                    metallic_explicit: false,
+                },
+            ],
+            fallback: hot_trimmer_effect_compiler::DetailFallback::Disabled,
+            provenance: "stage16-test-provenance".into(),
+            seed: 0x1600 + family as u64,
+            required_sources: vec![stage16_asset(name)],
+            required_halo_px: 2,
+            dependencies: vec!["stage15-profile-occupancy".into()],
+        }
+    }
+
+    fn stage16_operation(
+        name: &str,
+        scope: hot_trimmer_effect_compiler::StampScope,
+    ) -> hot_trimmer_effect_compiler::StampOperation {
+        hot_trimmer_effect_compiler::StampOperation {
+            asset: stage16_asset(name),
+            scope,
+            target_region: name.into(),
+            physical_position_m: [0.0, 0.0],
+            physical_size_m: [12.0, 12.0],
+            pivot: [0.5, 0.5],
+            rotation_degrees: 15.0,
+            mirror: [false, false],
+            opacity: 1.0,
+            blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+            clipping: hot_trimmer_effect_compiler::DetailFitPolicy::FailIfOversized,
+            seed: 0x16,
+            spacing_m: [8.0, 8.0],
+            scatter: 0.25,
+            jitter_m: [0.1, 0.1],
+            layer_order: 3,
+            occupancy: hot_trimmer_effect_compiler::OccupancyRelation::AboveProfile,
+            channels: vec![hot_trimmer_effect_compiler::DetailChannelContribution {
+                channel: MaterialChannelRole::Height,
+                amount: 0.25,
+                blend: hot_trimmer_effect_compiler::StampBlendPolicy::Add,
+                material_id: None,
+                metallic_explicit: false,
+            }],
+        }
+    }
+
+    fn compile_stage16_fixture(
+        definitions: &[hot_trimmer_effect_compiler::DetailDefinition],
+        operations: &[hot_trimmer_effect_compiler::StampOperation],
+        pixels: [u32; 2],
+    ) -> hot_trimmer_effect_compiler::CompiledDetailSet {
+        hot_trimmer_effect_compiler::compile_details(
+            hot_trimmer_effect_compiler::DetailCompileRequest {
+                definitions,
+                operations,
+                strokes: &[],
+                slot_role: TemplateSlotRole::Planar,
+                slot_size_m: [64.0, 64.0],
+                destination_pixels: pixels,
+                capacity: &hot_trimmer_effect_compiler::conservative_profile_capacity([64.0, 64.0]),
+                upstream_identity: &ContentDigest::sha256(b"stage16-detail-fixture"),
+            },
+        )
+        .expect("Stage 16 fixture should compile")
+    }
+
+    fn read_cached_detail_field(
+        handle: &hot_trimmer_preview::GpuDeviceState,
+        cache: &Mutex<GpuAtlasSourceTextureCache>,
+        plan: &CompiledAtlasPlanV1,
+        map: MaterialMapKind,
+        shader: &str,
+    ) -> Arc<[u8]> {
+        let mut identity = plan.tile_identity(map, shader);
+        identity.pixel_format = match map {
+            MaterialMapKind::BaseColor => crate::CompiledTilePixelFormat::Rgba8UnormSrgb,
+            MaterialMapKind::Normal => crate::CompiledTilePixelFormat::Rgba8UnormLinear,
+            MaterialMapKind::MaterialId => crate::CompiledTilePixelFormat::R32Uint,
+            _ => crate::CompiledTilePixelFormat::R32Float,
+        };
+        let texture = cache
+            .lock()
+            .unwrap()
+            .cached_rendered_texture(&identity)
+            .expect("detail field must remain GPU resident");
+        let tile = plan.tile_request.output_rect.0;
+        let mut encoder = handle
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("stage16-detail-field-readback"),
+            });
+        let pending = schedule_readback(
+            handle.device(),
+            cache,
+            &mut encoder,
+            &texture._texture,
+            tile.width,
+            tile.height,
+            4,
+        )
+        .expect("bounded detail readback should schedule");
+        handle.queue().submit(Some(encoder.finish()));
+        finish_readback(handle.device(), pending)
+            .expect("detail field readback")
+            .0
     }
 
     fn assert_close(actual: f32, expected: f32, tolerance: f32, label: &str) {
@@ -9579,5 +11761,394 @@ mod tests {
             subpixel.lod,
             ProfileLod::NormalOnly | ProfileLod::RoughnessOnly | ProfileLod::Disabled
         ));
+    }
+
+    #[test]
+    fn algorithm_stage_16_gpu_details() {
+        use hot_trimmer_effect_compiler::{DetailFallback, DetailFamily, DetailLod, StampScope};
+
+        let families = [
+            DetailFamily::RepeatingStrip,
+            DetailFamily::UniqueDetail,
+            DetailFamily::RadialDetail,
+            DetailFamily::TrimCap,
+            DetailFamily::BoltGroup,
+            DetailFamily::Vent,
+            DetailFamily::PanelStamp,
+            DetailFamily::Groove,
+            DetailFamily::Decal,
+            DetailFamily::ProceduralMotif,
+            DetailFamily::UserPatch,
+        ];
+        let definitions = families
+            .iter()
+            .enumerate()
+            .map(|(index, family)| {
+                stage16_detail(
+                    *family,
+                    &format!("detail-{index}"),
+                    [10.0 + index as f64, 6.0],
+                    Some([8.0 + index as f64, 8.0]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reusable = stage16_operation("detail-0", StampScope::MaterialReusableAtlas);
+        let mut second_reusable = stage16_operation("detail-0", StampScope::MaterialReusableAtlas);
+        second_reusable.physical_position_m = [8.0, 0.0];
+        second_reusable.seed = 0x17;
+        let deferred = stage16_operation("detail-1", StampScope::AssetSpecificDeferred);
+        let compiled_1k = compile_stage16_fixture(
+            &definitions,
+            &[reusable.clone(), second_reusable.clone(), deferred.clone()],
+            [1024, 1024],
+        );
+        let compiled_8k = compile_stage16_fixture(
+            &definitions,
+            &[reusable, second_reusable, deferred.clone()],
+            [8192, 8192],
+        );
+        assert_eq!(compiled_1k.details.len(), families.len());
+        assert_eq!(compiled_8k.details.len(), families.len());
+        assert_eq!(
+            compiled_1k.details[0].physical_size_m,
+            compiled_8k.details[0].physical_size_m
+        );
+        assert_eq!(
+            compiled_1k.details[0].repeat_period_m,
+            compiled_8k.details[0].repeat_period_m
+        );
+        assert_ne!(
+            compiled_1k.details[0].pixels_per_meter,
+            compiled_8k.details[0].pixels_per_meter
+        );
+        assert_ne!(
+            detail_family_code(DetailFamily::BoltGroup),
+            detail_family_code(DetailFamily::RepeatingStrip)
+        );
+        assert_eq!(compiled_1k.details[0].reusable_atlas_operations.len(), 2);
+        assert_eq!(
+            compiled_1k.details[1]
+                .asset_specific_deferred_operations
+                .len(),
+            1
+        );
+        assert!(compiled_1k.details.iter().all(|detail| matches!(
+            detail.lod,
+            DetailLod::Full
+                | DetailLod::SimplifiedHeightNormal
+                | DetailLod::NormalOnly
+                | DetailLod::RoughnessColor
+        )));
+
+        let serialized = serde_json::to_string(&compiled_1k.details[0]).unwrap();
+        let reopened: hot_trimmer_effect_compiler::CompiledDetail =
+            serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            reopened.physical_size_m,
+            compiled_1k.details[0].physical_size_m
+        );
+        assert_eq!(
+            reopened.definition.seed,
+            compiled_1k.details[0].definition.seed
+        );
+        assert_eq!(
+            reopened.cache_identity,
+            compiled_1k.details[0].cache_identity
+        );
+
+        let mut oversized = stage16_detail(DetailFamily::Decal, "oversized", [80.0, 80.0], None);
+        oversized.fallback = DetailFallback::None;
+        assert!(matches!(
+            hot_trimmer_effect_compiler::compile_details(
+                hot_trimmer_effect_compiler::DetailCompileRequest {
+                    definitions: &[oversized],
+                    operations: &[],
+                    strokes: &[],
+                    slot_role: TemplateSlotRole::Planar,
+                    slot_size_m: [64.0, 64.0],
+                    destination_pixels: [1024, 1024],
+                    capacity: &hot_trimmer_effect_compiler::conservative_profile_capacity([
+                        64.0, 64.0
+                    ]),
+                    upstream_identity: &ContentDigest::sha256(b"stage16-oversized"),
+                }
+            ),
+            Err(hot_trimmer_effect_compiler::DetailCompileError::Incompatible)
+        ));
+        assert!(matches!(
+            hot_trimmer_effect_compiler::compile_details(
+                hot_trimmer_effect_compiler::DetailCompileRequest {
+                    definitions: &[],
+                    operations: &[stage16_operation(
+                        "missing",
+                        StampScope::MaterialReusableAtlas
+                    )],
+                    strokes: &[],
+                    slot_role: TemplateSlotRole::Planar,
+                    slot_size_m: [64.0, 64.0],
+                    destination_pixels: [1024, 1024],
+                    capacity: &hot_trimmer_effect_compiler::conservative_profile_capacity([
+                        64.0, 64.0
+                    ]),
+                    upstream_identity: &ContentDigest::sha256(b"stage16-orphan"),
+                }
+            ),
+            Err(hot_trimmer_effect_compiler::DetailCompileError::OrphanOperation)
+        ));
+        let mut pixel_detail =
+            stage16_detail(DetailFamily::Decal, "pixel-detail", [4.0, 4.0], None);
+        pixel_detail.scale_space = hot_trimmer_effect_compiler::EffectScaleSpace::Pixels;
+        pixel_detail.minimum_pixels = [8, 8];
+        let pixel_low = compile_stage16_fixture(&[pixel_detail.clone()], &[], [64, 64]);
+        let pixel_high = compile_stage16_fixture(&[pixel_detail], &[], [1024, 1024]);
+        assert_eq!(pixel_low.details[0].physical_size_m, [4.0, 4.0]);
+        assert_eq!(pixel_low.details[0].lod, DetailLod::Disabled);
+        assert_eq!(pixel_high.details[0].lod, DetailLod::Disabled);
+        let empty = hot_trimmer_effect_compiler::compile_details(
+            hot_trimmer_effect_compiler::DetailCompileRequest {
+                definitions: &[],
+                operations: &[],
+                strokes: &[],
+                slot_role: TemplateSlotRole::Planar,
+                slot_size_m: [64.0, 64.0],
+                destination_pixels: [1024, 1024],
+                capacity: &hot_trimmer_effect_compiler::conservative_profile_capacity([64.0, 64.0]),
+                upstream_identity: &ContentDigest::sha256(b"stage16-empty"),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            empty.stage_result,
+            hot_trimmer_domain::StageResult::SkippedBecauseUnused { .. }
+        ));
+
+        let gpu = hot_trimmer_preview::GpuCapabilityService::default();
+        let handle = gpu
+            .initialize()
+            .expect("GPU service should initialize for Stage 16 detail coverage");
+        let mut plan = gpu_tiled_export_resized_plan(64);
+        plan.ordered_regions[0].compiled_details = compile_stage16_fixture(
+            &definitions,
+            &[
+                stage16_operation("detail-0", StampScope::MaterialReusableAtlas),
+                stage16_operation("detail-1", StampScope::MaterialReusableAtlas),
+                deferred,
+            ],
+            [64, 64],
+        );
+        plan.final_plan_hash = ContentDigest(String::new());
+        plan = plan
+            .finalize()
+            .expect("Stage 16 detail plan should validate");
+        let mut prepared_sources = Vec::new();
+        for (index, name) in (0..definitions.len())
+            .map(|index| format!("detail-{index}"))
+            .enumerate()
+        {
+            let (source_set_id, domain) = stage16_prepared_asset(&name, index);
+            for channel in domain.registered_channels() {
+                prepared_sources.push(AtlasPreparedSource {
+                    source_set_id,
+                    source_id: stage16_asset(&name).digest,
+                    channel_role: channel.role(),
+                    domain: Arc::clone(&domain),
+                });
+            }
+        }
+        let execution_input = AtlasRenderExecutionInput {
+            prepared_sources,
+            source_frame_cache: None,
+        };
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &cache,
+        };
+        let cancellation = CancellationToken::new();
+        let material_id_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let material_id_executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &material_id_cache,
+        };
+        let material_id_only = execute_or_load_detail_fields(
+            &material_id_executor,
+            &plan,
+            Some(&execution_input),
+            Some(MaterialMapKind::MaterialId),
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("MaterialId-only Stage 16 execution should allocate ID and validity tiles");
+        assert_eq!(material_id_only.dispatches, 1);
+        assert_eq!(material_id_only.asset_resident_bytes, 5 * 4 * 2 * 4 + 4);
+        assert_eq!(material_id_only.asset_upload_bytes, (3 * 2 + 5 * 4) * 4);
+        assert_eq!(
+            material_id_only.resident_bytes,
+            2 * 64 * 64 * 4 + 5 * 4 + material_id_only.asset_resident_bytes
+        );
+        let material_id_only_value = read_cached_detail_field(
+            &handle,
+            &material_id_cache,
+            &plan,
+            MaterialMapKind::MaterialId,
+            "stage16-detail-material-id-r32uint-v2",
+        );
+        let material_id_only_valid = read_cached_detail_field(
+            &handle,
+            &material_id_cache,
+            &plan,
+            MaterialMapKind::MaterialId,
+            "stage16-detail-material-id-valid-r32uint-v1",
+        );
+        assert_eq!(u32_pixel(&material_id_only_value, 64, 32, 32), 0);
+        assert_eq!(u32_pixel(&material_id_only_valid, 64, 32, 32), 1);
+        assert_eq!(material_id_cache.lock().unwrap().source_count(), 1);
+        material_id_cache.lock().unwrap().rendered_textures.clear();
+        let material_id_reloaded = execute_or_load_detail_fields(
+            &material_id_executor,
+            &plan,
+            Some(&execution_input),
+            Some(MaterialMapKind::MaterialId),
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("MaterialId map reevaluation should reuse the digest-keyed stamp array");
+        assert_eq!(material_id_reloaded.dispatches, 1);
+        assert_eq!(material_id_reloaded.asset_upload_bytes, 0);
+        assert_eq!(material_id_cache.lock().unwrap().source_count(), 1);
+
+        let stats = execute_or_load_detail_fields(
+            &executor,
+            &plan,
+            Some(&execution_input),
+            None,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("Stage 16 details should execute on GPU");
+        assert_eq!(stats.dispatches, 1);
+        assert_eq!(stats.command_count as usize, 2);
+        assert!(stats.required_halo_px >= 2);
+        assert_eq!(stats.asset_resident_bytes, (5 * 4 * 2 * 4 + 4) * 5);
+        assert_eq!(stats.asset_upload_bytes, (3 * 2 + 5 * 4) * 4 * 5);
+        assert_eq!(
+            stats.resident_bytes,
+            7 * 64 * 64 * 4 + stats.asset_resident_bytes
+        );
+        let color = read_cached_detail_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::BaseColor,
+            "stage16-detail-base-color-rgba-v2",
+        );
+        let normal = read_cached_detail_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::Normal,
+            "stage16-detail-normal-rgba-v2",
+        );
+        let mask = read_cached_detail_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::EdgeMask,
+            "stage16-detail-mask-v1",
+        );
+        let height = read_cached_detail_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::Height,
+            "stage16-detail-height-v1",
+        );
+        let id = read_cached_detail_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::MaterialId,
+            "stage16-detail-material-id-r32uint-v2",
+        );
+        let id_valid = read_cached_detail_field(
+            &handle,
+            &cache,
+            &plan,
+            MaterialMapKind::MaterialId,
+            "stage16-detail-material-id-valid-r32uint-v1",
+        );
+        let color_offset = color
+            .chunks_exact(4)
+            .position(|pixel| pixel[3] != 0)
+            .expect("asset-backed Base Color must publish RGBA pixels")
+            * 4;
+        assert_eq!(&color[color_offset..color_offset + 4], &[0, 255, 188, 64]);
+        let normal_offset = normal
+            .chunks_exact(4)
+            .position(|pixel| pixel[3] != 0)
+            .expect("asset-backed Normal must publish vector pixels")
+            * 4;
+        assert!(
+            normal[normal_offset + 1] < 128,
+            "DirectX -> OpenGL must flip normal Y"
+        );
+        assert!(r32_pixel(&mask, 64, 0, 32).is_finite());
+        assert!(r32_pixel(&height, 64, 32, 32).is_finite());
+        assert!(r32_pixel(&height, 64, 8, 8) >= 0.0);
+        assert_eq!(u32_pixel(&id, 64, 32, 32), 0);
+        assert_eq!(u32_pixel(&id_valid, 64, 32, 32), 1);
+        let cached = execute_or_load_detail_fields(
+            &executor,
+            &plan,
+            Some(&execution_input),
+            None,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("identical Stage 16 detail plan should hit cache");
+        assert!(cached.cache_hit);
+        assert_eq!(cached.dispatches, 0);
+        let pruned = execute_or_load_detail_fields(
+            &executor,
+            &plan,
+            Some(&execution_input),
+            Some(MaterialMapKind::Metallic),
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("unrequested absent metallic detail contribution should prune");
+        assert_eq!(pruned.command_count, 0);
+        assert_eq!(pruned.dispatches, 0);
+
+        let mut empty_plan = gpu_tiled_export_resized_plan(64);
+        empty_plan.ordered_regions[0].compiled_details =
+            hot_trimmer_effect_compiler::empty_compiled_detail_set();
+        empty_plan.final_plan_hash = ContentDigest(String::new());
+        empty_plan = empty_plan
+            .finalize()
+            .expect("empty detail plan should validate");
+        let empty_stats = execute_or_load_detail_fields(
+            &executor,
+            &empty_plan,
+            Some(&execution_input),
+            None,
+            handle.device(),
+            handle.queue(),
+            &cancellation,
+            &|| true,
+        )
+        .expect("empty details should dispatch no GPU work");
+        assert_eq!(empty_stats.command_count, 0);
+        assert_eq!(empty_stats.dispatches, 0);
     }
 }

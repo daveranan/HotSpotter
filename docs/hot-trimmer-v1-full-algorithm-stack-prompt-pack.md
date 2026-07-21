@@ -140,6 +140,7 @@ renderer, or an unrelated synthesis engine.
 | 15 | Compact structural-profile compilation and tiled GPU occupancy/Height | 15 |
 | LIB | Reusable source/patch/stamp/profile library and management window | Cross-cutting before Stage 16 |
 | 16 | Compact semantic-detail plans and tiled GPU evaluation | 16 |
+| 20A | Early profile/detail authoring, raw contribution inspection, and Stage 15-20 feedback telemetry | Product feedback integration after Stage 16 |
 | 18 | Effect compilation and tiled GPU effect evaluation | 18 |
 | 17 | Requested-map GPU PBR composition from compiled effects | 17 |
 | 19 | Tiled GPU finishing, reduced validation, and metadata | 19 |
@@ -148,6 +149,9 @@ renderer, or an unrelated synthesis engine.
 
 Stage 18 precedes Stage 17 in implementation because Stage 17 consumes `CompiledEffect` operations produced by
 Stage 18. The product-stage numbers remain unchanged.
+
+Prompt 20A deliberately runs after Prompt 16 without claiming Stage 20 completion. It exposes only installed compiler
+truth, gives product feedback a real in-app loop, and establishes UI/telemetry contracts that Prompts 18-20 extend.
 
 ---
 
@@ -1460,6 +1464,134 @@ Stop conditions:
 
 ---
 
+## Prompt 20A — early Stage 15-16 product feedback workbench and Stage 15-20 telemetry
+
+```text
+Implement Prompt 20A from the full algorithm-stack prompt pack after Prompt 16 and before Prompt 18.
+
+Read the common rules and the Stage 15, Prompt LIB, Stage 16, and Stage 20 contracts. Consume only the accepted Stage
+15/16 compiler plans, GPU tile publications, persisted document commands, and existing source-first application shell.
+No subagents.
+
+Objective:
+Start the product feedback cycle now by exposing typed structural-profile and semantic-detail authoring, raw compiler
+contribution/QA previews, and one copyable Stage 15-20 diagnostic payload without inventing unfinished Stage 17-20
+material results or creating a second renderer.
+
+Scope — product feedback workbench:
+- Unlock a deliberately limited Layers & Maps workbench inside the existing source-first shell. Label it as
+  "Profile & Detail Contributions" until final Stage 17-19 composition exists; never present raw Stage 15/16 fields as
+  a finished PBR material.
+- Provide an in-app deterministic Stage 15-16 feedback project/sample that is created through normal typed project and
+  document commands, uses owned registered assets, and can be saved, closed, reopened, and edited. Do not require SQL,
+  hand-authored decoration JSON, hidden test hooks, or external fixture preparation to begin review.
+- Let the user select a hotspot/region and author its Stage 15 structural profile using legal typed controls for Flat,
+  Bevel, RoundedBevel, Groove, PanelFrame, RadialDisc, and Annulus where the slot role permits them. Show physical width/
+  depth/radius inputs, selected role evaluator, occupancy semantics, LOD, fallback, and compilation failure from the
+  authoritative compiled profile. Do not imply that a texture profile changes mesh silhouette.
+- Integrate the existing Prompt LIB browser for immutable registered stamp/channel assets. Let the user create, select,
+  edit, duplicate, enable/disable, reorder, and delete typed Stage 16 DetailDefinition, StampOperation, and StampStroke
+  intent with undo/redo.
+- Expose physical target region, family, size, position, pivot, rotation, mirror, opacity, spacing, deterministic seed,
+  scatter/jitter, clipping/fit, mapping mode, blend policy, occupancy relation, layer order, per-channel amounts, exact
+  Material ID, and explicit material-reusable versus asset-specific-deferred scope. Commit physical slot/atlas
+  coordinates and immutable asset/version references; screen coordinates are transient input only.
+- Provide direct-manipulation placement overlays for bounds, pivot, orientation, repeat period, stroke samples, valid
+  interior, halo, and occupancy conflicts. Decorations remain non-destructive and do not modify topology by default.
+- Persist authoring through typed/versioned IPC and domain commands. The frontend must not manufacture decoration keys,
+  serialize Rust contracts by hand, resolve fallback/fit/LOD, or become placement authority.
+
+Scope — previews and QA:
+- Reuse the single persisted compiler, application-owned GPU service, digest-keyed source cache, requested-map graph,
+  binary tile publication, revision guards, and cancellation path. Do not add preview-only material math, CPU raster
+  composition, Base64/PNG atlas transport, a second GPU owner, or a second asset/render cache.
+- Add explicitly labeled raw contribution views for Stage 15 occupancy/Height and Stage 16 registered mask, physical
+  Height, vector-normal input, scalar contribution by semantic channel, Base Color contribution, exact Material ID, and
+  Material-ID validity. Request only the visible map and its real dependencies.
+- Add compiler-owned Stage 15 profile route/occupancy/LOD/fallback views and Stage 16 detail route/occupancy/LOD/scope/
+  asset-resolution views. QA pixels come from requested GPU tiles; text and outlines come from compiled plan metadata.
+  The UI must not reverse-engineer compiler truth from displayed pixels.
+- Support 1K/2K/4K/8K review, before/after and selected-operation isolation, cache-hit visibility, and a clear distinction
+  among current, compiling, cancelled, superseded, failed, missing-asset, deferred-only, and skipped-because-unused
+  states. Never publish a stale generation as current.
+- Show Stages 18, 17, 19, and final 20 as explicit NotInstalled/Unavailable stages in this early workbench. Do not add
+  guessed weathering, PBR composition, finishing, final-material, export, or Blender behavior to fill those gaps.
+
+Scope — Copy Stage 15-20 telemetry + debug:
+- Extend the existing "Copy telemetry + debug" interaction and F2 shortcut rather than creating a competing debug
+  button. Rename its visible action to "Copy Stage 15-20 telemetry + debug" in this workbench and preserve concise
+  copied/copy-failed feedback.
+- Define one versioned, deterministic clipboard schema and human-readable summary. Later Prompts 18-20 must extend this
+  schema compatibly rather than replace it. Use explicit InstalledNotRequested, Requested, Executed, CacheHit,
+  SkippedBecauseUnused, DeferredOnly, Failed, Cancelled, Superseded, and NotInstalled states; absence is never ambiguous.
+- Include app/build/protocol/schema versions; GPU adapter/backend/capabilities; project/document/topology/appearance/
+  generation identities; selected region/hotspot and physical scale; requested map/QA view; tile output/valid rectangles,
+  halo, format, row stride, opaque-handle identity, and publication/paint gates.
+- For Stage 15 include requested and compiled profile identities, physical parameters, role/evaluator, occupancy, LOD,
+  fallback/diagnostics, dependencies, requested/executed/cache-hit counts, timings, formats, residency, readback, and CPU
+  profile-raster counters.
+- For Stage 16 include definition/operation/stroke counts and identities, family, physical placement, scope, asset ID/
+  version/digest, layer order, channel intent, mapping/fit/blend/occupancy, LOD/fallback/diagnostics, requested/executed/
+  cache-hit counts, command/upload bytes, source/detail residency and pins, tile/halo/format/shader identities, readback,
+  and CPU detail/mask/SDF/stamp raster counters.
+- For Prompt 20A include its workbench/schema version, active tool and contribution view, selected/draft/committed
+  operation identities, dirty/undo/redo state, before/after or isolation mode, last typed command result, and current
+  authoring/preview error state.
+- For Stages 18, 17, 19, and final 20 include the explicit current availability state and any installed version/identity;
+  once those prompts land, add their plan routes, requested/executed/cache data, timings, residency, readbacks, CPU pixel
+  counters, validation summaries, and publication status to the same payload.
+- Include exact typed compiler/GPU/IPC errors, cancellation/supersession reason, preview-client paint summary, display
+  gates, and the last bounded telemetry records needed to reproduce the selected view. Provide a one-click copy from
+  both success and error states.
+- Do not copy source pixels, encoded asset bytes, clipboard contents, credentials, environment variables, or absolute
+  user paths. Prefer stable IDs, immutable content digests, project-relative labels, numeric measurements, and bounded
+  diagnostics so users can paste the payload directly into a feedback report.
+
+Scope — contracts and evidence:
+- Add versioned IPC projections/commands for profile/detail authoring, compiled Stage 15/16 inspection, QA tile requests,
+  and the Stage 15-20 debug payload. Keep Rust/TypeScript fixtures aligned and reject unknown or stale command versions.
+- Add `stage15-20-feedback` to the desktop test runner. That focused suite must run the UI/IPC feedback-workbench tests
+  and the native `algorithm_stage_20a_feedback_workbench` test under the single verification command below.
+- Add docs/phase-reports/algorithm-stage-20a.md with the exact in-app review workflow, feedback sample contents,
+  screenshots or deterministic view evidence, delivered limitations, and the handoff contract for Prompts 18-20.
+
+Acceptance:
+- From a clean launch, a reviewer can create/open the bundled feedback project, select a region, change a legal bevel or
+  groove profile, place and transform a registered detail stamp, switch raw contribution/QA views, and see only the
+  current GPU generation update without editing project internals.
+- Profile and detail edits survive save/reopen with identical physical placement, seed, asset version/digest, scope,
+  operation order, compiled identities, and requested-map pixels on the same supported backend.
+- Review at 1K/2K/4K/8K preserves physical profile/detail scale and deterministic placement; selected-operation isolation
+  and before/after do not mutate authoritative intent.
+- Material ID 0 and its validity remain distinguishable; imported normal convention and registered channel alignment
+  remain visible and exact through the raw contribution views.
+- Missing assets, illegal role/fit, oversized motifs, occupancy conflicts, deferred-only operations, empty detail lists,
+  cancellations, and superseded generations are visible typed states rather than blank previews or silent success.
+- Repeating an identical visible request reports cache reuse and zero avoidable stamp upload/dispatch work. Unrequested
+  Stage 15/16 contribution and QA passes dispatch zero work.
+- The copied Stage 15-20 payload is available on success and failure, is deterministic apart from explicitly identified
+  timings/runtime adapter data, contains enough identities and route evidence to reproduce the selected view, marks
+  unfinished stages NotInstalled, and contains no source pixels, encoded assets, secrets, or absolute user paths.
+- Production CPU profile/detail/mask/SDF/stamp raster counters remain zero, GPU intermediates remain bounded/tiled, and
+  the early workbench introduces no alternate renderer, compositor, cache, exporter, or frontend material evaluator.
+
+Verification — run exactly:
+npm test --workspace @hot-trimmer/desktop -- stage15-20-feedback
+
+Stop conditions:
+- Stop if the workbench displays invented final PBR/weathering/finishing output before Stages 18, 17, and 19 exist.
+- Stop if a frontend control writes raw decoration JSON, decides compiler fit/LOD/fallback, or commits display-space
+  coordinates as physical authority.
+- Stop if a QA/preview image is computed in React/TypeScript or on the production CPU instead of requested through the
+  accepted GPU tile path.
+- Stop if telemetry requires SQL/log-file inspection, omits exact stage availability/cache/error state, leaks source
+  pixels or private paths, or cannot be copied from a failed preview.
+- Stop if Prompt 20A replaces the existing source-first shell or creates a renderer, cache, exporter, or debug schema
+  that final Prompt 20 would need to discard.
+```
+
+---
+
 ## Prompt 18 — Stage 18: scale-aware effect compilation and tiled GPU evaluation
 
 ```text
@@ -1682,8 +1814,9 @@ Stop conditions:
 ```text
 Implement Prompt 20 / Stage 20 from the full algorithm-stack prompt pack.
 
-Read the common rules and revised Stage 20. Consume the Stage 19 `CompiledSheet` lineage/tile manifest through the
-single `compile_persisted` GPU artifact and accepted streaming-export routes only.
+Read the common rules, revised Stage 20, and Prompt 20A report. Extend the accepted Prompt 20A authoring, QA, and
+versioned Stage 15-20 telemetry contracts. Consume the Stage 19 `CompiledSheet` lineage/tile manifest through the single
+`compile_persisted` GPU artifact and accepted streaming-export routes only.
 No subagents.
 
 Objective:
@@ -1692,6 +1825,8 @@ publish it through the already-atomic GPU streaming exporter, and apply semantic
 creating another renderer, map compositor, QA rasterizer, or exporter.
 
 Scope — desktop workflow:
+- Extend the Prompt 20A workbench in place. Preserve its typed Stage 15/16 commands, saved intent, review project,
+  contribution/QA views, F2 copy interaction, and versioned Stage 15-20 debug schema; do not fork or replace them.
 - Keep the established source library/canvas/sheet/inspector shell. Add typed controls for material-class override,
   physical-scale measurement, orientation, de-lighting, domain-route policy, seed, source sufficiency, placement pin/
   override, legal transforms, ExplicitStretch warning, material-state recipe, and effect fallback.

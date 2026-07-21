@@ -395,6 +395,7 @@ fn plan(domain: &PreparedMaterialDomain) -> CompiledAtlasPlanV1 {
                 &ContentDigest::sha256(format!("profile-{id}").as_bytes()),
             )
             .unwrap(),
+            compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
             continuity: RegionContinuity::None,
             padding_px: 0,
             edge_eligibility: EdgeEligibility::default(),
@@ -1503,6 +1504,7 @@ fn region_command(
             &ContentDigest::sha256(format!("profile-{region_id}").as_bytes()),
         )
         .unwrap(),
+        compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
         continuity: RegionContinuity::None,
         padding_px: 0,
         edge_eligibility: EdgeEligibility::default(),

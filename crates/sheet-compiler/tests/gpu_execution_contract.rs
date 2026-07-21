@@ -208,6 +208,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 &ContentDigest::sha256(b"region-a-profile"),
             )
             .unwrap(),
+            compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
             continuity: RegionContinuity::None,
             padding_px: 4,
             edge_eligibility: EdgeEligibility::default(),
@@ -277,6 +278,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 &ContentDigest::sha256(b"region-b-profile"),
             )
             .unwrap(),
+            compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
             continuity: RegionContinuity::X,
             padding_px: 8,
             edge_eligibility: EdgeEligibility {
@@ -351,6 +353,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 &ContentDigest::sha256(b"region-c-profile"),
             )
             .unwrap(),
+            compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
             continuity: RegionContinuity::Y,
             padding_px: 6,
             edge_eligibility: EdgeEligibility {

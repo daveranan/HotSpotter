@@ -10,7 +10,7 @@ use std::{
 use hot_trimmer_domain::{
     AddressMode, AlgorithmProvenance, CancellationToken, ContentDigest, ContentReference,
     ManualRegionRole, MaterialChannelRole, OrientedPixelSize, OriginalAssetProvenance, Patch,
-    PhysicalScaleEvidence, Projection, QuarterTurn, RegionMapping, RegionSampling,
+    PhysicalScaleEvidence, Projection, QuarterTurn, RegionId, RegionMapping, RegionSampling,
     RegisteredChannel, RegisteredChannelSet, SamplingMode, SamplingPolicy, SolidChannelValues,
     SourceOwnershipIntent, StageResult, TemplateSlotRole,
 };
@@ -97,6 +97,212 @@ impl MaterialDomainView for MappedDomainView<'_> {
             .filter_map(|(index, seam)| (seam.axis == axis).then_some(index as u32))
             .collect()
     }
+}
+
+fn compile_persisted_details_for_region(
+    decorations: &[hot_trimmer_domain::DecorationBinding],
+    region_id: RegionId,
+    slot_role: TemplateSlotRole,
+    slot_size_m: [f64; 2],
+    destination_pixels: [u32; 2],
+    capacity: &hot_trimmer_effect_compiler::EffectCapacity,
+    upstream_identity: &ContentDigest,
+) -> Result<hot_trimmer_effect_compiler::CompiledDetailSet, String> {
+    let region_key = region_id.to_string();
+    let mut all_definitions = Vec::new();
+    let mut operations = Vec::new();
+    let mut strokes = Vec::new();
+    for decoration in decorations {
+        if decoration
+            .decoration_key
+            .starts_with("stage16.detail.definition")
+        {
+            let definition: hot_trimmer_effect_compiler::DetailDefinition =
+                serde_json::from_str(&decoration.value).map_err(|error| {
+                    format!(
+                        "Stage 16 detail definition decoration '{}' is malformed: {error}",
+                        decoration.decoration_key
+                    )
+                })?;
+            all_definitions.push((decoration.decoration_key.as_str(), definition));
+        } else if decoration
+            .decoration_key
+            .starts_with("stage16.stamp.operation")
+        {
+            let operation: hot_trimmer_effect_compiler::StampOperation =
+                serde_json::from_str(&decoration.value).map_err(|error| {
+                    format!(
+                        "Stage 16 stamp operation decoration '{}' is malformed: {error}",
+                        decoration.decoration_key
+                    )
+                })?;
+            operations.push(operation);
+        } else if decoration
+            .decoration_key
+            .starts_with("stage16.stamp.stroke")
+        {
+            let stroke: hot_trimmer_effect_compiler::StampStroke =
+                serde_json::from_str(&decoration.value).map_err(|error| {
+                    format!(
+                        "Stage 16 stamp stroke decoration '{}' is malformed: {error}",
+                        decoration.decoration_key
+                    )
+                })?;
+            strokes.push(stroke);
+        }
+    }
+    let all_definition_names = all_definitions
+        .iter()
+        .map(|(_, definition)| definition.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(orphan) = operations
+        .iter()
+        .find(|operation| !all_definition_names.contains(operation.target_region.as_str()))
+    {
+        return Err(format!(
+            "Stage 16 operation targets unknown detail '{}'",
+            orphan.target_region
+        ));
+    }
+    if let Some(orphan) = strokes
+        .iter()
+        .find(|stroke| !all_definition_names.contains(stroke.operation.target_region.as_str()))
+    {
+        return Err(format!(
+            "Stage 16 stroke targets unknown detail '{}'",
+            orphan.operation.target_region
+        ));
+    }
+    let definitions = all_definitions
+        .into_iter()
+        .filter_map(|(key, definition)| {
+            decoration_targets_region(key, &definition.name, &region_key).then_some(definition)
+        })
+        .collect::<Vec<_>>();
+    if definitions.is_empty() {
+        return Ok(hot_trimmer_effect_compiler::empty_compiled_detail_set());
+    }
+    let definition_names = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    operations.retain(|operation| definition_names.contains(operation.target_region.as_str()));
+    strokes.retain(|stroke| definition_names.contains(stroke.operation.target_region.as_str()));
+    hot_trimmer_effect_compiler::compile_details(
+        hot_trimmer_effect_compiler::DetailCompileRequest {
+            definitions: &definitions,
+            operations: &operations,
+            strokes: &strokes,
+            slot_role,
+            slot_size_m,
+            destination_pixels,
+            capacity,
+            upstream_identity,
+        },
+    )
+    .map_err(|error| format!("Stage 16 detail compilation failed: {error}"))
+}
+
+fn stage16_stamp_asset_domains(
+    project: &ProjectSummary,
+    decorations: &[hot_trimmer_domain::DecorationBinding],
+    profile: SourceFramePreviewProfile,
+    cancellation: &ImageCancellationToken,
+    cache: Option<&Mutex<SourceFramePreviewCache>>,
+) -> Result<
+    Vec<(
+        hot_trimmer_effect_compiler::StampAssetRef,
+        hot_trimmer_domain::SourceSetId,
+        Arc<hot_trimmer_material_synthesis::PreparedMaterialDomain>,
+    )>,
+    String,
+> {
+    let assets = stage16_stamp_assets(decorations)?;
+    let mut resolved = Vec::new();
+    for asset in assets {
+        let source_set_id = project
+            .sources
+            .iter()
+            .find(|source| {
+                source.input.sha256 == asset.digest.0
+                    || source.source_set_id.to_string() == asset.asset_id
+                    || source.input.id.to_string() == asset.asset_id
+            })
+            .map(|source| {
+                hot_trimmer_domain::SourceSetId::from_bytes(*source.source_set_id.as_bytes())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Stage 16 stamp asset {} ({}) does not resolve to a project source set",
+                    asset.asset_id, asset.digest.0
+                )
+            })?;
+        let (domain, _) =
+            direct_source_frame_domain(project, source_set_id, profile, cancellation, cache)?;
+        resolved.push((asset, source_set_id, domain));
+    }
+    Ok(resolved)
+}
+
+fn stage16_stamp_assets(
+    decorations: &[hot_trimmer_domain::DecorationBinding],
+) -> Result<Vec<hot_trimmer_effect_compiler::StampAssetRef>, String> {
+    let mut assets = Vec::new();
+    for decoration in decorations {
+        if decoration
+            .decoration_key
+            .starts_with("stage16.detail.definition")
+        {
+            let definition: hot_trimmer_effect_compiler::DetailDefinition =
+                serde_json::from_str(&decoration.value).map_err(|error| {
+                    format!(
+                        "Stage 16 detail definition decoration '{}' is malformed: {error}",
+                        decoration.decoration_key
+                    )
+                })?;
+            assets.extend(definition.required_sources);
+        } else if decoration
+            .decoration_key
+            .starts_with("stage16.stamp.operation")
+        {
+            let operation: hot_trimmer_effect_compiler::StampOperation =
+                serde_json::from_str(&decoration.value).map_err(|error| {
+                    format!(
+                        "Stage 16 stamp operation decoration '{}' is malformed: {error}",
+                        decoration.decoration_key
+                    )
+                })?;
+            assets.push(operation.asset);
+        } else if decoration
+            .decoration_key
+            .starts_with("stage16.stamp.stroke")
+        {
+            let stroke: hot_trimmer_effect_compiler::StampStroke =
+                serde_json::from_str(&decoration.value).map_err(|error| {
+                    format!(
+                        "Stage 16 stamp stroke decoration '{}' is malformed: {error}",
+                        decoration.decoration_key
+                    )
+                })?;
+            assets.push(stroke.operation.asset);
+        }
+    }
+    assets.sort_by(|left, right| {
+        left.digest
+            .0
+            .cmp(&right.digest.0)
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+    assets.dedup_by(|left, right| left.digest == right.digest && left.asset_id == right.asset_id);
+    Ok(assets)
+}
+
+fn decoration_targets_region(key: &str, detail_name: &str, region_key: &str) -> bool {
+    detail_name == region_key
+        || key
+            .rsplit('.')
+            .next()
+            .is_some_and(|suffix| suffix == region_key)
 }
 
 use crate::{
@@ -711,6 +917,13 @@ fn compile_persisted(
             &region_domains,
             &stage10.slots,
         )?;
+        let stamp_domains = stage16_stamp_asset_domains(
+            request.project,
+            &document.decorations,
+            request.profile,
+            image_cancellation,
+            source_frame_cache,
+        )?;
         let mut prepared_sources = BTreeMap::new();
         for artifacts in &domains {
             for channel_role in compiled_source_roles_for_domain(&artifacts.domain) {
@@ -722,6 +935,22 @@ fn compile_persisted(
                         source_id,
                         channel_role,
                         domain: Arc::new(artifacts.domain.clone()),
+                    });
+            }
+        }
+        for (asset, source_set_id, domain) in &stamp_domains {
+            for channel_role in compiled_source_roles_for_domain(domain.as_ref()) {
+                // Preserve the immutable persisted stamp identity at the executor boundary.
+                // A prepared-domain digest describes normalization output and is not the same
+                // identity as the asset digest stored in the document.
+                let source_id = asset.digest.clone();
+                prepared_sources
+                    .entry((*source_set_id, source_id.clone(), channel_role))
+                    .or_insert_with(|| AtlasPreparedSource {
+                        source_set_id: *source_set_id,
+                        source_id,
+                        channel_role,
+                        domain: Arc::clone(domain),
                     });
             }
         }
@@ -1413,6 +1642,15 @@ fn compile_source_frame(
                 sampling_plan.candidate.seed,
             )
             .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))?,
+            compiled_details: compile_persisted_details_for_region(
+                &document.decorations,
+                region.id,
+                region.role,
+                sampling_plan.slot_physical_size,
+                [allocation.width, allocation.height],
+                &conservative_profile_capacity(sampling_plan.slot_physical_size),
+                &render_cache_key,
+            )?,
             continuity: behavior.continuity,
             padding_px: preview_padding_px,
             edge_eligibility: behavior.edge_eligibility,
@@ -1454,6 +1692,26 @@ fn compile_source_frame(
                 .or_insert_with(|| AtlasPreparedSource {
                     source_set_id: *source_set_id,
                     source_id: source_id.clone(),
+                    channel_role,
+                    domain: Arc::clone(domain),
+                });
+        }
+    }
+    let stamp_domains = stage16_stamp_asset_domains(
+        request.project,
+        &document.decorations,
+        request.profile,
+        image_cancellation,
+        reusable_source_cache,
+    )?;
+    for (asset, source_set_id, domain) in &stamp_domains {
+        for channel_role in compiled_source_roles_for_domain(domain.as_ref()) {
+            let source_id = asset.digest.clone();
+            prepared_sources
+                .entry((*source_set_id, source_id.clone(), channel_role))
+                .or_insert_with(|| AtlasPreparedSource {
+                    source_set_id: *source_set_id,
+                    source_id,
                     channel_role,
                     domain: Arc::clone(domain),
                 });
@@ -2137,6 +2395,19 @@ fn fixed_template_compiled_atlas_plan(
                 sampling_plan.candidate.seed,
             )
             .map_err(|error| format!("Stage 15 profile compilation failed: {error}"))?,
+            compiled_details: compile_persisted_details_for_region(
+                &document.decorations,
+                region.id,
+                region.role,
+                sampling_plan.slot_physical_size,
+                [slot.allocation.width, slot.allocation.height],
+                &demands
+                    .iter()
+                    .find(|demand| demand.slot_id == region.id)
+                    .ok_or_else(|| format!("region {} has no Stage 10 capacity", region.id))?
+                    .effect_capacity,
+                &render_cache_key,
+            )?,
             continuity: binding.mapping.behavior.continuity,
             padding_px,
             edge_eligibility: binding.mapping.behavior.edge_eligibility,
@@ -3954,10 +4225,23 @@ fn algorithm_versions<const N: usize>(
 
 #[cfg(test)]
 mod gpu_stage_14_base_color_reachability_tests {
-    use super::{legal_gate1_mode, synthesis_family_matches_domain_route};
-    use hot_trimmer_domain::{SamplingMode, TemplateSlotRole};
+    use std::{io::Cursor, path::PathBuf};
+
+    use super::{
+        compile_persisted_details_for_region, legal_gate1_mode, stage16_stamp_asset_domains,
+        synthesis_family_matches_domain_route,
+    };
+    use hot_trimmer_domain::{
+        ChannelRegistration, ContentDigest, DecorationBinding, MaterialChannelRole, ProjectId,
+        RegionId, SamplingMode, SourceId, TemplateSlotRole,
+    };
     use hot_trimmer_material_synthesis::DomainRoute;
     use hot_trimmer_placement_solver::CandidateFamily;
+    use hot_trimmer_project_store::{
+        ProjectSummary, SourceChannel, SourceInput, SourceOwnership, StoredSource,
+    };
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use uuid::Uuid;
 
     #[test]
     fn gpu_stage_14_base_color_required_modes_are_reachable_and_route_exact() {
@@ -3984,5 +4268,167 @@ mod gpu_stage_14_base_color_reachability_tests {
             CandidateFamily::PanelPatchMatchExpansion,
             DomainRoute::TextureQuilting,
         ));
+    }
+
+    #[test]
+    fn algorithm_stage_16_gpu_details_persisted_decorations_reach_production_compile() {
+        let region_id = RegionId::from_bytes([0x16; 16]);
+        let region_key = region_id.to_string();
+        let image = RgbaImage::from_pixel(3, 2, Rgba([0, 255, 188, 64]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode persisted Stage 16 asset");
+        let encoded = encoded.into_inner();
+        let asset = hot_trimmer_effect_compiler::StampAssetRef {
+            asset_id: "persisted-bolt-mask".into(),
+            version: "1.0.0".into(),
+            digest: ContentDigest::sha256(&encoded),
+            kind: "RegisteredStampChannels".into(),
+        };
+        let definition = hot_trimmer_effect_compiler::DetailDefinition {
+            name: region_key.clone(),
+            family: hot_trimmer_effect_compiler::DetailFamily::BoltGroup,
+            physical_size: [0.25, 0.25],
+            scale_space: hot_trimmer_effect_compiler::EffectScaleSpace::World,
+            compatible_roles: vec![TemplateSlotRole::Planar],
+            orientation: hot_trimmer_effect_compiler::DetailOrientation::Slot,
+            explicit_rotation_degrees: 0.0,
+            aspect_limits: [0.5, 2.0],
+            minimum_pixels: [2, 2],
+            repeat_period_m: Some([0.5, 0.5]),
+            fit_policy: hot_trimmer_effect_compiler::DetailFitPolicy::FailIfOversized,
+            mapping_mode: hot_trimmer_effect_compiler::DetailMappingMode::Planar,
+            channels: vec![hot_trimmer_effect_compiler::DetailChannelContribution {
+                channel: MaterialChannelRole::MaterialId,
+                amount: 1.0,
+                blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+                material_id: Some(42),
+                metallic_explicit: false,
+            }],
+            fallback: hot_trimmer_effect_compiler::DetailFallback::Disabled,
+            provenance: "persisted-test".into(),
+            seed: 16,
+            required_sources: vec![asset.clone()],
+            required_halo_px: 2,
+            dependencies: vec!["stage15-profile-occupancy".into()],
+        };
+        let operation = hot_trimmer_effect_compiler::StampOperation {
+            asset: asset.clone(),
+            scope: hot_trimmer_effect_compiler::StampScope::MaterialReusableAtlas,
+            target_region: region_key.clone(),
+            physical_position_m: [0.0, 0.0],
+            physical_size_m: [0.25, 0.25],
+            pivot: [0.5, 0.5],
+            rotation_degrees: 0.0,
+            mirror: [false, false],
+            opacity: 1.0,
+            blend: hot_trimmer_effect_compiler::StampBlendPolicy::Replace,
+            clipping: hot_trimmer_effect_compiler::DetailFitPolicy::FailIfOversized,
+            seed: 16,
+            spacing_m: [0.5, 0.5],
+            scatter: 0.0,
+            jitter_m: [0.0, 0.0],
+            layer_order: 0,
+            occupancy: hot_trimmer_effect_compiler::OccupancyRelation::AboveProfile,
+            channels: Vec::new(),
+        };
+        let decorations = vec![
+            DecorationBinding {
+                decoration_key: format!("stage16.detail.definition.{region_key}"),
+                value: serde_json::to_string(&definition).unwrap(),
+            },
+            DecorationBinding {
+                decoration_key: "stage16.stamp.operation".into(),
+                value: serde_json::to_string(&operation).unwrap(),
+            },
+        ];
+        let compiled = compile_persisted_details_for_region(
+            &decorations,
+            region_id,
+            TemplateSlotRole::Planar,
+            [1.0, 1.0],
+            [1024, 1024],
+            &hot_trimmer_effect_compiler::conservative_profile_capacity([1.0, 1.0]),
+            &ContentDigest::sha256(b"persisted-stage16"),
+        )
+        .expect("persisted Stage 16 decorations should compile");
+        assert_eq!(compiled.details.len(), 1);
+        assert_eq!(compiled.details[0].reusable_atlas_operations.len(), 1);
+
+        let source_set_uuid = Uuid::from_bytes([0x26; 16]);
+        let source_id = SourceId::from_bytes([0x36; 16]);
+        let project = ProjectSummary {
+            id: ProjectId::from_bytes([0x46; 16]),
+            name: "Stage 16 persisted asset resolution".into(),
+            path: PathBuf::from("stage16-persisted-asset.hottrimmer"),
+            sources: vec![StoredSource {
+                source_set_id: source_set_uuid,
+                channel: SourceChannel::BaseColor,
+                registration: ChannelRegistration::explicit(MaterialChannelRole::BaseColor),
+                input: SourceInput {
+                    id: source_id,
+                    ownership: SourceOwnership::OwnedCopy,
+                    external_path: None,
+                    origin_path: PathBuf::from("persisted-bolt-mask.png"),
+                    sha256: asset.digest.0.clone(),
+                    width: 3,
+                    height: 2,
+                    format: "PNG".into(),
+                    color_type: "Rgba8".into(),
+                    has_alpha: true,
+                    exif_orientation: 1,
+                    has_embedded_icc_profile: false,
+                    encoded_bytes: encoded.len() as u64,
+                    owned_bytes: Some(encoded),
+                },
+            }],
+            source_sets: Vec::new(),
+            patches: Vec::new(),
+            document: None,
+            legacy_layout_discarded: false,
+            stale_lock_recovered: false,
+        };
+        let cancellation = hot_trimmer_image_io::CancellationToken::new();
+        let resolved = stage16_stamp_asset_domains(
+            &project,
+            &decorations,
+            super::SourceFramePreviewProfile::Draft512,
+            &cancellation,
+            None,
+        )
+        .expect("persisted Stage 16 asset should resolve through production preparation");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0.digest, asset.digest);
+        assert_eq!(resolved[0].1.to_string(), source_set_uuid.to_string());
+        assert_eq!([resolved[0].2.width, resolved[0].2.height], [3, 2]);
+        assert!(
+            resolved[0]
+                .2
+                .registered_channels()
+                .iter()
+                .any(|channel| channel.role() == MaterialChannelRole::BaseColor)
+        );
+
+        let orphan = DecorationBinding {
+            decoration_key: "stage16.stamp.operation".into(),
+            value: serde_json::to_string(&hot_trimmer_effect_compiler::StampOperation {
+                target_region: region_key,
+                ..operation
+            })
+            .unwrap(),
+        };
+        assert!(
+            compile_persisted_details_for_region(
+                &[orphan],
+                region_id,
+                TemplateSlotRole::Planar,
+                [1.0, 1.0],
+                [1024, 1024],
+                &hot_trimmer_effect_compiler::conservative_profile_capacity([1.0, 1.0]),
+                &ContentDigest::sha256(b"orphan-stage16"),
+            )
+            .is_err()
+        );
     }
 }

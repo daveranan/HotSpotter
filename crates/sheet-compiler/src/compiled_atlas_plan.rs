@@ -509,10 +509,11 @@ impl CompiledAtlasPlanV1 {
             .iter()
             .map(|region| {
                 format!(
-                    "{}:{:?}:{}:{:?}:{:?}:{}x{};",
+                    "{}:{:?}:{}:{}:{:?}:{:?}:{}x{};",
                     region.region_id,
                     region.structural_profile,
                     region.compiled_profile.cache_identity.0,
+                    region.detail_plan_id().0,
                     region.continuity,
                     region.edge_eligibility,
                     region.destination_rect.0.width,
@@ -720,6 +721,16 @@ fn validate_region(
             reason: "compiled structural profile identity or physical slot size is invalid".into(),
         });
     }
+    if region.compiled_details.details.iter().any(|detail| {
+        detail.cache_identity.0.is_empty()
+            || detail.algorithm_version.is_empty()
+            || detail.slot_size_m != region.sampling_plan.slot_physical_size
+    }) {
+        return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
+            region_id: region.region_id,
+            reason: "compiled semantic detail identity or physical slot size is invalid",
+        });
+    }
     if region.sampling_plan.slot_id != region.region_id {
         return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
             region_id: region.region_id,
@@ -886,6 +897,7 @@ pub struct CompiledRegionCommandV1 {
     pub radial_parameters: Option<RadialMappingSettings>,
     pub structural_profile: StructuralProfile,
     pub compiled_profile: hot_trimmer_effect_compiler::CompiledProfile,
+    pub compiled_details: hot_trimmer_effect_compiler::CompiledDetailSet,
     pub continuity: RegionContinuity,
     pub padding_px: u32,
     pub edge_eligibility: EdgeEligibility,
@@ -917,6 +929,18 @@ pub fn compile_profile_for_region(
 }
 
 impl CompiledRegionCommandV1 {
+    #[must_use]
+    pub fn detail_plan_id(&self) -> ContentDigest {
+        let payload = self
+            .compiled_details
+            .details
+            .iter()
+            .map(|detail| detail.cache_identity.0.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        ContentDigest::sha256(payload.as_bytes())
+    }
+
     #[must_use]
     pub const fn region_classification(&self) -> CompiledRegionClassification {
         match self.region_role {

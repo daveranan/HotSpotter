@@ -378,6 +378,7 @@ fn region_command(
             &ContentDigest::sha256(format!("profile-{region_id}").as_bytes()),
         )
         .unwrap(),
+        compiled_details: hot_trimmer_effect_compiler::empty_compiled_detail_set(),
         continuity: match sampling {
             RegionSampling::LoopX => RegionContinuity::X,
             RegionSampling::LoopY => RegionContinuity::Y,
