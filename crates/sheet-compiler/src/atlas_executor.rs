@@ -10063,6 +10063,7 @@ mod tests {
                 continuity: RegionContinuity::None,
                 padding_px: 0,
                 edge_eligibility: EdgeEligibility::default(),
+                edge_detail: None,
                 edge_wear: None,
                 sampling_plan,
                 render_cache_key: ContentDigest::sha256(b"gpu-tiled-export-region-render"),

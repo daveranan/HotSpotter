@@ -15,7 +15,7 @@ use hot_trimmer_domain::{
     SourceOwnershipIntent, StageResult, TemplateSlotRole,
 };
 use hot_trimmer_effect_compiler::{
-    RequiredSourceFootprint, ResolvedSlotDemand, SlotDemandIntent, SourceFootprintUnit,
+    EdgeDetailCompileRequest, EdgeDetailRegionInput, RequiredSourceFootprint, ResolvedSlotDemand, SlotDemandIntent, SourceFootprintUnit,
     VisualImportance, WorldDimensionSource, compile_structural_intent,
     conservative_profile_capacity, resolve_slot_demands_with_guard,
 };
@@ -1646,6 +1646,30 @@ fn compile_source_frame(
             });
             source_index.insert(source_key, source_records.len());
         }
+        let compiled_profile = compile_persisted_profile_for_region(
+            &document.decorations,
+            region.id,
+            region.structural_profile,
+            sampling_plan.slot_physical_size,
+            [allocation.width, allocation.height],
+            &conservative_profile_capacity(sampling_plan.slot_physical_size),
+            &render_cache_key,
+            sampling_plan.candidate.seed,
+        )?;
+        let edge_detail = compile_edge_detail_for_region(
+            document.edge_detail.as_ref(),
+            region.id,
+            region.role,
+            behavior.role,
+            region.structural_profile,
+            sampling_plan.slot_physical_size,
+            [allocation.width, allocation.height],
+            behavior.edge_eligibility,
+            compiled_profile.cache_identity.clone(),
+            domain.as_ref(),
+            &material_maps_for_view_intent(request.view_intent.as_ref()),
+            &format!("{:?}", request.profile),
+        )?;
         region_records.push(CompiledRegionCommandV1 {
             region_id: region.id,
             compact_index: region_index.try_into().map_err(|_| {
@@ -1674,16 +1698,7 @@ fn compile_source_frame(
             source_to_region_transform,
             radial_parameters: behavior.radial,
             structural_profile: region.structural_profile,
-            compiled_profile: compile_persisted_profile_for_region(
-                &document.decorations,
-                region.id,
-                region.structural_profile,
-                sampling_plan.slot_physical_size,
-                [allocation.width, allocation.height],
-                &conservative_profile_capacity(sampling_plan.slot_physical_size),
-                &render_cache_key,
-                sampling_plan.candidate.seed,
-            )?,
+            compiled_profile,
             compiled_details: compile_persisted_details_for_region(
                 &document.decorations,
                 region.id,
@@ -1696,7 +1711,8 @@ fn compile_source_frame(
             continuity: behavior.continuity,
             padding_px: preview_padding_px,
             edge_eligibility: behavior.edge_eligibility,
-            edge_wear: edge_wear_for_region(document.edge_wear.as_ref(), region.id),
+            edge_detail,
+            edge_wear: legacy_edge_wear_for_region(document.edge_detail.as_ref(), region.id),
             sampling_plan,
             render_cache_key,
         });
@@ -2411,6 +2427,34 @@ fn fixed_template_compiled_atlas_plan(
             )
             .as_bytes(),
         );
+        let compiled_profile = compile_persisted_profile_for_region(
+            &document.decorations,
+            region.id,
+            region.structural_profile,
+            sampling_plan.slot_physical_size,
+            [slot.allocation.width, slot.allocation.height],
+            &demands
+                .iter()
+                .find(|demand| demand.slot_id == region.id)
+                .ok_or_else(|| format!("region {} has no Stage 10 capacity", region.id))?
+                .effect_capacity,
+            &render_cache_key,
+            sampling_plan.candidate.seed,
+        )?;
+        let edge_detail = compile_edge_detail_for_region(
+            document.edge_detail.as_ref(),
+            region.id,
+            region.role,
+            binding.mapping.behavior.role,
+            region.structural_profile,
+            sampling_plan.slot_physical_size,
+            [slot.allocation.width, slot.allocation.height],
+            binding.mapping.behavior.edge_eligibility,
+            compiled_profile.cache_identity.clone(),
+            &artifacts.domain,
+            &material_maps_for_view_intent(request.view_intent.as_ref()),
+            &format!("{:?}", request.profile),
+        )?;
         region_records.push(CompiledRegionCommandV1 {
             region_id: region.id,
             compact_index: u32::try_from(index)
@@ -2435,20 +2479,7 @@ fn fixed_template_compiled_atlas_plan(
             source_to_region_transform: binding.mapping.transform,
             radial_parameters: binding.mapping.behavior.radial,
             structural_profile: region.structural_profile,
-            compiled_profile: compile_persisted_profile_for_region(
-                &document.decorations,
-                region.id,
-                region.structural_profile,
-                sampling_plan.slot_physical_size,
-                [slot.allocation.width, slot.allocation.height],
-                &demands
-                    .iter()
-                    .find(|demand| demand.slot_id == region.id)
-                    .ok_or_else(|| format!("region {} has no Stage 10 capacity", region.id))?
-                    .effect_capacity,
-                &render_cache_key,
-                sampling_plan.candidate.seed,
-            )?,
+            compiled_profile,
             compiled_details: compile_persisted_details_for_region(
                 &document.decorations,
                 region.id,
@@ -2465,7 +2496,8 @@ fn fixed_template_compiled_atlas_plan(
             continuity: binding.mapping.behavior.continuity,
             padding_px,
             edge_eligibility: binding.mapping.behavior.edge_eligibility,
-            edge_wear: edge_wear_for_region(document.edge_wear.as_ref(), region.id),
+            edge_detail,
+            edge_wear: legacy_edge_wear_for_region(document.edge_detail.as_ref(), region.id),
             sampling_plan,
             render_cache_key,
         });
@@ -3139,29 +3171,156 @@ fn aspect_matches(width: f64, height: f64, expected_width: f64, expected_height:
 #[cfg(test)]
 mod source_frame_partition_tests {
     use hot_trimmer_domain::{
-        CanonicalRect, LogicalGridSpec, PartitionRecipe, RegionSampling, SamplingMode,
-        SolidChannelValues, generate_partition, resolve_boundaries,
+        CanonicalRect, ContentDigest, EdgeDetailIntentV1, EdgeEligibility, LogicalGridSpec,
+        ManualRegionRole, MaterialMapKind, PartitionRecipe, RegionSampling, SamplingMode,
+        SolidChannelValues, StructuralProfile, TemplateSlotRole, generate_partition,
+        resolve_boundaries,
+    };
+    use hot_trimmer_effect_compiler::{
+        EdgeDetailCompileError, EdgeDetailCompileRequest, EdgeDetailRegionInput,
+        EdgeDetailRoleEvaluator, compile_edge_detail_plan,
     };
     use hot_trimmer_placement_solver::SourceCrop;
     use std::collections::BTreeMap;
 
-    use super::{build_solid_domain, edge_wear_for_region, manual_physical_mapping};
+    use super::{build_solid_domain, legacy_edge_wear_for_region, manual_physical_mapping};
 
     #[test]
     fn mvp_edge_wear_global_target_lowers_into_every_region() {
         let first = hot_trimmer_domain::RegionId::from_bytes([1; 16]);
         let second = hot_trimmer_domain::RegionId::from_bytes([2; 16]);
-        let global = hot_trimmer_domain::EdgeWearIntent::default();
+        let global = hot_trimmer_domain::EdgeDetailIntentV1::default();
         assert!(global.target_region.is_none());
-        assert!(edge_wear_for_region(Some(&global), first).is_some());
-        assert!(edge_wear_for_region(Some(&global), second).is_some());
+        assert!(legacy_edge_wear_for_region(Some(&global), first).is_some());
+        assert!(legacy_edge_wear_for_region(Some(&global), second).is_some());
 
-        let targeted = hot_trimmer_domain::EdgeWearIntent {
+        let targeted = hot_trimmer_domain::EdgeDetailIntentV1 {
             target_region: Some(second),
             ..global
         };
-        assert!(edge_wear_for_region(Some(&targeted), first).is_none());
-        assert!(edge_wear_for_region(Some(&targeted), second).is_some());
+        assert!(legacy_edge_wear_for_region(Some(&targeted), first).is_none());
+        assert!(legacy_edge_wear_for_region(Some(&targeted), second).is_some());
+    }
+
+    fn edge_detail_region(
+        byte: u8,
+        role: TemplateSlotRole,
+        manual_role: ManualRegionRole,
+    ) -> EdgeDetailRegionInput {
+        EdgeDetailRegionInput {
+            region_id: hot_trimmer_domain::RegionId::from_bytes([byte; 16]),
+            role,
+            manual_role,
+            structural_profile: StructuralProfile::Bevel,
+            slot_size_m: [0.1, 0.1],
+            destination_pixels: [100, 100],
+            edge_eligibility: EdgeEligibility::default(),
+            stage15_plan_identity: ContentDigest::sha256(&[byte, 15]),
+            source_height_identity: None,
+            source_luminance_identity: Some(ContentDigest::sha256(&[byte, 14])),
+        }
+    }
+
+    fn compile_edge_fixture(
+        intent: &EdgeDetailIntentV1,
+        regions: &[EdgeDetailRegionInput],
+    ) -> Result<hot_trimmer_effect_compiler::CompiledEdgeDetailPlan, EdgeDetailCompileError> {
+        compile_edge_detail_plan(&EdgeDetailCompileRequest {
+            intent,
+            regions,
+            requested_maps: &[MaterialMapKind::BaseColor, MaterialMapKind::Height],
+            resolution_profile: "mvp-edge-wear-fixture-100",
+        })
+    }
+
+    #[test]
+    fn mvp_edge_wear_compiler_covers_global_target_reorder_and_authoritative_role_identity() {
+        let panel = edge_detail_region(1, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        let horizontal = edge_detail_region(
+            2,
+            TemplateSlotRole::RepeatingStrip,
+            ManualRegionRole::HorizontalStrip,
+        );
+        let vertical = edge_detail_region(
+            3,
+            TemplateSlotRole::RepeatingStrip,
+            ManualRegionRole::VerticalStrip,
+        );
+        let mut ineligible = edge_detail_region(4, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        ineligible.edge_eligibility = EdgeEligibility {
+            left: false,
+            right: false,
+            top: false,
+            bottom: false,
+        };
+        let regions = vec![panel.clone(), horizontal.clone(), vertical.clone(), ineligible];
+        let global = EdgeDetailIntentV1::default();
+        let compiled = compile_edge_fixture(&global, &regions).expect("global Edge Detail plan");
+        assert_eq!(compiled.commands.len(), 3, "one command per eligible region");
+        assert_eq!(compiled.commands[0].region_id, panel.region_id);
+        assert_eq!(compiled.commands[0].evaluator, EdgeDetailRoleEvaluator::RectangularPanel);
+        assert_eq!(compiled.commands[1].evaluator, EdgeDetailRoleEvaluator::HorizontalStrip);
+        assert_eq!(compiled.commands[2].evaluator, EdgeDetailRoleEvaluator::VerticalStrip);
+
+        let targeted = EdgeDetailIntentV1 {
+            target_region: Some(vertical.region_id),
+            ..global.clone()
+        };
+        let targeted_plan = compile_edge_fixture(&targeted, &regions).expect("targeted Edge Detail plan");
+        assert_eq!(targeted_plan.commands.len(), 1);
+        assert_eq!(targeted_plan.commands[0].region_id, vertical.region_id);
+
+        let mut reordered = regions.clone();
+        reordered.reverse();
+        let reordered_plan = compile_edge_fixture(&global, &reordered).expect("reordered Edge Detail plan");
+        let identities = compiled.commands.iter().map(|command| {
+            (command.region_id, command.cache_identity.clone())
+        }).collect::<BTreeMap<_, _>>();
+        let reordered_identities = reordered_plan.commands.iter().map(|command| {
+            (command.region_id, command.cache_identity.clone())
+        }).collect::<BTreeMap<_, _>>();
+        assert_eq!(identities, reordered_identities, "command identity is keyed by stable UUID");
+
+        let role_a = edge_detail_region(9, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        let mut role_b = role_a.clone();
+        role_b.manual_role = ManualRegionRole::Unique;
+        let command_a = compile_edge_fixture(&global, &[role_a]).unwrap().commands.remove(0);
+        let command_b = compile_edge_fixture(&global, &[role_b]).unwrap().commands.remove(0);
+        assert_eq!(command_a.evaluator, command_b.evaluator, "collapsed evaluator is intentionally equal");
+        assert_ne!(command_a.cache_identity, command_b.cache_identity, "raw authoritative role metadata is hashed");
+        assert_ne!(command_a.manual_role, command_b.manual_role);
+
+        let mut profile_region = edge_detail_region(10, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        let profile_a = compile_edge_fixture(&global, &[profile_region.clone()]).unwrap().commands.remove(0);
+        profile_region.structural_profile = StructuralProfile::Flat;
+        let profile_b = compile_edge_fixture(&global, &[profile_region]).unwrap().commands.remove(0);
+        assert_eq!(profile_a.evaluator, profile_b.evaluator);
+        assert_ne!(profile_a.structural_profile, profile_b.structural_profile);
+        assert_ne!(profile_a.cache_identity, profile_b.cache_identity, "raw structural profile is hashed");
+    }
+
+    #[test]
+    fn mvp_edge_wear_compiler_rejects_invalid_and_subpixel_intents_and_disables_cleanly() {
+        let region = edge_detail_region(5, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        let disabled = EdgeDetailIntentV1 { enabled: false, ..EdgeDetailIntentV1::default() };
+        assert!(compile_edge_fixture(&disabled, &[region.clone()]).unwrap().commands.is_empty());
+
+        let cases = [
+            (EdgeDetailIntentV1 { schema_version: 2, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::UnknownSchemaVersion(2)),
+            (EdgeDetailIntentV1 { height_amplitude_m: f64::NAN, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::NonFiniteValue),
+            (EdgeDetailIntentV1 { wear_amount: 2.0, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::OutOfRange),
+            (EdgeDetailIntentV1 { edge_width_m: 0.0, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::InvalidPhysicalScale),
+            (EdgeDetailIntentV1 { exposed_metal_enabled: false, metallic_offset: 0.5, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::MetallicRequiresExposedMetal),
+            (EdgeDetailIntentV1 { edge_width_m: 0.000_5, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::BelowPhysicalLod(region.region_id)),
+            (EdgeDetailIntentV1 { breakup_scale_m: 0.001_5, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::BelowPhysicalLod(region.region_id)),
+            (EdgeDetailIntentV1 { micro_detail_scale_m: 0.001_5, ..EdgeDetailIntentV1::default() }, EdgeDetailCompileError::BelowPhysicalLod(region.region_id)),
+        ];
+        for (intent, expected) in cases {
+            assert_eq!(compile_edge_fixture(&intent, &[region.clone()]), Err(expected));
+        }
+        let missing = hot_trimmer_domain::RegionId::from_bytes([99; 16]);
+        let targeted = EdgeDetailIntentV1 { target_region: Some(missing), ..EdgeDetailIntentV1::default() };
+        assert_eq!(compile_edge_fixture(&targeted, &[region]), Err(EdgeDetailCompileError::UnknownTargetRegion));
     }
 
     #[test]
@@ -3381,13 +3540,56 @@ fn manual_physical_mapping(
     )
 }
 
-fn edge_wear_for_region(
-    intent: Option<&hot_trimmer_domain::EdgeWearIntent>,
+fn legacy_edge_wear_for_region(
+    intent: Option<&hot_trimmer_domain::EdgeDetailIntentV1>,
     region_id: RegionId,
 ) -> Option<hot_trimmer_domain::EdgeWearIntent> {
     intent
         .filter(|intent| intent.target_region.is_none_or(|target| target == region_id))
-        .cloned()
+        .map(hot_trimmer_domain::EdgeDetailIntentV1::legacy_renderer_adapter)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_edge_detail_for_region(
+    intent: Option<&hot_trimmer_domain::EdgeDetailIntentV1>,
+    region_id: RegionId,
+    role: TemplateSlotRole,
+    manual_role: ManualRegionRole,
+    structural_profile: hot_trimmer_domain::StructuralProfile,
+    slot_size_m: [f64; 2],
+    destination_pixels: [u32; 2],
+    edge_eligibility: hot_trimmer_domain::EdgeEligibility,
+    stage15_plan_identity: ContentDigest,
+    domain: &hot_trimmer_material_synthesis::PreparedMaterialDomain,
+    requested_maps: &[hot_trimmer_domain::MaterialMapKind],
+    resolution_profile: &str,
+) -> Result<Option<hot_trimmer_effect_compiler::CompiledEdgeDetailCommand>, String> {
+    let Some(intent) = intent else { return Ok(None); };
+    if intent.target_region.is_some_and(|target| target != region_id) {
+        return Ok(None);
+    }
+    let roles = compiled_source_roles_for_domain(domain);
+    let region = EdgeDetailRegionInput {
+        region_id,
+        role,
+        manual_role,
+        structural_profile,
+        slot_size_m,
+        destination_pixels,
+        edge_eligibility,
+        stage15_plan_identity,
+        source_height_identity: roles.contains(&MaterialChannelRole::Height)
+            .then(|| prepared_channel_digest(domain, MaterialChannelRole::Height)),
+        source_luminance_identity: roles.contains(&MaterialChannelRole::BaseColor)
+            .then(|| prepared_channel_digest(domain, MaterialChannelRole::BaseColor)),
+    };
+    let plan = hot_trimmer_effect_compiler::compile_edge_detail_plan(&EdgeDetailCompileRequest {
+        intent,
+        regions: &[region],
+        requested_maps,
+        resolution_profile,
+    }).map_err(|error| format!("Edge Detail compilation failed for region {region_id}: {error}"))?;
+    Ok(plan.commands.into_iter().next())
 }
 
 fn build_solid_domain(

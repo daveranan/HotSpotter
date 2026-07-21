@@ -1,6 +1,6 @@
 import type {
   CompiledMapView,
-  EdgeWearIntent,
+  EdgeDetailIntentV1,
   FeedbackComparisonMode,
   FeedbackContributionView,
   FeedbackDetailIntent,
@@ -15,26 +15,39 @@ import type {
 const finiteOr = (value: number, fallback: number) => Number.isFinite(value) ? value : fallback;
 const clamp = (value: number, minimum: number, maximum: number) => Math.min(maximum, Math.max(minimum, value));
 
-export function sanitizeEdgeWearIntent(intent: EdgeWearIntent): EdgeWearIntent {
-  const defaults = {
-    coverage: 0.55, strength: 0.8, edgeWidthM: 0.004, breakupScaleM: 0.012,
-    breakupSeed: 201516, heightAmplitudeM: -0.00035, hueShiftDegrees: 0,
-    saturationMultiplier: 0.55, valueOffset: 0.12, roughnessOffset: 0.18,
+export function sanitizeEdgeDetailIntent(intent: EdgeDetailIntentV1): EdgeDetailIntentV1 {
+  const defaults: EdgeDetailIntentV1 = {
+    schemaVersion: 1, enabled: true, wearAmount: 0.55, intensity: 0.8,
+    edgeWidthM: 0.004, bevelRadiusM: 0.0025, edgeSoftness: 0.3,
+    breakupAmount: 0.7, breakupScaleM: 0.012, microDetailAmount: 0.25,
+    microDetailScaleM: 0.002, seed: 201516, sourceHeightInfluence: 0.65,
+    sourceLuminanceInfluence: 0.2, heightAmplitudeM: -0.00035,
+    normalDetailStrength: 1, hueShiftDegrees: 0, saturationMultiplier: 0.55,
+    valueMultiplier: 1.12, roughnessOffset: 0.18, exposedMetalEnabled: false,
     metallicOffset: 0,
   };
   const exposedMetalEnabled = !!intent.exposedMetalEnabled;
   return {
     ...intent,
-    coverage: clamp(finiteOr(intent.coverage, defaults.coverage), 0, 1),
-    strength: clamp(finiteOr(intent.strength, defaults.strength), 0, 1),
+    schemaVersion: 1,
+    wearAmount: clamp(finiteOr(intent.wearAmount, defaults.wearAmount), 0, 1),
+    intensity: clamp(finiteOr(intent.intensity, defaults.intensity), 0, 1),
     edgeWidthM: Math.max(0.00001, finiteOr(intent.edgeWidthM, defaults.edgeWidthM)),
+    bevelRadiusM: Math.max(0, finiteOr(intent.bevelRadiusM, defaults.bevelRadiusM)),
+    edgeSoftness: clamp(finiteOr(intent.edgeSoftness, defaults.edgeSoftness), 0, 1),
+    breakupAmount: clamp(finiteOr(intent.breakupAmount, defaults.breakupAmount), 0, 1),
     breakupScaleM: Math.max(0.00001, finiteOr(intent.breakupScaleM, defaults.breakupScaleM)),
-    breakupSeed: Math.max(0, Math.trunc(finiteOr(intent.breakupSeed, defaults.breakupSeed))),
+    microDetailAmount: clamp(finiteOr(intent.microDetailAmount, defaults.microDetailAmount), 0, 1),
+    microDetailScaleM: Math.max(0.00001, finiteOr(intent.microDetailScaleM, defaults.microDetailScaleM)),
+    seed: Math.min(0xffff_ffff, Math.max(0, Math.trunc(finiteOr(intent.seed, defaults.seed)))),
+    sourceHeightInfluence: clamp(finiteOr(intent.sourceHeightInfluence, defaults.sourceHeightInfluence), 0, 1),
+    sourceLuminanceInfluence: clamp(finiteOr(intent.sourceLuminanceInfluence, defaults.sourceLuminanceInfluence), 0, 1),
     heightAmplitudeM: finiteOr(intent.heightAmplitudeM, defaults.heightAmplitudeM),
-    hueShiftDegrees: finiteOr(intent.hueShiftDegrees, defaults.hueShiftDegrees),
-    saturationMultiplier: Math.max(0, finiteOr(intent.saturationMultiplier, defaults.saturationMultiplier)),
-    valueOffset: finiteOr(intent.valueOffset, defaults.valueOffset),
-    roughnessOffset: finiteOr(intent.roughnessOffset, defaults.roughnessOffset),
+    normalDetailStrength: clamp(finiteOr(intent.normalDetailStrength, defaults.normalDetailStrength), 0, 2),
+    hueShiftDegrees: clamp(finiteOr(intent.hueShiftDegrees, defaults.hueShiftDegrees), -180, 180),
+    saturationMultiplier: clamp(finiteOr(intent.saturationMultiplier, defaults.saturationMultiplier), 0, 2),
+    valueMultiplier: clamp(finiteOr(intent.valueMultiplier, defaults.valueMultiplier), 0, 3),
+    roughnessOffset: clamp(finiteOr(intent.roughnessOffset, defaults.roughnessOffset), -1, 1),
     exposedMetalEnabled,
     metallicOffset: exposedMetalEnabled
       ? clamp(finiteOr(intent.metallicOffset, defaults.metallicOffset), 0, 1)
@@ -204,7 +217,7 @@ export function feedbackPreviewRegionAfterCommand(
   availableRegionIds: readonly string[],
 ): string | null {
   if (currentRegionId && availableRegionIds.includes(currentRegionId)) return currentRegionId;
-  if (command.type === "set_edge_wear"
+  if (command.type === "set_edge_detail"
     && command.intent.targetRegion
     && availableRegionIds.includes(command.intent.targetRegion)) {
     return command.intent.targetRegion;
@@ -216,7 +229,7 @@ export function feedbackViewAfterCommand(
   command: FeedbackWorkbenchCommand,
   currentView: FeedbackContributionView,
 ): FeedbackContributionView {
-  return command.type === "set_edge_wear" ? "stage16BaseColor" : currentView;
+  return command.type === "set_edge_detail" ? "stage16BaseColor" : currentView;
 }
 
 export function updateFeedbackOperationIntent(
@@ -236,7 +249,7 @@ export function selectedOperationAfterCommand(
 ): string | null {
   switch (command.type) {
     case "set_profile":
-    case "set_edge_wear":
+    case "set_edge_detail":
     case "reorder_details":
       return current;
     case "delete_detail":

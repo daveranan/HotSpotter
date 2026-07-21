@@ -484,8 +484,8 @@ pub enum FeedbackWorkbenchCommand {
         region_id: RegionId,
         requested: hot_trimmer_effect_compiler::RequestedProfile,
     },
-    SetEdgeWear {
-        intent: hot_trimmer_domain::EdgeWearIntent,
+    SetEdgeDetail {
+        intent: hot_trimmer_domain::EdgeDetailIntentV1,
     },
     UpsertDetail {
         operation_id: Option<String>,
@@ -1774,14 +1774,14 @@ pub fn apply_feedback_workbench_command(
                 identity,
             )
         }
-        FeedbackWorkbenchCommand::SetEdgeWear { intent } => {
+        FeedbackWorkbenchCommand::SetEdgeDetail { intent } => {
             let identity = hot_trimmer_domain::ContentDigest::sha256(
                 &serde_json::to_vec(&intent)
                     .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?,
             )
             .0;
             (
-                TrimSheetDocumentCommand::SetEdgeWearIntent { intent },
+                TrimSheetDocumentCommand::SetEdgeDetailIntent { intent },
                 identity,
             )
         }
@@ -2090,7 +2090,7 @@ pub fn stage_15_20_debug_payload(
         .iter()
         .filter(|decoration| is_feedback_detail_key(&decoration.decoration_key))
         .count();
-    let edge_wear_enabled = document.edge_wear.as_ref().is_some_and(|intent| intent.enabled);
+    let edge_wear_enabled = document.edge_detail.as_ref().is_some_and(|intent| intent.enabled);
     let stage16_count = stage16_detail_count + usize::from(edge_wear_enabled);
     let compiled_profile = request.compiled_inspection.as_ref().and_then(|value| value.get("compiledProfile"));
     let compiled_details = request.compiled_inspection.as_ref().and_then(|value| value.get("compiledDetails"));

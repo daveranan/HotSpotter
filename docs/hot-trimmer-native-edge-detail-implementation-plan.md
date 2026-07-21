@@ -489,7 +489,7 @@ Primary controls:
 - Bevel Radius;
 - Breakup;
 - Height;
-- Apply/commit.
+- live draft preview with an explicit committed undo/redo boundary.
 
 Advanced controls:
 
@@ -521,6 +521,21 @@ Apply behavior:
 - retain the last valid preview on failure and show the typed error;
 - do not require Render Full Resolution before the effect becomes visible;
 - debounce live draft preview if added, but only committed values enter persistence/cache identity.
+
+Final product-shell reference:
+
+- visual reference: `docs/mockups/hot-trimmer-processing-screen-concept.png`;
+- the top-level workspaces are `Workbench`, `Hotspot Sheet`, and `Processing`;
+- those workspaces are mutually exclusive: opening Processing hides Workbench and opening Workbench hides Processing;
+- Workbench edits the original/source texture, Hotspot Sheet edits the atlas layout, and Processing authors generated maps;
+- Processing uses a large atlas canvas, an Edit/Preview toggle, map inspection tabs, and a focused Layers/Outputs sidebar;
+- Preview hides region colors, grids, borders, and handles; Edit reveals only the overlays needed to select and edit;
+- the selected layer always states whether it targets all regions or a named/stable selected region;
+- changing a slider previews the draft without an Apply button, while pointer release, blur, Enter, or another deliberate
+  editing boundary commits one undoable command;
+- Prompt 20A labels, fixtures, immutable-asset registration, raw compiler QA, stage status, and telemetry belong in a
+  separate Debug drawer opened beside Export, never in the Processing authoring sidebar;
+- GPU/physical execution and non-destructive mesh behavior are invariants, not user-facing options or badges.
 
 Inspection routes:
 
@@ -670,6 +685,11 @@ to unrelated suites unless this command reveals a concrete shared regression.
 Run these prompts in order. Each prompt assumes the previous prompt is green and committed in the current workspace.
 The worker must read this entire plan before acting, inspect only directly relevant files, make at most one correction
 pass, rerun the same focused verification command, and stop.
+
+ED-6 is not a prerequisite for ED-1 or ED-2. The implementation order is ED-1 contract/compiler, ED-2 evaluator,
+ED-3 channel composition, ED-4 functional authoring and evidence, ED-5 bounded renderer acceptance, then ED-6 product
+workspace reorganization. Do not invent an ED-1.5 UI pass: it would wire controls to a contract that ED-1 is designed to
+replace and create avoidable duplicate work.
 
 ## Prompt ED-1 — Versioned intent, persistence, compiler command, and migration
 
@@ -840,6 +860,9 @@ Objective:
 Finish the native Hot Trimmer Edge Detail user experience and close it against behavioral, visual, persistence, cache,
 and telemetry acceptance. Do not add Blender integration, DreamUV, or unrelated Stage 17-20 work.
 
+This prompt owns functional authoring behavior in the current shell. Do not perform the full Processing workspace,
+Debug-drawer, or navigation reorganization; that product-shell rework is isolated in ED-6.
+
 Required behavior:
 - Update the ordered Layers & Maps Edge Detail card to use the ED-1 contract.
 - Expose the primary and advanced controls from section 10 with units/ranges shown clearly.
@@ -915,6 +938,111 @@ Verification — run exactly once after any correction:
 npm.cmd run test --workspace @hot-trimmer/desktop -- mvp-edge-wear
 
 Stop after reporting PASS or the remaining concrete blocker. Do not launch another reviewer or invent additional gates.
+```
+
+## Prompt ED-6 — Production Processing workspace and Debug separation
+
+```text
+Implement Prompt ED-6 from docs/hot-trimmer-native-edge-detail-implementation-plan.md.
+
+Objective:
+Rework the finished ED-1 through ED-5 Edge Detail experience into the production Processing workspace shown in
+docs/mockups/hot-trimmer-processing-screen-concept.png. This is a product-shell and interaction pass over real,
+already-working behavior. Do not change Edge Detail algorithms, shader math, physical units, cache identity, persistence,
+or native contracts except for the minimum UI wiring needed to expose them.
+
+Workspace model:
+- Replace independent show/hide booleans with one typed workspace mode: workbench | hotspotSheet | processing.
+- Show exactly Workbench, Hotspot Sheet, and Processing as the primary top navigation modes.
+- The modes are mutually exclusive. Processing hides the Workbench/source editor; Workbench hides Processing and
+  restores original/source-texture editing; Hotspot Sheet remains its own layout-authoring workspace.
+- Keep Debug independent of workspace mode. Add a Debug action beside Export that opens a drawer or overlay without
+  becoming a fourth creative workspace.
+- Preserve the current document, selection, zoom, map, and last valid preview when switching modes wherever that state is
+  meaningful. A mode switch must not issue an authoring command or invalidate a rendered artifact.
+
+Processing canvas:
+- Use the saved mockup as a visual/interaction reference, not a pixel-exact golden. Preserve Hot Trimmer's established
+  typography, color system, density, and native control styling.
+- Give the atlas the majority of the viewport. Do not show the source/Workbench canvas beside it.
+- Add an Edit | Preview segmented control above the atlas; Preview is the normal inspection state.
+- Preview hides region colors, grid, region borders, labels, eligibility marks, and resize handles.
+- Edit shows the minimum overlays needed for region selection and existing layout editing.
+- Provide real map tabs for Material, Base Color, Normal, Height, Roughness, Metallic, AO, and Edge Mask. Each tab must
+  request and display the corresponding current artifact, not recolor Base Color as a substitute.
+- Retain compact Before | After, preview-resolution, Fit, and render-status controls without exposing compiler jargon.
+- Pending or failed requests retain the last valid preview and show a concise typed error without unloading the atlas.
+
+Processing sidebar:
+- Use Layers and Outputs as the two top-level sidebar tabs.
+- Layers contains ordered, selectable rows such as Structural Profile, Edge Detail, Roughness Adjust, and AO / Cavity.
+  Only include a row when backed by real current behavior; unavailable future rows must be clearly disabled and must not
+  pretend to execute.
+- Every row supports the applicable visibility, reorder, duplicate, delete, target, and selection operations through the
+  existing typed document-command/undo system.
+- The selected Edge Detail row opens an expanded editor. Show the preset and primary controls first: Wear Amount,
+  Intensity, Edge Width with millimeter units, Bevel Radius with millimeter units, Breakup, and Height with millimeter
+  units. Group Color response, Surface response, and Advanced controls into collapsible sections.
+- Use the actual ED-1 field ranges and units. The mockup's Soft Worn Edge values are illustrative, not permission to
+  introduce another contract or unit conversion.
+- Remove the Apply Edge Wear button. Input creates a debounced live draft preview; pointer/key release, blur, Enter, or
+  another deliberate editing boundary commits exactly one undoable typed command. Invalid intermediate text must not
+  destroy the last committed value or preview.
+- Preserve layer visibility, order, selection, target, and expanded/collapsed state as appropriate across map changes.
+
+Region targeting:
+- Always display the active target at the top of the expanded editor as either All regions or a human-readable region
+  label backed by its stable UUID, for example Region 05 · Horizontal Strip.
+- In Edit mode, selecting a region makes it available for Selected region targeting and visibly highlights the same
+  region in the atlas.
+- Do not silently convert an existing All regions layer into a region layer merely because the user clicked a region.
+  Retargeting requires an explicit target choice.
+- If a targeted region is deleted, use the typed contract's existing validation/recovery behavior and show the result;
+  never fall back to a different region by array index.
+
+Outputs:
+- Summarize readiness for Base Color, Edge Mask, Height, Normal, Roughness, Metallic, and AO from authoritative current
+  publication evidence.
+- Keep export resolution/format and output-generation controls compact. Do not claim a map is ready when the current
+  document revision lacks matching evidence.
+
+Debug separation:
+- Move the existing Profile & Detail Contributions / Prompt 20A UI, Create bundled feedback sample, Prompt LIB registered
+  immutable assets, typed-placement internals, raw contribution/compiler QA, stage installation status, telemetry, cache,
+  residency, dispatch, and publication evidence into the Debug drawer.
+- Remove user-facing Prompt 20A copy, Stage 15-20 status, MissingAsset diagnostic blocks, GPU · PHYSICAL controls, and
+  Non-destructive mesh silhouette badges from Processing.
+- GPU physical execution and no mesh-silhouette mutation remain enforced behavior, not toggles.
+- Keep fixture/sample creation clearly labeled as a Debug / Fixtures action so it cannot be mistaken for applying an
+  authored layer.
+
+Likely relevant files:
+- apps/desktop/src/source-first-app.tsx
+- apps/desktop/src/feedback-workbench.tsx
+- apps/desktop/src/feedback-workbench-contract.ts
+- the desktop stylesheet(s) containing the current feedback-workbench layout
+- a focused Processing workspace/sidebar component if splitting the monolith improves ownership
+- apps/desktop/src/mvp-edge-wear.test.ts
+
+Acceptance:
+- Exactly one creative workspace is visible; Workbench and Processing can never render simultaneously.
+- Processing shows the clean atlas plus the production Layers/Outputs sidebar and no Prompt 20A/compiler QA language.
+- Preview mode removes authoring overlays; Edit mode restores selection and the correct region highlight.
+- All regions and a selected stable region are unambiguous, survive normal editing, and never retarget silently.
+- The expanded Edge Detail editor exposes the real ED-1 controls with correct units and provides live draft preview with
+  one committed undo step per deliberate edit; no Apply button remains.
+- Debug beside Export contains the displaced fixtures, asset registration, stage status, raw QA, and telemetry tools.
+- Switching workspace, map, Edit/Preview, Layers/Outputs, or Debug does not mutate the document or discard the last valid
+  preview.
+- Existing ED-5 visual artifacts and renderer behavior remain unchanged by the shell reorganization.
+- Add focused frontend assertions for navigation exclusivity, overlay visibility, region target identity, no-Apply live
+  authoring, and Debug separation.
+
+Verification — run exactly:
+npm.cmd run test --workspace @hot-trimmer/desktop -- mvp-edge-wear
+
+Make at most one correction pass, rerun the same command, and stop. Report the UI files changed and the focused command
+result. Do not begin DreamUV, Blender companion, or unrelated Stage 17-20 work.
 ```
 
 ## 15. Work explicitly deferred

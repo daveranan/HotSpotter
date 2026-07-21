@@ -230,7 +230,7 @@ export interface TrimSheetDocument {
   primaryMaterial: string | null;
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
   decorations: readonly { decorationKey: string; value: string }[];
-  edgeWear?: EdgeWearIntent;
+  edgeDetail?: EdgeDetailIntentV1;
   regionBindings: Record<string, RegionBinding>;
   renderSettings: {
     outputSize: PixelSize;
@@ -258,6 +258,32 @@ export interface EdgeWearIntent {
   hueShiftDegrees: number;
   saturationMultiplier: number;
   valueOffset: number;
+  roughnessOffset: number;
+  exposedMetalEnabled: boolean;
+  metallicOffset: number;
+}
+
+export interface EdgeDetailIntentV1 {
+  schemaVersion: 1;
+  enabled: boolean;
+  targetRegion?: string;
+  wearAmount: number;
+  intensity: number;
+  edgeWidthM: number;
+  bevelRadiusM: number;
+  edgeSoftness: number;
+  breakupAmount: number;
+  breakupScaleM: number;
+  microDetailAmount: number;
+  microDetailScaleM: number;
+  seed: number;
+  sourceHeightInfluence: number;
+  sourceLuminanceInfluence: number;
+  heightAmplitudeM: number;
+  normalDetailStrength: number;
+  hueShiftDegrees: number;
+  saturationMultiplier: number;
+  valueMultiplier: number;
   roughnessOffset: number;
   exposedMetalEnabled: boolean;
   metallicOffset: number;
@@ -579,7 +605,7 @@ export interface CompiledDetailSetProjection { stageResult: unknown; details: re
 
 export type FeedbackWorkbenchCommand =
   | { type: "set_profile"; regionId: string; requested: FeedbackProfileIntent }
-  | { type: "set_edge_wear"; intent: EdgeWearIntent }
+  | { type: "set_edge_detail"; intent: EdgeDetailIntentV1 }
   | { type: "upsert_detail"; operationId?: string; enabled: boolean; intent: FeedbackDetailIntent }
   | { type: "duplicate_detail"; operationId: string }
   | { type: "set_detail_enabled"; operationId: string; enabled: boolean }

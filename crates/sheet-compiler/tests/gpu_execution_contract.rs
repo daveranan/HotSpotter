@@ -212,6 +212,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
             continuity: RegionContinuity::None,
             padding_px: 4,
             edge_eligibility: EdgeEligibility::default(),
+            edge_detail: None,
             edge_wear: None,
             sampling_plan: test_sampling_plan(
                 region_a,
@@ -288,6 +289,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 top: false,
                 bottom: false,
             },
+            edge_detail: None,
             edge_wear: None,
             sampling_plan: test_sampling_plan(
                 region_b,
@@ -364,6 +366,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 top: true,
                 bottom: true,
             },
+            edge_detail: None,
             edge_wear: None,
             sampling_plan: test_sampling_plan(
                 region_c,

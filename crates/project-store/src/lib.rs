@@ -390,15 +390,18 @@ impl ProjectStore {
         verify_integrity(&connection)?;
 
         let patch_set = PatchSet::new(load_patches(&connection)?)?;
+        let migrate_edge_detail = document_uses_legacy_edge_wear(&connection)?;
         let mut document = load_document(&connection)?;
-        if let Some(current) = document.as_mut()
-            && snapshot_legacy_authored_layout(current)?
-        {
-            persist_document_state(
-                &mut connection,
-                Some(current),
-                "migrate_accepted_topology_to_authored_preset",
-            )?;
+        if let Some(current) = document.as_mut() {
+            let migrate_layout = snapshot_legacy_authored_layout(current)?;
+            if migrate_layout || migrate_edge_detail {
+                let operation = if migrate_edge_detail {
+                    "migrate_edge_wear_to_edge_detail_v1"
+                } else {
+                    "migrate_accepted_topology_to_authored_preset"
+                };
+                persist_document_state(&mut connection, Some(current), operation)?;
+            }
         }
         let store = Self {
             connection,
@@ -1879,6 +1882,17 @@ fn load_document(connection: &Connection) -> Result<Option<TrimSheetDocument>, S
     .transpose()
 }
 
+fn document_uses_legacy_edge_wear(connection: &Connection) -> Result<bool, StoreError> {
+    let json = connection
+        .query_row(
+            "SELECT document_json FROM trim_sheet_documents WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(json.is_some_and(|json| json.contains("\"edgeWear\"") && !json.contains("\"edgeDetail\"")))
+}
+
 fn snapshot_legacy_authored_layout(document: &mut TrimSheetDocument) -> Result<bool, StoreError> {
     if document.authored_layout_preset.is_some()
         || document.source_frame.is_none()
@@ -2184,7 +2198,7 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::SetRegionBehavior { .. } => "set_region_behavior",
         TrimSheetDocumentCommand::SetRegionStructuralProfile { .. } => "set_region_structural_profile",
         TrimSheetDocumentCommand::SetFeedbackProfile { .. } => "set_feedback_profile",
-        TrimSheetDocumentCommand::SetEdgeWearIntent { .. } => "set_edge_wear_intent",
+        TrimSheetDocumentCommand::SetEdgeDetailIntent { .. } => "set_edge_detail_intent",
         TrimSheetDocumentCommand::UpsertDecoration { .. } => "upsert_decoration",
         TrimSheetDocumentCommand::DeleteDecoration { .. } => "delete_decoration",
         TrimSheetDocumentCommand::ReplaceDecoration { .. } => "replace_decoration",
@@ -3215,6 +3229,95 @@ mod document_tests {
         );
         drop(connection);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod edge_detail_migration_tests {
+    use std::{fs, path::PathBuf};
+
+    use hot_trimmer_domain::{ContentDigest, EdgeDetailIntentV1, EdgeWearIntent, SourceId};
+    use rusqlite::{Connection, params};
+    use uuid::Uuid;
+
+    use super::{ProjectStore, SourceChannel, SourceInput, SourceOwnership};
+
+    #[test]
+    fn mvp_edge_wear_project_save_reopen_migrates_once_to_edge_detail_v1() {
+        let root = std::env::temp_dir().join(format!("hot-trimmer-edge-detail-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create Edge Detail fixture directory");
+        let path = root.join("migration.hottrimmer");
+        let bytes = vec![1, 2, 3, 4];
+        let source = SourceInput {
+            id: SourceId::new(),
+            ownership: SourceOwnership::OwnedCopy,
+            external_path: None,
+            origin_path: PathBuf::from("edge-detail-fixture.png"),
+            sha256: ContentDigest::sha256(&bytes).0,
+            width: 64,
+            height: 64,
+            format: "PNG".into(),
+            color_type: "Rgba8".into(),
+            has_alpha: true,
+            exif_orientation: 1,
+            has_embedded_icc_profile: false,
+            encoded_bytes: bytes.len() as u64,
+            owned_bytes: Some(bytes),
+        };
+        let mut store = ProjectStore::create(&path, "Edge Detail migration").expect("create project");
+        store.replace_source(SourceChannel::BaseColor, &source).expect("persist Base Color");
+        store.create_source_frame_document().expect("create typed document");
+        drop(store);
+
+        let connection = Connection::open(&path).expect("open fixture database");
+        let encoded: String = connection.query_row(
+            "SELECT document_json FROM trim_sheet_documents WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        ).expect("read document JSON");
+        let mut json: serde_json::Value = serde_json::from_str(&encoded).expect("decode document JSON");
+        let object = json.as_object_mut().expect("document object");
+        object.remove("edgeDetail");
+        object.insert(
+            "edgeWear".into(),
+            serde_json::to_value(EdgeWearIntent::default()).expect("legacy Edge Wear JSON"),
+        );
+        connection.execute(
+            "UPDATE trim_sheet_documents SET document_json = ?1 WHERE singleton = 1",
+            params![serde_json::to_string(&json).unwrap()],
+        ).expect("install legacy fixture");
+        drop(connection);
+
+        let reopened = ProjectStore::open(&path).expect("migrate legacy Edge Wear");
+        assert_eq!(reopened.document().unwrap().edge_detail, Some(EdgeDetailIntentV1::default()));
+        drop(reopened);
+
+        let connection = Connection::open(&path).unwrap();
+        let migrated_json: String = connection.query_row(
+            "SELECT document_json FROM trim_sheet_documents WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(migrated_json.contains("\"edgeDetail\""));
+        assert!(!migrated_json.contains("\"edgeWear\""));
+        let first_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM document_journal WHERE operation = 'migrate_edge_wear_to_edge_detail_v1'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(first_count, 1);
+        drop(connection);
+
+        drop(ProjectStore::open(&path).expect("second reopen is already V1"));
+        let connection = Connection::open(&path).unwrap();
+        let second_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM document_journal WHERE operation = 'migrate_edge_wear_to_edge_detail_v1'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(second_count, 1, "migration is persisted exactly once");
+        drop(connection);
+        fs::remove_dir_all(root).expect("remove Edge Detail fixture");
     }
 }
 

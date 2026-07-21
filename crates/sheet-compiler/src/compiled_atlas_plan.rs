@@ -734,6 +734,29 @@ fn validate_region(
             reason: "compiled semantic detail identity or physical slot size is invalid",
         });
     }
+    if let Some(edge_detail) = &region.edge_detail {
+        let expected_meters_per_pixel = [
+            region.sampling_plan.slot_physical_size[0]
+                / f64::from(region.destination_rect.0.width),
+            region.sampling_plan.slot_physical_size[1]
+                / f64::from(region.destination_rect.0.height),
+        ];
+        if edge_detail.region_id != region.region_id
+            || edge_detail.role != region.sampling_plan.role
+            || edge_detail.manual_role != region.region_role
+            || edge_detail.structural_profile != region.structural_profile
+            || edge_detail.slot_size_m != region.sampling_plan.slot_physical_size
+            || edge_detail.meters_per_pixel != expected_meters_per_pixel
+            || edge_detail.edge_eligibility != region.edge_eligibility
+            || edge_detail.stage15_plan_identity != region.compiled_profile.cache_identity
+            || edge_detail.cache_identity.0.is_empty()
+        {
+            return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
+                region_id: region.region_id,
+                reason: "compiled Edge Detail command disagrees with authoritative region metadata",
+            });
+        }
+    }
     if region.sampling_plan.slot_id != region.region_id {
         return Err(CompiledAtlasPlanValidationError::InvalidExecutionCommand {
             region_id: region.region_id,
@@ -904,6 +927,8 @@ pub struct CompiledRegionCommandV1 {
     pub continuity: RegionContinuity,
     pub padding_px: u32,
     pub edge_eligibility: EdgeEligibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_detail: Option<hot_trimmer_effect_compiler::CompiledEdgeDetailCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_wear: Option<hot_trimmer_domain::EdgeWearIntent>,
     /// Exact Stage 14 instruction consumed by both the Prompt 1 CPU executor and

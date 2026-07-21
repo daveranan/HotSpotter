@@ -773,8 +773,8 @@ pub struct TreatmentLayer {
     pub parameters: BTreeMap<TreatmentParameter, f64>,
 }
 
-/// The single MVP procedural edge-wear layer. Distances and amplitudes are
-/// physical so the compiled result is resolution independent.
+/// Legacy MVP edge-wear payload, retained only as the deterministic persisted
+/// migration input and as the compatibility adapter for the pre-ED-2 renderer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EdgeWearIntent {
@@ -793,6 +793,146 @@ pub struct EdgeWearIntent {
     pub roughness_offset: f64,
     pub exposed_metal_enabled: bool,
     pub metallic_offset: f64,
+}
+
+pub const EDGE_DETAIL_INTENT_SCHEMA_VERSION: u16 = 1;
+/// The legacy renderer and migration use the same authored physical convention
+/// as Stage 14 source sampling: one source pixel is one millimeter.
+pub const LEGACY_EDGE_WEAR_METERS_PER_PIXEL: f64 = 0.001;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeDetailIntentV1 {
+    pub schema_version: u16,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_region: Option<RegionId>,
+    pub wear_amount: f64,
+    pub intensity: f64,
+    pub edge_width_m: f64,
+    pub bevel_radius_m: f64,
+    pub edge_softness: f64,
+    pub breakup_amount: f64,
+    pub breakup_scale_m: f64,
+    pub micro_detail_amount: f64,
+    pub micro_detail_scale_m: f64,
+    pub seed: u32,
+    pub source_height_influence: f64,
+    pub source_luminance_influence: f64,
+    pub height_amplitude_m: f64,
+    pub normal_detail_strength: f64,
+    pub hue_shift_degrees: f64,
+    pub saturation_multiplier: f64,
+    pub value_multiplier: f64,
+    pub roughness_offset: f64,
+    pub exposed_metal_enabled: bool,
+    pub metallic_offset: f64,
+}
+
+impl Default for EdgeDetailIntentV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: EDGE_DETAIL_INTENT_SCHEMA_VERSION,
+            enabled: true,
+            target_region: None,
+            wear_amount: 0.55,
+            intensity: 0.80,
+            edge_width_m: 0.004,
+            bevel_radius_m: 0.0025,
+            edge_softness: 0.30,
+            breakup_amount: 0.70,
+            breakup_scale_m: 0.012,
+            micro_detail_amount: 0.25,
+            micro_detail_scale_m: 0.002,
+            seed: 201_516,
+            source_height_influence: 0.65,
+            source_luminance_influence: 0.20,
+            height_amplitude_m: -0.000_35,
+            normal_detail_strength: 1.00,
+            hue_shift_degrees: 0.0,
+            saturation_multiplier: 0.55,
+            value_multiplier: 1.12,
+            roughness_offset: 0.18,
+            exposed_metal_enabled: false,
+            metallic_offset: 0.0,
+        }
+    }
+}
+
+impl EdgeDetailIntentV1 {
+    #[must_use]
+    pub fn migrate_from_edge_wear(old: &EdgeWearIntent, meters_per_pixel: f64) -> Self {
+        Self {
+            schema_version: EDGE_DETAIL_INTENT_SCHEMA_VERSION,
+            enabled: old.enabled,
+            target_region: old.target_region,
+            wear_amount: old.coverage.clamp(0.0, 1.0),
+            intensity: old.strength.clamp(0.0, 1.0),
+            edge_width_m: old.edge_width_m,
+            bevel_radius_m: (old.edge_width_m * 0.625).min(old.edge_width_m),
+            edge_softness: 0.30,
+            breakup_amount: 0.70,
+            breakup_scale_m: old.breakup_scale_m,
+            micro_detail_amount: 0.25,
+            micro_detail_scale_m: (old.breakup_scale_m / 6.0).max(meters_per_pixel * 2.0),
+            seed: old.breakup_seed as u32,
+            source_height_influence: 0.65,
+            source_luminance_influence: 0.20,
+            height_amplitude_m: old.height_amplitude_m,
+            normal_detail_strength: 1.00,
+            hue_shift_degrees: old.hue_shift_degrees.clamp(-180.0, 180.0),
+            saturation_multiplier: old.saturation_multiplier.clamp(0.0, 2.0),
+            value_multiplier: (1.0 + old.value_offset).clamp(0.0, 3.0),
+            roughness_offset: old.roughness_offset.clamp(-1.0, 1.0),
+            exposed_metal_enabled: old.exposed_metal_enabled,
+            metallic_offset: if old.exposed_metal_enabled {
+                old.metallic_offset.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn legacy_renderer_adapter(&self) -> EdgeWearIntent {
+        EdgeWearIntent {
+            enabled: self.enabled,
+            target_region: self.target_region,
+            coverage: self.wear_amount,
+            strength: self.intensity,
+            edge_width_m: self.edge_width_m,
+            breakup_scale_m: self.breakup_scale_m,
+            breakup_seed: u64::from(self.seed),
+            height_amplitude_m: self.height_amplitude_m,
+            hue_shift_degrees: self.hue_shift_degrees,
+            saturation_multiplier: self.saturation_multiplier,
+            value_offset: self.value_multiplier - 1.0,
+            roughness_offset: self.roughness_offset,
+            exposed_metal_enabled: self.exposed_metal_enabled,
+            metallic_offset: if self.exposed_metal_enabled { self.metallic_offset } else { 0.0 },
+        }
+    }
+}
+
+fn deserialize_edge_detail<'de, D>(deserializer: D) -> Result<Option<EdgeDetailIntentV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else { return Ok(None); };
+    if let Some(version) = value.get("schemaVersion") {
+        let version = version.as_u64().ok_or_else(|| D::Error::custom("Edge Detail schemaVersion must be an integer"))?;
+        if version != u64::from(EDGE_DETAIL_INTENT_SCHEMA_VERSION) {
+            return Err(D::Error::custom(format!("unknown Edge Detail schema version {version}")));
+        }
+        return serde_json::from_value(value).map(Some).map_err(D::Error::custom);
+    }
+    let legacy: EdgeWearIntent = serde_json::from_value(value).map_err(D::Error::custom)?;
+    Ok(Some(EdgeDetailIntentV1::migrate_from_edge_wear(
+        &legacy,
+        LEGACY_EDGE_WEAR_METERS_PER_PIXEL,
+    )))
 }
 
 impl Default for EdgeWearIntent {
@@ -838,7 +978,7 @@ pub struct AppearanceHashInputs {
     pub region_bindings: BTreeMap<RegionId, RegionBinding>,
     pub decorations: Vec<DecorationBinding>,
     pub treatments: Vec<TreatmentLayer>,
-    pub edge_wear: Option<EdgeWearIntent>,
+    pub edge_detail: Option<EdgeDetailIntentV1>,
     pub sheet_framing: SheetFraming,
     pub render_settings: RenderSettings,
 }
@@ -900,8 +1040,14 @@ pub struct TrimSheetDocument {
     pub region_bindings: BTreeMap<RegionId, RegionBinding>,
     pub decorations: Vec<DecorationBinding>,
     pub treatments: Vec<TreatmentLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edge_wear: Option<EdgeWearIntent>,
+    #[serde(
+        default,
+        rename = "edgeDetail",
+        alias = "edgeWear",
+        deserialize_with = "deserialize_edge_detail",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edge_detail: Option<EdgeDetailIntentV1>,
     #[serde(default)]
     pub sheet_framing: SheetFraming,
     pub render_settings: RenderSettings,
@@ -959,7 +1105,7 @@ impl TrimSheetDocument {
             region_bindings: self.region_bindings.clone(),
             decorations: self.decorations.clone(),
             treatments: self.treatments.clone(),
-            edge_wear: self.edge_wear.clone(),
+            edge_detail: self.edge_detail.clone(),
             sheet_framing: self.sheet_framing.clone(),
             render_settings: self.render_settings.clone(),
         }
@@ -1244,30 +1390,63 @@ impl TrimSheetDocument {
                 return Err(TrimSheetDocumentError::InvalidTreatment(treatment.id));
             }
         }
-        if let Some(intent) = &self.edge_wear {
+        if let Some(intent) = &self.edge_detail {
             let finite = [
-                intent.coverage,
-                intent.strength,
+                intent.wear_amount,
+                intent.intensity,
                 intent.edge_width_m,
+                intent.bevel_radius_m,
+                intent.edge_softness,
+                intent.breakup_amount,
                 intent.breakup_scale_m,
+                intent.micro_detail_amount,
+                intent.micro_detail_scale_m,
+                intent.source_height_influence,
+                intent.source_luminance_influence,
                 intent.height_amplitude_m,
+                intent.normal_detail_strength,
                 intent.hue_shift_degrees,
                 intent.saturation_multiplier,
-                intent.value_offset,
+                intent.value_multiplier,
                 intent.roughness_offset,
                 intent.metallic_offset,
             ]
             .into_iter()
             .all(f64::is_finite);
-            if !finite
-                || !(0.0..=1.0).contains(&intent.coverage)
-                || !(0.0..=1.0).contains(&intent.strength)
-                || intent.edge_width_m <= 0.0
-                || intent.breakup_scale_m <= 0.0
-                || intent.saturation_multiplier < 0.0
-                || intent.target_region.is_some_and(|id| !region_ids.contains(&id))
+            let reason = if intent.schema_version != EDGE_DETAIL_INTENT_SCHEMA_VERSION {
+                Some(EdgeDetailValidationReason::UnknownSchemaVersion)
+            } else if !finite {
+                Some(EdgeDetailValidationReason::NonFiniteValue)
+            } else if !(0.0..=1.0).contains(&intent.wear_amount)
+                || !(0.0..=1.0).contains(&intent.intensity)
+                || !(0.0..=1.0).contains(&intent.edge_softness)
+                || !(0.0..=1.0).contains(&intent.breakup_amount)
+                || !(0.0..=1.0).contains(&intent.micro_detail_amount)
+                || !(0.0..=1.0).contains(&intent.source_height_influence)
+                || !(0.0..=1.0).contains(&intent.source_luminance_influence)
+                || !(0.0..=2.0).contains(&intent.normal_detail_strength)
+                || !(-180.0..=180.0).contains(&intent.hue_shift_degrees)
+                || !(0.0..=2.0).contains(&intent.saturation_multiplier)
+                || !(0.0..=3.0).contains(&intent.value_multiplier)
+                || !(-1.0..=1.0).contains(&intent.roughness_offset)
+                || !(0.0..=1.0).contains(&intent.metallic_offset)
             {
-                return Err(TrimSheetDocumentError::InvalidEdgeWear);
+                Some(EdgeDetailValidationReason::OutOfRange)
+            } else if intent.edge_width_m <= 0.0
+                || intent.bevel_radius_m < 0.0
+                || intent.breakup_scale_m <= 0.0
+                || intent.micro_detail_scale_m <= 0.0
+            {
+                Some(EdgeDetailValidationReason::InvalidPhysicalScale)
+            } else if !intent.exposed_metal_enabled && intent.metallic_offset != 0.0 {
+                Some(EdgeDetailValidationReason::MetallicRequiresExposedMetal)
+            } else if intent.target_region.is_some_and(|id| !region_ids.contains(&id)) {
+                Some(EdgeDetailValidationReason::UnknownTargetRegion)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(TrimSheetDocumentError::InvalidEdgeDetail(reason));
             }
         }
         let mut decoration_keys = BTreeSet::new();
@@ -1461,7 +1640,7 @@ impl TrimSheetDocument {
                 .collect(),
             decorations: Vec::new(),
             treatments: Vec::new(),
-            edge_wear: None,
+            edge_detail: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings {
                 output_size,
@@ -1584,7 +1763,7 @@ impl TrimSheetDocument {
             region_bindings: bindings,
             decorations: Vec::new(),
             treatments: Vec::new(),
-            edge_wear: None,
+            edge_detail: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings {
                 output_size,
@@ -1702,7 +1881,7 @@ impl TrimSheetDocument {
             region_bindings: bindings,
             decorations: Vec::new(),
             treatments: Vec::new(),
-            edge_wear: None,
+            edge_detail: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
@@ -1902,8 +2081,8 @@ impl TrimSheetDocument {
                     });
                 }
             }
-            TrimSheetDocumentCommand::SetEdgeWearIntent { intent } => {
-                next.edge_wear = Some(intent.clone());
+            TrimSheetDocumentCommand::SetEdgeDetailIntent { intent } => {
+                next.edge_detail = Some(intent.clone());
             }
             TrimSheetDocumentCommand::UpsertDecoration { decoration } => {
                 if decoration.decoration_key.trim().is_empty() || decoration.value.is_empty() {
@@ -2910,8 +3089,8 @@ pub enum TrimSheetDocumentCommand {
         structural_profile: StructuralProfile,
         compiled_request: String,
     },
-    SetEdgeWearIntent {
-        intent: EdgeWearIntent,
+    SetEdgeDetailIntent {
+        intent: EdgeDetailIntentV1,
     },
     UpsertDecoration {
         decoration: DecorationBinding,
@@ -3721,6 +3900,22 @@ fn hex_hash(value: DocumentHash) -> String {
     value.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum EdgeDetailValidationReason {
+    #[error("unknown schema version")]
+    UnknownSchemaVersion,
+    #[error("non-finite numeric value")]
+    NonFiniteValue,
+    #[error("numeric value outside the persisted contract range")]
+    OutOfRange,
+    #[error("non-positive or invalid physical scale")]
+    InvalidPhysicalScale,
+    #[error("Metallic requires explicit exposed-metal intent")]
+    MetallicRequiresExposedMetal,
+    #[error("target region does not exist")]
+    UnknownTargetRegion,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TrimSheetDocumentError {
     #[error("canonical topology size or schema version is invalid")]
@@ -3811,8 +4006,8 @@ pub enum TrimSheetDocumentError {
     InvalidWarp { region_id: RegionId, index: usize },
     #[error("treatment layer is duplicated or invalid: {0}")]
     InvalidTreatment(LayerId),
-    #[error("edge-wear intent is invalid")]
-    InvalidEdgeWear,
+    #[error("edge-detail intent is invalid: {0}")]
+    InvalidEdgeDetail(EdgeDetailValidationReason),
     #[error("decoration binding is missing, duplicated, or exceeds bounded storage")]
     InvalidDecoration,
     #[error("render settings are invalid")]
@@ -3952,7 +4147,7 @@ mod tests {
             )]),
             decorations: Vec::new(),
             treatments: Vec::new(),
-            edge_wear: None,
+            edge_detail: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
@@ -3985,19 +4180,74 @@ mod tests {
         let document = document();
         let topology_hash = document.topology.topology_hash;
         let before = document.appearance_hash().expect("appearance hash");
-        let intent = EdgeWearIntent {
+        let intent = EdgeDetailIntentV1 {
             target_region: Some(document.topology.regions[0].id),
-            ..EdgeWearIntent::default()
+            ..EdgeDetailIntentV1::default()
         };
         let next = document
-            .apply_command(&TrimSheetDocumentCommand::SetEdgeWearIntent {
+            .apply_command(&TrimSheetDocumentCommand::SetEdgeDetailIntent {
                 intent: intent.clone(),
             })
-            .expect("valid edge-wear command");
-        assert_eq!(next.edge_wear, Some(intent));
+            .expect("valid edge-detail command");
+        assert_eq!(next.edge_detail, Some(intent));
         assert_eq!(next.topology.topology_hash, topology_hash, "coverage never moves topology");
         assert_ne!(next.appearance_hash().expect("changed appearance"), before);
         assert_eq!(next.document_revision, document.document_revision + 1);
+    }
+
+    #[test]
+    fn mvp_edge_wear_migrates_to_edge_detail_v1_with_exact_values() {
+        let old = EdgeWearIntent {
+            enabled: true,
+            target_region: Some(RegionId::from_bytes([9; 16])),
+            coverage: 1.25,
+            strength: -0.5,
+            edge_width_m: 0.008,
+            breakup_scale_m: 0.006,
+            breakup_seed: 4_294_967_303,
+            height_amplitude_m: -0.0007,
+            hue_shift_degrees: 200.0,
+            saturation_multiplier: 2.5,
+            value_offset: -2.0,
+            roughness_offset: -2.0,
+            exposed_metal_enabled: false,
+            metallic_offset: 0.8,
+        };
+        let migrated = EdgeDetailIntentV1::migrate_from_edge_wear(&old, 0.001);
+        assert_eq!(migrated, EdgeDetailIntentV1 {
+            schema_version: 1,
+            enabled: true,
+            target_region: old.target_region,
+            wear_amount: 1.0,
+            intensity: 0.0,
+            edge_width_m: 0.008,
+            bevel_radius_m: 0.005,
+            edge_softness: 0.30,
+            breakup_amount: 0.70,
+            breakup_scale_m: 0.006,
+            micro_detail_amount: 0.25,
+            micro_detail_scale_m: 0.002,
+            seed: 7,
+            source_height_influence: 0.65,
+            source_luminance_influence: 0.20,
+            height_amplitude_m: -0.0007,
+            normal_detail_strength: 1.0,
+            hue_shift_degrees: 180.0,
+            saturation_multiplier: 2.0,
+            value_multiplier: 0.0,
+            roughness_offset: -1.0,
+            exposed_metal_enabled: false,
+            metallic_offset: 0.0,
+        });
+    }
+
+    #[test]
+    fn mvp_edge_wear_shared_edge_detail_v1_fixture_matches_rust_defaults_exactly() {
+        let fixture: EdgeDetailIntentV1 = serde_json::from_str(include_str!(
+            "../../../fixtures/edge-detail-intent-v1.json"
+        ))
+        .expect("shared Edge Detail V1 fixture");
+        assert_eq!(fixture, EdgeDetailIntentV1::default());
     }
 
     #[test]

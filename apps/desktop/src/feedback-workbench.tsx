@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import type {
   CompiledMapView,
-  EdgeWearIntent,
+  EdgeDetailIntentV1,
   FeedbackComparisonMode,
   FeedbackContributionView,
   FeedbackDetailIntent,
@@ -11,16 +11,20 @@ import type {
   IntermediateAtlasProjection,
   ProjectProjection,
 } from "@hot-trimmer/ipc-contracts";
-import { occupancyRelationFromValue, occupancyRelations, sanitizeEdgeWearIntent, updateFeedbackOperationIntent } from "./feedback-workbench-contract";
+import { occupancyRelationFromValue, occupancyRelations, sanitizeEdgeDetailIntent, updateFeedbackOperationIntent } from "./feedback-workbench-contract";
 
 export const FEEDBACK_WORKBENCH_VERSION = "20A.1" as const;
 
-export function defaultEdgeWearIntent(): EdgeWearIntent {
+export function defaultEdgeWearIntent(): EdgeDetailIntentV1 {
   return {
-    enabled: true, coverage: 0.55, strength: 0.8, edgeWidthM: 0.004,
-    breakupScaleM: 0.012, breakupSeed: 201516, heightAmplitudeM: -0.00035,
-    hueShiftDegrees: 0, saturationMultiplier: 0.55, valueOffset: 0.12,
-    roughnessOffset: 0.18, exposedMetalEnabled: false, metallicOffset: 0,
+    schemaVersion: 1, enabled: true, wearAmount: 0.55, intensity: 0.8,
+    edgeWidthM: 0.004, bevelRadiusM: 0.0025, edgeSoftness: 0.3,
+    breakupAmount: 0.7, breakupScaleM: 0.012, microDetailAmount: 0.25,
+    microDetailScaleM: 0.002, seed: 201516, sourceHeightInfluence: 0.65,
+    sourceLuminanceInfluence: 0.2, heightAmplitudeM: -0.00035,
+    normalDetailStrength: 1, hueShiftDegrees: 0, saturationMultiplier: 0.55,
+    valueMultiplier: 1.12, roughnessOffset: 0.18,
+    exposedMetalEnabled: false, metallicOffset: 0,
   };
 }
 
@@ -110,10 +114,10 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
   const selectedRegion = props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId);
   const compiled = props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegionId);
   const [profileIntent, setProfileIntent] = useState<FeedbackProfileIntent>(() => defaultFeedbackProfile());
-  const [edgeWear, setEdgeWear] = useState<EdgeWearIntent>(() => props.project?.document?.edgeWear ?? defaultEdgeWearIntent());
+  const [edgeWear, setEdgeWear] = useState<EdgeDetailIntentV1>(() => props.project?.document?.edgeDetail ?? defaultEdgeWearIntent());
   const [edgeWearNotice, setEdgeWearNotice] = useState<string | null>(null);
   useEffect(() => {
-    setEdgeWear(props.project?.document?.edgeWear ?? defaultEdgeWearIntent());
+    setEdgeWear(props.project?.document?.edgeDetail ?? defaultEdgeWearIntent());
   }, [props.project?.id, props.project?.document?.documentRevision]);
   const records = props.project?.feedbackAuthoring.records ?? [];
   const selectedRecord = records.find((record) => record.operationId === props.selectedOperationId);
@@ -216,13 +220,13 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
   }
 
   async function applyEdgeWear() {
-    const sanitized = sanitizeEdgeWearIntent(edgeWear);
+    const sanitized = sanitizeEdgeDetailIntent(edgeWear);
     const wasClamped = JSON.stringify(sanitized) !== JSON.stringify(edgeWear);
     setEdgeWear(sanitized);
     setEdgeWearNotice(wasClamped
-      ? "Invalid values were corrected before applying. Coverage and Strength use the 0–1 range."
+      ? "Invalid values were corrected before applying the Edge Detail V1 ranges."
       : null);
-    await props.onCommand({ type: "set_edge_wear", intent: sanitized });
+    await props.onCommand({ type: "set_edge_detail", intent: sanitized });
   }
 
   return <aside className="feedback-workbench" aria-label="Profile & Detail Contributions">
@@ -231,7 +235,7 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
       <section className="edge-wear-column"><h3>Ordered material layers</h3>
         <ol className="layer-card-list"><li className="layer-card selected"><header><strong>Edge Wear</strong><span>GPU · physical</span><input aria-label="Edge Wear enabled" type="checkbox" checked={edgeWear.enabled} onChange={(event) => setEdgeWear({ ...edgeWear, enabled: event.currentTarget.checked })} /></header>
           <label>Target<select value={edgeWear.targetRegion ?? "global"} onChange={(event) => setEdgeWear({ ...edgeWear, targetRegion: event.currentTarget.value === "global" ? undefined : event.currentTarget.value })}><option value="global">Global</option>{props.project?.document?.topology.regions.map((region) => <option key={region.id} value={region.id}>{region.displayName}</option>)}</select></label>
-          <div className="physical-controls"><label>Coverage<input type="number" min="0" max="1" step="0.05" value={edgeWear.coverage} onChange={(event) => setEdgeWear({ ...edgeWear, coverage: Number(event.currentTarget.value) })} /></label><label>Strength<input type="number" min="0" max="1" step="0.05" value={edgeWear.strength} onChange={(event) => setEdgeWear({ ...edgeWear, strength: Number(event.currentTarget.value) })} /></label><label>Edge width m<input type="number" min="0.00001" step="0.0005" value={edgeWear.edgeWidthM} onChange={(event) => setEdgeWear({ ...edgeWear, edgeWidthM: Number(event.currentTarget.value) })} /></label><label>Breakup scale m<input type="number" min="0.00001" step="0.001" value={edgeWear.breakupScaleM} onChange={(event) => setEdgeWear({ ...edgeWear, breakupScaleM: Number(event.currentTarget.value) })} /></label><label>Seed<input type="number" min="0" step="1" value={edgeWear.breakupSeed} onChange={(event) => setEdgeWear({ ...edgeWear, breakupSeed: Number(event.currentTarget.value) })} /></label><label>Height m<input type="number" step="0.00005" value={edgeWear.heightAmplitudeM} onChange={(event) => setEdgeWear({ ...edgeWear, heightAmplitudeM: Number(event.currentTarget.value) })} /></label><label>Hue °<input type="number" step="1" value={edgeWear.hueShiftDegrees} onChange={(event) => setEdgeWear({ ...edgeWear, hueShiftDegrees: Number(event.currentTarget.value) })} /></label><label>Saturation ×<input type="number" min="0" step="0.05" value={edgeWear.saturationMultiplier} onChange={(event) => setEdgeWear({ ...edgeWear, saturationMultiplier: Number(event.currentTarget.value) })} /></label><label>Value<input type="number" step="0.05" value={edgeWear.valueOffset} onChange={(event) => setEdgeWear({ ...edgeWear, valueOffset: Number(event.currentTarget.value) })} /></label><label>Roughness<input type="number" step="0.05" value={edgeWear.roughnessOffset} onChange={(event) => setEdgeWear({ ...edgeWear, roughnessOffset: Number(event.currentTarget.value) })} /></label></div>
+          <div className="physical-controls"><label>Wear Amount<input type="number" min="0" max="1" step="0.05" value={edgeWear.wearAmount} onChange={(event) => setEdgeWear({ ...edgeWear, wearAmount: Number(event.currentTarget.value) })} /></label><label>Intensity<input type="number" min="0" max="1" step="0.05" value={edgeWear.intensity} onChange={(event) => setEdgeWear({ ...edgeWear, intensity: Number(event.currentTarget.value) })} /></label><label>Edge width m<input type="number" min="0.00001" step="0.0005" value={edgeWear.edgeWidthM} onChange={(event) => setEdgeWear({ ...edgeWear, edgeWidthM: Number(event.currentTarget.value) })} /></label><label>Bevel radius m<input type="number" min="0" step="0.0005" value={edgeWear.bevelRadiusM} onChange={(event) => setEdgeWear({ ...edgeWear, bevelRadiusM: Number(event.currentTarget.value) })} /></label><label>Breakup<input type="number" min="0" max="1" step="0.05" value={edgeWear.breakupAmount} onChange={(event) => setEdgeWear({ ...edgeWear, breakupAmount: Number(event.currentTarget.value) })} /></label><label>Breakup scale m<input type="number" min="0.00001" step="0.001" value={edgeWear.breakupScaleM} onChange={(event) => setEdgeWear({ ...edgeWear, breakupScaleM: Number(event.currentTarget.value) })} /></label><label>Seed<input type="number" min="0" max="4294967295" step="1" value={edgeWear.seed} onChange={(event) => setEdgeWear({ ...edgeWear, seed: Number(event.currentTarget.value) })} /></label><label>Height m<input type="number" step="0.00005" value={edgeWear.heightAmplitudeM} onChange={(event) => setEdgeWear({ ...edgeWear, heightAmplitudeM: Number(event.currentTarget.value) })} /></label><label>Hue °<input type="number" min="-180" max="180" step="1" value={edgeWear.hueShiftDegrees} onChange={(event) => setEdgeWear({ ...edgeWear, hueShiftDegrees: Number(event.currentTarget.value) })} /></label><label>Saturation ×<input type="number" min="0" max="2" step="0.05" value={edgeWear.saturationMultiplier} onChange={(event) => setEdgeWear({ ...edgeWear, saturationMultiplier: Number(event.currentTarget.value) })} /></label><label>Value ×<input type="number" min="0" max="3" step="0.05" value={edgeWear.valueMultiplier} onChange={(event) => setEdgeWear({ ...edgeWear, valueMultiplier: Number(event.currentTarget.value) })} /></label><label>Roughness<input type="number" min="-1" max="1" step="0.05" value={edgeWear.roughnessOffset} onChange={(event) => setEdgeWear({ ...edgeWear, roughnessOffset: Number(event.currentTarget.value) })} /></label></div>
           <label className="metal-intent"><input type="checkbox" checked={edgeWear.exposedMetalEnabled} onChange={(event) => setEdgeWear({ ...edgeWear, exposedMetalEnabled: event.currentTarget.checked, metallicOffset: event.currentTarget.checked ? edgeWear.metallicOffset : 0 })} /> Exposed metal (explicit)</label>{edgeWear.exposedMetalEnabled ? <label>Metallic offset<input type="number" min="0" max="1" step="0.05" value={edgeWear.metallicOffset} onChange={(event) => setEdgeWear({ ...edgeWear, metallicOffset: Number(event.currentTarget.value) })} /></label> : null}
           <button disabled={props.commandBusy || !props.project?.document} onClick={() => void applyEdgeWear()}>Apply Edge Wear</button>
           {edgeWearNotice ? <p className="typed-state" role="status">{edgeWearNotice}</p> : null}

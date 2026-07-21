@@ -136,7 +136,7 @@ function requestedMaterialMapsForExport(project: ProjectProjection | null): read
   const channels = project?.document?.renderSettings.channels;
   if (!channels) return ["base_color"];
   const requested = exportableMaterialMaps.filter((map) => channels[map]?.enabled);
-  if (project?.document?.edgeWear?.enabled) {
+  if (project?.document?.edgeDetail?.enabled) {
     for (const map of ["base_color", "height", "normal", "roughness", "metallic"] as const) {
       if (!requested.includes(map)) requested.push(map);
     }
@@ -973,7 +973,7 @@ function App() {
         selectedRegionId,
         result.project.document?.topology.regions.map((region) => region.id) ?? [],
       );
-      const previewAllRegions = commandValue.type === "set_edge_wear" && !commandValue.intent.targetRegion;
+      const previewAllRegions = commandValue.type === "set_edge_detail" && !commandValue.intent.targetRegion;
       setFeedbackPreviewAllRegions(previewAllRegions);
       if (!previewAllRegions && previewRegionId !== selectedRegionId) setSelectedRegionId(previewRegionId);
       const nextFeedbackView = feedbackViewAfterCommand(commandValue, feedbackView);
@@ -986,7 +986,7 @@ function App() {
         setMapViewState(dependency);
         mapViewRef.current = dependency;
       }
-      if (commandValue.type === "set_edge_wear" && previewRegionId) {
+      if (commandValue.type === "set_edge_detail" && previewRegionId) {
         const revision = result.project.document?.documentRevision;
         if (revision !== undefined) {
           feedbackCommandPreviewRevision.current = revision;
