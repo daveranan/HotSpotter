@@ -435,6 +435,7 @@ function App() {
   const pendingAutomaticPreviewKey = useRef<string | null>(null);
   const patchPreviewRequestId = useRef(0);
   const radialCommitId = useRef(0);
+  const radialCommitTail = useRef<Promise<void>>(Promise.resolve());
   const previewPublishStartedAt = useRef<number | null>(null);
   const projectRef = useRef<ProjectProjection | null>(null);
   const mapViewRef = useRef<CompiledMapView>("baseColor");
@@ -1904,21 +1905,34 @@ function App() {
     dirtyPreviewRegion.current = regionId;
     setActivity("editing");
     try {
-      const next = await applyCommand({ type: "set_region_radial", regionId, radial });
-      // Numeric inputs can commit faster than native document commands settle.
-      // Only the newest radial intent may update the client or publish pixels.
-      if (commitId !== radialCommitId.current) return;
-      const revision = next.document!.documentRevision;
-      // Source-side radial gestures bypass the Layout command helper, so publish their
-      // persisted revision explicitly. Keep the previous artifact visible until the
-      // selected preview size is ready rather than flashing a lower-quality square pass.
-      pendingAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile, mapView);
-      dirtyPreviewRegion.current = null;
-      projectRef.current = next;
-      setProject(next);
-      await requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true);
+      // Tauri commands from separate input events can acquire the native document lock
+      // out of order. Serialize them, and coalesce requests that are still waiting, so an
+      // older radial value can never advance the native revision after the newest value.
+      const queued = radialCommitTail.current.then(async () => {
+        if (commitId !== radialCommitId.current) return;
+        const next = await applyCommand({ type: "set_region_radial", regionId, radial });
+        // A newer value may have arrived while this command held the native lock. Let its
+        // queued command own the projection and preview instead of publishing this one.
+        if (commitId !== radialCommitId.current) return;
+        const revision = next.document!.documentRevision;
+        // Source-side radial gestures bypass the Layout command helper, so publish their
+        // persisted revision explicitly. Keep the previous artifact visible until the
+        // selected preview size is ready rather than flashing a lower-quality square pass.
+        pendingAutomaticPreviewKey.current = automaticPreviewKey(revision, interactivePreviewProfile, mapView);
+        dirtyPreviewRegion.current = null;
+        projectRef.current = next;
+        setProject(next);
+        await requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, true);
+      });
+      radialCommitTail.current = queued.catch(() => undefined);
+      await queued;
     }
-    catch (reason) { dirtyPreviewRegion.current = null; setProblem(failure(reason)); }
+    catch (reason) {
+      if (commitId === radialCommitId.current) {
+        dirtyPreviewRegion.current = null;
+        setProblem(failure(reason));
+      }
+    }
     finally { if (commitId === radialCommitId.current) setActivity("idle"); }
   }
 

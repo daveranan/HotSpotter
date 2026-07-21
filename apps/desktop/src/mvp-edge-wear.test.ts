@@ -258,6 +258,9 @@ test("mvp-edge-wear Processing switches retained map publications, keeps the pri
   assert.match(shell, /\}, \[processingOpen, interactivePreviewProfile\]\)/);
   assert.doesNotMatch(shell, /feedbackCommandPreviewRevision/);
   assert.match(shell, /const radialCommitId = useRef\(0\)/);
+  assert.match(shell, /const radialCommitTail = useRef<Promise<void>>\(Promise\.resolve\(\)\)/);
+  assert.match(shell, /const queued = radialCommitTail\.current\.then\(async \(\) =>/);
+  assert.match(shell, /radialCommitTail\.current = queued\.catch\(\(\) => undefined\)/);
   assert.match(shell, /if \(commitId !== radialCommitId\.current\) return/);
   assert.match(shell, /await requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false, true\)/);
 });
