@@ -3324,6 +3324,33 @@ mod source_frame_partition_tests {
     }
 
     #[test]
+    fn mvp_edge_wear_preview_scales_subpixel_detail_without_changing_authored_intent() {
+        let mut region = edge_detail_region(6, TemplateSlotRole::Planar, ManualRegionRole::Panel);
+        region.slot_size_m = [0.4, 0.4];
+        region.destination_pixels = [100, 100];
+        let intent = EdgeDetailIntentV1::default();
+        let plan = compile_edge_detail_plan(&EdgeDetailCompileRequest {
+            intent: &intent,
+            regions: &[region],
+            requested_maps: &[MaterialMapKind::BaseColor, MaterialMapKind::Height],
+            resolution_profile: "preview2048",
+        })
+        .expect("preview LOD fallback");
+        let command = &plan.commands[0];
+        let fallback = command.lod_fallback.as_ref().expect("reported preview fallback");
+
+        assert_eq!(fallback.policy, "preview_scale_floor");
+        assert_eq!(fallback.maximum_meters_per_pixel, 0.004);
+        assert_eq!(fallback.authored_edge_width_m, intent.edge_width_m);
+        assert_eq!(fallback.authored_breakup_scale_m, intent.breakup_scale_m);
+        assert_eq!(fallback.authored_micro_detail_scale_m, intent.micro_detail_scale_m);
+        assert_eq!(command.edge_width_m, 0.004);
+        assert_eq!(command.breakup_scale_m, intent.breakup_scale_m as f32);
+        assert_eq!(command.micro_detail_scale_m, 0.008);
+        assert_eq!(intent.micro_detail_scale_m, 0.002, "authored intent remains unchanged");
+    }
+
+    #[test]
     fn mvp_edge_wear_manual_source_frame_has_a_resolution_independent_meter_basis() {
         let crop = SourceCrop { x: 0, y: 0, width: 800, height: 400 };
         let allocation = CanonicalRect { x: 0, y: 0, width: 800, height: 400 };

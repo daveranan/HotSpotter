@@ -871,6 +871,7 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     assert!(output.telemetry.iter().any(|line| {
         line.contains("requested_map=EdgeMask")
             && line.contains("logical_passes=hotspot-profile,edge-wear-mask,publish")
+            && line.contains("executed_gpu_passes=material-r32float-publish")
     }));
 }
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { feedbackPreviewRegionAfterCommand, feedbackViewAfterCommand, sanitizeEdgeDetailIntent } from "./feedback-workbench-contract.ts";
 
@@ -57,32 +58,62 @@ const root = new URL("../../..", import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, root), "utf8");
 
 test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
-  const shader = read("crates/preview/src/gpu_base_color.wgsl");
+  const shader = read("crates/preview/src/gpu_edge_detail.wgsl");
+  const baseColor = read("crates/preview/src/gpu_base_color.wgsl");
   const normal = read("crates/preview/src/gpu_normal_from_height.wgsl");
   const executor = read("crates/sheet-compiler/src/atlas_executor.rs");
-  assert.match(shader, /fn edge_wear_mask/);
-  assert.match(shader, /edge_wear_width_m/);
-  assert.match(shader, /edge_wear_breakup_scale_m/);
-  assert.match(shader, /fn edge_value_noise/);
-  assert.match(shader, /fn edge_fbm/);
-  assert.match(shader, /spatial_feather_m/);
-  assert.doesNotMatch(shader, /let cell = vec2<u32>\(floor\(physical/);
-  assert.match(shader, /header\.map_kind == 8u/);
-  assert.match(executor, /MaterialMapKind::EdgeMask => 8/);
+  assert.match(shader, /var stage15_sdf: texture_2d<f32>/);
+  assert.match(shader, /var stage15_semantics: texture_2d<f32>/);
+  assert.match(shader, /fn value_noise/);
+  assert.match(shader, /fn role_coordinates/);
+  assert.match(shader, /Periodic angular embedding/);
+  assert.match(shader, /fn srgb_to_linear/);
+  assert.match(shader, /clamp\(local \+ vec2<i32>\(x, y\), stencil_min, stencil_max\)/);
+  assert.match(shader, /transition_micro/);
+  assert.match(shader, /cmd\.cap_major_axis == 1u/);
+  assert.match(shader, /var core_out: texture_storage_2d<r32float/);
+  assert.match(shader, /var transition_out: texture_storage_2d<r32float/);
+  assert.match(shader, /var fade_out: texture_storage_2d<r32float/);
+  assert.match(shader, /var combined_out: texture_storage_2d<r32float/);
+  assert.match(shader, /var height_out: texture_storage_2d<r32float/);
+  assert.match(shader, /sqrt\(max\(0\.0, 1\.0 - \(1\.0 - x\)/);
+  assert.doesNotMatch(shader, /normal.*rgb.*height/i);
+  assert.match(executor, /GpuAtlasPipelineKind::EdgeDetail/);
+  assert.match(executor, /execute_or_load_edge_detail_fields/);
+  assert.match(executor, /edge-detail\.core/);
+  assert.match(executor, /edge-detail\.transition/);
+  assert.match(executor, /edge-detail\.fade/);
+  assert.match(executor, /edge-detail\.combined/);
+  assert.match(executor, /edge-detail\.height/);
+  assert.match(executor, /EdgeDetailSourceModulationRoute::RegisteredHeight => 1/);
+  assert.match(executor, /EdgeDetailSourceModulationRoute::HighPassedLinearLuminance => 2/);
+  assert.match(executor, /selected_source_routes=/);
+  assert.match(executor, /lod_fallbacks=/);
+  assert.match(executor, /stage15_sdf_identity=/);
+  assert.match(executor, /bounded-resolution-cross-section/);
+  assert.match(executor, /tile-origin overlap changed/);
+  assert.match(baseColor, /var source_tex: texture_2d_array<f32>/, "ED-3 still owns final source composition");
   assert.match(executor, /execute_height_normal_gpu/);
   assert.match(normal, /textureLoad\(final_height_tex/);
   assert.doesNotMatch(normal, /mix\([^\n]*authored_decoded/);
 });
 
 test("mvp-edge-wear is eligibility gated, deterministic, and metallic explicit-only", () => {
-  const shader = read("crates/preview/src/gpu_base_color.wgsl");
-  assert.match(shader, /edge_wear_flags & 2u/);
-  assert.match(shader, /edge_wear_flags & 4u/);
-  assert.match(shader, /edge_wear_flags & 8u/);
-  assert.match(shader, /edge_wear_flags & 16u/);
-  assert.match(shader, /edge_wear_seed/);
-  assert.match(shader, /edge_wear_flags & 32u/);
-  assert.match(shader, /select\(0\.0, wear \* cmd\.edge_wear_metallic_offset, explicit_metal\)/);
+  const shader = read("crates/preview/src/gpu_edge_detail.wgsl");
+  const executor = read("crates/sheet-compiler/src/atlas_executor.rs");
+  assert.match(shader, /edge_mask: u32/);
+  assert.match(shader, /cmd\.seed/);
+  assert.match(shader, /atlas_pixel = id\.xy \+ vec2<u32>\(header\.tile_x, header\.tile_y\)/);
+  assert.match(shader, /inside_rect\(atlas_pixel/);
+  assert.match(shader, /semantic_bits & 1u/);
+  assert.match(executor, /commands\.is_empty\(\)/);
+});
+
+test("mvp-edge-wear runs the real native Edge Detail GPU fixture", () => {
+  const result = spawnSync("cargo", ["test", "-p", "hot-trimmer-sheet-compiler", "native_edge_detail_gpu_fixture_covers_roles_masks_height_and_cache"], {
+    cwd: new URL("../../..", import.meta.url), encoding: "utf8",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
 test("mvp-edge-wear Edge Detail V1 fields agree with the native persisted contract", () => {
@@ -103,6 +134,8 @@ test("mvp-edge-wear Edge Detail V1 fields agree with the native persisted contra
   const focusedNative = read("crates/sheet-compiler/src/persisted_pipeline.rs");
   assert.match(focusedNative, /mvp_edge_wear_compiler_covers_global_target_reorder_and_authoritative_role_identity/);
   assert.match(focusedNative, /mvp_edge_wear_compiler_rejects_invalid_and_subpixel_intents_and_disables_cleanly/);
+  assert.match(focusedNative, /mvp_edge_wear_preview_scales_subpixel_detail_without_changing_authored_intent/);
+  assert.match(focusedNative, /preview_scale_floor/);
   const store = read("crates/project-store/src/lib.rs");
   assert.match(store, /mvp_edge_wear_project_save_reopen_migrates_once_to_edge_detail_v1/);
   assert.match(read("apps/desktop/src-tauri/src/document_commands.rs"), /"18": \{ "state": FeedbackExecutionState::NotInstalled/);

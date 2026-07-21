@@ -801,6 +801,7 @@ enum GpuAtlasPipelineKind {
     RegionIdDisplayRgba8,
     StructuralProfile,
     SemanticDetail,
+    EdgeDetail,
 }
 
 #[derive(Default)]
@@ -1351,6 +1352,48 @@ struct GpuProfileCommand {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+struct GpuEdgeDetailCommand {
+    evaluator: u32,
+    source_route: u32,
+    seed: u32,
+    edge_mask: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_width: u32,
+    dst_height: u32,
+    semantic_x: u32,
+    semantic_y: u32,
+    semantic_width: u32,
+    semantic_height: u32,
+    declared_halo_px: u32,
+    cap_major_axis: u32,
+    source_stencil_halo_px: u32,
+    _pad_u1: u32,
+    slot_width_m: f32,
+    slot_height_m: f32,
+    meters_per_pixel_x: f32,
+    meters_per_pixel_y: f32,
+    wear_amount: f32,
+    intensity: f32,
+    edge_width_m: f32,
+    bevel_radius_m: f32,
+    edge_softness: f32,
+    breakup_amount: f32,
+    breakup_scale_m: f32,
+    micro_detail_amount: f32,
+    micro_detail_scale_m: f32,
+    source_height_influence: f32,
+    source_luminance_influence: f32,
+    height_amplitude_m: f32,
+    requested_extent_m: f32,
+    _pad_f0: f32,
+    _pad_f1: f32,
+    _pad_f2: f32,
+    _pad_f3: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct GpuDetailCommand {
     family: u32,
     lod: u32,
@@ -1402,6 +1445,7 @@ struct GpuDetailCommand {
 const GPU_PROFILE_HEADER_BYTES: usize = 32;
 const GPU_PROFILE_COMMAND_BYTES: usize = 96;
 const GPU_DETAIL_COMMAND_BYTES: usize = 180;
+const GPU_EDGE_DETAIL_COMMAND_BYTES: usize = 148;
 
 const GPU_HEADER_BYTES: usize = 88;
 const GPU_COMMAND_BYTES: usize = 224;
@@ -2844,7 +2888,7 @@ fn synthesis_family_matches_domain_route(family: CandidateFamily, route: DomainR
     }
 }
 
-fn logical_passes_for_map(map: MaterialMapKind) -> &'static str {
+fn logical_passes_for_map(plan: &CompiledAtlasPlanV1, map: MaterialMapKind) -> &'static str {
     match map {
         MaterialMapKind::BaseColor => "registered-source,publish",
         MaterialMapKind::Height => {
@@ -2859,7 +2903,13 @@ fn logical_passes_for_map(map: MaterialMapKind) -> &'static str {
         MaterialMapKind::AmbientOcclusion => "hotspot-profile,structural-height,ao,publish",
         MaterialMapKind::Metallic => "registered-source,metallic,publish",
         MaterialMapKind::RegionId => "compact-region-id,publish",
-        MaterialMapKind::EdgeMask => "hotspot-profile,edge-wear-mask,publish",
+        MaterialMapKind::EdgeMask => {
+            if plan.ordered_regions.iter().any(|region| region.edge_detail.is_some()) {
+                "stage15-sdf,stage15-semantics,edge-detail-masks,publish"
+            } else {
+                "hotspot-profile,edge-wear-mask,publish"
+            }
+        }
         MaterialMapKind::Specular | MaterialMapKind::Opacity | MaterialMapKind::MaterialId => {
             "unavailable"
         }
@@ -2950,7 +3000,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
                         .any(|source| source.channel_role == MaterialChannelRole::Normal);
                     telemetry.push(format!(
                         "executor=gpu; requested_map=Normal; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; dependency={}; intermediate_cache={}; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0",
-                        logical_passes_for_map(MaterialMapKind::Normal),
+                        logical_passes_for_map(plan, MaterialMapKind::Normal),
                         if cached_has_authored_normal {
                             "Normal<-authored-Normal"
                         } else {
@@ -3122,7 +3172,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             ));
         }
         let requested_map = requested_maps[0];
-        let logical_passes = logical_passes_for_map(requested_map);
+        let logical_passes = logical_passes_for_map(plan, requested_map);
         let identity = plan.tile_identity(requested_map, GPU_SHADER_VERSION);
         if let Some(cached) = self
             .source_texture_cache
@@ -3198,6 +3248,14 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             return Ok(AtlasRenderExecutorOutput::FinalAtlas(
                 execute_height_normal_gpu(self, plan, input, false, cancellation, is_current)?,
             ));
+        }
+        if requested_map == MaterialMapKind::EdgeMask
+            && plan
+                .ordered_regions
+                .iter()
+                .any(|region| region.edge_detail.is_some())
+        {
+            return execute_edge_detail_gpu_tile(self, plan, input, cancellation, is_current);
         }
         if matches!(
             requested_map,
@@ -3639,6 +3697,19 @@ fn pipeline(
             texture_array_layout_entry(13),
             texture_layout_entry(14),
         ],
+        GpuAtlasPipelineKind::EdgeDetail => vec![
+            uniform_layout_entry(0, GPU_PROFILE_HEADER_BYTES as u64),
+            readonly_storage_layout_entry(1, GPU_EDGE_DETAIL_COMMAND_BYTES as u64),
+            texture_layout_entry(2),
+            texture_layout_entry(3),
+            texture_layout_entry(4),
+            texture_layout_entry(5),
+            storage_texture_layout_entry(6, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(7, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(8, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(9, wgpu::TextureFormat::R32Float),
+            storage_texture_layout_entry(10, wgpu::TextureFormat::R32Float),
+        ],
     };
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(match kind {
@@ -3652,6 +3723,7 @@ fn pipeline(
             }
             GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-bind-layout",
             GpuAtlasPipelineKind::SemanticDetail => "hot-trimmer-semantic-detail-bind-layout",
+            GpuAtlasPipelineKind::EdgeDetail => "hot-trimmer-edge-detail-bind-layout",
         }),
         entries: &entries,
     });
@@ -3677,6 +3749,7 @@ fn pipeline(
         GpuAtlasPipelineKind::SemanticDetail => {
             hot_trimmer_preview::SEMANTIC_DETAIL_ATLAS_WGSL.into()
         }
+        GpuAtlasPipelineKind::EdgeDetail => hot_trimmer_preview::EDGE_DETAIL_ATLAS_WGSL.into(),
     };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(match kind {
@@ -3688,6 +3761,7 @@ fn pipeline(
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-wgsl",
             GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-wgsl",
             GpuAtlasPipelineKind::SemanticDetail => "hot-trimmer-semantic-detail-wgsl",
+            GpuAtlasPipelineKind::EdgeDetail => "hot-trimmer-edge-detail-wgsl",
         }),
         source: wgpu::ShaderSource::Wgsl(shader_source),
     });
@@ -3706,6 +3780,7 @@ fn pipeline(
             GpuAtlasPipelineKind::RegionIdDisplayRgba8 => "hot-trimmer-region-id-display-pipeline",
             GpuAtlasPipelineKind::StructuralProfile => "hot-trimmer-structural-profile-pipeline",
             GpuAtlasPipelineKind::SemanticDetail => "hot-trimmer-semantic-detail-pipeline",
+            GpuAtlasPipelineKind::EdgeDetail => "hot-trimmer-edge-detail-pipeline",
         }),
         layout: Some(&pipeline_layout),
         module: &shader,
@@ -4038,6 +4113,19 @@ struct GpuDetailDispatchStats {
     dispatch_ms: u128,
 }
 
+#[derive(Default)]
+struct GpuEdgeDetailDispatchStats {
+    cache_hit: bool,
+    dispatches: u32,
+    command_count: u32,
+    command_bytes: u64,
+    resident_bytes: u64,
+    source_cache_hits: u32,
+    source_upload_bytes: u64,
+    required_halo_px: u32,
+    dispatch_ms: u128,
+}
+
 const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
     (MaterialMapKind::Height, "stage15-profile-height-v1"),
     (MaterialMapKind::Roughness, "stage15-profile-sdf-v1"),
@@ -4047,6 +4135,14 @@ const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
     ),
     (MaterialMapKind::Metallic, "stage15-profile-derivative-x-v1"),
     (MaterialMapKind::Opacity, "stage15-profile-derivative-y-v1"),
+];
+
+const EDGE_DETAIL_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
+    (MaterialMapKind::BaseColor, "edge-detail-core-r32float-v1"),
+    (MaterialMapKind::Roughness, "edge-detail-transition-r32float-v1"),
+    (MaterialMapKind::AmbientOcclusion, "edge-detail-fade-r32float-v1"),
+    (MaterialMapKind::EdgeMask, "edge-detail-combined-r32float-v1"),
+    (MaterialMapKind::Height, "edge-detail-height-r32float-v1"),
 ];
 
 #[derive(Clone, Copy)]
@@ -4403,6 +4499,316 @@ fn execute_or_load_profile_fields(
     })
 }
 
+fn edge_detail_identity(
+    plan: &CompiledAtlasPlanV1,
+    map: MaterialMapKind,
+    shader: &str,
+) -> crate::CompiledAtlasTileIdentity {
+    let mut identity = plan.tile_identity(map, shader);
+    identity.pixel_format = crate::CompiledTilePixelFormat::R32Float;
+    identity
+}
+
+fn edge_detail_evaluator_code(
+    evaluator: hot_trimmer_effect_compiler::EdgeDetailRoleEvaluator,
+) -> u32 {
+    use hot_trimmer_effect_compiler::EdgeDetailRoleEvaluator;
+    match evaluator {
+        EdgeDetailRoleEvaluator::RectangularPanel => 0,
+        EdgeDetailRoleEvaluator::HorizontalStrip => 1,
+        EdgeDetailRoleEvaluator::VerticalStrip => 2,
+        EdgeDetailRoleEvaluator::RadialOuter => 3,
+        EdgeDetailRoleEvaluator::RadialInnerOuter => 4,
+        EdgeDetailRoleEvaluator::TrimCap => 5,
+        EdgeDetailRoleEvaluator::Unique => 6,
+    }
+}
+
+fn edge_detail_source_route_code(
+    route: hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute,
+) -> u32 {
+    use hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute;
+    match route {
+        EdgeDetailSourceModulationRoute::None => 0,
+        EdgeDetailSourceModulationRoute::RegisteredHeight => 1,
+        EdgeDetailSourceModulationRoute::HighPassedLinearLuminance => 2,
+    }
+}
+
+fn pack_edge_detail_command(region: &CompiledRegionCommandV1) -> Option<GpuEdgeDetailCommand> {
+    let edge = region.edge_detail.as_ref()?;
+    let destination = region.destination_rect.0;
+    let semantic = semantic_rect_for_padding(
+        hot_trimmer_domain::CanonicalRect {
+            x: destination.x, y: destination.y,
+            width: destination.width, height: destination.height,
+        },
+        region.padding_px,
+        region.edge_eligibility,
+    );
+    let eligible = region.edge_eligibility;
+    let edge_mask = u32::from(eligible.left)
+        | (u32::from(eligible.right) << 1)
+        | (u32::from(eligible.top) << 2)
+        | (u32::from(eligible.bottom) << 3);
+    Some(GpuEdgeDetailCommand {
+        evaluator: edge_detail_evaluator_code(edge.evaluator),
+        source_route: edge_detail_source_route_code(edge.source_modulation_route),
+        seed: edge.seed, edge_mask,
+        dst_x: destination.x, dst_y: destination.y,
+        dst_width: destination.width, dst_height: destination.height,
+        semantic_x: semantic.x, semantic_y: semantic.y,
+        semantic_width: semantic.width, semantic_height: semantic.height,
+        declared_halo_px: u32::from(
+            edge.source_modulation_route
+                != hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::None,
+        ),
+        cap_major_axis: u32::from(matches!(
+            edge.manual_role,
+            hot_trimmer_domain::ManualRegionRole::VerticalStrip
+        )),
+        source_stencil_halo_px: u32::from(
+            edge.source_modulation_route
+                != hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::None,
+        ),
+        _pad_u1: 0,
+        slot_width_m: edge.slot_size_m[0] as f32,
+        slot_height_m: edge.slot_size_m[1] as f32,
+        meters_per_pixel_x: edge.meters_per_pixel[0] as f32,
+        meters_per_pixel_y: edge.meters_per_pixel[1] as f32,
+        wear_amount: edge.wear_amount, intensity: edge.intensity,
+        edge_width_m: edge.edge_width_m, bevel_radius_m: edge.bevel_radius_m,
+        edge_softness: edge.edge_softness, breakup_amount: edge.breakup_amount,
+        breakup_scale_m: edge.breakup_scale_m,
+        micro_detail_amount: edge.micro_detail_amount,
+        micro_detail_scale_m: edge.micro_detail_scale_m,
+        source_height_influence: edge.source_height_influence,
+        source_luminance_influence: edge.source_luminance_influence,
+        height_amplitude_m: edge.height_amplitude_m,
+        requested_extent_m: edge.requested_physical_extent_m as f32,
+        _pad_f0: 0.0, _pad_f1: 0.0, _pad_f2: 0.0, _pad_f3: 0.0,
+    })
+}
+
+fn encode_edge_detail_commands(commands: &[GpuEdgeDetailCommand]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(commands.len() * GPU_EDGE_DETAIL_COMMAND_BYTES);
+    for command in commands {
+        for value in [
+            command.evaluator, command.source_route, command.seed, command.edge_mask,
+            command.dst_x, command.dst_y, command.dst_width, command.dst_height,
+            command.semantic_x, command.semantic_y, command.semantic_width, command.semantic_height,
+            command.declared_halo_px, command.cap_major_axis,
+            command.source_stencil_halo_px, command._pad_u1,
+        ] { bytes.extend_from_slice(&value.to_le_bytes()); }
+        for value in [
+            command.slot_width_m, command.slot_height_m, command.meters_per_pixel_x,
+            command.meters_per_pixel_y, command.wear_amount, command.intensity,
+            command.edge_width_m, command.bevel_radius_m, command.edge_softness,
+            command.breakup_amount, command.breakup_scale_m, command.micro_detail_amount,
+            command.micro_detail_scale_m, command.source_height_influence,
+            command.source_luminance_influence, command.height_amplitude_m,
+            command.requested_extent_m, command._pad_f0, command._pad_f1, command._pad_f2,
+            command._pad_f3,
+        ] { bytes.extend_from_slice(&value.to_le_bytes()); }
+    }
+    debug_assert_eq!(bytes.len(), commands.len() * GPU_EDGE_DETAIL_COMMAND_BYTES);
+    bytes
+}
+
+fn execute_or_load_edge_detail_fields(
+    executor: &GpuAtlasRenderExecutor<'_>,
+    plan: &CompiledAtlasPlanV1,
+    input: Option<&AtlasRenderExecutionInput<'_>>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cancellation: &CancellationToken,
+    is_current: &dyn Fn() -> bool,
+) -> Result<GpuEdgeDetailDispatchStats, AtlasRenderExecutionError> {
+    if cancellation.is_cancelled() { return Err(AtlasRenderExecutionError::Cancelled); }
+    if !is_current() { return Err(AtlasRenderExecutionError::Superseded); }
+    let commands = plan.ordered_regions.iter().filter_map(pack_edge_detail_command).collect::<Vec<_>>();
+    let required_halo_px = commands
+        .iter()
+        .map(|command| command.declared_halo_px.max(command.source_stencil_halo_px))
+        .max()
+        .unwrap_or(0);
+    if commands.is_empty() {
+        return Ok(GpuEdgeDetailDispatchStats { required_halo_px, ..Default::default() });
+    }
+    let tile = plan.tile_request.output_rect.0;
+    let is_bounded_tile = tile.x != 0
+        || tile.y != 0
+        || tile.width != plan.output_size.width
+        || tile.height != plan.output_size.height;
+    if is_bounded_tile && plan.tile_request.halo_px < required_halo_px {
+        return Err(AtlasRenderExecutionError::InvalidInput(format!(
+            "Edge Detail requires tile halo {required_halo_px}, but the request declares {}",
+            plan.tile_request.halo_px
+        )));
+    }
+    let bytes_per_field = u64::from(tile.width).saturating_mul(u64::from(tile.height)).saturating_mul(4);
+    let resident_bytes = bytes_per_field.saturating_mul(7);
+    if resident_bytes > GpuAtlasSourceTextureCache::budgets().gpu_output_intermediate_residency_bytes {
+        return Err(AtlasRenderExecutionError::Gpu(format!(
+            "Edge Detail fields require {resident_bytes} bytes, exceeding the bounded GPU tile residency budget"
+        )));
+    }
+    let identities = EDGE_DETAIL_FIELD_IDENTITIES.map(|(map, shader)| edge_detail_identity(plan, map, shader));
+    let cached_count = executor.source_texture_cache.lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?
+        .rendered_textures.iter().filter(|texture| identities.iter().any(|identity| {
+            texture.pixel_identity == identity.pixel_identity()
+                && texture.format == wgpu::TextureFormat::R32Float
+                && texture.width == tile.width && texture.height == tile.height
+        })).count();
+    if cached_count == identities.len() {
+        return Ok(GpuEdgeDetailDispatchStats {
+            cache_hit: true, resident_bytes: bytes_per_field * 5,
+            required_halo_px, ..Default::default()
+        });
+    }
+    execute_or_load_profile_fields(executor, plan, device, queue, cancellation, is_current)?;
+    let sdf_identity = plan.tile_identity(MaterialMapKind::Roughness, "stage15-profile-sdf-v1");
+    let semantics_identity = plan.tile_identity(MaterialMapKind::AmbientOcclusion, "stage15-profile-semantics-v1");
+    let (sdf, semantics) = {
+        let mut cache = executor.source_texture_cache.lock()
+            .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+        (
+            cache.cached_rendered_texture(&sdf_identity)
+                .ok_or_else(|| AtlasRenderExecutionError::Gpu("Stage 15 SDF field is missing".into()))?,
+            cache.cached_rendered_texture(&semantics_identity)
+                .ok_or_else(|| AtlasRenderExecutionError::Gpu("Stage 15 semantics field is missing".into()))?,
+        )
+    };
+    let started = Instant::now();
+    let (height_source_texture, height_source_view) = create_working_texture(
+        device, "hot-trimmer-edge-source-height", tile.width, tile.height,
+        wgpu::TextureFormat::R32Float,
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+    );
+    let (color_source_texture, color_source_view) = create_working_texture(
+        device, "hot-trimmer-edge-source-color", tile.width, tile.height,
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+    );
+    let fill = pipeline(device, executor.source_texture_cache, GpuAtlasPipelineKind::FillR32Float)?.0;
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-edge-source-clear"),
+    });
+    dispatch_fill_r32float_with_pipeline(
+        device, &mut encoder, None, &fill, &height_source_view, tile.width, tile.height,
+    )?;
+    encoder.clear_texture(&color_source_texture, &wgpu::ImageSubresourceRange::default());
+    submit_encoder_and_wait(device, queue, encoder)?;
+    let mut source_cache_hits = 0;
+    let mut source_upload_bytes = 0;
+    if let Some(input) = input {
+        let mut modulation_plan = plan.clone();
+        for region in &mut modulation_plan.ordered_regions { region.edge_wear = None; }
+        if commands.iter().any(|command| command.source_route == 1) {
+            let material = pipeline(device, executor.source_texture_cache, GpuAtlasPipelineKind::MaterialR32Float)?.0;
+            let stats = dispatch_material_map_to_view(
+                device, queue, executor.source_texture_cache, "edge-detail-source-height",
+                &material, &modulation_plan, input, MaterialMapKind::Height, &height_source_view,
+                device.limits().max_texture_dimension_2d, cancellation, is_current,
+            )?;
+            source_cache_hits += stats.source_cache_hits;
+            source_upload_bytes += stats.upload_bytes;
+        }
+        if commands.iter().any(|command| command.source_route == 2) {
+            let material = pipeline(device, executor.source_texture_cache, GpuAtlasPipelineKind::MaterialRgba8)?.0;
+            let stats = dispatch_material_map_to_view(
+                device, queue, executor.source_texture_cache, "edge-detail-source-linear-color",
+                &material, &modulation_plan, input, MaterialMapKind::BaseColor, &color_source_view,
+                device.limits().max_texture_dimension_2d, cancellation, is_current,
+            )?;
+            source_cache_hits += stats.source_cache_hits;
+            source_upload_bytes += stats.upload_bytes;
+        }
+    }
+    let (edge_pipeline, _) = pipeline(device, executor.source_texture_cache, GpuAtlasPipelineKind::EdgeDetail)?;
+    let header = GpuProfileHeader {
+        output_width: plan.output_size.width, output_height: plan.output_size.height,
+        tile_x: tile.x, tile_y: tile.y, tile_width: tile.width, tile_height: tile.height,
+        command_count: commands.len() as u32, _pad: plan.tile_request.halo_px,
+    };
+    let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-edge-detail-header"),
+        contents: &encode_profile_header(header), usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let command_bytes = encode_edge_detail_commands(&commands);
+    let command_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("hot-trimmer-edge-detail-commands"),
+        contents: &command_bytes, usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut fields = Vec::with_capacity(5);
+    for label in ["core", "transition", "fade", "combined", "height"] {
+        fields.push(create_working_texture(
+            device,
+            match label {
+                "core" => "hot-trimmer-edge-core",
+                "transition" => "hot-trimmer-edge-transition",
+                "fade" => "hot-trimmer-edge-fade",
+                "combined" => "hot-trimmer-edge-combined",
+                _ => "hot-trimmer-edge-height",
+            },
+            tile.width, tile.height, wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        ));
+    }
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hot-trimmer-edge-detail-bind-group"),
+        layout: &edge_pipeline.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: header_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: command_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&sdf.view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&semantics.view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&height_source_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&color_source_view) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&fields[0].1) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&fields[1].1) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&fields[2].1) },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&fields[3].1) },
+            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&fields[4].1) },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-edge-detail-encoder"),
+    });
+    for (texture, _) in &fields {
+        encoder.clear_texture(texture, &wgpu::ImageSubresourceRange::default());
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("hot-trimmer-edge-detail-dispatch"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&edge_pipeline.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(tile.width.div_ceil(16), tile.height.div_ceil(16), 1);
+    }
+    submit_encoder_and_wait(device, queue, encoder)?;
+    drop(height_source_texture);
+    drop(color_source_texture);
+    let mut cache = executor.source_texture_cache.lock()
+        .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+    for ((texture, view), identity) in fields.into_iter().zip(identities) {
+        cache.remember_rendered_texture(
+            identity, texture, view, tile.width, tile.height,
+            wgpu::TextureFormat::R32Float, bytes_per_field,
+        );
+    }
+    Ok(GpuEdgeDetailDispatchStats {
+        cache_hit: false, dispatches: 1, command_count: commands.len() as u32,
+        command_bytes: command_bytes.len() as u64, resident_bytes: bytes_per_field * 5,
+        source_cache_hits, source_upload_bytes, required_halo_px,
+        dispatch_ms: started.elapsed().as_millis(),
+    })
+}
+
+
 fn execute_or_load_detail_fields(
     executor: &GpuAtlasRenderExecutor<'_>,
     plan: &CompiledAtlasPlanV1,
@@ -4758,6 +5164,191 @@ fn execute_or_load_detail_fields(
     })
 }
 
+fn execute_edge_detail_gpu_tile(
+    executor: &GpuAtlasRenderExecutor<'_>,
+    plan: &CompiledAtlasPlanV1,
+    input: &AtlasRenderExecutionInput<'_>,
+    cancellation: &CancellationToken,
+    is_current: &dyn Fn() -> bool,
+) -> Result<AtlasRenderExecutorOutput, AtlasRenderExecutionError> {
+    let started = Instant::now();
+    let state = executor.service.initialize()
+        .map_err(|error| AtlasRenderExecutionError::Gpu(error.to_string()))?;
+    validate_tile_size(plan, state.capabilities())?;
+    require_format(state.capabilities(), "R32Float", true, true)?;
+    require_format(state.capabilities(), "Rgba8Unorm", true, true)?;
+    let device = state.device();
+    let queue = state.queue();
+    let stats = execute_or_load_edge_detail_fields(
+        executor, plan, Some(input), device, queue, cancellation, is_current,
+    )?;
+    let tile = plan.tile_request.output_rect.0;
+    let mut cached_fields = Vec::with_capacity(5);
+    {
+        let mut cache = executor.source_texture_cache.lock()
+            .map_err(|_| AtlasRenderExecutionError::Gpu("GPU atlas cache is unavailable".into()))?;
+        for (map, shader) in EDGE_DETAIL_FIELD_IDENTITIES {
+            let identity = edge_detail_identity(plan, map, shader);
+            cached_fields.push(cache.cached_rendered_texture(&identity).ok_or_else(|| {
+                AtlasRenderExecutionError::Gpu(format!("Edge Detail output {shader} is missing"))
+            })?);
+        }
+    }
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("hot-trimmer-edge-detail-readback"),
+    });
+    let mut pending = Vec::with_capacity(5);
+    for field in &cached_fields {
+        pending.push(schedule_readback(
+            device, executor.source_texture_cache, &mut encoder, &field._texture,
+            tile.width, tile.height, 4,
+        )?);
+    }
+    queue.submit(Some(encoder.finish()));
+    let mut payloads = Vec::with_capacity(5);
+    let mut readback_ms = 0;
+    let mut readback_bytes = 0;
+    for readback in pending {
+        let (pixels, elapsed) = finish_readback(device, readback)?;
+        readback_ms += elapsed;
+        readback_bytes += pixels.len() as u64;
+        payloads.push(pixels);
+    }
+    let combined_pixels = Arc::clone(&payloads[3]);
+    let combined_tile = remember_rendered_tile(
+        executor.source_texture_cache, plan, MaterialMapKind::EdgeMask, combined_pixels,
+    )?;
+    let mut intermediate_tiles = BTreeMap::new();
+    for (index, label) in ["edge-detail.core", "edge-detail.transition", "edge-detail.fade", "edge-detail.combined", "edge-detail.height"].into_iter().enumerate() {
+        let (map, shader) = EDGE_DETAIL_FIELD_IDENTITIES[index];
+        let tile = remember_rendered_tile_with_identity(
+            executor.source_texture_cache, plan, map,
+            edge_detail_identity(plan, map, shader), Arc::clone(&payloads[index]),
+        )?;
+        intermediate_tiles.insert(label.into(), tile);
+    }
+    let mut map_tiles = BTreeMap::new();
+    map_tiles.insert(MaterialMapKind::EdgeMask, Arc::clone(&combined_tile));
+    let mut display_tiles = BTreeMap::new();
+    display_tiles.insert(MaterialMapKind::EdgeMask, Arc::clone(&combined_tile));
+    let smooth_values = combined_tile.pixels().chunks_exact(4).filter(|pixel| {
+        let value = f32::from_le_bytes((*pixel).try_into().unwrap_or([0; 4]));
+        value > 0.0 && value < 1.0
+    }).count();
+    let edge_regions = plan
+        .ordered_regions
+        .iter()
+        .filter_map(|region| region.edge_detail.as_ref().map(|edge| (region, edge)))
+        .collect::<Vec<_>>();
+    let eligible_regions = plan
+        .ordered_regions
+        .iter()
+        .filter(|region| {
+            let edge = region.edge_eligibility;
+            edge.left || edge.right || edge.top || edge.bottom
+        })
+        .count();
+    let scope = if edge_regions.len() == eligible_regions {
+        "global"
+    } else {
+        "region"
+    };
+    let region_ids = edge_regions
+        .iter()
+        .map(|(region, _)| format!("{:?}", region.region_id))
+        .collect::<Vec<_>>()
+        .join("|");
+    let source_routes = edge_regions
+        .iter()
+        .map(|(_, edge)| format!("{:?}", edge.source_modulation_route))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|");
+    let source_identities = edge_regions
+        .iter()
+        .filter_map(|(_, edge)| edge.source_modulation_identity.as_ref())
+        .map(|identity| identity.0.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|");
+    let lod_fallbacks = edge_regions
+        .iter()
+        .filter_map(|(region, edge)| edge.lod_fallback.as_ref().map(|fallback| (region, fallback)))
+        .map(|(region, fallback)| format!(
+            "{:?}:{}:mpp={:.9}:edge={:.9}->{:.9}:breakup={:.9}->{:.9}:micro={:.9}->{:.9}",
+            region.region_id,
+            fallback.policy,
+            fallback.maximum_meters_per_pixel,
+            fallback.authored_edge_width_m,
+            fallback.effective_edge_width_m,
+            fallback.authored_breakup_scale_m,
+            fallback.effective_breakup_scale_m,
+            fallback.authored_micro_detail_scale_m,
+            fallback.effective_micro_detail_scale_m,
+        ))
+        .collect::<Vec<_>>()
+        .join("|");
+    let sdf_identity = plan.tile_identity(MaterialMapKind::Roughness, "stage15-profile-sdf-v1");
+    let semantics_identity = plan.tile_identity(
+        MaterialMapKind::AmbientOcclusion,
+        "stage15-profile-semantics-v1",
+    );
+    let output_identities = EDGE_DETAIL_FIELD_IDENTITIES
+        .iter()
+        .map(|(map, shader)| {
+            let identity = edge_detail_identity(plan, *map, shader);
+            format!("{shader}:{:?}:{:?}", identity.pixel_format, identity.output_rect.0)
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let telemetry = vec![
+        format!(
+            "executor=gpu; backend={}; plan_hash={}; requested_map=EdgeMask; logical_passes={}; executed_gpu_passes=stage15-profile,edge-detail-mvp-v1; shader_identity=edge-detail-mvp-v1; mask_format=R32Float; height_format=R32Float; final_tile_cache=miss; edge_detail_cache={}; dispatches={}; command_count={}; command_bytes={}; resident_bytes={}; required_halo_px={}; source_cache_hits={}; source_upload_bytes={}; dispatch_ms={}; readback_ms={}; smooth_intermediate_pixels={smooth_values}; render_ms={}",
+            state.capabilities().backend, plan.final_plan_hash.0,
+            logical_passes_for_map(plan, MaterialMapKind::EdgeMask),
+            if stats.cache_hit { "CacheHit" } else { "CacheMiss" },
+            stats.dispatches, stats.command_count, stats.command_bytes,
+            stats.resident_bytes, stats.required_halo_px, stats.source_cache_hits,
+            stats.source_upload_bytes, stats.dispatch_ms, readback_ms,
+            started.elapsed().as_millis(),
+        ),
+        format!(
+            "requested_map_dependencies=EdgeMask<-Stage15Sdf|Stage15Semantics|EdgeDetailCombined; scope={scope}; region_ids={region_ids}; stage15_sdf_identity={}:{}; stage15_semantics_identity={}:{}; selected_source_routes={source_routes}; selected_source_identities={source_identities}; lod_fallbacks={lod_fallbacks}; output_identities={output_identities}; edge_detail_outputs=core|transition|fade|combined|signed-physical-height; declared_halo_px={}; resident_bytes={}; dispatch_ms={}; cache_result={}",
+            sdf_identity.structural_plan_id.0,
+            sdf_identity.shader_version,
+            semantics_identity.structural_plan_id.0,
+            semantics_identity.shader_version,
+            stats.required_halo_px,
+            stats.resident_bytes,
+            stats.dispatch_ms,
+            if stats.cache_hit { "CacheHit" } else { "CacheMiss" },
+        ),
+    ];
+    Ok(AtlasRenderExecutorOutput::FinalAtlas(AtlasFinalAtlasOutput {
+        map_tiles: map_tiles.clone(),
+        display_tiles,
+        intermediate_tiles,
+        base_color_rgba8: combined_tile.payload(),
+        interactive_tile: combined_tile,
+        tile_timings: tile_timings_for(&map_tiles, stats.dispatch_ms, readback_ms),
+        region_valid_pixel_counts: final_atlas_metadata(plan)?,
+        render_ms: started.elapsed().as_millis(),
+        source_cache_hits: stats.source_cache_hits,
+        pipeline_cache_hits: u32::from(stats.cache_hit),
+        upload_bytes: stats.source_upload_bytes,
+        upload_ms: 0,
+        command_count: stats.command_count,
+        command_bytes: stats.command_bytes,
+        dispatch_ms: stats.dispatch_ms,
+        readback_bytes,
+        readback_ms,
+        telemetry,
+    }))
+}
+
+
 fn execute_r32float_material_tile(
     executor: &GpuAtlasRenderExecutor<'_>,
     plan: &CompiledAtlasPlanV1,
@@ -4812,7 +5403,7 @@ fn execute_r32float_material_tile(
                 telemetry: vec![format!(
                     "executor=gpu; plan_hash={}; requested_map={requested_map:?}; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; intermediate_cache=not-available; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}",
                     plan.final_plan_hash.0,
-                    logical_passes_for_map(requested_map)
+                    logical_passes_for_map(plan, requested_map)
                 )],
             },
         ));
@@ -5025,7 +5616,7 @@ fn execute_r32float_material_tile(
         "executor=gpu; backend={}; plan_hash={}; requested_map={requested_map:?}; logical_passes={}; executed_gpu_passes=material-r32float-publish,material-rgba8-display-publish; pixel_format=R32Float; display_pixel_format=Rgba8UnormLinear; final_tile_cache=miss; intermediate_cache=not-available; source_cache_hits={}; source_resident_bytes={source_resident_bytes}; source_resident_layers={source_resident_layers}; checked_out_source_resident_bytes_peak={checked_out_source_resident_bytes_peak}; checked_out_source_layers_peak={checked_out_source_layers_peak}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={}; readback_ms={}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; composition_ms=0; render_ms={}",
         state.capabilities().backend,
         plan.final_plan_hash.0,
-        logical_passes_for_map(requested_map),
+        logical_passes_for_map(plan, requested_map),
         stats
             .source_cache_hits
             .saturating_add(display_stats.source_cache_hits),
@@ -5157,7 +5748,7 @@ fn execute_detail_material_id_gpu_tile(
                 telemetry: vec![format!(
                     "executor=gpu; plan_hash={}; requested_map=MaterialId; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}",
                     plan.final_plan_hash.0,
-                    logical_passes_for_map(requested_map)
+                    logical_passes_for_map(plan, requested_map)
                 )],
             },
         ));
@@ -5264,7 +5855,7 @@ fn execute_detail_material_id_gpu_tile(
                 "executor=gpu; backend={}; plan_hash={}; requested_map=MaterialId; logical_passes={}; executed_gpu_passes=semantic-detail-publish; pixel_format=R32Uint; final_tile_cache=miss; detail_cache_hit={}; detail_commands={}; detail_command_bytes={}; detail_resident_bytes={}; detail_asset_resident_bytes={}; detail_asset_upload_bytes={}; detail_dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; render_ms={}",
                 state.capabilities().backend,
                 plan.final_plan_hash.0,
-                logical_passes_for_map(requested_map),
+                logical_passes_for_map(plan, requested_map),
                 detail_stats.cache_hit,
                 detail_stats.command_count,
                 detail_stats.command_bytes,
@@ -5331,7 +5922,7 @@ fn execute_region_id_gpu_tile(
                 telemetry: vec![format!(
                     "executor=gpu; plan_hash={}; requested_map=RegionId; logical_passes={}; executed_gpu_passes=none; final_tile_cache=hit; gpu_tile_cache=hit; dispatch_ms=0; readback_ms=0; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}",
                     plan.final_plan_hash.0,
-                    logical_passes_for_map(requested_map)
+                    logical_passes_for_map(plan, requested_map)
                 )],
             },
         ));
@@ -5565,7 +6156,7 @@ fn execute_region_id_gpu_tile(
         "executor=gpu; backend={}; plan_hash={}; requested_map=RegionId; logical_passes={}; executed_gpu_passes=compact-region-id-r32uint,compact-region-id-rgba8-display; pixel_format=R32Uint; display_pixel_format=Rgba8UnormLinear; final_tile_cache=miss; pipeline_cache_hits={}; pipeline_ms={pipeline_ms}; command_count={}; command_bytes={}; dispatch_ms={dispatch_ms}; readback_bytes={}; readback_ms={}; tile_nontransparent={nontransparent}; tile_nonzero_rgb={nonzero_rgb}; render_ms={}",
         state.capabilities().backend,
         plan.final_plan_hash.0,
-        logical_passes_for_map(requested_map),
+        logical_passes_for_map(plan, requested_map),
         u32::from(pipeline_cache_hit) + u32::from(display_pipeline_cache_hit),
         plan.ordered_regions.len(),
         command_buffer_bytes.len(),
@@ -6129,7 +6720,7 @@ fn execute_height_normal_gpu(
         "executor=gpu; backend={}; plan_hash={}; requested_map=Normal; logical_passes={}; executed_gpu_passes={}; dependency={}; intermediate_cache={}; normal_publish={}; source_cache_hits={}; source_resident_bytes={source_resident_bytes}; source_resident_layers={source_resident_layers}; checked_out_source_resident_bytes_peak={checked_out_source_resident_bytes_peak}; checked_out_source_layers_peak={checked_out_source_layers_peak}; pipeline_cache_hits={}; upload_bytes={}; upload_ms={}; command_count={}; command_bytes={}; pipeline_ms={pipeline_ms}; dispatch_ms={}; readback_bytes={readback_bytes}; readback_ms={readback_ms}; render_ms={}",
         state.capabilities().backend,
         plan.final_plan_hash.0,
-        logical_passes_for_map(MaterialMapKind::Normal),
+        logical_passes_for_map(plan, MaterialMapKind::Normal),
         if has_authored_normal {
             if cached_height_texture.is_some() {
                 "height-r32float-gpu-resource-cache,authored-normal-sample"
@@ -10120,7 +10711,11 @@ mod tests {
         map: MaterialMapKind,
         shader: &str,
     ) -> Arc<[u8]> {
-        let identity = plan.tile_identity(map, shader);
+        let identity = if shader.starts_with("edge-detail-") {
+            edge_detail_identity(plan, map, shader)
+        } else {
+            plan.tile_identity(map, shader)
+        };
         let texture = cache
             .lock()
             .unwrap()
@@ -12207,4 +12802,624 @@ mod tests {
         assert_eq!(empty_stats.command_count, 0);
         assert_eq!(empty_stats.dispatches, 0);
     }
+
+
+    #[test]
+    fn native_edge_detail_gpu_fixture_covers_roles_masks_height_and_cache() {
+        use hot_trimmer_effect_compiler::{
+            CompiledEdgeDetailCommand, EdgeDetailRoleEvaluator,
+            EdgeDetailSourceModulationRoute, EDGE_DETAIL_ALGORITHM_ID,
+            EDGE_DETAIL_ALGORITHM_VERSION,
+        };
+        let gpu = hot_trimmer_preview::GpuCapabilityService::default();
+        let handle = gpu.initialize().expect("GPU service should initialize for Edge Detail");
+        let cancellation = CancellationToken::new();
+        let rectangular_plan = |width: u32, height: u32, slot_size_m: [f64; 2]| {
+            let mut plan = gpu_tiled_export_resized_plan(width.max(height));
+            let bounds = PixelBounds { x: 0, y: 0, width, height };
+            plan.output_size = PixelSize { width, height };
+            plan.tile_request.output_rect = OutputPixelRect(bounds);
+            plan.tile_request.valid_rect = OutputPixelRect(bounds);
+            plan.ordered_sources[0].oriented_dimensions.width = width;
+            plan.ordered_sources[0].oriented_dimensions.height = height;
+            let region = &mut plan.ordered_regions[0];
+            region.source_crop = SourcePixelRect(bounds);
+            region.destination_rect = OutputPixelRect(bounds);
+            region.sampling_plan.prepared_domain_dimensions = [width, height];
+            region.sampling_plan.candidate.crop = Some(SourceCrop {
+                x: 0, y: 0, width, height,
+            });
+            region.sampling_plan.slot_physical_size = slot_size_m;
+            region.compiled_profile = crate::compile_profile_for_region(
+                region.structural_profile,
+                &region.sampling_plan,
+                bounds,
+                &ContentDigest::sha256(b"edge-detail-profile"),
+            ).expect("Edge Detail profile fixture");
+            plan
+        };
+        for evaluator in [
+            EdgeDetailRoleEvaluator::RectangularPanel,
+            EdgeDetailRoleEvaluator::HorizontalStrip,
+            EdgeDetailRoleEvaluator::VerticalStrip,
+            EdgeDetailRoleEvaluator::RadialOuter,
+            EdgeDetailRoleEvaluator::RadialInnerOuter,
+            EdgeDetailRoleEvaluator::TrimCap,
+        ] {
+            let mut plan = match evaluator {
+                EdgeDetailRoleEvaluator::HorizontalStrip | EdgeDetailRoleEvaluator::TrimCap => {
+                    rectangular_plan(256, 16, [256.0, 16.0])
+                }
+                EdgeDetailRoleEvaluator::VerticalStrip => {
+                    rectangular_plan(16, 256, [16.0, 256.0])
+                }
+                _ => rectangular_plan(64, 64, [64.0, 64.0]),
+            };
+            plan.requested_maps = vec![MaterialMapKind::EdgeMask];
+            if evaluator == EdgeDetailRoleEvaluator::HorizontalStrip {
+                plan.ordered_regions[0].sampling_plan.role = TemplateSlotRole::RepeatingStrip;
+                plan.ordered_regions[0].region_role = ManualRegionRole::HorizontalStrip;
+            } else if evaluator == EdgeDetailRoleEvaluator::VerticalStrip {
+                plan.ordered_regions[0].sampling_plan.role = TemplateSlotRole::RepeatingStrip;
+                plan.ordered_regions[0].region_role = ManualRegionRole::VerticalStrip;
+            } else if evaluator == EdgeDetailRoleEvaluator::TrimCap {
+                plan.ordered_regions[0].sampling_plan.role = TemplateSlotRole::TrimCap;
+                plan.ordered_regions[0].region_role = ManualRegionRole::HorizontalStrip;
+            } else if matches!(
+                evaluator,
+                EdgeDetailRoleEvaluator::RadialOuter
+                    | EdgeDetailRoleEvaluator::RadialInnerOuter
+            ) {
+                use hot_trimmer_effect_compiler::{
+                    ProfileCompileRequest, ProfileLength, ProfileProgram, RequestedProfile,
+                    compile_profile, conservative_profile_capacity,
+                };
+                let region = &mut plan.ordered_regions[0];
+                region.sampling_plan.role = TemplateSlotRole::Radial;
+                region.region_role = ManualRegionRole::Radial;
+                region.structural_profile = if evaluator == EdgeDetailRoleEvaluator::RadialOuter {
+                    StructuralProfile::RadialDisc
+                } else {
+                    StructuralProfile::Annulus
+                };
+                let mut requested = RequestedProfile::from_structural_intent(
+                    region.structural_profile,
+                    0xED02,
+                );
+                requested.program = if evaluator == EdgeDetailRoleEvaluator::RadialOuter {
+                    ProfileProgram::RadialDisc
+                } else {
+                    ProfileProgram::Annulus
+                };
+                requested.first_width = ProfileLength::Meters(8.0);
+                requested.second_width = ProfileLength::Meters(5.0);
+                requested.inner_radius = ProfileLength::Meters(16.0);
+                requested.outer_radius = ProfileLength::Meters(28.0);
+                requested.maximum_supersampling = 1;
+                region.compiled_profile = compile_profile(ProfileCompileRequest {
+                    requested: &requested,
+                    slot_size_m: [64.0, 64.0],
+                    destination_pixels: [64, 64],
+                    capacity: &conservative_profile_capacity([64.0, 64.0]),
+                    upstream_identity: &ContentDigest::sha256(b"edge-detail-radial-profile"),
+                }).expect("radial Edge Detail profile");
+            }
+            let region = &plan.ordered_regions[0];
+            let edge = CompiledEdgeDetailCommand {
+                schema_version: 1,
+                region_id: region.region_id,
+                role: region.sampling_plan.role,
+                manual_role: region.region_role,
+                structural_profile: region.structural_profile,
+                slot_size_m: region.sampling_plan.slot_physical_size,
+                meters_per_pixel: [
+                    region.sampling_plan.slot_physical_size[0]
+                        / f64::from(region.destination_rect.0.width),
+                    region.sampling_plan.slot_physical_size[1]
+                        / f64::from(region.destination_rect.0.height),
+                ],
+                edge_eligibility: region.edge_eligibility,
+                evaluator,
+                source_modulation_route: EdgeDetailSourceModulationRoute::None,
+                source_modulation_identity: None,
+                requested_physical_extent_m: 14.0,
+                seed: 0xED02,
+                intent_identity: ContentDigest::sha256(b"edge-detail-intent"),
+                stage15_plan_identity: region.compiled_profile.cache_identity.clone(),
+                requested_maps: vec![MaterialMapKind::EdgeMask, MaterialMapKind::Height],
+                resolution_profile: "gpu-fixture".into(),
+                lod_fallback: None,
+                wear_amount: 0.8,
+                intensity: 0.85,
+                edge_width_m: 8.0,
+                bevel_radius_m: 5.0,
+                edge_softness: 0.3,
+                breakup_amount: 0.7,
+                breakup_scale_m: 16.0,
+                micro_detail_amount: 0.25,
+                micro_detail_scale_m: 2.0,
+                source_height_influence: 0.0,
+                source_luminance_influence: 0.0,
+                height_amplitude_m: -0.35,
+                normal_detail_strength: 1.0,
+                hue_shift_degrees: 0.0,
+                saturation_multiplier: 0.55,
+                value_multiplier: 1.12,
+                roughness_offset: 0.18,
+                exposed_metal_enabled: false,
+                metallic_offset: 0.0,
+                algorithm_id: EDGE_DETAIL_ALGORITHM_ID.into(),
+                algorithm_version: EDGE_DETAIL_ALGORITHM_VERSION.into(),
+                cache_identity: ContentDigest::sha256(format!("{evaluator:?}").as_bytes()),
+            };
+            plan.ordered_regions[0].edge_detail = Some(edge);
+            plan.final_plan_hash = ContentDigest(String::new());
+            plan = plan.finalize().expect("valid Edge Detail fixture plan");
+            let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+            let executor = GpuAtlasRenderExecutor { service: &gpu, source_texture_cache: &cache };
+            let stats = execute_or_load_edge_detail_fields(
+                &executor, &plan, None, handle.device(), handle.queue(),
+                &cancellation, &|| true,
+            ).expect("Edge Detail role should execute");
+            assert_eq!(stats.dispatches, 1);
+            let read = |index: usize| {
+                let (map, shader) = EDGE_DETAIL_FIELD_IDENTITIES[index];
+                read_cached_profile_field(&handle, &cache, &plan, map, shader)
+            };
+            let fields = [read(0), read(1), read(2), read(3), read(4)];
+            let fixture_width = plan.tile_request.output_rect.0.width;
+            let fixture_height = plan.tile_request.output_rect.0.height;
+            for field in &fields {
+                assert_eq!(field.len(), (fixture_width * fixture_height * 4) as usize);
+            }
+            let values = |bytes: &[u8]| bytes.chunks_exact(4)
+                .map(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let combined = values(&fields[3]);
+            assert!(combined.iter().any(|value| *value > 0.0 && *value < 1.0));
+            for field in &fields[0..4] {
+                assert!(values(field).iter().any(|value| *value > 0.0));
+            }
+            let height_bits = values(&fields[4]).into_iter()
+                .filter(|value| value.abs() > 1.0e-6)
+                .map(f32::to_bits).collect::<BTreeSet<_>>();
+            assert!(height_bits.len() > 3, "rounded Height profile");
+            if evaluator == EdgeDetailRoleEvaluator::HorizontalStrip {
+                let along = (1..255).map(|x| {
+                    (r32_pixel(&fields[3], 256, x, 1)
+                        - r32_pixel(&fields[3], 256, x - 1, 1)).abs()
+                }).sum::<f32>() / 254.0;
+                let across = (1..15).map(|y| {
+                    (r32_pixel(&fields[3], 256, 128, y)
+                        - r32_pixel(&fields[3], 256, 128, y - 1)).abs()
+                }).sum::<f32>() / 14.0;
+                assert!(along < across, "horizontal strip must correlate along X");
+            }
+            if evaluator == EdgeDetailRoleEvaluator::VerticalStrip {
+                let along = (1..255).map(|y| {
+                    (r32_pixel(&fields[3], 16, 1, y)
+                        - r32_pixel(&fields[3], 16, 1, y - 1)).abs()
+                }).sum::<f32>() / 254.0;
+                let across = (1..15).map(|x| {
+                    (r32_pixel(&fields[3], 16, x, 128)
+                        - r32_pixel(&fields[3], 16, x - 1, 128)).abs()
+                }).sum::<f32>() / 14.0;
+                assert!(along < across, "vertical strip must correlate along Y");
+            }
+            if matches!(
+                evaluator,
+                EdgeDetailRoleEvaluator::RadialOuter
+                    | EdgeDetailRoleEvaluator::RadialInnerOuter
+            ) {
+                let above = r32_pixel(&fields[3], 64, 4, 31);
+                let below = r32_pixel(&fields[3], 64, 4, 32);
+                assert!(above > 0.0 || below > 0.0, "radial seam probe must be active");
+                assert!((above - below).abs() < 0.08, "radial angular seam continuity");
+            }
+            let cached = execute_or_load_edge_detail_fields(
+                &executor, &plan, None, handle.device(), handle.queue(),
+                &cancellation, &|| true,
+            ).expect("repeated request should be cached");
+            assert!(cached.cache_hit);
+            assert_eq!(cached.dispatches, 0);
+        }
+
+        let mut multi = rectangular_plan(96, 64, [0.096, 0.064]);
+        multi.requested_maps = vec![MaterialMapKind::EdgeMask];
+        let base = multi.ordered_regions.remove(0);
+        multi.ordered_regions = (0..3)
+            .map(|index| {
+                let mut region = base.clone();
+                let region_id = RegionId::new();
+                let rect = PixelBounds { x: index * 32, y: 0, width: 32, height: 64 };
+                region.region_id = region_id;
+                region.compact_index = index;
+                region.source_crop = SourcePixelRect(rect);
+                region.destination_rect = OutputPixelRect(rect);
+                region.padding_px = if index == 2 { 3 } else { 0 };
+                region.sampling_plan.slot_id = region_id;
+                region.sampling_plan.candidate.slot_id = region_id;
+                region.sampling_plan.candidate.crop = Some(SourceCrop {
+                    x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+                });
+                region.sampling_plan.slot_physical_size = [0.032, 0.064];
+                region.compiled_profile = crate::compile_profile_for_region(
+                    region.structural_profile,
+                    &region.sampling_plan,
+                    rect,
+                    &ContentDigest::sha256(format!("edge-adjacent-{index}").as_bytes()),
+                ).expect("adjacent profile");
+                region.render_cache_key =
+                    ContentDigest::sha256(format!("edge-adjacent-render-{index}").as_bytes());
+                region
+            })
+            .collect();
+        let mut intent = hot_trimmer_domain::EdgeDetailIntentV1::default();
+        intent.source_height_influence = 0.0;
+        intent.source_luminance_influence = 0.0;
+        let inputs = multi.ordered_regions.iter().map(|region| {
+            hot_trimmer_effect_compiler::EdgeDetailRegionInput {
+                region_id: region.region_id,
+                role: region.sampling_plan.role,
+                manual_role: region.region_role,
+                structural_profile: region.structural_profile,
+                slot_size_m: region.sampling_plan.slot_physical_size,
+                destination_pixels: [
+                    region.destination_rect.0.width,
+                    region.destination_rect.0.height,
+                ],
+                edge_eligibility: region.edge_eligibility,
+                stage15_plan_identity: region.compiled_profile.cache_identity.clone(),
+                source_height_identity: None,
+                source_luminance_identity: None,
+            }
+        }).collect::<Vec<_>>();
+        let compiled = hot_trimmer_effect_compiler::compile_edge_detail_plan(
+            &hot_trimmer_effect_compiler::EdgeDetailCompileRequest {
+                intent: &intent,
+                regions: &inputs,
+                requested_maps: &[MaterialMapKind::EdgeMask, MaterialMapKind::Height],
+                resolution_profile: "global-adjacency-padding",
+            },
+        ).expect("global Edge Detail compile");
+        for region in &mut multi.ordered_regions {
+            region.edge_detail = compiled.commands.iter()
+                .find(|command| command.region_id == region.region_id).cloned();
+        }
+        multi.final_plan_hash = ContentDigest(String::new());
+        multi = multi.finalize().expect("multi-region Edge Detail fixture");
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let executor = GpuAtlasRenderExecutor { service: &gpu, source_texture_cache: &cache };
+        let global_stats = execute_or_load_edge_detail_fields(
+            &executor, &multi, None, handle.device(), handle.queue(),
+            &cancellation, &|| true,
+        ).expect("global adjacency fixture");
+        assert_eq!(global_stats.command_count, 3);
+        let combined = read_cached_profile_field(
+            &handle, &cache, &multi, MaterialMapKind::EdgeMask,
+            "edge-detail-combined-r32float-v1",
+        );
+        for x in [1, 16, 31, 32, 47, 63, 67, 80, 92] {
+            let nonzero = (0..64).any(|y| r32_pixel(&combined, 96, x, y) > 0.0);
+            assert!(nonzero, "global output must reach eligible region column {x}");
+        }
+        for x in [64, 65, 66, 93, 94, 95] {
+            for y in 0..64 {
+                assert_eq!(
+                    r32_pixel(&combined, 96, x, y),
+                    0.0,
+                    "padding pixel ({x},{y}) must remain zero",
+                );
+            }
+        }
+
+
+        let attach_source_edge = |
+            plan: &mut CompiledAtlasPlanV1,
+            route: hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute,
+            source_identity: Option<ContentDigest>,
+        | {
+            let region = &plan.ordered_regions[0];
+            let mut source_intent = hot_trimmer_domain::EdgeDetailIntentV1::default();
+            source_intent.source_height_influence =
+                if route == hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::RegisteredHeight {
+                    0.65
+                } else {
+                    0.0
+                };
+            source_intent.source_luminance_influence =
+                if route == hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::HighPassedLinearLuminance {
+                    0.5
+                } else {
+                    0.0
+                };
+            let source_input = hot_trimmer_effect_compiler::EdgeDetailRegionInput {
+                region_id: region.region_id,
+                role: region.sampling_plan.role,
+                manual_role: region.region_role,
+                structural_profile: region.structural_profile,
+                slot_size_m: region.sampling_plan.slot_physical_size,
+                destination_pixels: [
+                    region.destination_rect.0.width,
+                    region.destination_rect.0.height,
+                ],
+                edge_eligibility: region.edge_eligibility,
+                stage15_plan_identity: region.compiled_profile.cache_identity.clone(),
+                source_height_identity: if route
+                    == hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::RegisteredHeight
+                {
+                    source_identity.clone()
+                } else {
+                    None
+                },
+                source_luminance_identity: if route
+                    == hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::HighPassedLinearLuminance
+                {
+                    source_identity
+                } else {
+                    None
+                },
+            };
+            let compiled = hot_trimmer_effect_compiler::compile_edge_detail_plan(
+                &hot_trimmer_effect_compiler::EdgeDetailCompileRequest {
+                    intent: &source_intent,
+                    regions: &[source_input],
+                    requested_maps: &[MaterialMapKind::EdgeMask, MaterialMapKind::Height],
+                    resolution_profile: "source-modulation-fixture",
+                },
+            ).expect("source-aware Edge Detail compile");
+            plan.ordered_regions[0].edge_detail = compiled.commands.into_iter().next();
+            plan.final_plan_hash = ContentDigest(String::new());
+            *plan = plan.clone().finalize().expect("source-aware Edge Detail plan");
+        };
+        let render_combined = |
+            plan: &CompiledAtlasPlanV1,
+            input: Option<&AtlasRenderExecutionInput<'_>>,
+        | {
+            let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+            let executor = GpuAtlasRenderExecutor { service: &gpu, source_texture_cache: &cache };
+            let stats = execute_or_load_edge_detail_fields(
+                &executor, plan, input, handle.device(), handle.queue(),
+                &cancellation, &|| true,
+            ).expect("source-aware Edge Detail execution");
+            let bytes = read_cached_profile_field(
+                &handle, &cache, plan, MaterialMapKind::EdgeMask,
+                "edge-detail-combined-r32float-v1",
+            );
+            (bytes, stats)
+        };
+
+        let mut no_source = rectangular_plan(64, 64, [0.064, 0.064]);
+        no_source.requested_maps = vec![MaterialMapKind::EdgeMask];
+        attach_source_edge(
+            &mut no_source,
+            hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::None,
+            None,
+        );
+        let (no_source_bytes, _) = render_combined(&no_source, None);
+        let (no_source_repeat, _) = render_combined(&no_source, None);
+        assert_eq!(no_source_bytes, no_source_repeat, "same seed is byte deterministic");
+        let publication_cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let publication_executor = GpuAtlasRenderExecutor {
+            service: &gpu,
+            source_texture_cache: &publication_cache,
+        };
+        let empty_input = AtlasRenderExecutionInput {
+            prepared_sources: Vec::new(),
+            source_frame_cache: None,
+        };
+        execute_edge_detail_gpu_tile(
+            &publication_executor,
+            &no_source,
+            &empty_input,
+            &cancellation,
+            &|| true,
+        ).expect("initial Edge Detail publication");
+        let repeated_publication = execute_edge_detail_gpu_tile(
+            &publication_executor,
+            &no_source,
+            &empty_input,
+            &cancellation,
+            &|| true,
+        ).expect("repeated Edge Detail publication");
+        let repeated_publication = repeated_publication
+            .as_final_atlas()
+            .expect("GPU final atlas");
+        assert!(
+            repeated_publication.telemetry.iter()
+                .any(|line| line.contains("edge_detail_cache=CacheHit")),
+            "identical publication must truthfully report CacheHit",
+        );
+        assert_eq!(
+            repeated_publication.interactive_tile.manifest.generation,
+            no_source.tile_request.generation,
+        );
+
+        let gray_pixels = vec![
+            LinearColor { rgb: [0.5, 0.5, 0.5], alpha: 1.0 };
+            64 * 64
+        ];
+        let gray_plane = ImagePlane::from_row_major(64, 64, 64, &gray_pixels).unwrap();
+        let gray_domain = Arc::new(PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(b"constant-gray-domain"),
+            ContentDigest::sha256(b"constant-gray-prepared"),
+            vec![PreparedExemplarChannel::BaseColor {
+                plane: gray_plane,
+                alpha_mode: hot_trimmer_image_io::ResolvedAlphaMode::Straight,
+            }],
+        ).unwrap());
+        let mut gray_plan = rectangular_plan(64, 64, [0.064, 0.064]);
+        gray_plan.requested_maps = vec![MaterialMapKind::EdgeMask];
+        let gray_identity = gray_plan.ordered_sources[0].digest.clone();
+        attach_source_edge(
+            &mut gray_plan,
+            hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::HighPassedLinearLuminance,
+            Some(gray_identity),
+        );
+        let gray_input = AtlasRenderExecutionInput {
+            prepared_sources: vec![AtlasPreparedSource {
+                source_set_id: gray_plan.ordered_sources[0].source_set_id,
+                source_id: gray_plan.ordered_sources[0].source_id.clone(),
+                channel_role: MaterialChannelRole::BaseColor,
+                domain: gray_domain,
+            }],
+            source_frame_cache: None,
+        };
+        let (gray_bytes, gray_stats) = render_combined(&gray_plan, Some(&gray_input));
+        assert_eq!(
+            no_source_bytes, gray_bytes,
+            "constant-gray high-pass must not alter Edge Detail or bleed at bounds",
+        );
+        assert!(gray_stats.source_upload_bytes > 0 || gray_stats.source_cache_hits > 0);
+
+        let height_values = (0..64 * 64)
+            .map(|index| LinearScalar(((index % 64) as f32 / 63.0).clamp(0.0, 1.0)))
+            .collect::<Vec<_>>();
+        let height_plane = ImagePlane::from_row_major(64, 64, 64, &height_values).unwrap();
+        let height_domain = Arc::new(PreparedMaterialDomain::from_registered_channels(
+            ContentDigest::sha256(b"controlled-height-domain"),
+            ContentDigest::sha256(b"controlled-height-prepared"),
+            vec![PreparedExemplarChannel::Scalar {
+                role: MaterialChannelRole::Height,
+                plane: height_plane,
+            }],
+        ).unwrap());
+        let mut height_plan = rectangular_plan(64, 64, [0.064, 0.064]);
+        height_plan.requested_maps = vec![MaterialMapKind::EdgeMask];
+        let mut height_source = height_plan.ordered_sources[0].clone();
+        height_source.channel_role = MaterialChannelRole::Height;
+        height_source.decoded_format = "r32float".into();
+        height_source.digest = ContentDigest::sha256(b"controlled-height-source");
+        height_plan.ordered_sources.push(height_source.clone());
+        attach_source_edge(
+            &mut height_plan,
+            hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::RegisteredHeight,
+            Some(height_source.digest.clone()),
+        );
+        let height_input = AtlasRenderExecutionInput {
+            prepared_sources: vec![AtlasPreparedSource {
+                source_set_id: height_source.source_set_id,
+                source_id: height_source.source_id,
+                channel_role: MaterialChannelRole::Height,
+                domain: height_domain,
+            }],
+            source_frame_cache: None,
+        };
+        let (height_source_bytes, height_source_stats) =
+            render_combined(&height_plan, Some(&height_input));
+        assert_ne!(
+            no_source_bytes, height_source_bytes,
+            "registered source Height must modulate breakup",
+        );
+        assert!(height_source_stats.source_upload_bytes > 0
+            || height_source_stats.source_cache_hits > 0);
+
+
+        let resolution_plan = |edge: u32, tile_rect: PixelBounds, seed: u32| {
+            let mut plan = rectangular_plan(edge, edge, [1.0, 1.0]);
+            plan.requested_maps = vec![MaterialMapKind::EdgeMask];
+            plan.tile_request.output_rect = OutputPixelRect(tile_rect);
+            plan.tile_request.valid_rect = OutputPixelRect(tile_rect);
+            plan.tile_request.halo_px = 8;
+            let region = &plan.ordered_regions[0];
+            let mut resolution_intent = hot_trimmer_domain::EdgeDetailIntentV1::default();
+            resolution_intent.source_height_influence = 0.0;
+            resolution_intent.source_luminance_influence = 0.0;
+            resolution_intent.micro_detail_scale_m = 0.008;
+            resolution_intent.seed = seed;
+            let input = hot_trimmer_effect_compiler::EdgeDetailRegionInput {
+                region_id: region.region_id,
+                role: region.sampling_plan.role,
+                manual_role: region.region_role,
+                structural_profile: region.structural_profile,
+                slot_size_m: region.sampling_plan.slot_physical_size,
+                destination_pixels: [edge, edge],
+                edge_eligibility: region.edge_eligibility,
+                stage15_plan_identity: region.compiled_profile.cache_identity.clone(),
+                source_height_identity: None,
+                source_luminance_identity: None,
+            };
+            let compiled = hot_trimmer_effect_compiler::compile_edge_detail_plan(
+                &hot_trimmer_effect_compiler::EdgeDetailCompileRequest {
+                    intent: &resolution_intent,
+                    regions: &[input],
+                    requested_maps: &[MaterialMapKind::EdgeMask],
+                    resolution_profile: "bounded-resolution-cross-section",
+                },
+            ).expect("resolution Edge Detail compile");
+            plan.ordered_regions[0].edge_detail = compiled.commands.into_iter().next();
+            plan.final_plan_hash = ContentDigest(String::new());
+            plan.finalize().expect("bounded resolution plan")
+        };
+        let support_width_m = |bytes: &[u8], width: u32, height: u32, mpp: f32| {
+            let maximum_x = (0..width)
+                .filter(|x| (0..height).any(|y| r32_pixel(bytes, width, *x, y) > 0.0))
+                .max()
+                .unwrap_or(0);
+            (maximum_x as f32 + 1.0) * mpp
+        };
+        let mut measured_widths = Vec::new();
+        for edge in [512, 1024, 2048, 4096] {
+            let tile = PixelBounds {
+                x: 0,
+                y: edge / 2 - 16,
+                width: 48,
+                height: 32,
+            };
+            let plan = resolution_plan(edge, tile, 201516);
+            let (bytes, _) = render_combined(&plan, None);
+            let measured = support_width_m(&bytes, tile.width, tile.height, 1.0 / edge as f32);
+            assert!(
+                measured <= plan.ordered_regions[0].edge_detail.as_ref().unwrap()
+                    .requested_physical_extent_m as f32 + 2.0 / edge as f32,
+                "{edge} output exceeded compiled physical extent: {measured}",
+            );
+            measured_widths.push((edge, measured));
+        }
+        let reference_width = measured_widths[3].1;
+        for (edge, measured) in measured_widths {
+            let declared_tolerance_m = 2.5 / edge as f32 + 0.0015;
+            assert!(
+                (measured - reference_width).abs() <= declared_tolerance_m,
+                "{edge} physical width {measured} differs from 4096 width {reference_width} beyond {declared_tolerance_m}",
+            );
+        }
+
+        let tile_a = PixelBounds { x: 0, y: 496, width: 48, height: 32 };
+        let tile_b = PixelBounds { x: 4, y: 496, width: 48, height: 32 };
+        let plan_a = resolution_plan(1024, tile_a, 201516);
+        let plan_b = resolution_plan(1024, tile_b, 201516);
+        let (bytes_a, _) = render_combined(&plan_a, None);
+        let (bytes_b, _) = render_combined(&plan_b, None);
+        for y in 0..32 {
+            for x in 4..48 {
+                assert_eq!(
+                    r32_pixel(&bytes_a, 48, x, y).to_bits(),
+                    r32_pixel(&bytes_b, 48, x - 4, y).to_bits(),
+                    "tile-origin overlap changed at ({x},{y})",
+                );
+            }
+        }
+
+        let other_seed_plan = resolution_plan(1024, tile_a, 201517);
+        let (other_seed_bytes, _) = render_combined(&other_seed_plan, None);
+        assert_ne!(bytes_a, other_seed_bytes, "different seed must change breakup");
+        let extent_a = support_width_m(&bytes_a, 48, 32, 1.0 / 1024.0);
+        let extent_b = support_width_m(&other_seed_bytes, 48, 32, 1.0 / 1024.0);
+        assert!(
+            (extent_a - extent_b).abs() <= 2.0 / 1024.0,
+            "seed changed physical extent: {extent_a} vs {extent_b}",
+        );
+
+        let disabled = gpu_tiled_export_resized_plan(64);
+        let cache = Mutex::new(GpuAtlasSourceTextureCache::default());
+        let executor = GpuAtlasRenderExecutor { service: &gpu, source_texture_cache: &cache };
+        let empty = execute_or_load_edge_detail_fields(
+            &executor, &disabled, None, handle.device(), handle.queue(),
+            &cancellation, &|| true,
+        ).expect("disabled intent should be zero-work");
+        assert_eq!(empty.dispatches, 0);
+        assert!(cache.lock().unwrap().rendered_textures.is_empty());
+    }
+
 }

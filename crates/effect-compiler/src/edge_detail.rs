@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const EDGE_DETAIL_ALGORITHM_ID: &str = "hot_trimmer.edge_detail_mvp";
-pub const EDGE_DETAIL_ALGORITHM_VERSION: &str = "1.0.0";
+pub const EDGE_DETAIL_ALGORITHM_VERSION: &str = "1.1.0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +26,19 @@ pub enum EdgeDetailSourceModulationRoute {
     None,
     RegisteredHeight,
     HighPassedLinearLuminance,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeDetailLodFallback {
+    pub policy: String,
+    pub maximum_meters_per_pixel: f64,
+    pub authored_edge_width_m: f64,
+    pub effective_edge_width_m: f64,
+    pub authored_breakup_scale_m: f64,
+    pub effective_breakup_scale_m: f64,
+    pub authored_micro_detail_scale_m: f64,
+    pub effective_micro_detail_scale_m: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +83,7 @@ pub struct CompiledEdgeDetailCommand {
     pub stage15_plan_identity: ContentDigest,
     pub requested_maps: Vec<MaterialMapKind>,
     pub resolution_profile: String,
+    pub lod_fallback: Option<EdgeDetailLodFallback>,
     pub wear_amount: f32,
     pub intensity: f32,
     pub edge_width_m: f32,
@@ -162,15 +176,35 @@ pub fn compile_edge_detail_plan(
             return Err(EdgeDetailCompileError::BevelDoesNotFit(region.region_id));
         }
         let maximum_meters_per_pixel = mpp[0].max(mpp[1]);
-        if request.intent.edge_width_m < maximum_meters_per_pixel
+        let below_physical_lod = request.intent.edge_width_m < maximum_meters_per_pixel
             || request.intent.breakup_scale_m < maximum_meters_per_pixel * 2.0
-            || request.intent.micro_detail_scale_m < maximum_meters_per_pixel * 2.0
-        {
+            || request.intent.micro_detail_scale_m < maximum_meters_per_pixel * 2.0;
+        let preview_fallback_allowed = request.resolution_profile.starts_with("preview");
+        if below_physical_lod && !preview_fallback_allowed {
             return Err(EdgeDetailCompileError::BelowPhysicalLod(region.region_id));
         }
+        let effective_edge_width_m = request.intent.edge_width_m.max(maximum_meters_per_pixel);
+        let effective_breakup_scale_m = request
+            .intent
+            .breakup_scale_m
+            .max(maximum_meters_per_pixel * 2.0);
+        let effective_micro_detail_scale_m = request
+            .intent
+            .micro_detail_scale_m
+            .max(maximum_meters_per_pixel * 2.0);
+        let lod_fallback = below_physical_lod.then(|| EdgeDetailLodFallback {
+            policy: "preview_scale_floor".into(),
+            maximum_meters_per_pixel,
+            authored_edge_width_m: request.intent.edge_width_m,
+            effective_edge_width_m,
+            authored_breakup_scale_m: request.intent.breakup_scale_m,
+            effective_breakup_scale_m,
+            authored_micro_detail_scale_m: request.intent.micro_detail_scale_m,
+            effective_micro_detail_scale_m,
+        });
         let evaluator = role_evaluator(region.role, region.manual_role, region.structural_profile);
         let (source_modulation_route, source_modulation_identity) = source_route(request.intent, region)?;
-        let requested_physical_extent_m = (request.intent.edge_width_m
+        let requested_physical_extent_m = (effective_edge_width_m
             * (1.0 + request.intent.breakup_amount * 0.75))
             .max(request.intent.bevel_radius_m);
         let mut command = CompiledEdgeDetailCommand {
@@ -191,15 +225,16 @@ pub fn compile_edge_detail_plan(
             stage15_plan_identity: region.stage15_plan_identity.clone(),
             requested_maps: request.requested_maps.to_vec(),
             resolution_profile: request.resolution_profile.to_owned(),
+            lod_fallback,
             wear_amount: request.intent.wear_amount as f32,
             intensity: request.intent.intensity as f32,
-            edge_width_m: request.intent.edge_width_m as f32,
+            edge_width_m: effective_edge_width_m as f32,
             bevel_radius_m: request.intent.bevel_radius_m as f32,
             edge_softness: request.intent.edge_softness as f32,
             breakup_amount: request.intent.breakup_amount as f32,
-            breakup_scale_m: request.intent.breakup_scale_m as f32,
+            breakup_scale_m: effective_breakup_scale_m as f32,
             micro_detail_amount: request.intent.micro_detail_amount as f32,
-            micro_detail_scale_m: request.intent.micro_detail_scale_m as f32,
+            micro_detail_scale_m: effective_micro_detail_scale_m as f32,
             source_height_influence: request.intent.source_height_influence as f32,
             source_luminance_influence: request.intent.source_luminance_influence as f32,
             height_amplitude_m: request.intent.height_amplitude_m as f32,
