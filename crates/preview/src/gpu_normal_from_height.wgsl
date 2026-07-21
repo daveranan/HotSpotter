@@ -43,6 +43,8 @@ struct RegionCommand {
     slice_top: u32,
     slice_bottom: u32,
     slice_center: u32,
+    edge_wear_flags: u32,
+    edge_wear_seed: u32,
     slot_width: f32,
     slot_height: f32,
     pixels_per_unit: f32,
@@ -60,6 +62,16 @@ struct RegionCommand {
     transform_offset_y: f32,
     transform_rotation_sin: f32,
     transform_rotation_cos: f32,
+    edge_wear_coverage: f32,
+    edge_wear_strength: f32,
+    edge_wear_width_m: f32,
+    edge_wear_breakup_scale_m: f32,
+    edge_wear_height_m: f32,
+    edge_wear_hue_degrees: f32,
+    edge_wear_saturation: f32,
+    edge_wear_value_offset: f32,
+    edge_wear_roughness_offset: f32,
+    edge_wear_metallic_offset: f32,
 };
 
 @group(0) @binding(0) var<uniform> header: AtlasHeader;
@@ -120,7 +132,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let authored_decoded = authored_sample.xyz * 2.0 - vec3<f32>(1.0);
                 var n = height_normal;
                 if (header.source_role == 2u && authored_sample.a > 0.0 && dot(authored_decoded, authored_decoded) > 0.0001) {
-                    n = normalize(authored_decoded);
+                    // Combine decoded tangent vectors. Encoded RGB is never
+                    // multiplied or blended, and final Height still contributes.
+                    n = normalize(height_normal + vec3<f32>(authored_decoded.xy, authored_decoded.z - 1.0));
                 }
                 if (header.normal_convention == 1u) {
                     n.y = -n.y;

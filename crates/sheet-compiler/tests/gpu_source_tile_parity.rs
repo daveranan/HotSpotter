@@ -387,6 +387,7 @@ fn region_command(
         },
         padding_px: 0,
         edge_eligibility: EdgeEligibility::default(),
+        edge_wear: None,
         sampling_plan,
         render_cache_key: ContentDigest::sha256(
             format!("gpu-source-tile-parity-render-{region_id}").as_bytes(),

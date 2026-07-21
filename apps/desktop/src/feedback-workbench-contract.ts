@@ -1,5 +1,6 @@
 import type {
   CompiledMapView,
+  EdgeWearIntent,
   FeedbackComparisonMode,
   FeedbackContributionView,
   FeedbackDetailIntent,
@@ -10,6 +11,36 @@ import type {
   StampOperationIntent,
   SourceFramePreviewMaterialMap,
 } from "@hot-trimmer/ipc-contracts";
+
+const finiteOr = (value: number, fallback: number) => Number.isFinite(value) ? value : fallback;
+const clamp = (value: number, minimum: number, maximum: number) => Math.min(maximum, Math.max(minimum, value));
+
+export function sanitizeEdgeWearIntent(intent: EdgeWearIntent): EdgeWearIntent {
+  const defaults = {
+    coverage: 0.55, strength: 0.8, edgeWidthM: 0.004, breakupScaleM: 0.012,
+    breakupSeed: 201516, heightAmplitudeM: -0.00035, hueShiftDegrees: 0,
+    saturationMultiplier: 0.55, valueOffset: 0.12, roughnessOffset: 0.18,
+    metallicOffset: 0,
+  };
+  const exposedMetalEnabled = !!intent.exposedMetalEnabled;
+  return {
+    ...intent,
+    coverage: clamp(finiteOr(intent.coverage, defaults.coverage), 0, 1),
+    strength: clamp(finiteOr(intent.strength, defaults.strength), 0, 1),
+    edgeWidthM: Math.max(0.00001, finiteOr(intent.edgeWidthM, defaults.edgeWidthM)),
+    breakupScaleM: Math.max(0.00001, finiteOr(intent.breakupScaleM, defaults.breakupScaleM)),
+    breakupSeed: Math.max(0, Math.trunc(finiteOr(intent.breakupSeed, defaults.breakupSeed))),
+    heightAmplitudeM: finiteOr(intent.heightAmplitudeM, defaults.heightAmplitudeM),
+    hueShiftDegrees: finiteOr(intent.hueShiftDegrees, defaults.hueShiftDegrees),
+    saturationMultiplier: Math.max(0, finiteOr(intent.saturationMultiplier, defaults.saturationMultiplier)),
+    valueOffset: finiteOr(intent.valueOffset, defaults.valueOffset),
+    roughnessOffset: finiteOr(intent.roughnessOffset, defaults.roughnessOffset),
+    exposedMetalEnabled,
+    metallicOffset: exposedMetalEnabled
+      ? clamp(finiteOr(intent.metallicOffset, defaults.metallicOffset), 0, 1)
+      : 0,
+  };
+}
 
 export const FEEDBACK_WORKBENCH_VERSION = "20A.1" as const;
 export const FEEDBACK_COMMAND_VERSION = 1 as const;
@@ -106,6 +137,7 @@ export function occupancyRelationFromValue(value: string): StampOperationIntent[
 export interface FeedbackPixelRequestIdentity {
   revision: number;
   regionId: string;
+  allRegions: boolean;
   view: FeedbackContributionView;
   map: CompiledMapView;
   profile: FeedbackPreviewProfile;
@@ -118,6 +150,7 @@ export function feedbackPixelRequestIdentity(request: FeedbackPixelRequestIdenti
     "stage15-16-feedback-v1",
     request.revision,
     request.regionId,
+    request.allRegions,
     request.view,
     request.map,
     request.profile,
@@ -134,6 +167,7 @@ export function feedbackExecutionMatchesRequest(
   const nativeProfile = request.profile === "preview1024" ? "refinement1024" : request.profile;
   return execution.revision === request.revision
     && execution.regionId === request.regionId
+    && execution.allRegions === request.allRegions
     && execution.view === request.view
     && execution.requestedMap === request.map
     && execution.profile === nativeProfile
@@ -164,6 +198,27 @@ export function selectFeedbackRegionWithoutPixelWork<T>(
   return { ...current, selectedRegionId, previewInvocations: 0 };
 }
 
+export function feedbackPreviewRegionAfterCommand(
+  command: FeedbackWorkbenchCommand,
+  currentRegionId: string | null,
+  availableRegionIds: readonly string[],
+): string | null {
+  if (currentRegionId && availableRegionIds.includes(currentRegionId)) return currentRegionId;
+  if (command.type === "set_edge_wear"
+    && command.intent.targetRegion
+    && availableRegionIds.includes(command.intent.targetRegion)) {
+    return command.intent.targetRegion;
+  }
+  return availableRegionIds[0] ?? null;
+}
+
+export function feedbackViewAfterCommand(
+  command: FeedbackWorkbenchCommand,
+  currentView: FeedbackContributionView,
+): FeedbackContributionView {
+  return command.type === "set_edge_wear" ? "stage16BaseColor" : currentView;
+}
+
 export function updateFeedbackOperationIntent(
   intent: Extract<FeedbackDetailIntent, { kind: "operation" | "stroke" }>,
   patch: Partial<StampOperationIntent>,
@@ -181,6 +236,7 @@ export function selectedOperationAfterCommand(
 ): string | null {
   switch (command.type) {
     case "set_profile":
+    case "set_edge_wear":
     case "reorder_details":
       return current;
     case "delete_detail":

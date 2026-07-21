@@ -7,6 +7,7 @@ const suites = {
   "multi-source-patch-assignment": "src/multi-source-patch-assignment.test.ts",
   "workbench-interactions": "src/workbench-interactions.test.ts",
   "stage15-20-feedback": "src/stage15-20-feedback.test.ts",
+  "mvp-edge-wear": "src/mvp-edge-wear.test.ts",
 };
 const requested = process.argv.slice(2);
 const files = requested.length
@@ -20,6 +21,12 @@ if (requested.includes("multi-source-patch-assignment")) {
 }
 if (requested.includes("stage15-20-feedback")) {
   const native = spawnSync("cargo", ["test", "-p", "hot-trimmer-desktop", "algorithm_stage_20a_feedback_workbench"], { stdio: "inherit", cwd: new URL("../..", import.meta.url) });
+  process.exit(native.status ?? 1);
+}
+if (requested.includes("mvp-edge-wear")) {
+  const types = spawnSync("npm.cmd", ["run", "typecheck"], { stdio: "inherit", cwd: new URL(".", import.meta.url), shell: true });
+  if ((types.status ?? 1) !== 0) process.exit(types.status ?? 1);
+  const native = spawnSync("cargo", ["test", "-p", "hot-trimmer-domain", "-p", "hot-trimmer-project-store", "-p", "hot-trimmer-sheet-compiler", "-p", "hot-trimmer-desktop", "mvp_edge_wear"], { stdio: "inherit", cwd: new URL("../..", import.meta.url) });
   process.exit(native.status ?? 1);
 }
 process.exit(0);

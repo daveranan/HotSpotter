@@ -16,7 +16,8 @@ pub use channel::{Channel, ChannelDataKind};
 pub use document::{
     AUTHORED_LAYOUT_PRESET_SCHEMA_VERSION, AcceptedTopology, AddressMode, AppearanceHashInputs,
     AuthoredLayoutPreset, AuthoredLayoutPresetRegion, BlendPolicy, ChangeClassification,
-    ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, EdgeEligibility, FitAxis,
+    ChannelBitDepth, ChannelRenderPolicy, ContentReference, DocumentHash, EdgeEligibility,
+    EdgeWearIntent, FitAxis,
     GeneratorProvenance, MAX_MAPPING_MAGNITUDE, ManualRegionRole, MappingTransform,
     MaterialMapContent, MaterialMapKind, MaterialSourceSet, PartitionAxis, ProceduralMaterial,
     Projection, QuarterTurn, REGION_BEHAVIOR_VERSION, RadialMappingSettings,

@@ -230,6 +230,7 @@ export interface TrimSheetDocument {
   primaryMaterial: string | null;
   materials: readonly { id: string; name: string; maps: readonly { kind: string; sha256: string }[] }[];
   decorations: readonly { decorationKey: string; value: string }[];
+  edgeWear?: EdgeWearIntent;
   regionBindings: Record<string, RegionBinding>;
   renderSettings: {
     outputSize: PixelSize;
@@ -243,6 +244,23 @@ export interface TrimSheetDocument {
   authoredLayoutPreset?: AuthoredLayoutPreset;
   authoredLayoutInstanceId?: string;
   sourceOverrides?: Record<string, RegionSourceOverride>;
+}
+
+export interface EdgeWearIntent {
+  enabled: boolean;
+  targetRegion?: string;
+  coverage: number;
+  strength: number;
+  edgeWidthM: number;
+  breakupScaleM: number;
+  breakupSeed: number;
+  heightAmplitudeM: number;
+  hueShiftDegrees: number;
+  saturationMultiplier: number;
+  valueOffset: number;
+  roughnessOffset: number;
+  exposedMetalEnabled: boolean;
+  metallicOffset: number;
 }
 
 export interface SourceProjection {
@@ -561,6 +579,7 @@ export interface CompiledDetailSetProjection { stageResult: unknown; details: re
 
 export type FeedbackWorkbenchCommand =
   | { type: "set_profile"; regionId: string; requested: FeedbackProfileIntent }
+  | { type: "set_edge_wear"; intent: EdgeWearIntent }
   | { type: "upsert_detail"; operationId?: string; enabled: boolean; intent: FeedbackDetailIntent }
   | { type: "duplicate_detail"; operationId: string }
   | { type: "set_detail_enabled"; operationId: string; enabled: boolean }
@@ -571,7 +590,7 @@ export interface FeedbackWorkbenchCommandResult { commandVersion: 1; committedId
 export interface FeedbackQaTileRequest {
   protocolVersion: number; commandVersion: 1; revision: number; generation: number; regionId: string;
   view: FeedbackContributionView; profile: "refinement1024" | "preview2048" | "preview4096" | "preview8192";
-  comparisonMode: FeedbackComparisonMode; selectedOperationId?: string;
+  comparisonMode: FeedbackComparisonMode; allRegions: boolean; selectedOperationId?: string;
 }
 
 export interface FeedbackPreviewExecution {
@@ -580,6 +599,7 @@ export interface FeedbackPreviewExecution {
   publishedGeneration: number;
   revision: number;
   regionId: string;
+  allRegions: boolean;
   view: FeedbackContributionView;
   requestedMap: CompiledMapView;
   profile: "refinement1024" | "preview2048" | "preview4096" | "preview8192";

@@ -1276,6 +1276,8 @@ struct GpuRegionCommand {
     slice_top: u32,
     slice_bottom: u32,
     slice_center: u32,
+    edge_wear_flags: u32,
+    edge_wear_seed: u32,
     slot_width: f32,
     slot_height: f32,
     pixels_per_unit: f32,
@@ -1293,6 +1295,16 @@ struct GpuRegionCommand {
     transform_offset_y: f32,
     transform_rotation_sin: f32,
     transform_rotation_cos: f32,
+    edge_wear_coverage: f32,
+    edge_wear_strength: f32,
+    edge_wear_width_m: f32,
+    edge_wear_breakup_scale_m: f32,
+    edge_wear_height_m: f32,
+    edge_wear_hue_degrees: f32,
+    edge_wear_saturation: f32,
+    edge_wear_value_offset: f32,
+    edge_wear_roughness_offset: f32,
+    edge_wear_metallic_offset: f32,
 }
 
 #[repr(C)]
@@ -1392,8 +1404,8 @@ const GPU_PROFILE_COMMAND_BYTES: usize = 96;
 const GPU_DETAIL_COMMAND_BYTES: usize = 180;
 
 const GPU_HEADER_BYTES: usize = 88;
-const GPU_COMMAND_BYTES: usize = 176;
-const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v14-complete-lowering";
+const GPU_COMMAND_BYTES: usize = 224;
+const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v15-continuous-edge-wear";
 
 fn requested_material_maps(
     plan: &CompiledAtlasPlanV1,
@@ -2847,10 +2859,10 @@ fn logical_passes_for_map(map: MaterialMapKind) -> &'static str {
         MaterialMapKind::AmbientOcclusion => "hotspot-profile,structural-height,ao,publish",
         MaterialMapKind::Metallic => "registered-source,metallic,publish",
         MaterialMapKind::RegionId => "compact-region-id,publish",
-        MaterialMapKind::Specular
-        | MaterialMapKind::Opacity
-        | MaterialMapKind::EdgeMask
-        | MaterialMapKind::MaterialId => "unavailable",
+        MaterialMapKind::EdgeMask => "hotspot-profile,edge-wear-mask,publish",
+        MaterialMapKind::Specular | MaterialMapKind::Opacity | MaterialMapKind::MaterialId => {
+            "unavailable"
+        }
     }
 }
 
@@ -8122,9 +8134,9 @@ fn gpu_map_code(map: hot_trimmer_domain::MaterialMapKind) -> u32 {
         MaterialMapKind::AmbientOcclusion => 4,
         MaterialMapKind::Metallic => 5,
         MaterialMapKind::RegionId => 6,
+        MaterialMapKind::EdgeMask => 8,
         MaterialMapKind::Specular
         | MaterialMapKind::Opacity
-        | MaterialMapKind::EdgeMask
         | MaterialMapKind::MaterialId => 0,
     }
 }
@@ -8280,6 +8292,14 @@ fn pack_command(
             blend_width: 0.0,
             seam_blend_width: 0.0,
         });
+    let edge_wear = command.edge_wear.as_ref().filter(|intent| intent.enabled);
+    let eligibility = command.edge_eligibility;
+    let edge_wear_flags = u32::from(edge_wear.is_some())
+        | (u32::from(eligibility.left) << 1)
+        | (u32::from(eligibility.right) << 2)
+        | (u32::from(eligibility.top) << 3)
+        | (u32::from(eligibility.bottom) << 4)
+        | (u32::from(edge_wear.is_some_and(|intent| intent.exposed_metal_enabled)) << 5);
     Ok(GpuRegionCommand {
         region_index: command.compact_index,
         mode,
@@ -8344,6 +8364,18 @@ fn pack_command(
             .rotation_degrees
             .to_radians())
         .cos() as f32,
+        edge_wear_flags,
+        edge_wear_seed: edge_wear.map_or(0, |intent| intent.breakup_seed as u32),
+        edge_wear_coverage: edge_wear.map_or(0.0, |intent| intent.coverage as f32),
+        edge_wear_strength: edge_wear.map_or(0.0, |intent| intent.strength as f32),
+        edge_wear_width_m: edge_wear.map_or(1.0, |intent| intent.edge_width_m as f32),
+        edge_wear_breakup_scale_m: edge_wear.map_or(1.0, |intent| intent.breakup_scale_m as f32),
+        edge_wear_height_m: edge_wear.map_or(0.0, |intent| intent.height_amplitude_m as f32),
+        edge_wear_hue_degrees: edge_wear.map_or(0.0, |intent| intent.hue_shift_degrees as f32),
+        edge_wear_saturation: edge_wear.map_or(1.0, |intent| intent.saturation_multiplier as f32),
+        edge_wear_value_offset: edge_wear.map_or(0.0, |intent| intent.value_offset as f32),
+        edge_wear_roughness_offset: edge_wear.map_or(0.0, |intent| intent.roughness_offset as f32),
+        edge_wear_metallic_offset: edge_wear.map_or(0.0, |intent| intent.metallic_offset as f32),
     })
 }
 
@@ -9750,6 +9782,8 @@ fn encode_commands(commands: &[GpuRegionCommand]) -> Vec<u8> {
             command.slice_top,
             command.slice_bottom,
             command.slice_center,
+            command.edge_wear_flags,
+            command.edge_wear_seed,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -9771,6 +9805,16 @@ fn encode_commands(commands: &[GpuRegionCommand]) -> Vec<u8> {
             command.transform_offset_y,
             command.transform_rotation_sin,
             command.transform_rotation_cos,
+            command.edge_wear_coverage,
+            command.edge_wear_strength,
+            command.edge_wear_width_m,
+            command.edge_wear_breakup_scale_m,
+            command.edge_wear_height_m,
+            command.edge_wear_hue_degrees,
+            command.edge_wear_saturation,
+            command.edge_wear_value_offset,
+            command.edge_wear_roughness_offset,
+            command.edge_wear_metallic_offset,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -10019,6 +10063,7 @@ mod tests {
                 continuity: RegionContinuity::None,
                 padding_px: 0,
                 edge_eligibility: EdgeEligibility::default(),
+                edge_wear: None,
                 sampling_plan,
                 render_cache_key: ContentDigest::sha256(b"gpu-tiled-export-region-render"),
             }],

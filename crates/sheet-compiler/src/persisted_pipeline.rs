@@ -1696,6 +1696,7 @@ fn compile_source_frame(
             continuity: behavior.continuity,
             padding_px: preview_padding_px,
             edge_eligibility: behavior.edge_eligibility,
+            edge_wear: edge_wear_for_region(document.edge_wear.as_ref(), region.id),
             sampling_plan,
             render_cache_key,
         });
@@ -2464,6 +2465,7 @@ fn fixed_template_compiled_atlas_plan(
             continuity: binding.mapping.behavior.continuity,
             padding_px,
             edge_eligibility: binding.mapping.behavior.edge_eligibility,
+            edge_wear: edge_wear_for_region(document.edge_wear.as_ref(), region.id),
             sampling_plan,
             render_cache_key,
         });
@@ -3137,12 +3139,48 @@ fn aspect_matches(width: f64, height: f64, expected_width: f64, expected_height:
 #[cfg(test)]
 mod source_frame_partition_tests {
     use hot_trimmer_domain::{
-        LogicalGridSpec, PartitionRecipe, SamplingMode, SolidChannelValues, generate_partition,
-        resolve_boundaries,
+        CanonicalRect, LogicalGridSpec, PartitionRecipe, RegionSampling, SamplingMode,
+        SolidChannelValues, generate_partition, resolve_boundaries,
     };
+    use hot_trimmer_placement_solver::SourceCrop;
     use std::collections::BTreeMap;
 
-    use super::build_solid_domain;
+    use super::{build_solid_domain, edge_wear_for_region, manual_physical_mapping};
+
+    #[test]
+    fn mvp_edge_wear_global_target_lowers_into_every_region() {
+        let first = hot_trimmer_domain::RegionId::from_bytes([1; 16]);
+        let second = hot_trimmer_domain::RegionId::from_bytes([2; 16]);
+        let global = hot_trimmer_domain::EdgeWearIntent::default();
+        assert!(global.target_region.is_none());
+        assert!(edge_wear_for_region(Some(&global), first).is_some());
+        assert!(edge_wear_for_region(Some(&global), second).is_some());
+
+        let targeted = hot_trimmer_domain::EdgeWearIntent {
+            target_region: Some(second),
+            ..global
+        };
+        assert!(edge_wear_for_region(Some(&targeted), first).is_none());
+        assert!(edge_wear_for_region(Some(&targeted), second).is_some());
+    }
+
+    #[test]
+    fn mvp_edge_wear_manual_source_frame_has_a_resolution_independent_meter_basis() {
+        let crop = SourceCrop { x: 0, y: 0, width: 800, height: 400 };
+        let allocation = CanonicalRect { x: 0, y: 0, width: 800, height: 400 };
+        let (physical_size, pixels_per_meter) =
+            manual_physical_mapping(RegionSampling::OneShot, crop, allocation);
+
+        assert_eq!(physical_size, [0.8, 0.4]);
+        assert_eq!(pixels_per_meter, 1_000.0);
+        assert_eq!(physical_size[0] * pixels_per_meter, f64::from(crop.width));
+        assert_eq!(physical_size[1] * pixels_per_meter, f64::from(crop.height));
+
+        let edge_width_m = 0.004;
+        let preview_fraction = edge_width_m / physical_size[0];
+        assert!((preview_fraction * 800.0 - 4.0).abs() < f64::EPSILON);
+        assert!((preview_fraction * 1_600.0 - 8.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn multi_source_patch_assignment_solid_content_builds_an_exact_domain() {
@@ -3317,9 +3355,15 @@ fn manual_physical_mapping(
     crop: SourceCrop,
     allocation: hot_trimmer_domain::CanonicalRect,
 ) -> ([f64; 2], f64) {
+    // SourceFrame regions do not yet carry authored world calibration. Use the
+    // documented MVP convention of 1000 source pixels per meter so persisted
+    // meter-valued profile and edge-wear controls stay visible and invariant
+    // when only the output preview resolution changes. Multiplying the source
+    // sampling density by the same factor preserves the existing UV sampling.
+    const CONVENTIONAL_SOURCE_PIXELS_PER_METER: f64 = 1_000.0;
     let crop_size = [f64::from(crop.width), f64::from(crop.height)];
     let destination = [f64::from(allocation.width), f64::from(allocation.height)];
-    match sampling {
+    let (slot_size_in_source_pixels, source_pixels_per_slot_unit) = match sampling {
         RegionSampling::OneShot => (crop_size, 1.0),
         RegionSampling::LoopX => (destination, crop_size[1] / destination[1]),
         RegionSampling::LoopY => (destination, crop_size[0] / destination[0]),
@@ -3327,7 +3371,23 @@ fn manual_physical_mapping(
             destination,
             (crop_size[0] / destination[0]).max(crop_size[1] / destination[1]),
         ),
-    }
+    };
+    (
+        [
+            slot_size_in_source_pixels[0] / CONVENTIONAL_SOURCE_PIXELS_PER_METER,
+            slot_size_in_source_pixels[1] / CONVENTIONAL_SOURCE_PIXELS_PER_METER,
+        ],
+        source_pixels_per_slot_unit * CONVENTIONAL_SOURCE_PIXELS_PER_METER,
+    )
+}
+
+fn edge_wear_for_region(
+    intent: Option<&hot_trimmer_domain::EdgeWearIntent>,
+    region_id: RegionId,
+) -> Option<hot_trimmer_domain::EdgeWearIntent> {
+    intent
+        .filter(|intent| intent.target_region.is_none_or(|target| target == region_id))
+        .cloned()
 }
 
 fn build_solid_domain(

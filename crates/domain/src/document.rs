@@ -773,6 +773,49 @@ pub struct TreatmentLayer {
     pub parameters: BTreeMap<TreatmentParameter, f64>,
 }
 
+/// The single MVP procedural edge-wear layer. Distances and amplitudes are
+/// physical so the compiled result is resolution independent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeWearIntent {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_region: Option<RegionId>,
+    pub coverage: f64,
+    pub strength: f64,
+    pub edge_width_m: f64,
+    pub breakup_scale_m: f64,
+    pub breakup_seed: u64,
+    pub height_amplitude_m: f64,
+    pub hue_shift_degrees: f64,
+    pub saturation_multiplier: f64,
+    pub value_offset: f64,
+    pub roughness_offset: f64,
+    pub exposed_metal_enabled: bool,
+    pub metallic_offset: f64,
+}
+
+impl Default for EdgeWearIntent {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_region: None,
+            coverage: 0.55,
+            strength: 0.8,
+            edge_width_m: 0.004,
+            breakup_scale_m: 0.012,
+            breakup_seed: 201_516,
+            height_amplitude_m: -0.000_35,
+            hue_shift_degrees: 0.0,
+            saturation_multiplier: 0.55,
+            value_offset: 0.12,
+            roughness_offset: 0.18,
+            exposed_metal_enabled: false,
+            metallic_offset: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionAppearanceHashInput {
@@ -795,6 +838,7 @@ pub struct AppearanceHashInputs {
     pub region_bindings: BTreeMap<RegionId, RegionBinding>,
     pub decorations: Vec<DecorationBinding>,
     pub treatments: Vec<TreatmentLayer>,
+    pub edge_wear: Option<EdgeWearIntent>,
     pub sheet_framing: SheetFraming,
     pub render_settings: RenderSettings,
 }
@@ -856,6 +900,8 @@ pub struct TrimSheetDocument {
     pub region_bindings: BTreeMap<RegionId, RegionBinding>,
     pub decorations: Vec<DecorationBinding>,
     pub treatments: Vec<TreatmentLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_wear: Option<EdgeWearIntent>,
     #[serde(default)]
     pub sheet_framing: SheetFraming,
     pub render_settings: RenderSettings,
@@ -913,6 +959,7 @@ impl TrimSheetDocument {
             region_bindings: self.region_bindings.clone(),
             decorations: self.decorations.clone(),
             treatments: self.treatments.clone(),
+            edge_wear: self.edge_wear.clone(),
             sheet_framing: self.sheet_framing.clone(),
             render_settings: self.render_settings.clone(),
         }
@@ -1197,6 +1244,32 @@ impl TrimSheetDocument {
                 return Err(TrimSheetDocumentError::InvalidTreatment(treatment.id));
             }
         }
+        if let Some(intent) = &self.edge_wear {
+            let finite = [
+                intent.coverage,
+                intent.strength,
+                intent.edge_width_m,
+                intent.breakup_scale_m,
+                intent.height_amplitude_m,
+                intent.hue_shift_degrees,
+                intent.saturation_multiplier,
+                intent.value_offset,
+                intent.roughness_offset,
+                intent.metallic_offset,
+            ]
+            .into_iter()
+            .all(f64::is_finite);
+            if !finite
+                || !(0.0..=1.0).contains(&intent.coverage)
+                || !(0.0..=1.0).contains(&intent.strength)
+                || intent.edge_width_m <= 0.0
+                || intent.breakup_scale_m <= 0.0
+                || intent.saturation_multiplier < 0.0
+                || intent.target_region.is_some_and(|id| !region_ids.contains(&id))
+            {
+                return Err(TrimSheetDocumentError::InvalidEdgeWear);
+            }
+        }
         let mut decoration_keys = BTreeSet::new();
         if self.decorations.len() > 4_096
             || self.decorations.iter().any(|decoration| {
@@ -1388,6 +1461,7 @@ impl TrimSheetDocument {
                 .collect(),
             decorations: Vec::new(),
             treatments: Vec::new(),
+            edge_wear: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings {
                 output_size,
@@ -1510,6 +1584,7 @@ impl TrimSheetDocument {
             region_bindings: bindings,
             decorations: Vec::new(),
             treatments: Vec::new(),
+            edge_wear: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings {
                 output_size,
@@ -1627,6 +1702,7 @@ impl TrimSheetDocument {
             region_bindings: bindings,
             decorations: Vec::new(),
             treatments: Vec::new(),
+            edge_wear: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
@@ -1825,6 +1901,9 @@ impl TrimSheetDocument {
                         value: compiled_request.clone(),
                     });
                 }
+            }
+            TrimSheetDocumentCommand::SetEdgeWearIntent { intent } => {
+                next.edge_wear = Some(intent.clone());
             }
             TrimSheetDocumentCommand::UpsertDecoration { decoration } => {
                 if decoration.decoration_key.trim().is_empty() || decoration.value.is_empty() {
@@ -2831,6 +2910,9 @@ pub enum TrimSheetDocumentCommand {
         structural_profile: StructuralProfile,
         compiled_request: String,
     },
+    SetEdgeWearIntent {
+        intent: EdgeWearIntent,
+    },
     UpsertDecoration {
         decoration: DecorationBinding,
     },
@@ -3729,6 +3811,8 @@ pub enum TrimSheetDocumentError {
     InvalidWarp { region_id: RegionId, index: usize },
     #[error("treatment layer is duplicated or invalid: {0}")]
     InvalidTreatment(LayerId),
+    #[error("edge-wear intent is invalid")]
+    InvalidEdgeWear,
     #[error("decoration binding is missing, duplicated, or exceeds bounded storage")]
     InvalidDecoration,
     #[error("render settings are invalid")]
@@ -3868,6 +3952,7 @@ mod tests {
             )]),
             decorations: Vec::new(),
             treatments: Vec::new(),
+            edge_wear: None,
             sheet_framing: SheetFraming::default(),
             render_settings: RenderSettings::default(),
             generator_provenance: None,
@@ -3893,6 +3978,26 @@ mod tests {
             .expect("binding")
             .content = ContentReference::Patch(patch_id);
         document.validate().expect("patch binding");
+    }
+
+    #[test]
+    fn mvp_edge_wear_is_typed_hashed_and_undoable_as_one_appearance_command() {
+        let document = document();
+        let topology_hash = document.topology.topology_hash;
+        let before = document.appearance_hash().expect("appearance hash");
+        let intent = EdgeWearIntent {
+            target_region: Some(document.topology.regions[0].id),
+            ..EdgeWearIntent::default()
+        };
+        let next = document
+            .apply_command(&TrimSheetDocumentCommand::SetEdgeWearIntent {
+                intent: intent.clone(),
+            })
+            .expect("valid edge-wear command");
+        assert_eq!(next.edge_wear, Some(intent));
+        assert_eq!(next.topology.topology_hash, topology_hash, "coverage never moves topology");
+        assert_ne!(next.appearance_hash().expect("changed appearance"), before);
+        assert_eq!(next.document_revision, document.document_revision + 1);
     }
 
     #[test]

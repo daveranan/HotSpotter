@@ -2184,6 +2184,7 @@ fn document_operation(command: &TrimSheetDocumentCommand) -> &'static str {
         TrimSheetDocumentCommand::SetRegionBehavior { .. } => "set_region_behavior",
         TrimSheetDocumentCommand::SetRegionStructuralProfile { .. } => "set_region_structural_profile",
         TrimSheetDocumentCommand::SetFeedbackProfile { .. } => "set_feedback_profile",
+        TrimSheetDocumentCommand::SetEdgeWearIntent { .. } => "set_edge_wear_intent",
         TrimSheetDocumentCommand::UpsertDecoration { .. } => "upsert_decoration",
         TrimSheetDocumentCommand::DeleteDecoration { .. } => "delete_decoration",
         TrimSheetDocumentCommand::ReplaceDecoration { .. } => "replace_decoration",

@@ -1,6 +1,7 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import type {
   CompiledMapView,
+  EdgeWearIntent,
   FeedbackComparisonMode,
   FeedbackContributionView,
   FeedbackDetailIntent,
@@ -10,9 +11,18 @@ import type {
   IntermediateAtlasProjection,
   ProjectProjection,
 } from "@hot-trimmer/ipc-contracts";
-import { occupancyRelationFromValue, occupancyRelations, updateFeedbackOperationIntent } from "./feedback-workbench-contract";
+import { occupancyRelationFromValue, occupancyRelations, sanitizeEdgeWearIntent, updateFeedbackOperationIntent } from "./feedback-workbench-contract";
 
 export const FEEDBACK_WORKBENCH_VERSION = "20A.1" as const;
+
+export function defaultEdgeWearIntent(): EdgeWearIntent {
+  return {
+    enabled: true, coverage: 0.55, strength: 0.8, edgeWidthM: 0.004,
+    breakupScaleM: 0.012, breakupSeed: 201516, heightAmplitudeM: -0.00035,
+    hueShiftDegrees: 0, saturationMultiplier: 0.55, valueOffset: 0.12,
+    roughnessOffset: 0.18, exposedMetalEnabled: false, metallicOffset: 0,
+  };
+}
 
 export const contributionViews: readonly { value: FeedbackContributionView; label: string; map: CompiledMapView | null }[] = [
   { value: "stage15Occupancy", label: "Stage 15 · raw occupancy", map: "ambientOcclusion" },
@@ -100,6 +110,11 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
   const selectedRegion = props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId);
   const compiled = props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegionId);
   const [profileIntent, setProfileIntent] = useState<FeedbackProfileIntent>(() => defaultFeedbackProfile());
+  const [edgeWear, setEdgeWear] = useState<EdgeWearIntent>(() => props.project?.document?.edgeWear ?? defaultEdgeWearIntent());
+  const [edgeWearNotice, setEdgeWearNotice] = useState<string | null>(null);
+  useEffect(() => {
+    setEdgeWear(props.project?.document?.edgeWear ?? defaultEdgeWearIntent());
+  }, [props.project?.id, props.project?.document?.documentRevision]);
   const records = props.project?.feedbackAuthoring.records ?? [];
   const selectedRecord = records.find((record) => record.operationId === props.selectedOperationId);
   const assets = props.project?.materialSources.flatMap((sourceSet) =>
@@ -200,9 +215,29 @@ export function FeedbackWorkbench(props: FeedbackWorkbenchProps) {
     await props.onCommand({ type: "upsert_detail", operationId: selectedRecord.operationId, enabled: selectedRecord.enabled, intent: { kind: "definition", value: { ...definition, ...patch } } });
   }
 
+  async function applyEdgeWear() {
+    const sanitized = sanitizeEdgeWearIntent(edgeWear);
+    const wasClamped = JSON.stringify(sanitized) !== JSON.stringify(edgeWear);
+    setEdgeWear(sanitized);
+    setEdgeWearNotice(wasClamped
+      ? "Invalid values were corrected before applying. Coverage and Strength use the 0–1 range."
+      : null);
+    await props.onCommand({ type: "set_edge_wear", intent: sanitized });
+  }
+
   return <aside className="feedback-workbench" aria-label="Profile & Detail Contributions">
     <header><div><strong>Profile &amp; Detail Contributions</strong><small>Prompt 20A · raw compiler contributions, not a finished PBR material</small></div><button disabled={!!props.project?.document || !!props.project?.materialSources.length} onClick={props.onCreateSample}>Create bundled feedback sample</button><span className="non-destructive-badge">Non-destructive · no mesh silhouette change</span></header>
     <div className="feedback-grid">
+      <section className="edge-wear-column"><h3>Ordered material layers</h3>
+        <ol className="layer-card-list"><li className="layer-card selected"><header><strong>Edge Wear</strong><span>GPU · physical</span><input aria-label="Edge Wear enabled" type="checkbox" checked={edgeWear.enabled} onChange={(event) => setEdgeWear({ ...edgeWear, enabled: event.currentTarget.checked })} /></header>
+          <label>Target<select value={edgeWear.targetRegion ?? "global"} onChange={(event) => setEdgeWear({ ...edgeWear, targetRegion: event.currentTarget.value === "global" ? undefined : event.currentTarget.value })}><option value="global">Global</option>{props.project?.document?.topology.regions.map((region) => <option key={region.id} value={region.id}>{region.displayName}</option>)}</select></label>
+          <div className="physical-controls"><label>Coverage<input type="number" min="0" max="1" step="0.05" value={edgeWear.coverage} onChange={(event) => setEdgeWear({ ...edgeWear, coverage: Number(event.currentTarget.value) })} /></label><label>Strength<input type="number" min="0" max="1" step="0.05" value={edgeWear.strength} onChange={(event) => setEdgeWear({ ...edgeWear, strength: Number(event.currentTarget.value) })} /></label><label>Edge width m<input type="number" min="0.00001" step="0.0005" value={edgeWear.edgeWidthM} onChange={(event) => setEdgeWear({ ...edgeWear, edgeWidthM: Number(event.currentTarget.value) })} /></label><label>Breakup scale m<input type="number" min="0.00001" step="0.001" value={edgeWear.breakupScaleM} onChange={(event) => setEdgeWear({ ...edgeWear, breakupScaleM: Number(event.currentTarget.value) })} /></label><label>Seed<input type="number" min="0" step="1" value={edgeWear.breakupSeed} onChange={(event) => setEdgeWear({ ...edgeWear, breakupSeed: Number(event.currentTarget.value) })} /></label><label>Height m<input type="number" step="0.00005" value={edgeWear.heightAmplitudeM} onChange={(event) => setEdgeWear({ ...edgeWear, heightAmplitudeM: Number(event.currentTarget.value) })} /></label><label>Hue °<input type="number" step="1" value={edgeWear.hueShiftDegrees} onChange={(event) => setEdgeWear({ ...edgeWear, hueShiftDegrees: Number(event.currentTarget.value) })} /></label><label>Saturation ×<input type="number" min="0" step="0.05" value={edgeWear.saturationMultiplier} onChange={(event) => setEdgeWear({ ...edgeWear, saturationMultiplier: Number(event.currentTarget.value) })} /></label><label>Value<input type="number" step="0.05" value={edgeWear.valueOffset} onChange={(event) => setEdgeWear({ ...edgeWear, valueOffset: Number(event.currentTarget.value) })} /></label><label>Roughness<input type="number" step="0.05" value={edgeWear.roughnessOffset} onChange={(event) => setEdgeWear({ ...edgeWear, roughnessOffset: Number(event.currentTarget.value) })} /></label></div>
+          <label className="metal-intent"><input type="checkbox" checked={edgeWear.exposedMetalEnabled} onChange={(event) => setEdgeWear({ ...edgeWear, exposedMetalEnabled: event.currentTarget.checked, metallicOffset: event.currentTarget.checked ? edgeWear.metallicOffset : 0 })} /> Exposed metal (explicit)</label>{edgeWear.exposedMetalEnabled ? <label>Metallic offset<input type="number" min="0" max="1" step="0.05" value={edgeWear.metallicOffset} onChange={(event) => setEdgeWear({ ...edgeWear, metallicOffset: Number(event.currentTarget.value) })} /></label> : null}
+          <button disabled={props.commandBusy || !props.project?.document} onClick={() => void applyEdgeWear()}>Apply Edge Wear</button>
+          {edgeWearNotice ? <p className="typed-state" role="status">{edgeWearNotice}</p> : null}
+          <div className="map-inspection" role="group" aria-label="Edge Wear map inspection"><button onClick={() => props.onView("stage16BaseColor")}>Base Color</button><button onClick={() => props.onView("stage16RegisteredMask")}>Mask</button><button onClick={() => props.onView("stage16Height")}>Height</button><button onClick={() => props.onView("stage16VectorNormal")}>Normal</button><button onClick={() => props.onView("stage16ScalarRoughness")}>Roughness</button></div>
+        </li></ol>
+      </section>
       <section><h3>Target &amp; Stage 15 profile</h3>
         <label>Hotspot / region<select value={props.selectedRegionId ?? ""} onChange={(event) => props.onSelectRegion(event.currentTarget.value)}><option value="" disabled>Select a region</option>{props.project?.document?.topology.regions.map((region) => <option key={region.id} value={region.id}>{region.displayName} · {region.role}</option>)}</select></label>
         <label>Structural profile<select value={profileIntent.program} onChange={(event) => changeProgram(event.currentTarget.value as FeedbackProfileIntent["program"])}>{availablePrograms.map((program) => <option key={program} value={program}>{program.replaceAll("_", " ")}</option>)}</select></label>

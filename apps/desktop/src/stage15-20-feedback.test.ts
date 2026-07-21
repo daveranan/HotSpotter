@@ -51,7 +51,7 @@ test("region selection changes overlays only and preserves the active map and pu
 });
 
 test("comparison and isolation fields participate in exact pixel request identity", () => {
-  const base = { revision: 9, regionId: "region-a", view: "stage16RegisteredMask", map: "edgeMask", profile: "preview2048", selectedOperationId: null } as const;
+  const base = { revision: 9, regionId: "region-a", allRegions: false, view: "stage16RegisteredMask", map: "edgeMask", profile: "preview2048", selectedOperationId: null } as const;
   const before = feedbackPixelRequestIdentity({ ...base, comparisonMode: "before" });
   const after = feedbackPixelRequestIdentity({ ...base, comparisonMode: "after" });
   const isolatedA = feedbackPixelRequestIdentity({ ...base, comparisonMode: "selectedOperationIsolation", selectedOperationId: "operation-a" });
@@ -60,6 +60,7 @@ test("comparison and isolation fields participate in exact pixel request identit
   assert.notEqual(isolatedA, isolatedB);
   assert.notEqual(after, feedbackPixelRequestIdentity({ ...base, revision: 10, comparisonMode: "after" }));
   assert.notEqual(after, feedbackPixelRequestIdentity({ ...base, regionId: "region-b", comparisonMode: "after" }));
+  assert.notEqual(after, feedbackPixelRequestIdentity({ ...base, allRegions: true, comparisonMode: "after" }));
   assert.notEqual(after, feedbackPixelRequestIdentity({ ...base, view: "stage16Height", map: "height", comparisonMode: "after" }));
   assert.notEqual(after, feedbackPixelRequestIdentity({ ...base, profile: "preview4096", comparisonMode: "after" }));
   assert.equal(isolatedA, feedbackPixelRequestIdentity({ ...base, comparisonMode: "selectedOperationIsolation", selectedOperationId: "operation-a" }));
@@ -88,9 +89,9 @@ test("editing a StampStroke operation preserves physicalSamplesM byte-for-byte",
 });
 
 test("metadata and stale requests cannot attach old pixel or publication evidence", () => {
-  const request = { revision: 9, regionId: "region-a", view: "stage16RegisteredMask", map: "edgeMask", profile: "preview2048", comparisonMode: "after", selectedOperationId: null } as const;
+  const request = { revision: 9, regionId: "region-a", allRegions: false, view: "stage16RegisteredMask", map: "edgeMask", profile: "preview2048", comparisonMode: "after", selectedOperationId: null } as const;
   const execution = {
-    requestIdentity: "native-id", clientGeneration: 7, publishedGeneration: 11, revision: 9, regionId: "region-a",
+    requestIdentity: "native-id", clientGeneration: 7, publishedGeneration: 11, revision: 9, regionId: "region-a", allRegions: false,
     view: "stage16RegisteredMask", requestedMap: "edgeMask", profile: "preview2048", comparisonMode: "after", outcome: "Executed", cacheReused: false,
   } as const;
   const tile = { manifest: { generation: 11 }, payload: "gpu" };

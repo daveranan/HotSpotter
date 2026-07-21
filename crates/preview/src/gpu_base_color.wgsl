@@ -51,6 +51,8 @@ struct RegionCommand {
     slice_top: u32,
     slice_bottom: u32,
     slice_center: u32,
+    edge_wear_flags: u32,
+    edge_wear_seed: u32,
     slot_width: f32,
     slot_height: f32,
     pixels_per_unit: f32,
@@ -68,6 +70,16 @@ struct RegionCommand {
     transform_offset_y: f32,
     transform_rotation_sin: f32,
     transform_rotation_cos: f32,
+    edge_wear_coverage: f32,
+    edge_wear_strength: f32,
+    edge_wear_width_m: f32,
+    edge_wear_breakup_scale_m: f32,
+    edge_wear_height_m: f32,
+    edge_wear_hue_degrees: f32,
+    edge_wear_saturation: f32,
+    edge_wear_value_offset: f32,
+    edge_wear_roughness_offset: f32,
+    edge_wear_metallic_offset: f32,
 };
 
 struct SourcePosition {
@@ -127,6 +139,120 @@ fn linear_to_srgb(v: f32) -> f32 {
 
 fn encode_normal(v: f32) -> f32 {
     return clamp(v, -1.0, 1.0) * 0.5 + 0.5;
+}
+
+fn hash_u32(value: u32) -> u32 {
+    var x = value;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+fn edge_noise_lattice(cell: vec2<u32>, seed: u32) -> f32 {
+    let mixed = cell.x * 0x9e3779b9u ^ cell.y * 0x85ebca6bu ^ seed;
+    return f32(hash_u32(mixed)) / 4294967295.0;
+}
+
+fn edge_value_noise(point: vec2<f32>, seed: u32) -> f32 {
+    let base = vec2<u32>(floor(max(point, vec2<f32>(0.0, 0.0))));
+    let fraction = fract(point);
+    let fade = fraction * fraction * (vec2<f32>(3.0, 3.0) - 2.0 * fraction);
+    let a = edge_noise_lattice(base, seed);
+    let b = edge_noise_lattice(base + vec2<u32>(1u, 0u), seed);
+    let c = edge_noise_lattice(base + vec2<u32>(0u, 1u), seed);
+    let d = edge_noise_lattice(base + vec2<u32>(1u, 1u), seed);
+    return mix(mix(a, b, fade.x), mix(c, d, fade.x), fade.y);
+}
+
+fn edge_fbm(point: vec2<f32>, seed: u32) -> f32 {
+    let low = edge_value_noise(point, seed);
+    let medium = edge_value_noise(point * 2.03 + vec2<f32>(17.1, 9.2), seed ^ 0x68bc21ebu);
+    let micro = edge_value_noise(point * 4.11 + vec2<f32>(3.7, 29.4), seed ^ 0x02e5be93u);
+    return low * 0.57 + medium * 0.29 + micro * 0.14;
+}
+
+fn edge_wear_mask(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
+    if ((cmd.edge_wear_flags & 1u) == 0u) { return 0.0; }
+    let q = vec2<f32>(
+        (f32(clamp(pixel.x, cmd.semantic_x, cmd.semantic_x + cmd.semantic_width - 1u) - cmd.semantic_x) + 0.5) / f32(cmd.semantic_width),
+        (f32(clamp(pixel.y, cmd.semantic_y, cmd.semantic_y + cmd.semantic_height - 1u) - cmd.semantic_y) + 0.5) / f32(cmd.semantic_height),
+    );
+    let physical = q * vec2<f32>(cmd.slot_width, cmd.slot_height);
+    var distance_m = 3.402823e38;
+    if ((cmd.edge_wear_flags & 2u) != 0u) { distance_m = min(distance_m, physical.x); }
+    if ((cmd.edge_wear_flags & 4u) != 0u) { distance_m = min(distance_m, cmd.slot_width - physical.x); }
+    if ((cmd.edge_wear_flags & 8u) != 0u) { distance_m = min(distance_m, physical.y); }
+    if ((cmd.edge_wear_flags & 16u) != 0u) { distance_m = min(distance_m, cmd.slot_height - physical.y); }
+    if (cmd.structural_profile == 5u || cmd.structural_profile == 6u) {
+        let local = q - vec2<f32>(cmd.radial_center_x, cmd.radial_center_y);
+        let radial_m = length(local * vec2<f32>(cmd.slot_width, cmd.slot_height));
+        let minor = min(cmd.slot_width, cmd.slot_height);
+        distance_m = abs(radial_m - cmd.radial_outer_radius * minor);
+        if (cmd.structural_profile == 6u) {
+            distance_m = min(distance_m, abs(radial_m - cmd.radial_inner_radius * minor));
+        }
+    }
+    let width_m = max(cmd.edge_wear_width_m, 0.000001);
+    let pixel_m = max(
+        cmd.slot_width / f32(max(cmd.semantic_width, 1u)),
+        cmd.slot_height / f32(max(cmd.semantic_height, 1u)),
+    );
+    let breakup_m = max(cmd.edge_wear_breakup_scale_m, pixel_m * 2.0);
+    let noise_position = physical / breakup_m;
+
+    // Large smooth noise moves the wear boundary; it never selects a constant
+    // rectangular cell. Mid-frequency noise controls coverage and a third
+    // octave adds small chips without changing the authored physical width.
+    let boundary_noise = edge_fbm(noise_position * 0.55, cmd.edge_wear_seed);
+    let coverage_noise = edge_fbm(noise_position * 1.35 + vec2<f32>(11.7, 5.3), cmd.edge_wear_seed ^ 0xa511e9b3u);
+    let micro_noise = edge_value_noise(noise_position * 5.75 + vec2<f32>(2.1, 19.6), cmd.edge_wear_seed ^ 0x63d83595u);
+    let warped_distance = max(
+        0.0,
+        distance_m + (boundary_noise - 0.5) * width_m * 1.15 + (micro_noise - 0.5) * width_m * 0.18,
+    );
+    let spatial_feather_m = max(pixel_m * 0.75, width_m * 0.06);
+    let edge_fade = 1.0 - smoothstep(
+        max(0.0, width_m - spatial_feather_m),
+        width_m + spatial_feather_m,
+        warped_distance,
+    );
+    let coverage = clamp(cmd.edge_wear_coverage, 0.0, 1.0);
+    let coverage_mask = smoothstep(
+        1.0 - coverage - 0.18,
+        1.0 - coverage + 0.18,
+        coverage_noise,
+    );
+    let chip_detail = mix(0.72, 1.0, smoothstep(0.2, 0.82, micro_noise));
+    return clamp(edge_fade * coverage_mask * chip_detail * cmd.edge_wear_strength, 0.0, 1.0);
+}
+
+fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
+    let maximum = max(c.r, max(c.g, c.b));
+    let minimum = min(c.r, min(c.g, c.b));
+    let delta = maximum - minimum;
+    var hue = 0.0;
+    if (delta > 0.000001) {
+        if (maximum == c.r) { hue = ((c.g - c.b) / delta) % 6.0; }
+        else if (maximum == c.g) { hue = (c.b - c.r) / delta + 2.0; }
+        else { hue = (c.r - c.g) / delta + 4.0; }
+        hue = hue / 6.0;
+        if (hue < 0.0) { hue = hue + 1.0; }
+    }
+    return vec3<f32>(hue, select(0.0, delta / maximum, maximum > 0.000001), maximum);
+}
+
+fn hsv_to_rgb(c: vec3<f32>) -> vec3<f32> {
+    let h = fract(c.x) * 6.0;
+    let chroma = c.z * c.y;
+    let x = chroma * (1.0 - abs((h % 2.0) - 1.0));
+    var rgb = vec3<f32>(0.0);
+    if (h < 1.0) { rgb = vec3<f32>(chroma, x, 0.0); }
+    else if (h < 2.0) { rgb = vec3<f32>(x, chroma, 0.0); }
+    else if (h < 3.0) { rgb = vec3<f32>(0.0, chroma, x); }
+    else if (h < 4.0) { rgb = vec3<f32>(0.0, x, chroma); }
+    else if (h < 5.0) { rgb = vec3<f32>(x, 0.0, chroma); }
+    else { rgb = vec3<f32>(chroma, 0.0, x); }
+    return rgb + vec3<f32>(c.z - chroma);
 }
 
 fn transform_tangent_normal(normal: vec3<f32>, rotation: u32, mirror: u32) -> vec3<f32> {
@@ -283,7 +409,9 @@ fn material_height_sample(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
 fn final_height_at(cmd: RegionCommand, pixel: vec2<u32>) -> f32 {
     // Stage 15 structural Height is compiled and evaluated by the dedicated
     // physical profile pass. This material pass only samples authored Height.
-    return clamp(0.5 + material_height_sample(cmd, pixel), 0.0, 1.0);
+    let physical_scale = max(min(cmd.slot_width, cmd.slot_height), 0.000001);
+    let wear = edge_wear_mask(cmd, pixel) * cmd.edge_wear_height_m / physical_scale;
+    return clamp(0.5 + material_height_sample(cmd, pixel) + wear, 0.0, 1.0);
 }
 
 fn slice_axis(value: f32, destination: f32, origin: f32, extent: f32, leading: u32, trailing: u32, scale: f32, center: u32) -> f32 {
@@ -458,8 +586,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     blended = mix(linear, seam_linear, position.seam_blend);
                 }
                 let final_height = final_height_at(cmd, pixel);
+                let wear = edge_wear_mask(cmd, pixel);
                 if (header.map_kind == 0u) {
-                    color = vec4<f32>(linear_to_srgb(blended.r), linear_to_srgb(blended.g), linear_to_srgb(blended.b), blended.a);
+                    var hsv = rgb_to_hsv(blended.rgb);
+                    hsv.x = fract(hsv.x + cmd.edge_wear_hue_degrees / 360.0);
+                    hsv.y = clamp(hsv.y * cmd.edge_wear_saturation, 0.0, 1.0);
+                    hsv.z = clamp(hsv.z + cmd.edge_wear_value_offset, 0.0, 1.0);
+                    let worn = hsv_to_rgb(hsv);
+                    let result = mix(blended.rgb, worn, wear);
+                    color = vec4<f32>(linear_to_srgb(result.r), linear_to_srgb(result.g), linear_to_srgb(result.b), blended.a);
                 } else if (header.map_kind == 1u) {
                     color = vec4<f32>(final_height, final_height, final_height, 1.0);
                 } else if (header.map_kind == 2u) {
@@ -477,15 +612,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     }
                 } else if (header.map_kind == 3u) {
                     let base = select(170.0 / 255.0, clamp(blended.r, 0.0, 1.0), header.source_role == 3u);
-                    let value = clamp(base + max(0.0, 0.5 - final_height) * (70.0 / 255.0), 0.0, 1.0);
+                    let value = clamp(base + max(0.0, 0.5 - final_height) * (70.0 / 255.0) + wear * cmd.edge_wear_roughness_offset, 0.0, 1.0);
                     color = vec4<f32>(value, value, value, 1.0);
                 } else if (header.map_kind == 4u) {
                     let base = select(1.0, clamp(blended.r, 0.0, 1.0), header.source_role == 4u);
                     let value = clamp(base - max(0.0, 0.5 - final_height) * (130.0 / 255.0), 0.0, 1.0);
                     color = vec4<f32>(value, value, value, 1.0);
                 } else if (header.map_kind == 5u) {
-                    let value = select(0.0, clamp(blended.r, 0.0, 1.0), header.source_role == 5u);
+                    let base = select(0.0, clamp(blended.r, 0.0, 1.0), header.source_role == 5u);
+                    let explicit_metal = (cmd.edge_wear_flags & 32u) != 0u;
+                    let value = clamp(base + select(0.0, wear * cmd.edge_wear_metallic_offset, explicit_metal), 0.0, 1.0);
                     color = vec4<f32>(value, value, value, 1.0);
+                } else if (header.map_kind == 8u) {
+                    color = vec4<f32>(wear, wear, wear, 1.0);
                 }
                 matched = true;
             }

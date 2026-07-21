@@ -423,7 +423,10 @@ impl CompiledAtlasPlanV1 {
             hot_trimmer_domain::MaterialMapKind::Height
             | hot_trimmer_domain::MaterialMapKind::Roughness
             | hot_trimmer_domain::MaterialMapKind::Metallic
-            | hot_trimmer_domain::MaterialMapKind::AmbientOcclusion => {
+            | hot_trimmer_domain::MaterialMapKind::AmbientOcclusion
+            | hot_trimmer_domain::MaterialMapKind::Specular
+            | hot_trimmer_domain::MaterialMapKind::Opacity
+            | hot_trimmer_domain::MaterialMapKind::EdgeMask => {
                 CompiledTilePixelFormat::R32Float
             }
             hot_trimmer_domain::MaterialMapKind::RegionId => CompiledTilePixelFormat::R32Uint,
@@ -901,6 +904,8 @@ pub struct CompiledRegionCommandV1 {
     pub continuity: RegionContinuity,
     pub padding_px: u32,
     pub edge_eligibility: EdgeEligibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_wear: Option<hot_trimmer_domain::EdgeWearIntent>,
     /// Exact Stage 14 instruction consumed by both the Prompt 1 CPU executor and
     /// later GPU parity implementations. It is compiled before pixel execution.
     pub sampling_plan: SamplingPlan,

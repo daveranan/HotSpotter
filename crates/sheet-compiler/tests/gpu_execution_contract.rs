@@ -212,6 +212,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
             continuity: RegionContinuity::None,
             padding_px: 4,
             edge_eligibility: EdgeEligibility::default(),
+            edge_wear: None,
             sampling_plan: test_sampling_plan(
                 region_a,
                 first_source.clone(),
@@ -287,6 +288,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 top: false,
                 bottom: false,
             },
+            edge_wear: None,
             sampling_plan: test_sampling_plan(
                 region_b,
                 first_source.clone(),
@@ -362,6 +364,7 @@ fn base_plan() -> CompiledAtlasPlanV1 {
                 top: true,
                 bottom: true,
             },
+            edge_wear: None,
             sampling_plan: test_sampling_plan(
                 region_c,
                 second_source.clone(),

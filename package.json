@@ -12,6 +12,7 @@
     "build": "npm run build:web && cargo build --workspace",
     "build:native": "npm run tauri --workspace @hot-trimmer/desktop -- build --no-bundle",
     "build:web": "npm run build --workspace @hot-trimmer/desktop",
+    "check:algorithm-stage-20b": "node scripts/check-algorithm-stage-20b.mjs",
     "check": "node scripts/check.mjs && npm run typecheck --workspaces --if-present && npm run test --workspaces --if-present && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace",
     "dev": "npm run tauri --workspace @hot-trimmer/desktop -- dev",
     "format": "cargo fmt --all",

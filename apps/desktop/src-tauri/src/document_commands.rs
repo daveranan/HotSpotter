@@ -484,6 +484,9 @@ pub enum FeedbackWorkbenchCommand {
         region_id: RegionId,
         requested: hot_trimmer_effect_compiler::RequestedProfile,
     },
+    SetEdgeWear {
+        intent: hot_trimmer_domain::EdgeWearIntent,
+    },
     UpsertDetail {
         operation_id: Option<String>,
         enabled: bool,
@@ -786,6 +789,8 @@ pub struct FeedbackQaTileRequest {
     revision: u64,
     generation: u64,
     region_id: RegionId,
+    #[serde(default)]
+    all_regions: bool,
     view: FeedbackContributionView,
     profile: PreviewProfile,
     comparison_mode: FeedbackComparisonMode,
@@ -800,6 +805,7 @@ pub struct FeedbackPreviewExecution {
     published_generation: u64,
     revision: u64,
     region_id: RegionId,
+    all_regions: bool,
     view: FeedbackContributionView,
     requested_map: &'static str,
     profile: PreviewProfile,
@@ -1768,6 +1774,17 @@ pub fn apply_feedback_workbench_command(
                 identity,
             )
         }
+        FeedbackWorkbenchCommand::SetEdgeWear { intent } => {
+            let identity = hot_trimmer_domain::ContentDigest::sha256(
+                &serde_json::to_vec(&intent)
+                    .map_err(|failure| error(ErrorCode::Internal, &failure.to_string()))?,
+            )
+            .0;
+            (
+                TrimSheetDocumentCommand::SetEdgeWearIntent { intent },
+                identity,
+            )
+        }
         FeedbackWorkbenchCommand::UpsertDetail {
             operation_id,
             enabled,
@@ -2068,11 +2085,13 @@ pub fn stage_15_20_debug_payload(
         .rev()
         .map(|line| sanitize_debug_string(&line))
         .collect::<Vec<_>>();
-    let stage16_count = document
+    let stage16_detail_count = document
         .decorations
         .iter()
         .filter(|decoration| is_feedback_detail_key(&decoration.decoration_key))
         .count();
+    let edge_wear_enabled = document.edge_wear.as_ref().is_some_and(|intent| intent.enabled);
+    let stage16_count = stage16_detail_count + usize::from(edge_wear_enabled);
     let compiled_profile = request.compiled_inspection.as_ref().and_then(|value| value.get("compiledProfile"));
     let compiled_details = request.compiled_inspection.as_ref().and_then(|value| value.get("compiledDetails"));
     let cache_hit = matches!(&request.execution_outcome, FeedbackExecutionState::CacheHit);
@@ -2087,6 +2106,8 @@ pub fn stage_15_20_debug_payload(
     };
     let stage16_state = if stage16_count == 0 {
         FeedbackExecutionState::SkippedBecauseUnused
+    } else if edge_wear_enabled {
+        request.preview_state.clone()
     } else if compiled_details.is_some() {
         request.preview_state.clone()
     } else {
@@ -2656,7 +2677,7 @@ pub async fn preview_stage_15_16_feedback(
             draft_id: Some(request.generation),
             input_hash: Some(request_identity),
             profile: request.profile,
-            view_intent: Some(PreviewViewIntent::ExactSelectedRegion),
+            view_intent: feedback_preview_view_intent(&request),
             viewport_rect: None,
             requested_maps: vec![map],
             candidate_recipe: None,
@@ -2668,6 +2689,10 @@ pub async fn preview_stage_15_16_feedback(
         preview_service,
     )
     .await
+}
+
+fn feedback_preview_view_intent(request: &FeedbackQaTileRequest) -> Option<PreviewViewIntent> {
+    (!request.all_regions).then_some(PreviewViewIntent::ExactSelectedRegion)
 }
 
 fn feedback_map_for_view(
@@ -2698,6 +2723,7 @@ fn feedback_preview_cache_identity(
         "stage15-16-feedback-v1",
         request.revision,
         request.region_id,
+        request.all_regions,
         request.view,
         map,
         request.profile,
@@ -5028,6 +5054,7 @@ fn build_stage_14_preview(
             published_generation: publication.manifest.generation,
             revision: request.revision,
             region_id: request.region_id.expect("feedback requests target one region"),
+            all_regions: !matches!(request.view_intent, Some(PreviewViewIntent::ExactSelectedRegion)),
             view,
             requested_map,
             profile: request.profile,
@@ -5838,11 +5865,24 @@ mod algorithm_stage_20a_feedback_workbench_tests {
             revision,
             generation: 77,
             region_id,
+            all_regions: false,
             view: FeedbackContributionView::Stage16RegisteredMask,
             profile: PreviewProfile::Refinement1024,
             comparison_mode,
             selected_operation_id: selected_operation_id.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn mvp_edge_wear_global_feedback_request_uses_the_full_atlas() {
+        let region_id = RegionId::from_bytes([0x20; 16]);
+        let mut request = feedback_request(1, region_id, FeedbackComparisonMode::After, None);
+        assert!(matches!(
+            feedback_preview_view_intent(&request),
+            Some(PreviewViewIntent::ExactSelectedRegion)
+        ));
+        request.all_regions = true;
+        assert!(feedback_preview_view_intent(&request).is_none());
     }
 
     fn solid_png(pixel: [u8; 4]) -> Vec<u8> {
@@ -5873,7 +5913,7 @@ mod algorithm_stage_20a_feedback_workbench_tests {
                 draft_id: Some(request.generation),
                 input_hash: Some(identity),
                 profile: request.profile,
-                view_intent: Some(PreviewViewIntent::ExactSelectedRegion),
+                view_intent: feedback_preview_view_intent(request),
                 viewport_rect: None,
                 requested_maps: vec![map],
                 candidate_recipe: None,

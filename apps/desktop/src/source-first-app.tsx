@@ -64,6 +64,8 @@ import {
   feedbackExecutionMatchesRequest,
   feedbackEvidenceForRequest,
   feedbackPixelRequestIdentity,
+  feedbackPreviewRegionAfterCommand,
+  feedbackViewAfterCommand,
   selectFeedbackRegionWithoutPixelWork,
   selectedOperationAfterCommand,
   sourceFrameMaterialMapForCompiledView,
@@ -134,6 +136,11 @@ function requestedMaterialMapsForExport(project: ProjectProjection | null): read
   const channels = project?.document?.renderSettings.channels;
   if (!channels) return ["base_color"];
   const requested = exportableMaterialMaps.filter((map) => channels[map]?.enabled);
+  if (project?.document?.edgeWear?.enabled) {
+    for (const map of ["base_color", "height", "normal", "roughness", "metallic"] as const) {
+      if (!requested.includes(map)) requested.push(map);
+    }
+  }
   return requested.length > 0 ? requested : ["base_color"];
 }
 
@@ -391,6 +398,7 @@ function App() {
   const [feedbackComparisonMode, setFeedbackComparisonMode] = useState<FeedbackComparisonMode>("after");
   const [feedbackActiveTool, setFeedbackActiveTool] = useState<"select" | "profile" | "stamp" | "stroke">("select");
   const [feedbackSelectedOperationId, setFeedbackSelectedOperationId] = useState<string | null>(null);
+  const [feedbackPreviewAllRegions, setFeedbackPreviewAllRegions] = useState(false);
   const [feedbackCommandBusy, setFeedbackCommandBusy] = useState(false);
   const [feedbackLastCommandResult, setFeedbackLastCommandResult] = useState<string | null>(null);
   const [feedbackError, setFeedbackError] = useState<CommandFailure | null>(null);
@@ -402,6 +410,7 @@ function App() {
   const started = useRef(false);
   const documentHistoryBusy = useRef(false);
   const previewDraftId = useRef(0);
+  const feedbackCommandPreviewRevision = useRef<number | null>(null);
   const dirtyPreviewRegion = useRef<string | null>(null);
   const suppressAutomaticPreviewRevision = useRef<number | null>(null);
   const lastAutomaticPreviewKey = useRef<string | null>(null);
@@ -492,8 +501,8 @@ function App() {
   const buildState = buildStatus(project, artifact, activity, problem, stale);
   const paneMode = paneLayoutMode(workbenchWidth);
   const sourceFrameLayout = !!project?.document?.sourceFrame;
-  const showLibrary = sourceWorkbenchOpen && (paneMode === "full" || paneMode === "without-inspector");
-  const showSourceWorkspace = sourceWorkbenchOpen && paneMode !== "sheet-only";
+  const showLibrary = sourceWorkbenchOpen && !feedbackWorkbenchOpen && (paneMode === "full" || paneMode === "without-inspector");
+  const showSourceWorkspace = sourceWorkbenchOpen && !feedbackWorkbenchOpen && paneMode !== "sheet-only";
   // The Layout sidebar is the single region inspector. Keep the former context
   // inspector out of the pane layout so it cannot duplicate map or region controls.
   const showInspector = false;
@@ -502,7 +511,9 @@ function App() {
   if (showSourceWorkspace && hotspotSheetOpen) visibleTracks.push(`minmax(280px, ${sourceSheetShare}fr)`, `minmax(320px, ${1 - sourceSheetShare}fr)`);
   else if (showSourceWorkspace || hotspotSheetOpen) visibleTracks.push("minmax(0, 1fr)");
   if (showInspector) visibleTracks.push(`${panes.inspector}px`);
-  const workbenchColumns = visibleTracks.length ? visibleTracks.join(" 6px ") : "minmax(0, 1fr)";
+  const workbenchColumns = feedbackWorkbenchOpen
+    ? "minmax(0, 1fr) minmax(360px, 430px)"
+    : visibleTracks.length ? visibleTracks.join(" 6px ") : "minmax(0, 1fr)";
 
   useEffect(() => {
     // A topology command starts its replacement request before React commits this
@@ -606,13 +617,19 @@ function App() {
 
   useEffect(() => {
     const revision = project?.document?.documentRevision;
-    if (!feedbackWorkbenchOpen || !selectedRegionId || revision === undefined) return;
+    const previewRegionId = selectedRegionId
+      ?? (feedbackPreviewAllRegions ? project?.document?.topology.regions[0]?.id ?? null : null);
+    if (!feedbackWorkbenchOpen || !previewRegionId || revision === undefined) return;
+    if (feedbackCommandPreviewRevision.current === revision) {
+      feedbackCommandPreviewRevision.current = null;
+      return;
+    }
     if (!visibleMapDependency(feedbackView)) {
       setFeedbackExecution(null);
       setPreviewClientTelemetry([`feedback_view=${feedbackView}`, `requested_revision=${revision}`, "pixel_dispatch=0", "request_outcome=metadata_only"]);
       return;
     }
-    void requestFeedbackTile(revision, selectedRegionId);
+    void requestFeedbackTile(revision, previewRegionId, feedbackPreviewAllRegions);
   }, [feedbackWorkbenchOpen, project?.document?.documentRevision, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId, feedbackProfile]);
 
   useEffect(() => {
@@ -946,17 +963,35 @@ function App() {
     if (!native || !project?.document || feedbackCommandBusy) return;
     setFeedbackCommandBusy(true);
     setFeedbackError(null);
+    setProblem(null);
     try {
       const result = await invoke<FeedbackWorkbenchCommandResult>("apply_feedback_workbench_command", {
         request: { ...protocol, commandVersion: 1, command: commandValue },
       });
+      const previewRegionId = feedbackPreviewRegionAfterCommand(
+        commandValue,
+        selectedRegionId,
+        result.project.document?.topology.regions.map((region) => region.id) ?? [],
+      );
+      const previewAllRegions = commandValue.type === "set_edge_wear" && !commandValue.intent.targetRegion;
+      setFeedbackPreviewAllRegions(previewAllRegions);
+      if (!previewAllRegions && previewRegionId !== selectedRegionId) setSelectedRegionId(previewRegionId);
+      const nextFeedbackView = feedbackViewAfterCommand(commandValue, feedbackView);
+      if (nextFeedbackView !== feedbackView) setFeedbackView(nextFeedbackView);
       setProject(result.project);
       setFeedbackLastCommandResult(`${commandValue.type}:${result.committedIdentity}:${result.status}`);
       setFeedbackSelectedOperationId((current) => selectedOperationAfterCommand(commandValue, current, result.committedIdentity));
-      const dependency = visibleMapDependency(feedbackView);
+      const dependency = visibleMapDependency(nextFeedbackView);
       if (dependency) {
         setMapViewState(dependency);
         mapViewRef.current = dependency;
+      }
+      if (commandValue.type === "set_edge_wear" && previewRegionId) {
+        const revision = result.project.document?.documentRevision;
+        if (revision !== undefined) {
+          feedbackCommandPreviewRevision.current = revision;
+          await requestFeedbackTile(revision, previewRegionId, previewAllRegions, nextFeedbackView);
+        }
       }
     } catch (reason) {
       const commandFailure = failure(reason);
@@ -974,11 +1009,13 @@ function App() {
     if (!dependency || revision === undefined) return;
     setMapViewState(dependency);
     mapViewRef.current = dependency;
-    if (selectedRegionId) void requestFeedbackTile(revision, selectedRegionId);
+    const previewRegionId = selectedRegionId
+      ?? (feedbackPreviewAllRegions ? project?.document?.topology.regions[0]?.id ?? null : null);
+    if (previewRegionId) void requestFeedbackTile(revision, previewRegionId, feedbackPreviewAllRegions);
   }
 
-  async function requestFeedbackTile(revision: number, regionId: string) {
-    const dependency = visibleMapDependency(feedbackView);
+  async function requestFeedbackTile(revision: number, regionId: string, allRegions = false, requestedView = feedbackView) {
+    const dependency = visibleMapDependency(requestedView);
     if (!native || !dependency) return;
     const profile = feedbackProfile === "preview1024" ? "refinement1024" : feedbackProfile;
     const generation = ++previewDraftId.current;
@@ -986,16 +1023,16 @@ function App() {
     previewPublishStartedAt.current = startedAt;
     const targetDimensions = previewProfileDimensions(profile);
     const requestDescriptor: FeedbackPixelRequestIdentity = {
-      revision, regionId, view: feedbackView, map: dependency, profile: feedbackProfile,
+      revision, regionId, allRegions, view: requestedView, map: dependency, profile: feedbackProfile,
       comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId,
     };
     const requestIdentity = feedbackPixelRequestIdentity(requestDescriptor);
     setFeedbackExecution(null);
-    setPreviewProgress({ requestId: generation, phase: "compiling", profile, requestedRevision: revision, requestedMap: dependency, startedAt, targetDimensions, feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId });
+    setPreviewProgress({ requestId: generation, phase: "compiling", profile, requestedRevision: revision, requestedMap: dependency, startedAt, targetDimensions, feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
     setFeedbackError(null);
     try {
       const next = await invoke<IntermediateAtlasProjection>("preview_stage_15_16_feedback", {
-        request: { ...protocol, commandVersion: 1, revision, generation, regionId, view: feedbackView, profile, comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId ?? undefined },
+        request: { ...protocol, commandVersion: 1, revision, generation, regionId, allRegions, view: requestedView, profile, comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId ?? undefined },
       });
       if (generation !== previewDraftId.current) return;
       if (!next.feedbackExecution || next.feedbackExecution.clientGeneration !== generation || !feedbackExecutionMatchesRequest(next.feedbackExecution, requestDescriptor)) {
@@ -1003,9 +1040,10 @@ function App() {
       }
       setArtifact(next);
       setFeedbackExecution(next.feedbackExecution);
+      setProblem(null);
       if (next.project) setProject(next.project);
       setPreview(null);
-      setPreviewProgress({ requestId: generation, phase: "received", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published", feedbackRequestIdentity: next.feedbackExecution.requestIdentity, feedbackRegionId: regionId, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId });
+      setPreviewProgress({ requestId: generation, phase: "received", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published", feedbackRequestIdentity: next.feedbackExecution.requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
       setPreviewClientTelemetry([`request_identity=${next.feedbackExecution.requestIdentity}`, `feedback_view=${next.feedbackExecution.view}`, `profile=${next.feedbackExecution.profile}`, `requested_revision=${next.feedbackExecution.revision}`, `requested_map=${next.feedbackExecution.requestedMap}`, `artifact_revision=${next.documentRevision}`, `request_outcome=${next.feedbackExecution.outcome}`, `cache_reused=${next.feedbackExecution.cacheReused}`]);
     } catch (reason) {
       const commandFailure = failure(reason);
@@ -1013,14 +1051,15 @@ function App() {
       setFeedbackExecution(null);
       setFeedbackError(commandFailure);
       if (!superseded) setProblem(commandFailure);
-      if (generation === previewDraftId.current) setPreviewProgress({ requestId: generation, phase: "failed", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, terminalOutcome: superseded ? "superseded" : "failed", feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView, feedbackComparisonMode, feedbackSelectedOperationId });
-      setPreviewClientTelemetry([`request_identity=${requestIdentity}`, `feedback_view=${feedbackView}`, `requested_revision=${revision}`, `requested_map=${dependency}`, `request_outcome=${superseded ? "superseded" : "failed"}`, `problem=${commandFailure.code}`]);
+      if (generation === previewDraftId.current) setPreviewProgress({ requestId: generation, phase: "failed", profile, requestedRevision: revision, requestedMap: dependency, startedAt, elapsedMs: performance.now() - startedAt, terminalOutcome: superseded ? "superseded" : "failed", feedbackRequestIdentity: requestIdentity, feedbackRegionId: regionId, feedbackView: requestedView, feedbackComparisonMode, feedbackSelectedOperationId });
+      setPreviewClientTelemetry([`request_identity=${requestIdentity}`, `feedback_view=${requestedView}`, `requested_revision=${revision}`, `requested_map=${dependency}`, `request_outcome=${superseded ? "superseded" : "failed"}`, `problem=${commandFailure.code}`]);
     }
   }
 
   function selectFeedbackRegion(regionId: string) {
     const transition = selectFeedbackRegionWithoutPixelWork({ selectedRegionId, activeMap: mapView, publication: artifact }, regionId);
     setSelectedRegionId(transition.selectedRegionId);
+    setFeedbackPreviewAllRegions(false);
   }
 
   async function createFeedbackSample() {
@@ -1032,6 +1071,7 @@ function App() {
       setProject(next);
       const regionId = next.document?.topology.regions[0]?.id ?? null;
       setSelectedRegionId(regionId);
+      setFeedbackPreviewAllRegions(false);
       setFeedbackSelectedOperationId(next.feedbackAuthoring.records.find((record) => record.intent.kind === "operation")?.operationId ?? null);
       setFeedbackLastCommandResult("create_feedback_sample:executed");
       if (next.document && regionId) {
@@ -1879,7 +1919,7 @@ function App() {
         <nav className="workflow" aria-label="Workbench tabs">
           <button className={`mode ${sourceWorkbenchOpen ? "active" : ""}`} aria-pressed={sourceWorkbenchOpen} onClick={() => setSourceWorkbenchOpen((open) => !open)}>Workbench</button>
           <button className={`mode ${hotspotSheetOpen ? "active" : ""}`} aria-pressed={hotspotSheetOpen} onClick={() => setHotspotSheetOpen((open) => !open)}>Hotspot Sheet</button>
-          <button className={`mode ${feedbackWorkbenchOpen ? "active" : ""}`} aria-pressed={feedbackWorkbenchOpen} onClick={() => setFeedbackWorkbenchOpen((open) => !open)} title="Typed Stage 15/16 authoring and raw contribution QA only.">Layers &amp; Maps</button>
+          <button className={`mode ${feedbackWorkbenchOpen ? "active" : ""}`} aria-pressed={feedbackWorkbenchOpen} onClick={() => setFeedbackWorkbenchOpen((open) => { const next = !open; if (next) { setSourceWorkbenchOpen(false); setHotspotSheetOpen(true); } return next; })} title="Ordered GPU material layers and map inspection.">Layers &amp; Maps</button>
         </nav>
         <span className="window-drag-space" data-tauri-drag-region />
         <div className="publish-actions">
@@ -2029,6 +2069,7 @@ function App() {
              lastCommandResult: feedbackLastCommandResult,
              error: feedbackError,
              execution: feedbackExecution,
+             allRegions: feedbackPreviewAllRegions,
            } : null}
            onPreviewPaint={(dimensions) => {
              if (feedbackWorkbenchOpen && dimensions.generation !== undefined && dimensions.generation !== feedbackExecution?.publishedGeneration) return;
@@ -2065,29 +2106,29 @@ function App() {
           onSetRegionContent={(regionId, content) => void assignContentToRegion(regionId, content)}
           onSetRegionBehavior={(regionId, behavior) => void setRegionBehavior(regionId, behavior)}
         /> : null}
+        {feedbackWorkbenchOpen ? <FeedbackWorkbench
+          project={project}
+          artifact={artifact}
+          selectedRegionId={selectedRegionId}
+          selectedOperationId={feedbackSelectedOperationId}
+          view={feedbackView}
+          profile={feedbackProfile}
+          comparisonMode={feedbackComparisonMode}
+          activeTool={feedbackActiveTool}
+          commandBusy={feedbackCommandBusy}
+          onSelectRegion={selectFeedbackRegion}
+          onSelectOperation={setFeedbackSelectedOperationId}
+          onView={setFeedbackView}
+          onProfile={setFeedbackProfile}
+          onComparisonMode={setFeedbackComparisonMode}
+          onActiveTool={setFeedbackActiveTool}
+          onCommand={applyFeedbackCommand}
+          onRequestVisibleView={requestFeedbackVisibleView}
+          onCreateSample={() => void createFeedbackSample()}
+          onUndo={() => void history(false)}
+          onRedo={() => void history(true)}
+        /> : null}
       </section>
-      {feedbackWorkbenchOpen ? <FeedbackWorkbench
-        project={project}
-        artifact={artifact}
-        selectedRegionId={selectedRegionId}
-        selectedOperationId={feedbackSelectedOperationId}
-        view={feedbackView}
-        profile={feedbackProfile}
-        comparisonMode={feedbackComparisonMode}
-        activeTool={feedbackActiveTool}
-        commandBusy={feedbackCommandBusy}
-        onSelectRegion={selectFeedbackRegion}
-        onSelectOperation={setFeedbackSelectedOperationId}
-        onView={setFeedbackView}
-        onProfile={setFeedbackProfile}
-        onComparisonMode={setFeedbackComparisonMode}
-        onActiveTool={setFeedbackActiveTool}
-        onCommand={applyFeedbackCommand}
-        onRequestVisibleView={requestFeedbackVisibleView}
-        onCreateSample={() => void createFeedbackSample()}
-        onUndo={() => void history(false)}
-        onRedo={() => void history(true)}
-      /> : null}
       <footer className="statusbar">
         <span>{project?.name ?? "Untitled"}</span>
         <span>{buildState}</span>
@@ -3118,6 +3159,7 @@ function SheetWorkbench(props: {
     lastCommandResult: string | null;
     error: CommandFailure | null;
     execution: FeedbackPreviewExecution | null;
+    allRegions: boolean;
   };
   onPreviewPaint: (dimensions: { width: number; height: number; generation?: number }) => void;
 }) {
@@ -3356,9 +3398,12 @@ function SheetWorkbench(props: {
     const telemetry = [...(props.artifact?.telemetry ?? []), ...props.previewClientTelemetry];
     if (props.feedbackDebug && props.project?.document) {
       const dependency = visibleMapDependency(props.feedbackDebug.view);
-      const currentRequest: FeedbackPixelRequestIdentity | null = dependency && props.selectedRegionId ? {
+      const requestRegionId = props.selectedRegionId
+        ?? (props.feedbackDebug.allRegions ? props.project.document.topology.regions[0]?.id ?? null : null);
+      const currentRequest: FeedbackPixelRequestIdentity | null = dependency && requestRegionId ? {
         revision: props.project.document.documentRevision,
-        regionId: props.selectedRegionId,
+        regionId: requestRegionId,
+        allRegions: props.feedbackDebug.allRegions,
         view: props.feedbackDebug.view,
         map: dependency,
         profile: props.feedbackDebug.profile,
@@ -3381,7 +3426,7 @@ function SheetWorkbench(props: {
                 : progressIsCurrent && (props.feedbackDebug.error || props.previewProgress?.phase === "failed") ? "Failed"
                   : "InstalledNotRequested";
       const requestIdentity = exactExecution ? props.feedbackDebug.execution!.requestIdentity
-        : currentRequestIdentity ?? JSON.stringify(["stage15-16-feedback-metadata-v1", props.project.document.documentRevision, props.selectedRegionId, props.feedbackDebug.view, props.feedbackDebug.profile, props.feedbackDebug.comparisonMode, props.feedbackDebug.selectedOperationId]);
+        : currentRequestIdentity ?? JSON.stringify(["stage15-16-feedback-metadata-v1", props.project.document.documentRevision, props.selectedRegionId, props.feedbackDebug.allRegions, props.feedbackDebug.view, props.feedbackDebug.profile, props.feedbackDebug.comparisonMode, props.feedbackDebug.selectedOperationId]);
       const pixelDispatchCount = !dependency ? 0 : exactExecution || progressIsCurrent ? 1 : 0;
       const selectedInspection = props.artifact?.slots.find((slot) => slot.regionId === props.selectedRegionId);
       const request: Stage15To20DebugRequest = {

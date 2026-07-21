@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "projectId": "project-fixture",
+  "materialId": "material-fixture",
+  "materialName": "Hot Trimmer Fixture",
+  "materialRevision": 7,
+  "templateId": "template-fixture",
+  "templateVersion": "1.0.0",
+  "compatibilityKey": "fixture-v1",
+  "templateSnapshotHash": "fixture-snapshot-hash",
+  "outputSize": [1024, 1024],
+  "normalOrientation": "DirectX",
+  "maps": {},
+  "slots": [
+    {
+      "slotId": "rect_wide",
+      "regionId": "fixture-v1:rect_wide",
+      "role": "rectangular",
+      "normalizedHotspotRect": {"x": 0.05, "y": 0.05, "width": 0.4, "height": 0.2},
+      "uvFit": {"kind": "rectangular", "fitAxis": "automatic", "keepProportion": true, "allowedRotations": [0, 180], "mirrorAllowed": true, "classificationTags": ["HOTSPOT", "RECTANGULAR"]},
+      "worldSizeMeters": [2.0, 1.0],
+      "variationGroup": "rectangles",
+      "enabled": true,
+      "regionIdColor": [144, 136, 72]
+    },
+    {
+      "slotId": "rect_tall",
+      "regionId": "fixture-v1:rect_tall",
+      "role": "rectangular",
+      "normalizedHotspotRect": {"x": 0.55, "y": 0.05, "width": 0.2, "height": 0.4},
+      "uvFit": {"kind": "rectangular", "fitAxis": "automatic", "keepProportion": true, "allowedRotations": [0, 180], "mirrorAllowed": false, "classificationTags": ["HOTSPOT", "RECTANGULAR"]},
+      "worldSizeMeters": [1.0, 2.0],
+      "variationGroup": "rectangles",
+      "enabled": true,
+      "regionIdColor": [80, 120, 200]
+    },
+    {
+      "slotId": "radial_disc",
+      "regionId": "fixture-v1:radial_disc",
+      "role": "radial",
+      "normalizedHotspotRect": {"x": 0.2, "y": 0.6, "width": 0.3, "height": 0.3},
+      "uvFit": {"kind": "radial", "fitAxis": "none", "keepProportion": true, "allowedRotations": [0], "mirrorAllowed": false, "classificationTags": ["RADIAL", "DISC"]},
+      "worldSizeMeters": [2.0, 2.0],
+      "variationGroup": "radials",
+      "enabled": true,
+      "regionIdColor": [144, 136, 72],
+      "radialParameters": {"centerX": 0.5, "centerY": 0.5, "innerRadius": 0.0, "outerRadius": 0.5}
+    }
+  ]
+}
