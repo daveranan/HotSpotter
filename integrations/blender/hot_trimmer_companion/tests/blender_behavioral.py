@@ -187,7 +187,7 @@ def run():
         require(tuple(face.select for face in bm.faces) == selected_faces_before, "face selection was not preserved")
         bpy.ops.object.mode_set(mode="OBJECT")
         assignments = json.loads(mesh["ht_assignments"])
-        require(all(record.get("algorithmVersion") == 2 for record in assignments.values()), "assignment algorithm version was not persisted")
+        require(all(record.get("algorithmVersion") == 4 for record in assignments.values()), "assignment algorithm version was not persisted")
         require(all(record.get("templateSnapshotHash") == "fixture-snapshot-hash" for record in assignments.values()), "assignment template snapshot was not persisted")
         require(assignments["0"]["slotId"] == "rect_wide", "wide island did not choose expected manifest slot")
         require(assignments["1"]["slotId"] == "rect_tall", "tall island did not choose expected manifest slot")
@@ -215,8 +215,12 @@ def run():
         require(result == {"FINISHED"}, "second identical hotspot run failed")
         require(rect.mode == "EDIT", "second run did not preserve edit mode")
         bpy.ops.object.mode_set(mode="OBJECT")
-        require(uv_bytes(mesh) == first_uv_bytes, "second identical run was not byte-stable")
-        require(mesh["ht_assignments"] == first_assignments, "second identical assignment was not stable")
+        second_assignments = json.loads(mesh["ht_assignments"])
+        require(uv_bytes(mesh) != first_uv_bytes, "second click did not advance the hotspot distribution")
+        require(mesh["ht_assignments"] != first_assignments, "second click did not persist a new distribution")
+        require(all(record.get("variationCycle") == 1 for record in second_assignments.values()), "second distribution cycle was not persisted")
+        for face_index in (0, 1):
+            assert_face_inside(mesh, face_index, rects[second_assignments[str(face_index)]["slotId"]])
 
         stale = json.loads(mesh["ht_assignments"])
         for record in stale.values():
@@ -243,7 +247,7 @@ def run():
         require(rect.mode == "EDIT", "stale assignment rebuild did not preserve edit mode")
         bpy.ops.object.mode_set(mode="OBJECT")
         require(uv_bytes(mesh) != stale_uv_bytes, "stale rectangular assignment reused its shrunken UV footprint")
-        require(all(record.get("algorithmVersion") == 2 for record in json.loads(mesh["ht_assignments"]).values()), "stale assignment version was not replaced")
+        require(all(record.get("algorithmVersion") == 4 for record in json.loads(mesh["ht_assignments"]).values()), "stale assignment version was not replaced")
 
         for obj in bpy.context.selected_objects:
             obj.select_set(False)

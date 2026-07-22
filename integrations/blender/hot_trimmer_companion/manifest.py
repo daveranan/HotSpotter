@@ -15,6 +15,9 @@ MANIFEST_FILE_NAME = "manifest.hottrim.json"
 SUPPORTED_KINDS = frozenset(("rectangular", "radial"))
 SUPPORTED_FIT_AXES = frozenset(("automatic", "none"))
 SUPPORTED_ROTATIONS = frozenset((0, 90, 180, 270))
+SUPPORTED_BEHAVIOR_ROLES = frozenset(("panel", "horizontal_strip", "vertical_strip", "unique", "radial"))
+SUPPORTED_SAMPLING = frozenset(("one_shot", "loop_x", "loop_y", "loop_xy"))
+SUPPORTED_ORIENTATIONS = frozenset(("zero", "ninety", "one_eighty", "two_seventy"))
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,9 @@ class Slot:
     enabled: bool
     radial_parameters: dict | None
     region_id_color: tuple | None = None
+    behavior_role: str | None = None
+    sampling: str | None = None
+    orientation: str | None = None
 
     @property
     def is_radial(self):
@@ -107,6 +113,21 @@ def _validated_slot(record, index):
         if not isinstance(color, list) or len(color) != 3 or any(isinstance(channel, bool) or not isinstance(channel, int) or channel < 0 or channel > 255 for channel in color):
             raise ValueError(f"{description}.regionIdColor must be an RGB byte triplet")
         color = tuple(color)
+    behavior_role = record.get("behaviorRole")
+    if behavior_role is not None:
+        behavior_role = _nonempty_string(behavior_role, f"{description}.behaviorRole").lower()
+        if behavior_role not in SUPPORTED_BEHAVIOR_ROLES:
+            raise ValueError(f"{description}.behaviorRole is unsupported: {behavior_role}")
+    sampling = record.get("sampling")
+    if sampling is not None:
+        sampling = _nonempty_string(sampling, f"{description}.sampling").lower()
+        if sampling not in SUPPORTED_SAMPLING:
+            raise ValueError(f"{description}.sampling is unsupported: {sampling}")
+    orientation = record.get("orientation")
+    if orientation is not None:
+        orientation = _nonempty_string(orientation, f"{description}.orientation").lower()
+        if orientation not in SUPPORTED_ORIENTATIONS:
+            raise ValueError(f"{description}.orientation is unsupported: {orientation}")
     return Slot(
         slot_id=_nonempty_string(_required(record, "slotId", description), f"{description}.slotId"),
         region_id=_nonempty_string(_required(record, "regionId", description), f"{description}.regionId"),
@@ -123,6 +144,9 @@ def _validated_slot(record, index):
         enabled=enabled,
         radial_parameters=radial_parameters,
         region_id_color=color,
+        behavior_role=behavior_role,
+        sampling=sampling,
+        orientation=orientation,
     )
 
 

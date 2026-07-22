@@ -1440,7 +1440,9 @@ const GPU_PROFILE_HEADER_BYTES: usize = 32;
 const GPU_PROFILE_COMMAND_BYTES: usize = 96;
 const GPU_DETAIL_COMMAND_BYTES: usize = 180;
 const GPU_EDGE_DETAIL_COMMAND_BYTES: usize = 160;
-const SOURCE_HEIGHT_RANGE_M: f32 = 0.002;
+/// Full signed Height span represented by normalized material-map pixels.
+/// Zero meters maps to 0.5, with -1 mm and +1 mm at the endpoints.
+pub const SOURCE_HEIGHT_RANGE_M: f32 = 0.002;
 
 const GPU_HEADER_BYTES: usize = 88;
 const GPU_COMMAND_BYTES: usize = 176;

@@ -137,7 +137,8 @@ test("layout editing keeps the texture stable, pans in draw mode, and auto-previ
   assert.match(app, /window\.setTimeout\(\(\) => \{[\s\S]*props\.previewCandidate\(props\.candidateRecipe\)/);
   assert.doesNotMatch(app, /Drag shared vertical boundary/);
   assert.doesNotMatch(app, /Reset boundary/);
-  assert.match(app, /const editorHasImage = !!continuousTexture \|\| displayGpuTiles \|\| !!imageUrl/);
+  assert.match(app, /const editorHasImage = processingMaterialView && processing/);
+  assert.match(app, /\? litMaterialReady\s*: !!continuousTexture \|\| displayGpuTiles \|\| !!imageUrl/);
   assert.match(app, /const previewInFlight = props\.previewProgress\?\.phase === "compiling" \|\| props\.previewProgress\?\.phase === "received"/);
   assert.match(app, /Rendering preview/);
   assert.match(app, /Preview pixels unavailable/);

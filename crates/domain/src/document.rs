@@ -3149,7 +3149,11 @@ fn deterministic_region_id(template_key: &str, region_key: &str) -> RegionId {
     RegionId::from_bytes(bytes)
 }
 
-fn authored_region(ordinal: u32, rect: GridRect) -> AuthoredLayoutPresetRegion {
+fn authored_region(
+    ordinal: u32,
+    rect: GridRect,
+    grid: LogicalGridSpec,
+) -> AuthoredLayoutPresetRegion {
     let orientation = if rect.width > rect.height {
         RegionOrientation::Horizontal
     } else if rect.height > rect.width {
@@ -3157,23 +3161,60 @@ fn authored_region(ordinal: u32, rect: GridRect) -> AuthoredLayoutPresetRegion {
     } else {
         RegionOrientation::Unspecified
     };
+    let (role, kind, fit_axis, behavior_role, role_tag) = if rect.width >= rect.height * 4 {
+        (
+            TemplateSlotRole::RepeatingStrip,
+            UvFitKind::Strip,
+            FitAxis::Vertical,
+            ManualRegionRole::HorizontalStrip,
+            "HORIZONTAL_STRIP",
+        )
+    } else if rect.height >= rect.width * 4 {
+        (
+            TemplateSlotRole::RepeatingStrip,
+            UvFitKind::Strip,
+            FitAxis::Horizontal,
+            ManualRegionRole::VerticalStrip,
+            "VERTICAL_STRIP",
+        )
+    } else {
+        (
+            TemplateSlotRole::Planar,
+            UvFitKind::Rectangular,
+            FitAxis::Automatic,
+            ManualRegionRole::Panel,
+            "PANEL",
+        )
+    };
     AuthoredLayoutPresetRegion {
         preset_region_key: format!("cascade-{ordinal:02}"),
         display_name: format!("Region {:03}", ordinal + 1),
         grid_rect: rect,
-        role: TemplateSlotRole::Planar,
+        role,
         orientation,
         uv_fit: UvFitPolicy {
-            kind: UvFitKind::Rectangular,
-            fit_axis: FitAxis::Automatic,
+            kind,
+            fit_axis,
             keep_proportion: true,
-            allowed_rotations: vec![QuarterTurn::Zero],
+            allowed_rotations: vec![
+                QuarterTurn::Zero,
+                QuarterTurn::Ninety,
+                QuarterTurn::OneEighty,
+                QuarterTurn::TwoSeventy,
+            ],
             mirror_allowed: false,
-            world_size_meters: [f64::from(rect.width), f64::from(rect.height)],
-            classification_tags: vec!["AUTHORED_LAYOUT".into()],
+            world_size_meters: [
+                f64::from(rect.width) / f64::from(grid.width),
+                f64::from(rect.height) / f64::from(grid.height),
+            ],
+            classification_tags: vec![
+                "AUTHORED_LAYOUT".into(),
+                "REFERENCE_SHEET_1M".into(),
+                role_tag.into(),
+            ],
         },
         structural_profile: StructuralProfile::Flat,
-        default_behavior: RegionBehavior::default(),
+        default_behavior: RegionBehavior::new(behavior_role),
     }
 }
 
@@ -3334,7 +3375,7 @@ pub fn diagonal_cascade_authored_preset() -> AuthoredLayoutPreset {
         regions: rects
             .into_iter()
             .enumerate()
-            .map(|(i, rect)| authored_region(i as u32, rect))
+            .map(|(i, rect)| authored_region(i as u32, rect, LogicalGridSpec::DEFAULT))
             .collect(),
         provenance: "checked_in_authored_fixture".into(),
     }
@@ -3356,6 +3397,7 @@ pub fn new_blank_authored_preset(grid: LogicalGridSpec) -> AuthoredLayoutPreset 
                 width: grid.width,
                 height: grid.height,
             },
+            grid,
         )],
         provenance: "built_in_blank".into(),
     }

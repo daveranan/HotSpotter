@@ -21,7 +21,10 @@
       "worldSizeMeters": [2.0, 1.0],
       "variationGroup": "rectangles",
       "enabled": true,
-      "regionIdColor": [144, 136, 72]
+      "regionIdColor": [144, 136, 72],
+      "behaviorRole": "panel",
+      "sampling": "one_shot",
+      "orientation": "zero"
     },
     {
       "slotId": "rect_tall",
@@ -32,7 +35,24 @@
       "worldSizeMeters": [1.0, 2.0],
       "variationGroup": "rectangles",
       "enabled": true,
-      "regionIdColor": [80, 120, 200]
+      "regionIdColor": [80, 120, 200],
+      "behaviorRole": "panel",
+      "sampling": "one_shot",
+      "orientation": "zero"
+    },
+    {
+      "slotId": "strip_horizontal",
+      "regionId": "fixture-v1:strip_horizontal",
+      "role": "repeatingStrip",
+      "normalizedHotspotRect": {"x": 0.05, "y": 0.5, "width": 0.8, "height": 0.1},
+      "uvFit": {"kind": "rectangular", "fitAxis": "automatic", "keepProportion": true, "allowedRotations": [0, 180], "mirrorAllowed": false, "classificationTags": ["HOTSPOT", "HORIZONTAL_STRIP", "REFERENCE_SHEET_1M"]},
+      "worldSizeMeters": [0.8, 0.1],
+      "variationGroup": "strips",
+      "enabled": true,
+      "regionIdColor": [24, 180, 96],
+      "behaviorRole": "horizontal_strip",
+      "sampling": "one_shot",
+      "orientation": "zero"
     },
     {
       "slotId": "radial_disc",
@@ -44,6 +64,9 @@
       "variationGroup": "radials",
       "enabled": true,
       "regionIdColor": [144, 136, 72],
+      "behaviorRole": "radial",
+      "sampling": "one_shot",
+      "orientation": "zero",
       "radialParameters": {"centerX": 0.5, "centerY": 0.5, "innerRadius": 0.0, "outerRadius": 0.5}
     }
   ]

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Hot Trimmer Companion",
     "author": "Hot Trimmer",
-    "version": (0, 2, 8),
+    "version": (0, 3, 2),
     "blender": (4, 0, 0),
     "category": "Material",
 }

@@ -11,8 +11,22 @@ test("manual-layout-presets: built-ins are deterministic exact-cover authored sn
   assert.equal(JSON.stringify(diagonalCascadePreset).includes("recipe"), false);
 });
 
+test("manual-layout-presets: hotspot behavior and reference size are exported as authored metadata", () => {
+  const vertical = diagonalCascadePreset.regions.find((region) => region.gridRect.width === 1 && region.gridRect.height === 24)!;
+  const horizontal = diagonalCascadePreset.regions.find((region) => region.gridRect.width === 32 && region.gridRect.height === 1)!;
+  const panel = diagonalCascadePreset.regions.find((region) => region.gridRect.width === 16 && region.gridRect.height === 16)!;
+  assert.equal(vertical.role, "repeatingStrip");
+  assert.equal(vertical.defaultBehavior.role, "vertical_strip");
+  assert.deepEqual((vertical.uvFit as { worldSizeMeters: number[] }).worldSizeMeters, [1 / 64, 24 / 64]);
+  assert.deepEqual((vertical.uvFit as { allowedRotations: string[] }).allowedRotations, ["zero", "ninety", "one_eighty", "two_seventy"]);
+  assert.equal(horizontal.defaultBehavior.role, "horizontal_strip");
+  assert.deepEqual((horizontal.uvFit as { classificationTags: string[] }).classificationTags, ["AUTHORED_LAYOUT", "REFERENCE_SHEET_1M", "HORIZONTAL_STRIP"]);
+  assert.equal(panel.role, "planar");
+  assert.equal(panel.defaultBehavior.role, "panel");
+});
+
 test("manual-layout-presets: Diagonal Cascade exactly matches the classic source hotspot golden", () => {
-  const svg = readFileSync("../../target/hierarchical-goldens/hierarchical-classic-source-hotspot.golden.svg", "utf8");
+  const svg = readFileSync(new URL("./fixtures/hierarchical-classic-source-hotspot.golden.svg", import.meta.url), "utf8");
   const golden = [...svg.matchAll(/<rect x="(\d+)" y="(\d+)" width="(\d+)" height="(\d+)"/g)]
     .map((match) => ({ x: Number(match[1]), y: Number(match[2]), width: Number(match[3]), height: Number(match[4]) }));
   assert.deepEqual(diagonalCascadePreset.regions.map((region) => region.gridRect), golden);

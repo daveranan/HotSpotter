@@ -66,6 +66,17 @@ function discoverPython() {
   return existsSync(bundled) ? bundled : undefined;
 }
 
+const npmCommand = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "npm";
+const npmArgs = process.platform === "win32"
+  ? ["/d", "/c", "npm", "run", "test", "--workspace", "@hot-trimmer/desktop", "--", "manual-layout-presets"]
+  : ["run", "test", "--workspace", "@hot-trimmer/desktop", "--", "manual-layout-presets"];
+run(npmCommand, npmArgs, "Prompt 20B desktop hotspot metadata tests");
+run(
+  "cargo",
+  ["test", "-p", "hot-trimmer-desktop", "gpu_tiled_export_native_stage14_manifest_uses_authored_behavior_metadata"],
+  "Prompt 20B native manifest projection test",
+);
+
 const python = discoverPython();
 if (!python) {
   console.error("Prompt 20B prerequisite missing: Python 3 was not found. Set PYTHON_EXE to a Python 3 executable.");

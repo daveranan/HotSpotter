@@ -422,6 +422,7 @@ function App() {
   const [feedbackError, setFeedbackError] = useState<CommandFailure | null>(null);
   const [edgeDetailError, setEdgeDetailError] = useState<CommandFailure | null>(null);
   const [feedbackExecution, setFeedbackExecution] = useState<FeedbackPreviewExecution | null>(null);
+  const feedbackCommandInFlight = useRef(false);
   const [sourceSheetShare, setSourceSheetShare] = useState(() => {
     const saved = Number(localStorage.getItem("hot-trimmer.source-sheet-share.v1") ?? "0.46");
     return Number.isFinite(saved) ? Math.max(0.2, Math.min(0.8, saved)) : 0.46;
@@ -436,6 +437,7 @@ function App() {
   const patchPreviewRequestId = useRef(0);
   const radialCommitId = useRef(0);
   const radialCommitTail = useRef<Promise<void>>(Promise.resolve());
+  const stage14InvokeTail = useRef<Promise<void>>(Promise.resolve());
   const previewPublishStartedAt = useRef<number | null>(null);
   const projectRef = useRef<ProjectProjection | null>(null);
   const mapViewRef = useRef<CompiledMapView>("baseColor");
@@ -978,8 +980,25 @@ function App() {
     });
   }
 
+  function invokeStage14Serialized<T>(
+    commandName: "preview_through_stage_14" | "preview_stage_15_16_feedback",
+    args: Record<string, unknown>,
+  ): Promise<T> {
+    // Every Stage 14 entry point publishes through the same single-generation
+    // native tile cache. Preserve submission order at the IPC boundary so an
+    // automatic preview cannot invalidate an explicit radial/full render while
+    // it is publishing.
+    const queued = stage14InvokeTail.current.then(() => invoke<T>(commandName, args));
+    stage14InvokeTail.current = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
   async function applyFeedbackCommand(commandValue: FeedbackWorkbenchCommand): Promise<void> {
-    if (!native || !project?.document || feedbackCommandBusy) return;
+    // React state disables the controls on the next render, but a second click or
+    // editing-boundary event can enter before that render. Hold a synchronous lock
+    // through both the native mutation and its authoritative preview publication.
+    if (!native || !project?.document || feedbackCommandInFlight.current) return;
+    feedbackCommandInFlight.current = true;
     setFeedbackCommandBusy(true);
     setFeedbackError(null);
     if (commandValue.type === "set_edge_detail") setEdgeDetailError(null);
@@ -1026,6 +1045,7 @@ function App() {
       setProblem(commandFailure);
       setFeedbackLastCommandResult(`${commandValue.type}:failed:${commandFailure.code}`);
     } finally {
+      feedbackCommandInFlight.current = false;
       setFeedbackCommandBusy(false);
     }
   }
@@ -1081,7 +1101,7 @@ function App() {
     setFeedbackError(null);
     if (edgeDetailInspection) setEdgeDetailError(null);
     try {
-      const next = await invoke<IntermediateAtlasProjection>("preview_stage_15_16_feedback", {
+      const next = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_stage_15_16_feedback", {
         request: { ...protocol, commandVersion: 1, revision, generation, regionId, allRegions, view: requestedView, profile, comparisonMode: feedbackComparisonMode, selectedOperationId: feedbackSelectedOperationId ?? undefined, edgeDetailInspection: edgeDetailInspection ?? undefined },
       });
       if (generation !== previewDraftId.current) return;
@@ -1158,7 +1178,7 @@ function App() {
     setProblem(null);
     try {
       const current = project;
-      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+      const compiled = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
       });
       previewDraftId.current += 1;
@@ -1184,7 +1204,7 @@ function App() {
       });
       setProject(current);
       setArtifact(null);
-      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+      const compiled = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
       });
       setArtifact(compiled);
@@ -1201,7 +1221,7 @@ function App() {
     if (!native || !project?.document || activity !== "idle") return;
     setActivity("compiling"); setProblem(null);
     try {
-      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+      const compiled = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: { ...protocol, revision: project.document.documentRevision, profile: "draft512", candidateRecipe: recipe },
       });
       setArtifact(compiled); setCandidatePreviewing(true); setCandidatePreviewHash(partitionRecipeFingerprint(recipe)); setCandidatePreviewRecipe(recipe); setSelectedRegionId(null);
@@ -1218,7 +1238,7 @@ function App() {
       // Keep the settled fingerprint after acceptance. Clearing it caused the auto-preview
       // effect to immediately recreate the same read-only candidate and lock direct editing.
       setProject(current); setCandidatePreviewing(false); setCandidatePreviewHash(acceptedFingerprint); setCandidatePreviewRecipe(null); setArtifact(null);
-      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+      const compiled = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512" },
       });
       setArtifact(compiled); setSelectedRegionId(null);
@@ -1278,7 +1298,7 @@ function App() {
       suppressAutomaticPreviewRevision.current = current.document!.documentRevision;
       setProject(current);
       const requestedMaps = requestedMaterialMapsForView(mapView);
-      const compiled = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+      const compiled = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: { ...protocol, revision: current.document!.documentRevision, profile: "draft512", requestedMaps },
       });
       setArtifact(compiled);
@@ -1336,7 +1356,7 @@ function App() {
     setPreviewElapsedMs(0);
     setPreviewProgress({ requestId: draftId, phase: "compiling", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current, targetDimensions });
     try {
-      const next = await invoke<IntermediateAtlasProjection>("preview_through_stage_14", {
+      const next = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", {
         request: {
           ...protocol,
           revision: requestedRevision,
@@ -1412,15 +1432,28 @@ function App() {
             if (pendingAutomaticPreviewKey.current === latestKey) pendingAutomaticPreviewKey.current = null;
             return;
           }
+          let refreshedProject: ProjectProjection;
+          try {
+            refreshedProject = await invoke<ProjectProjection>("current_project_projection", { request: protocol });
+          } catch (reason) {
+            setProblem(failure(reason));
+            return;
+          }
+          if (draftId !== previewDraftId.current) {
+            if (pendingAutomaticPreviewKey.current === latestKey) pendingAutomaticPreviewKey.current = null;
+            return;
+          }
           const settledRevision = Math.max(
             latestRevision,
-            projectRef.current?.document?.documentRevision ?? latestRevision,
+            refreshedProject.document?.documentRevision ?? latestRevision,
           );
           pendingAutomaticPreviewKey.current = automaticPreviewKey(
             settledRevision,
             profile,
             processingOpen ? "materialSet" : requestedMapView,
           );
+          projectRef.current = refreshedProject;
+          setProject(refreshedProject);
           return requestPreview(regionId, projection, profile, settledRevision, scheduleRefinement, true, requestedMapView, 1);
         }
       }

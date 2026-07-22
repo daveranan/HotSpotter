@@ -185,6 +185,7 @@ pub type SharedPreviewService = Arc<PreviewService>;
 pub struct PreviewService {
     latest_draft_id: AtomicU64,
     cancellation_count: AtomicU64,
+    stage_14_execution_gate: Mutex<()>,
     source_frame_cache: Mutex<hot_trimmer_sheet_compiler::SourceFramePreviewCache>,
     gpu_source_cache: Mutex<hot_trimmer_sheet_compiler::GpuAtlasSourceTextureCache>,
     gpu_tile_cache: Mutex<GpuAtlasTileCache>,
@@ -1076,6 +1077,16 @@ pub fn startup_status(state: State<'_, StartupState>) -> StartupStatus {
     StartupStatus {
         previous_shutdown_clean: state.previous_shutdown_clean,
     }
+}
+
+#[tauri::command]
+pub fn current_project_projection(
+    request: FoundationStatusRequest,
+    session: State<'_, SharedProjectSession>,
+) -> Result<ProjectProjection, UserFacingError> {
+    request.validate().map_err(UserFacingError::from)?;
+    let session = session.lock().map_err(|_| poisoned())?;
+    project_projection(&session)
 }
 
 #[tauri::command]
@@ -2665,6 +2676,21 @@ pub async fn preview_through_stage_14(
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
     tauri::async_runtime::spawn_blocking(move || {
+        // Stage 14 publications share a single-generation native tile cache. Let a
+        // newly submitted job cancel the running compiler immediately, but do not
+        // allow both compilers to enter that cache concurrently. Once the prior job
+        // observes cancellation and releases the gate, only the latest queued job
+        // is allowed to compile and publish.
+        let _execution = preview_service
+            .stage_14_execution_gate
+            .lock()
+            .map_err(|_| poisoned())?;
+        if preview_service.latest_draft_id.load(Ordering::Acquire) != job {
+            return Err(error(
+                ErrorCode::OperationCancelled,
+                "A newer Stage 14 preview superseded this queued request.",
+            ));
+        }
         build_stage_14_preview(&session, &preview_service, request, job)
     })
     .await
@@ -4273,10 +4299,11 @@ impl NativeExportMapWriter {
                 let value = f32::from_le_bytes(source.try_into().map_err(|_| {
                     TiledExportError::Encoder("scalar source sample is malformed".into())
                 })?);
+                let value = native_export_encoded_scalar(self.map, value);
                 if self.layout.bit_depth == 8 {
-                    destination[0] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    destination[0] = (value * 255.0).round() as u8;
                 } else {
-                    let encoded = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                    let encoded = (value * 65535.0).round() as u16;
                     destination.copy_from_slice(&encoded.to_be_bytes());
                 }
             }
@@ -4343,6 +4370,16 @@ impl NativeExportMapWriter {
                 self.map
             ))
         })
+    }
+}
+
+fn native_export_encoded_scalar(map: MaterialMapKind, value: f32) -> f32 {
+    if map == MaterialMapKind::Height {
+        // Match gpu_scalar_display.wgsl exactly: the compiler publishes signed
+        // physical meters, while PNG stores the normalized displacement field.
+        (0.5 + value / hot_trimmer_sheet_compiler::SOURCE_HEIGHT_RANGE_M).clamp(0.0, 1.0)
+    } else {
+        value.clamp(0.0, 1.0)
     }
 }
 
@@ -4626,9 +4663,64 @@ fn native_export_slot_manifest(
             .map(hot_trimmer_domain::RadialMappingSettings::from)
     });
     let radial_parameters = radial_mapping.map(native_export_radial_parameters);
+    let authored_layout_metadata = region
+        .uv_fit
+        .classification_tags
+        .iter()
+        .any(|tag| tag == "AUTHORED_LAYOUT");
+    let legacy_authored_metadata = authored_layout_metadata
+        && region.uv_fit.classification_tags.len() == 1
+        && region.uv_fit.world_size_meters.iter().any(|value| *value > 1.0);
+    let (region_width, region_height) = region.grid_rect.map_or(
+        (region.hotspot_rect.width, region.hotspot_rect.height),
+        |rect| (rect.width, rect.height),
+    );
+    let authored_role = if region_width >= region_height.saturating_mul(4) {
+        hot_trimmer_domain::ManualRegionRole::HorizontalStrip
+    } else if region_height >= region_width.saturating_mul(4) {
+        hot_trimmer_domain::ManualRegionRole::VerticalStrip
+    } else {
+        hot_trimmer_domain::ManualRegionRole::Panel
+    };
+    let effective_behavior_role = if legacy_authored_metadata {
+        authored_role
+    } else {
+        behavior.map_or(hot_trimmer_domain::ManualRegionRole::Panel, |value| value.role)
+    };
     let is_radial = radial_mapping.is_some()
-        || behavior
-            .is_some_and(|behavior| behavior.role == hot_trimmer_domain::ManualRegionRole::Radial);
+        || effective_behavior_role == hot_trimmer_domain::ManualRegionRole::Radial;
+    let effective_slot_role = if matches!(
+        effective_behavior_role,
+        hot_trimmer_domain::ManualRegionRole::HorizontalStrip
+            | hot_trimmer_domain::ManualRegionRole::VerticalStrip
+    ) {
+        "RepeatingStrip".to_owned()
+    } else {
+        format!("{:?}", region.role)
+    };
+    let effective_world_size = if legacy_authored_metadata {
+        region.grid_rect.zip(document.logical_grid).map_or(
+            region.uv_fit.world_size_meters,
+            |(rect, grid)| {
+                [
+                    f64::from(rect.width) / f64::from(grid.width),
+                    f64::from(rect.height) / f64::from(grid.height),
+                ]
+            },
+        )
+    } else {
+        region.uv_fit.world_size_meters
+    };
+    let effective_classification_tags = if legacy_authored_metadata {
+        vec![
+            "AUTHORED_LAYOUT".to_owned(),
+            "REFERENCE_SHEET_1M".to_owned(),
+            native_export_behavior_role_name(effective_behavior_role)
+                .to_ascii_uppercase(),
+        ]
+    } else {
+        region.uv_fit.classification_tags.clone()
+    };
     let sampling = behavior.map(|behavior| native_export_sampling_name(behavior.sampling));
     let repeat_period_pixels = behavior.and_then(|behavior| behavior.period_pixels);
     HottrimSlot {
@@ -4642,7 +4734,7 @@ fn native_export_slot_manifest(
             output.width,
             output.height,
         ),
-        role: format!("{:?}", region.role),
+        role: effective_slot_role,
         uv_fit: UvFit {
             kind: if is_radial {
                 UvFitKind::Radial
@@ -4668,6 +4760,8 @@ fn native_export_slot_manifest(
             keep_proportion: region.uv_fit.keep_proportion,
             allowed_rotations: if is_radial {
                 vec![0]
+            } else if authored_layout_metadata {
+                vec![0, 90, 180, 270]
             } else {
                 region
                     .uv_fit
@@ -4682,15 +4776,14 @@ fn native_export_slot_manifest(
                     .collect()
             },
             mirror_allowed: !is_radial && region.uv_fit.mirror_allowed,
-            classification_tags: region.uv_fit.classification_tags.clone(),
+            classification_tags: effective_classification_tags,
         },
-        world_size_meters: region.uv_fit.world_size_meters,
+        world_size_meters: effective_world_size,
         variation_group: region.material_group.clone(),
         enabled: region.enabled,
         region_id_color: region.id_color.0,
         radial_parameters,
-        behavior_role: behavior
-            .map(|behavior| native_export_behavior_role_name(behavior.role).to_owned()),
+        behavior_role: Some(native_export_behavior_role_name(effective_behavior_role).to_owned()),
         sampling: sampling.map(str::to_owned),
         repeat_period_pixels,
         orientation: behavior
@@ -4961,7 +5054,17 @@ fn build_stage_14_preview(
         monitoring_complete.store(true, Ordering::Release);
         result
     })
-    .map_err(|failure| error(ErrorCode::OperationCancelled, &failure.to_string()))?;
+    .map_err(|failure| {
+        let code = match &failure {
+            hot_trimmer_sheet_compiler::CompilerFacadeError::Cancelled { .. }
+            | hot_trimmer_sheet_compiler::CompilerFacadeError::Intermediate(
+                hot_trimmer_sheet_compiler::IntermediateAtlasError::Cancelled
+                | hot_trimmer_sheet_compiler::IntermediateAtlasError::RevisionSuperseded,
+            ) => ErrorCode::OperationCancelled,
+            _ => ErrorCode::LayoutInvalid,
+        };
+        error(code, &failure.to_string())
+    })?;
     let preview_is_current = || {
         session
             .lock()
@@ -6746,6 +6849,15 @@ mod persisted_algorithm_stage_14_preview_a_tests {
     }
 
     #[test]
+    fn gpu_tiled_export_encodes_signed_physical_height_around_neutral_gray() {
+        let half_range = hot_trimmer_sheet_compiler::SOURCE_HEIGHT_RANGE_M * 0.5;
+        assert_eq!(native_export_encoded_scalar(MaterialMapKind::Height, -half_range), 0.0);
+        assert_eq!(native_export_encoded_scalar(MaterialMapKind::Height, 0.0), 0.5);
+        assert_eq!(native_export_encoded_scalar(MaterialMapKind::Height, half_range), 1.0);
+        assert_eq!(native_export_encoded_scalar(MaterialMapKind::Roughness, 0.25), 0.25);
+    }
+
+    #[test]
     fn gpu_tiled_export_native_stage14_package_streams_and_preserves_stale_output() {
         let root =
             std::env::temp_dir().join(format!("hot-trimmer-native-export-{}", Uuid::new_v4()));
@@ -7023,6 +7135,28 @@ mod persisted_algorithm_stage_14_preview_a_tests {
         );
         let radial_region = document.topology.regions[0].id;
         let loop_region = document.topology.regions[1].id;
+        let legacy_strip_index = document
+            .topology
+            .regions
+            .iter()
+            .position(|region| region.grid_rect.is_some_and(|rect| rect.width == 1 && rect.height == 24))
+            .expect("vertical authored strip");
+        let legacy_strip_region = document.topology.regions[legacy_strip_index].id;
+        {
+            let region = &mut document.topology.regions[legacy_strip_index];
+            region.role = TemplateSlotRole::Planar;
+            region.uv_fit.kind = hot_trimmer_domain::UvFitKind::Rectangular;
+            region.uv_fit.fit_axis = hot_trimmer_domain::FitAxis::Automatic;
+            region.uv_fit.world_size_meters = [1.0, 24.0];
+            region.uv_fit.classification_tags = vec!["AUTHORED_LAYOUT".into()];
+            region.uv_fit.allowed_rotations = vec![QuarterTurn::Zero];
+        }
+        document
+            .region_bindings
+            .get_mut(&legacy_strip_region)
+            .expect("legacy strip binding")
+            .mapping
+            .behavior = RegionBehavior::default();
         document.topology.regions[1].uv_fit.world_size_meters = [2.5, 0.25];
         document.topology.regions[1].uv_fit.classification_tags =
             vec!["AUTHORED_LAYOUT".into(), "STRIP".into()];
@@ -7079,7 +7213,20 @@ mod persisted_algorithm_stage_14_preview_a_tests {
             loop_slot.uv_fit.classification_tags,
             ["AUTHORED_LAYOUT", "STRIP"]
         );
-        assert_eq!(loop_slot.uv_fit.allowed_rotations, [0, 180]);
+        assert_eq!(loop_slot.uv_fit.allowed_rotations, [0, 90, 180, 270]);
+        let upgraded_strip = manifest
+            .slots
+            .iter()
+            .find(|slot| slot.region_id == legacy_strip_region.to_string())
+            .expect("upgraded legacy strip");
+        assert_eq!(upgraded_strip.role, "RepeatingStrip");
+        assert_eq!(upgraded_strip.behavior_role.as_deref(), Some("vertical_strip"));
+        assert_eq!(upgraded_strip.world_size_meters, [1.0 / 64.0, 24.0 / 64.0]);
+        assert_eq!(
+            upgraded_strip.uv_fit.classification_tags,
+            ["AUTHORED_LAYOUT", "REFERENCE_SHEET_1M", "VERTICAL_STRIP"]
+        );
+        assert_eq!(upgraded_strip.uv_fit.allowed_rotations, [0, 90, 180, 270]);
         fs::remove_dir_all(root).unwrap();
     }
 

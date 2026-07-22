@@ -74,6 +74,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::foundation_status,
             commands::startup_status,
+            commands::current_project_projection,
             commands::create_project,
             commands::create_draft_project,
             commands::open_project,

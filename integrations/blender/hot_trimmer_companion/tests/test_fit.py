@@ -16,7 +16,8 @@ class ManifestAndMatchingTests(unittest.TestCase):
         self.manifest = load_manifest(FIXTURES / "behavioral.hottrim.json")
 
     def test_projects_complete_slot_contract_without_using_id_color(self):
-        rectangular, _, radial = slots(self.manifest)
+        rectangular = slots(self.manifest)[0]
+        radial = slots(self.manifest)[3]
         self.assertEqual(rectangular.slot_id, "rect_wide")
         self.assertEqual(rectangular.region_id, "fixture-v1:rect_wide")
         self.assertEqual(rectangular.fit_axis, "automatic")
@@ -27,6 +28,9 @@ class ManifestAndMatchingTests(unittest.TestCase):
         self.assertEqual(rectangular.world_size_meters, (2.0, 1.0))
         self.assertEqual(rectangular.variation_group, "rectangles")
         self.assertTrue(rectangular.enabled)
+        self.assertEqual(rectangular.behavior_role, "panel")
+        self.assertEqual(rectangular.sampling, "one_shot")
+        self.assertEqual(rectangular.orientation, "zero")
         self.assertEqual(radial.uv_fit_kind, "radial")
         self.assertIsNotNone(radial.radial_parameters)
         self.assertEqual(radial.region_id_color, rectangular.region_id_color)
@@ -75,6 +79,28 @@ class ManifestAndMatchingTests(unittest.TestCase):
         descriptor = IslandDescriptor((0.0, 0.0, 0.4, 0.2), 2.0, 0.08, 0.00005, "U", True, 0.4)
         match = choose_slot(descriptor, reversed(rectangular), "RECTANGULAR")
         self.assertEqual(match.slot.slot_id, wide.slot_id)
+
+    def test_role_metadata_routes_long_islands_only_to_strip_hotspots(self):
+        strip = IslandDescriptor((0.0, 0.0, 8.0, 1.0), 8.0, 8.0, 0.08, "U", True, 0.2)
+        self.assertEqual(choose_slot(strip, reversed(slots(self.manifest)), "RECTANGULAR").slot.slot_id, "strip_horizontal")
+        panel = IslandDescriptor((0.0, 0.0, 2.0, 1.0), 2.0, 2.0, 2.0, "U", True, 0.2)
+        self.assertNotEqual(choose_slot(panel, slots(self.manifest), "RECTANGULAR").slot.slot_id, "strip_horizontal")
+
+    def test_rectangular_role_falls_back_when_manifest_has_no_exact_counterpart(self):
+        panels_only = [slot for slot in slots(self.manifest) if slot.behavior_role == "panel"]
+        strip = IslandDescriptor((0.0, 0.0, 8.0, 1.0), 8.0, 8.0, 0.08, "U", True, 0.2)
+        match = choose_slot(strip, reversed(panels_only), "RECTANGULAR")
+        self.assertEqual(match.slot.uv_fit_kind, "rectangular")
+        self.assertEqual(match.slot.behavior_role, "panel")
+
+    def test_click_variation_distributes_close_matches_and_rotation_states(self):
+        descriptor = IslandDescriptor((0.0, 0.0, 2.0, 1.0), 2.0, 2.0, 2.0, "U", True, 0.4)
+        candidates = slots(self.manifest)
+        first = choose_slot(descriptor, candidates, "RECTANGULAR", variation_index=0, distribute=True)
+        second = choose_slot(descriptor, candidates, "RECTANGULAR", variation_index=1, distribute=True)
+        repeated = choose_slot(descriptor, candidates, "RECTANGULAR", variation_index=0, distribute=True)
+        self.assertNotEqual((first.slot.slot_id, first.rotation, first.mirror), (second.slot.slot_id, second.rotation, second.mirror))
+        self.assertEqual((first.slot.slot_id, first.rotation, first.mirror), (repeated.slot.slot_id, repeated.rotation, repeated.mirror))
 
     def test_rectangular_transform_is_uniform_and_bounded(self):
         descriptor = IslandDescriptor((0.0, 0.0, 2.0, 1.0), 2.0, 2.0, 2.0, "U", True, 0.4)

@@ -11,17 +11,34 @@ const diagonalRects = [
   [20,48,4,8],[8,52,8,4],[0,56,32,1],[0,57,32,1],[0,58,32,2],[0,60,32,4],
 ] as const;
 
-export function defaultRegionBehavior(): RegionBehavior {
-  return { version: 2, role: "panel", continuity: "none", sampling: "one_shot", orientation: "zero", edgeEligibility: { left: true, right: true, top: true, bottom: true } };
+export function defaultRegionBehavior(role: RegionBehavior["role"] = "panel"): RegionBehavior {
+  return { version: 2, role, continuity: "none", sampling: "one_shot", orientation: "zero", edgeEligibility: { left: true, right: true, top: true, bottom: true } };
 }
 
-function record(key: string, displayName: string, x: number, y: number, width: number, height: number, defaultBehavior = defaultRegionBehavior()): AuthoredLayoutPresetRegion {
+function inferredBehavior(width: number, height: number): RegionBehavior {
+  if (width >= height * 4) return defaultRegionBehavior("horizontal_strip");
+  if (height >= width * 4) return defaultRegionBehavior("vertical_strip");
+  return defaultRegionBehavior("panel");
+}
+
+function record(key: string, displayName: string, x: number, y: number, width: number, height: number, defaultBehavior?: RegionBehavior, gridWidth = 64, gridHeight = 64): AuthoredLayoutPresetRegion {
+  const behavior = defaultBehavior ?? inferredBehavior(width, height);
+  const strip = behavior.role === "horizontal_strip" || behavior.role === "vertical_strip";
+  const roleTag = behavior.role.toUpperCase();
   return {
-    presetRegionKey: key, displayName, gridRect: { x, y, width, height }, role: "planar",
+    presetRegionKey: key, displayName, gridRect: { x, y, width, height }, role: strip ? "repeatingStrip" : behavior.role === "unique" ? "uniqueDetail" : "planar",
     orientation: width > height ? "horizontal" : height > width ? "vertical" : "unspecified",
-    uvFit: { kind: "rectangular", fitAxis: "automatic", keepProportion: true, allowedRotations: ["zero"], mirrorAllowed: false, worldSizeMeters: [width, height], classificationTags: ["AUTHORED_LAYOUT"] },
+    uvFit: {
+      kind: strip ? "strip" : "rectangular",
+      fitAxis: behavior.role === "horizontal_strip" ? "vertical" : behavior.role === "vertical_strip" ? "horizontal" : "automatic",
+      keepProportion: true,
+      allowedRotations: ["zero", "ninety", "one_eighty", "two_seventy"],
+      mirrorAllowed: false,
+      worldSizeMeters: [width / gridWidth, height / gridHeight],
+      classificationTags: ["AUTHORED_LAYOUT", "REFERENCE_SHEET_1M", roleTag],
+    },
     structuralProfile: "flat",
-    defaultBehavior,
+    defaultBehavior: behavior,
   };
 }
 
@@ -33,7 +50,7 @@ export const diagonalCascadePreset: AuthoredLayoutPreset = {
 };
 
 export function newBlankPreset(size = 64): AuthoredLayoutPreset {
-  return { presetId: NEW_BLANK_PRESET_ID, schemaVersion: 1, name: "New Blank", logicalGrid: { schemaVersion: 1, width: size, height: size }, canonicalAspect: [1, 1], regions: [record("remainder", "Remainder", 0, 0, size, size)], provenance: "built_in_blank" };
+  return { presetId: NEW_BLANK_PRESET_ID, schemaVersion: 1, name: "New Blank", logicalGrid: { schemaVersion: 1, width: size, height: size }, canonicalAspect: [1, 1], regions: [record("remainder", "Remainder", 0, 0, size, size, undefined, size, size)], provenance: "built_in_blank" };
 }
 
 export function snapshotDocumentPreset(document: TrimSheetDocument, presetId: string, name: string): AuthoredLayoutPreset {
@@ -44,7 +61,7 @@ export function snapshotDocumentPreset(document: TrimSheetDocument, presetId: st
   const priorKeys = new Map(document.authoredLayoutPreset?.regions.map((region) => [rectKey(region.gridRect), region.presetRegionKey]));
   return {
     presetId, schemaVersion: 1, name, logicalGrid: grid, canonicalAspect: [document.renderSettings.outputSize.width, document.renderSettings.outputSize.height],
-    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height, document.regionBindings?.[region.id]?.mapping.behavior ?? defaultRegionBehavior())] : []),
+    regions: document.topology.regions.flatMap((region, index) => region.gridRect ? [record(priorKeys.get(rectKey(region.gridRect)) ?? `authored-${region.id}`, region.displayName || `Region ${index + 1}`, region.gridRect.x, region.gridRect.y, region.gridRect.width, region.gridRect.height, document.regionBindings?.[region.id]?.mapping.behavior ?? inferredBehavior(region.gridRect.width, region.gridRect.height), grid.width, grid.height)] : []),
     provenance: "user_authored_snapshot",
   };
 }

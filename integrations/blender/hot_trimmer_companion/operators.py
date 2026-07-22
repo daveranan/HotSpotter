@@ -12,10 +12,10 @@ from mathutils import Vector
 from .fit import (
     EPSILON,
     IslandDescriptor,
-    Match,
     bounds,
     choose_slot,
     circularity_estimate,
+    island_behavior_role,
     points_inside_slot,
     polygon_signed_area,
     transform_uvs,
@@ -30,7 +30,7 @@ CLASSIFICATION_ITEMS = (
     ("RADIAL", "Radial", "Use only radial hotspots for an already circular UV island"),
 )
 
-ASSIGNMENT_ALGORITHM_VERSION = 2
+ASSIGNMENT_ALGORITHM_VERSION = 4
 
 
 def _result(context, message):
@@ -433,24 +433,22 @@ class HOTTRIM_OT_fit_selected(Operator):
         selected_objects = tuple(context.selected_objects)
         original_mode = active.mode if active is not None else "OBJECT"
         snapshots = {obj: _snapshot(obj) for obj in targets}
+        variation_cycle = max(0, int(context.scene.get("ht_hotspot_cycle", 0)))
         try:
             if original_mode == "EDIT":
                 bpy.ops.object.mode_set(mode="OBJECT")
             for obj, face_indices in targets.items():
                 mesh = obj.data
                 uv_layer = mesh.uv_layers.active
-                prior_assignments = _assignment_map(mesh)
-                stale_rectangular_assignment = any(
-                    (record := prior_assignments.get(str(face_index)))
-                    and record.get("classification") != "radial"
-                    and not _assignment_is_current(record, manifest)
-                    for face_index in face_indices
-                )
                 if classification == "RADIAL" and not _has_usable_uvs(mesh, uv_layer, face_indices):
                     raise ValueError(f"{obj.name}: unsupported radial topology")
                 if uv_layer is None:
                     uv_layer = mesh.uv_layers.new(name="HotTrimmerUV")
-                if stale_rectangular_assignment or not _has_usable_uvs(mesh, uv_layer, face_indices):
+                # Rebuild the selected islands from mesh geometry on every
+                # click.  Starting from previously fitted hotspot UVs would
+                # feed the old target rectangle back into measurement and lock
+                # subsequent cycles to the same slot shape.
+                if classification != "RADIAL":
                     _unwrap_object(context, obj, face_indices)
                     uv_layer = mesh.uv_layers.active
                     if not _has_usable_uvs(mesh, uv_layer, face_indices):
@@ -460,23 +458,24 @@ class HOTTRIM_OT_fit_selected(Operator):
                         raise ValueError(f"{obj.name}: automatic unwrap produced a zero-area island; inspect the selected faces for overlapping or invalid geometry")
 
             plans = []
+            island_ordinal = 0
             for obj, face_indices in targets.items():
                 mesh = obj.data
                 uv_layer = mesh.uv_layers.active
                 assignments = _assignment_map(mesh)
                 islands, edge_faces, adjacency = _form_islands(mesh, uv_layer, face_indices)
                 for island in islands:
-                    descriptor, existing = _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, manifest)
+                    descriptor, _existing = _descriptor(obj, uv_layer, island, edge_faces, adjacency, assignments, manifest)
                     points = [tuple(uv_layer.data[loop_index].uv) for face_index in island for loop_index in mesh.polygons[face_index].loop_indices]
-                    if existing:
-                        assigned_slot = next((slot for slot in slots(manifest) if slot.slot_id == existing.get("slotId") and slot.enabled), None)
-                        existing_classification = existing.get("classification")
-                        requested_classification = classify = "radial" if classification == "RADIAL" else "rectangular" if classification == "RECTANGULAR" else ("radial" if descriptor.strongly_radial else "rectangular")
-                        if assigned_slot and assigned_slot.uv_fit_kind == requested_classification and points_inside_slot(points, assigned_slot):
-                            match = Match(assigned_slot, int(existing.get("rotation", 0)), bool(existing.get("mirror", False)), existing_classification or requested_classification)
-                            plans.append((obj, island, match, None, existing))
-                            continue
-                    match = choose_slot(descriptor, slots(manifest), classification, self.slot_id)
+                    match = choose_slot(
+                        descriptor,
+                        slots(manifest),
+                        classification,
+                        self.slot_id,
+                        variation_index=variation_cycle + island_ordinal,
+                        distribute=True,
+                    )
+                    island_ordinal += 1
                     fitted = transform_uvs(points, match)
                     if not points_inside_slot(fitted, match.slot):
                         raise ValueError(f"{obj.name}: fitted UV escaped hotspot {match.slot.slot_id}")
@@ -486,9 +485,12 @@ class HOTTRIM_OT_fit_selected(Operator):
                         "rotation": match.rotation,
                         "mirror": match.mirror,
                         "classification": match.classification,
+                        "islandRole": island_behavior_role(descriptor, match.classification),
+                        "slotBehaviorRole": match.slot.behavior_role,
                         "compatibilityKey": manifest["compatibilityKey"],
                         "templateSnapshotHash": manifest["templateSnapshotHash"],
                         "algorithmVersion": ASSIGNMENT_ALGORITHM_VERSION,
+                        "variationCycle": variation_cycle,
                     }
                     plans.append((obj, island, match, fitted, record))
 
@@ -510,9 +512,10 @@ class HOTTRIM_OT_fit_selected(Operator):
             for obj, assignments in by_object.items():
                 obj.data["ht_assignments"] = json.dumps(assignments, sort_keys=True, separators=(",", ":"))
                 obj.data["ht_compatibility_key"] = manifest["compatibilityKey"]
+            context.scene["ht_hotspot_cycle"] = variation_cycle + 1
             slot_names = sorted({plan[2].slot.slot_id for plan in plans})
             preview_note = "; Base Color preview active" if _enable_material_preview(context) else ""
-            _result(context, f"Hotspotted {len(plans)} island(s) across {len(slot_names)} manifest slot(s){preview_note}")
+            _result(context, f"Cycle {variation_cycle + 1}: hotspotted {len(plans)} island(s) across {len(slot_names)} manifest slot(s){preview_note}")
         except Exception as error:
             if context.view_layer.objects.active and context.view_layer.objects.active.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
@@ -536,7 +539,7 @@ class HOTTRIM_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Add-on 0.2.8")
+        layout.label(text="Add-on 0.3.2")
         layout.operator(HOTTRIM_OT_import_package.bl_idname, text="Import Package", icon="FILE_FOLDER")
         path = context.scene.get("ht_manifest_path")
         if path:
@@ -546,6 +549,7 @@ class HOTTRIM_PT_panel(Panel):
         layout.prop(context.scene, "hottrimmer_classification", text="Classification")
         operator = layout.operator(HOTTRIM_OT_fit_selected.bl_idname, text="Auto Hotspot Selected", icon="UV")
         operator.classification = context.scene.hottrimmer_classification
+        operator.slot_id = ""
         message = context.scene.get("ht_last_result", "")
         if message:
             layout.label(text=message, icon="INFO")

@@ -1659,7 +1659,7 @@ fn compile_source_frame(
         let edge_detail = compile_edge_detail_for_region(
             document.edge_detail.as_ref(),
             region.id,
-            region.role,
+            sampling_plan.role,
             behavior.role,
             region.structural_profile,
             sampling_plan.slot_physical_size,
@@ -2444,7 +2444,7 @@ fn fixed_template_compiled_atlas_plan(
         let edge_detail = compile_edge_detail_for_region(
             document.edge_detail.as_ref(),
             region.id,
-            region.role,
+            sampling_plan.role,
             binding.mapping.behavior.role,
             region.structural_profile,
             sampling_plan.slot_physical_size,

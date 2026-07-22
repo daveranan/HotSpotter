@@ -85,28 +85,74 @@ def classify_island(descriptor, override):
     return "radial" if descriptor.strongly_radial else "rectangular"
 
 
-def _role_compatible(slot, classification):
-    role_is_radial = slot.role == "radial"
-    return role_is_radial if classification == "radial" else not role_is_radial
+def island_behavior_role(descriptor, classification):
+    if classification == "radial":
+        return "radial"
+    if descriptor.uv_aspect >= 4.0:
+        return "horizontal_strip"
+    if descriptor.uv_aspect <= 0.25:
+        return "vertical_strip"
+    return "panel"
 
 
-def choose_slot(descriptor, available_slots, override="AUTO", requested_slot_id=""):
+def _slot_behavior_role(slot):
+    if slot.behavior_role:
+        return slot.behavior_role
+    tags = {tag.lower() for tag in slot.classification_tags}
+    for role in ("horizontal_strip", "vertical_strip", "unique", "panel", "radial"):
+        if role in tags:
+            return role
+    normalized_role = slot.role.replace("_", "").lower()
+    if normalized_role == "repeatingstrip":
+        return "horizontal_strip" if slot.normalized_hotspot_rect["width"] >= slot.normalized_hotspot_rect["height"] else "vertical_strip"
+    if normalized_role in {"uniquedetail", "trimcap"}:
+        return "unique"
+    if normalized_role == "radial":
+        return "radial"
+    return "panel"
+
+
+def _role_compatible(slot, classification, island_role):
+    slot_role = _slot_behavior_role(slot)
+    if classification == "radial":
+        return slot_role == "radial"
+    if island_role in {"horizontal_strip", "vertical_strip"}:
+        return slot_role in {"horizontal_strip", "vertical_strip"}
+    return slot_role in {"panel", "unique"}
+
+
+def choose_slot(descriptor, available_slots, override="AUTO", requested_slot_id="", variation_index=0, distribute=False):
     classification = classify_island(descriptor, override)
-    candidates = [slot for slot in available_slots if slot.enabled and slot.uv_fit_kind == classification and _role_compatible(slot, classification)]
+    island_role = island_behavior_role(descriptor, classification)
+    kind_candidates = [slot for slot in available_slots if slot.enabled and slot.uv_fit_kind == classification]
+    candidates = [slot for slot in kind_candidates if _role_compatible(slot, classification, island_role)]
+    # Role metadata expresses the best semantic match; it does not make an
+    # otherwise valid rectangular atlas unusable.  Older/custom templates may
+    # legitimately contain only panels or only strips.  Preserve the role
+    # preference when possible and deterministically fall back to every slot
+    # of the required fit kind when no exact role counterpart exists.
+    if not candidates:
+        candidates = kind_candidates
     if requested_slot_id:
         candidates = [slot for slot in candidates if slot.slot_id == requested_slot_id]
     if not candidates:
         raise ValueError(f"no enabled compatible {classification} hotspot in the current manifest")
     if descriptor.existing_slot_id:
         existing = next((slot for slot in candidates if slot.slot_id == descriptor.existing_slot_id), None)
-        if existing is not None:
+        if existing is not None and not distribute:
             return Match(existing, existing.allowed_rotations[0], False, classification)
     if classification == "radial":
         def radial_score(slot):
             diameter = min(slot.world_size_meters)
             world_diameter = math.sqrt(max(descriptor.world_area, EPSILON) * 4.0 / math.pi)
             return (1.0 - descriptor.circularity, abs(math.log(max(world_diameter, EPSILON) / max(diameter, EPSILON))), slot.slot_id)
-        selected = min(candidates, key=radial_score)
+        ordered = sorted(candidates, key=radial_score)
+        if distribute:
+            best_cost = radial_score(ordered[0])[1]
+            close = [slot for slot in ordered if radial_score(slot)[1] <= best_cost + math.log(2.0)]
+            selected = close[variation_index % len(close)]
+        else:
+            selected = ordered[0]
         return Match(selected, selected.allowed_rotations[0], False, classification)
     scored = []
     for slot in candidates:
@@ -119,14 +165,19 @@ def choose_slot(descriptor, available_slots, override="AUTO", requested_slot_id=
             aspect_cost = abs(math.log(max(descriptor.uv_aspect, EPSILON) / max(effective_aspect, EPSILON)))
             uv_area_cost = abs(math.log(max(descriptor.uv_area, EPSILON) / max(target_uv_area, EPSILON)))
             world_cost = abs(math.log(max(descriptor.world_area, EPSILON) / max(target_world_area, EPSILON)))
-            # Shape is the primary compatibility signal.  For equally shaped
-            # atlas regions, match the island's current normalized footprint
-            # before consulting authored physical scale.  This prevents a
-            # malformed or legacy world-size value from forcing every island
-            # into the smallest same-aspect trim cell.
-            scored.append(((aspect_cost, uv_area_cost, world_cost, slot.slot_id, rotation), slot, rotation))
-    _, selected, rotation = min(scored, key=lambda item: item[0])
-    return Match(selected, rotation, False, classification)
+            for mirror in ((False, True) if slot.mirror_allowed else (False,)):
+                # Shape is the primary compatibility signal.  Area selects the
+                # preferred entry, while click cycling may use any entry within
+                # a bounded 2:1 aspect neighborhood of that best shape.
+                scored.append(((aspect_cost, uv_area_cost, world_cost, slot.slot_id, rotation, mirror), slot, rotation, mirror))
+    ordered = sorted(scored, key=lambda item: item[0])
+    if distribute:
+        best_aspect_cost = ordered[0][0][0]
+        close = [item for item in ordered if item[0][0] <= best_aspect_cost + math.log(2.0)]
+        _, selected, rotation, mirror = close[variation_index % len(close)]
+    else:
+        _, selected, rotation, mirror = ordered[0]
+    return Match(selected, rotation, mirror, classification)
 
 
 def transform_uvs(points, match):
