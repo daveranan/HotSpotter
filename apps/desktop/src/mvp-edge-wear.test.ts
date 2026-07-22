@@ -252,6 +252,7 @@ test("mvp-edge-wear Processing switches retained map publications, keeps the pri
   assert.match(shell, /supersessionRetry === 0/);
   assert.match(shell, /window\.setTimeout\(resolve, 180\)/);
   assert.match(shell, /if \(draftId !== previewDraftId\.current\)/);
+  assert.match(shell, /if \(failureReason\.code !== "operation_cancelled"\) \{[\s\S]*?if \(draftId !== previewDraftId\.current\) return;[\s\S]*?setProblem\(failureReason\)/);
   assert.match(shell, /pendingAutomaticPreviewKey\.current === latestKey/);
   assert.match(shell, /current_project_projection/);
   assert.match(shell, /projectRef\.current = refreshedProject/);

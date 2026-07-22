@@ -1403,9 +1403,13 @@ function App() {
       const elapsedMs = performance.now() - (previewPublishStartedAt.current ?? performance.now());
       if (automaticKey && pendingAutomaticPreviewKey.current === automaticKey) pendingAutomaticPreviewKey.current = null;
       if (failureReason.code !== "operation_cancelled") {
+        // A queued request can fail after a newer request has already become the
+        // publication owner. Never let that obsolete failure restore an error
+        // beside the newer successfully painted artifact.
+        if (draftId !== previewDraftId.current) return;
         setPreviewClientTelemetry([`profile=${profile}`, `requested_revision=${requestedRevision}`, `requested_map=${requestedMapView}`, `request_outcome=failed`, `problem=${failureReason.code}`]);
         setProblem(failureReason);
-        if (draftId === previewDraftId.current) setPreviewProgress({ requestId: draftId, phase: "failed", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs, terminalOutcome: "failed" });
+        setPreviewProgress({ requestId: draftId, phase: "failed", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current ?? performance.now(), elapsedMs, terminalOutcome: "failed" });
       } else if (draftId === previewDraftId.current) {
         // A superseded native job is terminal for this request. Do not leave the footer
         // counting forever as though CPU/GPU work were still running, and immediately
