@@ -172,15 +172,28 @@ def choose_slot(descriptor, available_slots, override="AUTO", requested_slot_id=
                 scored.append(((aspect_cost, uv_area_cost, world_cost, slot.slot_id, rotation, mirror), slot, rotation, mirror))
     ordered = sorted(scored, key=lambda item: item[0])
     if distribute:
-        best_aspect_cost = ordered[0][0][0]
-        close = [item for item in ordered if item[0][0] <= best_aspect_cost + math.log(2.0)]
-        _, selected, rotation, mirror = close[variation_index % len(close)]
+        # Spread consecutive islands across distinct rectangles before cycling
+        # the rotations/mirror states of any one rectangle.  Otherwise a slot
+        # with four allowed rotations and mirroring could consume eight islands
+        # before the next equally compatible hotspot was ever selected.
+        states_by_slot = {}
+        for item in ordered:
+            states_by_slot.setdefault(item[1].slot_id, []).append(item)
+        best_by_slot = sorted((items[0] for items in states_by_slot.values()), key=lambda item: item[0])
+        best_aspect_cost = best_by_slot[0][0][0]
+        close_slots = [item for item in best_by_slot if item[0][0] <= best_aspect_cost + math.log(2.0)]
+        slot_choice = close_slots[variation_index % len(close_slots)]
+        slot_states = states_by_slot[slot_choice[1].slot_id]
+        best_slot_aspect = slot_states[0][0][0]
+        close_states = [item for item in slot_states if item[0][0] <= best_slot_aspect + math.log(2.0)]
+        state_cycle = variation_index // len(close_slots)
+        _, selected, rotation, mirror = close_states[state_cycle % len(close_states)]
     else:
         _, selected, rotation, mirror = ordered[0]
     return Match(selected, rotation, mirror, classification)
 
 
-def transform_uvs(points, match):
+def transform_uvs(points, match, fill_rect=False):
     if not points:
         raise ValueError("zero-area UV island")
     center = (sum(point[0] for point in points) / len(points), sum(point[1] for point in points) / len(points))
@@ -197,12 +210,15 @@ def transform_uvs(points, match):
     if width <= EPSILON or height <= EPSILON:
         raise ValueError("zero-area UV island")
     rect = match.slot.normalized_hotspot_rect
-    scale = min(rect["width"] / width, rect["height"] / height)
+    scale_u = rect["width"] / width
+    scale_v = rect["height"] / height
+    if not fill_rect:
+        scale_u = scale_v = min(scale_u, scale_v)
     target_center = (rect["x"] + rect["width"] / 2.0, rect["y"] + rect["height"] / 2.0)
     source_center = ((source[0] + source[2]) / 2.0, (source[1] + source[3]) / 2.0)
     result = []
     for u, v in transformed:
-        fitted = (target_center[0] + (u - source_center[0]) * scale, target_center[1] + (v - source_center[1]) * scale)
+        fitted = (target_center[0] + (u - source_center[0]) * scale_u, target_center[1] + (v - source_center[1]) * scale_v)
         result.append((min(rect["x"] + rect["width"], max(rect["x"], fitted[0])), min(rect["y"] + rect["height"], max(rect["y"], fitted[1]))))
     return tuple(result)
 

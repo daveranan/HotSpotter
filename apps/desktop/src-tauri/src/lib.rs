@@ -1,5 +1,6 @@
 mod commands;
 mod diagnostics;
+mod mcp;
 mod paths;
 
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,7 @@ pub fn run() {
             );
             app.manage(Arc::new(Mutex::new(ProjectSession::new(&paths))) as SharedProjectSession);
             app.manage(Arc::new(Mutex::new(None)) as SharedImportJob);
+            app.manage(mcp::start(app.handle().clone()));
             let preview_service = Arc::new(PreviewService::default());
             app.manage(Arc::clone(&preview_service) as SharedPreviewService);
             app.manage(StartupState {
@@ -114,7 +116,8 @@ pub fn run() {
             commands::save_project_as,
             commands::close_project,
             commands::list_recent_projects,
-            commands::take_pending_project_path
+            commands::take_pending_project_path,
+            mcp::mcp_respond
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Hot Trimmer native application");

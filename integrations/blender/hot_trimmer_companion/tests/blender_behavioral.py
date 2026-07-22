@@ -19,6 +19,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "behavioral.hottrim.json"
 sys.path.insert(0, str(INTEGRATIONS))
 
 import hot_trimmer_companion
+from hot_trimmer_companion import operators as ht_operators
 
 
 def png_chunk(kind, payload):
@@ -37,6 +38,8 @@ ROLE_FILES = {
     "metallic": ("Metallic", "metallic.png", "Non-Color"),
     "normal": ("Normal", "normal.png", "Non-Color"),
     "height": ("Height", "height.png", "Non-Color"),
+    "ambientOcclusion": ("Ambient Occlusion", "ambient-occlusion.png", "Non-Color"),
+    "edgeMask": ("Edge Mask", "edge-mask.png", "Non-Color"),
 }
 
 
@@ -122,6 +125,34 @@ def rectangular_object():
     return obj
 
 
+def trapezoid_object():
+    mesh = bpy.data.meshes.new("HT Trapezoid Fixture Mesh")
+    mesh.from_pydata(((0, 0, 0), (2, 0, 0), (1.5, 1, 0), (0.5, 1, 0)), [], ((0, 1, 2, 3),))
+    obj = bpy.data.objects.new("HT Trapezoid Fixture", mesh)
+    bpy.context.collection.objects.link(obj)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    return obj
+
+
+def bent_strip_object():
+    vertices = (
+        (-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+        (1.0, 0.2, 0.0), (1.0, 1.2, 0.0),
+        (2.0, 0.7, 0.0), (2.0, 1.7, 0.0),
+    )
+    mesh = bpy.data.meshes.new("HT Bent Strip Fixture Mesh")
+    mesh.from_pydata(vertices, [], ((0, 2, 3, 1), (2, 4, 5, 3), (4, 6, 7, 5)))
+    for polygon in mesh.polygons:
+        polygon.use_smooth = False
+    obj = bpy.data.objects.new("HT Bent Strip Fixture", mesh)
+    bpy.context.collection.objects.link(obj)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    return obj
+
+
 def radial_object(segments=16):
     vertices = [(0, 0, 0)] + [(math.cos(2 * math.pi * index / segments), math.sin(2 * math.pi * index / segments), 0) for index in range(segments)]
     faces = [(0, index + 1, (index + 1) % segments + 1) for index in range(segments)]
@@ -140,7 +171,11 @@ def radial_object(segments=16):
 
 
 def slot_rects(data):
-    return {slot["slotId"]: slot["normalizedHotspotRect"] for slot in data["slots"]}
+    result = {}
+    for slot in data["slots"]:
+        raw = slot["normalizedHotspotRect"]
+        result[slot["slotId"]] = {"x": raw["x"], "y": 1.0 - raw["y"] - raw["height"], "width": raw["width"], "height": raw["height"]}
+    return result
 
 
 def assert_face_inside(mesh, face_index, rect, tolerance=1.0e-6):
@@ -152,6 +187,8 @@ def assert_face_inside(mesh, face_index, rect, tolerance=1.0e-6):
 def run():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     hot_trimmer_companion.register()
+    require(ht_operators.hottrimmer_auto_update_handler in bpy.app.handlers.depsgraph_update_post, "live mesh update handler was not registered")
+    require(bpy.app.timers.is_registered(ht_operators.poll_auto_updates), "live mesh polling fallback was not registered")
     import_properties = bpy.ops.hottrimmer.import_package.get_rna_type().properties
     require("filepath" in import_properties and import_properties["filepath"].subtype == "FILE_PATH", "import dialog is not bound to Blender's standard filepath")
     require("manifest_path" not in import_properties and "directory" not in import_properties, "import dialog exposes a stale custom path field")
@@ -187,10 +224,9 @@ def run():
         require(tuple(face.select for face in bm.faces) == selected_faces_before, "face selection was not preserved")
         bpy.ops.object.mode_set(mode="OBJECT")
         assignments = json.loads(mesh["ht_assignments"])
-        require(all(record.get("algorithmVersion") == 4 for record in assignments.values()), "assignment algorithm version was not persisted")
+        require(all(record.get("algorithmVersion") == 6 for record in assignments.values()), "assignment algorithm version was not persisted")
         require(all(record.get("templateSnapshotHash") == "fixture-snapshot-hash" for record in assignments.values()), "assignment template snapshot was not persisted")
-        require(assignments["0"]["slotId"] == "rect_wide", "wide island did not choose expected manifest slot")
-        require(assignments["1"]["slotId"] == "rect_tall", "tall island did not choose expected manifest slot")
+        require({assignments["0"]["slotId"], assignments["1"]["slotId"]} == {"rect_wide", "rect_tall"}, "close rectangular islands were not distributed across distinct compatible slots")
         material_index = next(index for index, candidate in enumerate(mesh.materials) if candidate == material)
         require(mesh.polygons[0].material_index == material_index and mesh.polygons[1].material_index == material_index, "Hot Trimmer material was not assigned")
         require(rect.active_material == material, "Hot Trimmer material slot was not made active for preview")
@@ -201,8 +237,8 @@ def run():
         rects = slot_rects(manifest_data)
         assert_face_inside(mesh, 0, rects[assignments["0"]["slotId"]])
         assert_face_inside(mesh, 1, rects[assignments["1"]["slotId"]])
-        require(abs(uv_aspect(face_uvs(mesh, 0)) - 2.0) < 1.0e-5, "wide island proportion was not preserved")
-        require(abs(uv_aspect(face_uvs(mesh, 1)) - 0.5) < 1.0e-5, "tall island proportion was not preserved")
+        require(min(abs(uv_aspect(face_uvs(mesh, 0)) - 2.0), abs(uv_aspect(face_uvs(mesh, 0)) - 0.5)) < 1.0e-5, "wide island proportion was not preserved")
+        require(min(abs(uv_aspect(face_uvs(mesh, 1)) - 2.0), abs(uv_aspect(face_uvs(mesh, 1)) - 0.5)) < 1.0e-5, "tall island proportion was not preserved")
         first_uv_bytes = uv_bytes(mesh)
         first_assignments = mesh["ht_assignments"]
         bpy.ops.object.mode_set(mode="EDIT")
@@ -247,7 +283,7 @@ def run():
         require(rect.mode == "EDIT", "stale assignment rebuild did not preserve edit mode")
         bpy.ops.object.mode_set(mode="OBJECT")
         require(uv_bytes(mesh) != stale_uv_bytes, "stale rectangular assignment reused its shrunken UV footprint")
-        require(all(record.get("algorithmVersion") == 4 for record in json.loads(mesh["ht_assignments"]).values()), "stale assignment version was not replaced")
+        require(all(record.get("algorithmVersion") == 6 for record in json.loads(mesh["ht_assignments"]).values()), "stale assignment version was not replaced")
 
         for obj in bpy.context.selected_objects:
             obj.select_set(False)
@@ -266,6 +302,103 @@ def run():
         require(closed_cube.active_material == material, "closed-mesh hotspot did not activate the Hot Trimmer material")
         require(tuple(edge.use_seam for edge in closed_mesh.edges) == closed_seams_before, "temporary automatic unwrap seams were not restored")
         require(tuple(tuple(vertex.co) for vertex in closed_mesh.vertices) == closed_positions_before, "automatic unwrap changed closed-mesh positions")
+
+        # Real Edit Mode topology changes must trigger a best-effort full mesh
+        # rebuild, including new faces and assignment cleanup after deletion.
+        bpy.context.scene.hottrimmer_live_update = True
+        bpy.ops.object.mode_set(mode="EDIT")
+        bm = bmesh.from_edit_mesh(closed_mesh)
+        bm.faces.ensure_lookup_table()
+        extrusion_offset = bm.faces[0].normal.normalized() * 0.5
+        extrusion = bmesh.ops.extrude_face_region(bm, geom=[bm.faces[0]])
+        new_vertices = [element for element in extrusion["geom"] if isinstance(element, bmesh.types.BMVert)]
+        bmesh.ops.translate(bm, verts=new_vertices, vec=extrusion_offset)
+        bmesh.update_edit_mesh(closed_mesh, loop_triangles=False, destructive=True)
+        extruded_face_count = len(bm.faces)
+        ht_operators.poll_auto_updates()
+        require(closed_cube.name in ht_operators._AUTO_PENDING, "polling fallback did not detect Edit Mode extrusion")
+        first_due_time = ht_operators._AUTO_DUE_TIME
+        ht_operators.poll_auto_updates()
+        require(ht_operators._AUTO_DUE_TIME == first_due_time, "repeated polling starved the live-update debounce")
+        ht_operators._AUTO_DUE_TIME = 0.0
+        require(ht_operators.run_pending_auto_updates() is None, "timer callback did not drain the pending live update")
+        require(closed_cube.mode == "EDIT", "live extrusion update did not restore Edit Mode")
+        assignments_after_extrude = json.loads(closed_mesh["ht_assignments"])
+        require(
+            len(assignments_after_extrude) == extruded_face_count,
+            f"newly extruded faces were not automatically hotspotted: assignments={sorted(assignments_after_extrude)} faces={extruded_face_count}",
+        )
+
+        bm = bmesh.from_edit_mesh(closed_mesh)
+        bm.faces.ensure_lookup_table()
+        bmesh.ops.delete(bm, geom=[bm.faces[-1]], context="FACES")
+        bmesh.update_edit_mesh(closed_mesh, loop_triangles=False, destructive=True)
+        deleted_face_count = len(bm.faces)
+        ht_operators.poll_auto_updates()
+        require(closed_cube.name in ht_operators._AUTO_PENDING, "polling fallback did not detect Edit Mode deletion")
+        ht_operators.run_pending_auto_updates(force=True)
+        require(closed_cube.mode == "EDIT", "live deletion update did not restore Edit Mode")
+        assignments_after_delete = json.loads(closed_mesh["ht_assignments"])
+        require(len(assignments_after_delete) == deleted_face_count, "deleted faces left stale hotspot assignments")
+
+        bm = bmesh.from_edit_mesh(closed_mesh)
+        bad_vertices = [bm.verts.new((20.0 + value, 0.0, 0.0)) for value in (0.0, 1.0, 2.0)]
+        bm.faces.new(bad_vertices)
+        bmesh.update_edit_mesh(closed_mesh, loop_triangles=False, destructive=True)
+        total_with_degenerate = len(bm.faces)
+        ht_operators.poll_auto_updates()
+        require(closed_cube.name in ht_operators._AUTO_PENDING, "polling fallback did not detect broken Edit Mode geometry")
+        ht_operators.run_pending_auto_updates(force=True)
+        require(closed_cube.mode == "EDIT", "best-effort degenerate update did not restore Edit Mode")
+        best_effort_assignments = json.loads(closed_mesh["ht_assignments"])
+        require(len(best_effort_assignments) == total_with_degenerate - 1, "best-effort live update did not skip only the degenerate face")
+        require(bpy.context.scene["ht_last_result"].startswith("Live hotspot updated:"), "live update did not report its result")
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        bent_strip = bent_strip_object()
+        result = bpy.ops.hottrimmer.fit_selected(classification="RECTANGULAR")
+        require(result == {"FINISHED"}, "flat-shaded bent strip hotspot failed")
+        strip_mesh = bent_strip.data
+        strip_islands, _, _ = ht_operators._form_islands(
+            strip_mesh,
+            strip_mesh.uv_layers.active,
+            tuple(range(len(strip_mesh.polygons))),
+        )
+        require(len(strip_islands) == 1, "flat-shaded multi-polygon strip was split into per-face islands")
+        bpy.ops.object.mode_set(mode="EDIT")
+        bm = bmesh.from_edit_mesh(strip_mesh)
+        bm.edges.ensure_lookup_table()
+        internal_edges = [edge for edge in bm.edges if len(edge.link_faces) == 2]
+        require(len(internal_edges) == 2, "bent strip fixture does not have two internal boundaries")
+        internal_edges[0].seam = True
+        bmesh.update_edit_mesh(strip_mesh, loop_triangles=False, destructive=False)
+        ht_operators.poll_auto_updates()
+        require(bent_strip.name in ht_operators._AUTO_PENDING, "marking a seam did not trigger live hotspot detection")
+        ht_operators.run_pending_auto_updates(force=True)
+        require(bent_strip.mode == "EDIT", "seam-triggered hotspot did not restore Edit Mode")
+        bpy.ops.object.mode_set(mode="OBJECT")
+        strip_islands, _, _ = ht_operators._form_islands(
+            strip_mesh,
+            strip_mesh.uv_layers.active,
+            tuple(range(len(strip_mesh.polygons))),
+        )
+        require(len(strip_islands) == 2, "authored seam did not split the bent strip into two hotspot islands")
+
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        trapezoid = trapezoid_object()
+        trapezoid_positions = tuple(tuple(vertex.co) for vertex in trapezoid.data.vertices)
+        result = bpy.ops.hottrimmer.fit_selected(classification="RECTANGULAR")
+        require(result == {"FINISHED"}, "trapezoid quad rectification failed")
+        trapezoid_assignment = json.loads(trapezoid.data["ht_assignments"])["0"]
+        require(trapezoid_assignment.get("rectifiedQuad") is True, "trapezoid was not recorded as a rectified quad")
+        target_rect = rects[trapezoid_assignment["slotId"]]
+        expected_corners = {(round(target_rect["x"], 6), round(target_rect["y"], 6)), (round(target_rect["x"] + target_rect["width"], 6), round(target_rect["y"], 6)), (round(target_rect["x"] + target_rect["width"], 6), round(target_rect["y"] + target_rect["height"], 6)), (round(target_rect["x"], 6), round(target_rect["y"] + target_rect["height"], 6))}
+        actual_corners = {(round(u, 6), round(v, 6)) for u, v in face_uvs(trapezoid.data, 0)}
+        require(actual_corners == expected_corners, "rectified trapezoid did not fill the complete hotspot rectangle")
+        require(tuple(tuple(vertex.co) for vertex in trapezoid.data.vertices) == trapezoid_positions, "quad rectification changed mesh positions")
 
         for obj in bpy.context.selected_objects:
             obj.select_set(False)
@@ -304,8 +437,14 @@ def run():
         material = bpy.data.materials["Hot Trimmer Fixture"]
         require(tuple(sorted(node.name for node in material.node_tree.nodes)) == node_names_before, "package reimport duplicated or changed material nodes")
         require(tuple(sorted(image.filepath for image in bpy.data.images if image.get("ht_material_id") == "material-fixture")) == images_before, "package reimport duplicated images")
-        for name in ("HT basecolor Texture", "HT roughness Texture", "HT metallic Texture", "HT normal Texture", "HT height Texture", "HT Normal Map", "HT Bump"):
+        for name in ("HT basecolor Texture", "HT roughness Texture", "HT metallic Texture", "HT normal Texture", "HT height Texture", "HT ambientocclusion Texture", "HT edgemask Texture", "HT AO Multiply", "HT Normal Map", "HT Bump"):
             require(sum(node.name == name for node in material.node_tree.nodes) == 1, f"named material node is not unique: {name}")
+        ao_node = material.node_tree.nodes["HT ambientocclusion Texture"]
+        edge_mask_node = material.node_tree.nodes["HT edgemask Texture"]
+        require(ao_node.image.colorspace_settings.name == "Non-Color", "AO was not imported as Non-Color")
+        require(edge_mask_node.image.colorspace_settings.name == "Non-Color", "Edge Mask was not imported as Non-Color")
+        require(material.node_tree.nodes["HT AO Multiply"].outputs["Color"].links[0].to_node == material.node_tree.nodes["HT Principled"], "AO multiply was not connected to Principled Base Color")
+        require(len(edge_mask_node.outputs["Color"].links) == 0, "Edge Mask was unexpectedly double-applied in the shader")
         require(material.node_tree.nodes.get("HT Normal Green Invert") is not None, "DirectX normal convention was not represented")
 
         malformed = json.loads(manifest_path.read_text(encoding="utf-8"))

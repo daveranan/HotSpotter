@@ -134,13 +134,13 @@ type EdgeNumberKey = Exclude<{
   [K in keyof EdgeDetailIntentV1]: EdgeDetailIntentV1[K] extends number ? K : never
 }[keyof EdgeDetailIntentV1], undefined>;
 
-const primaryEdgeFields: readonly { key: EdgeNumberKey; label: string; minimum?: number; maximum?: number; step: number; millimeters?: boolean }[] = [
-  { key: "wearAmount", label: "Wear Amount", minimum: 0, maximum: 1, step: 0.01 },
-  { key: "intensity", label: "Intensity", minimum: 0, maximum: 1, step: 0.01 },
-  { key: "edgeWidthM", label: "Edge Width", minimum: 0.01, step: 0.1, millimeters: true },
-  { key: "bevelRadiusM", label: "Bevel Radius", minimum: 0, step: 0.1, millimeters: true },
-  { key: "breakupAmount", label: "Breakup", minimum: 0, maximum: 1, step: 0.01 },
-  { key: "heightAmplitudeM", label: "Height", step: 0.05, millimeters: true },
+const primaryEdgeFields: readonly { key: EdgeNumberKey; label: string; minimum?: number; maximum?: number; step: number; millimeters?: boolean; slider?: boolean }[] = [
+  { key: "wearAmount", label: "Wear Amount", minimum: 0, maximum: 1, step: 0.01, slider: true },
+  { key: "intensity", label: "Intensity", minimum: 0, maximum: 1, step: 0.01, slider: true },
+  { key: "edgeWidthM", label: "Edge Width", minimum: 0.01, maximum: 50, step: 0.1, millimeters: true, slider: true },
+  { key: "bevelRadiusM", label: "Bevel Radius", minimum: 0, maximum: 25, step: 0.1, millimeters: true, slider: true },
+  { key: "breakupAmount", label: "Breakup", minimum: 0, maximum: 1, step: 0.01, slider: true },
+  { key: "heightAmplitudeM", label: "Height", minimum: -10, maximum: 10, step: 0.05, millimeters: true, slider: true },
 ];
 
 function ProcessingNumberField(props: {
@@ -163,7 +163,19 @@ function ProcessingNumberField(props: {
   const finish = () => props.onCommit();
   return <label className="processing-number-field">
     <span>{props.field.label}{props.field.millimeters ? <small>mm</small> : null}</span>
-    <input
+    <span className="processing-number-control">
+      {props.field.slider && props.field.minimum !== undefined && props.field.maximum !== undefined ? <input
+        aria-label={`${props.field.label} slider`}
+        type="range"
+        min={props.field.minimum}
+        max={props.field.maximum}
+        step={props.field.step}
+        value={displayValue}
+        onChange={(event) => accept(event.currentTarget.value)}
+        onPointerUp={finish}
+        onKeyUp={(event) => { if (event.key.startsWith("Arrow")) finish(); }}
+      /> : null}
+      <input
       aria-label={`${props.field.label}${props.field.millimeters ? " in millimeters" : ""}`}
       type="number"
       min={props.field.minimum}
@@ -174,7 +186,8 @@ function ProcessingNumberField(props: {
       onBlur={finish}
       onPointerUp={finish}
       onKeyUp={(event) => { if (event.key === "Enter" || event.key.startsWith("Arrow")) finish(); }}
-    />
+      />
+    </span>
   </label>;
 }
 
@@ -207,10 +220,6 @@ export function ProcessingSidebar(props: ProcessingSidebarProps) {
     const next = sanitizeEdgeDetailIntent(intent);
     updateDraft(next);
   };
-  const targetRegion = committed.targetRegion
-    ? props.project?.document?.topology.regions.find((region) => region.id === committed.targetRegion)
-    : null;
-  const targetLabel = targetRegion ? `${targetRegion.displayName} · ${targetRegion.id}` : "All regions";
   const revision = props.project?.document?.documentRevision;
   const artifactCurrent = revision !== undefined && props.artifact?.documentRevision === revision;
   const dirty = JSON.stringify(sanitizeEdgeDetailIntent(draft)) !== JSON.stringify(committed);
@@ -232,29 +241,32 @@ export function ProcessingSidebar(props: ProcessingSidebarProps) {
       <button role="tab" aria-selected={props.activeTab === "outputs"} className={props.activeTab === "outputs" ? "active" : ""} onClick={() => props.onActiveTab("outputs")}>Outputs</button>
     </div>
     {props.activeTab === "layers" ? <div className="processing-layers">
-      <div className="layer-target"><span>Active target</span><strong>{targetLabel}</strong></div>
+      <label className="layer-target"><span>Target</span><select value={draft.targetRegion ?? "all"} onChange={(event) => stageDraft({ ...draft, enabled: true, targetRegion: event.currentTarget.value === "all" ? undefined : event.currentTarget.value })}><option value="all">All regions</option>{props.selectedRegionId ? <option value={props.selectedRegionId}>Selected region · {props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId)?.displayName ?? props.selectedRegionId}</option> : null}{props.project?.document?.topology.regions.filter((region) => region.id !== props.selectedRegionId).map((region) => <option key={region.id} value={region.id}>{region.displayName} · {region.id}</option>)}</select></label>
+      <button className="processing-add-layer" disabled title="Additional processing operations will appear here as they become editable."><span>+</span> Add layer</button>
       <ol className="processing-layer-list">
+        <li className="processing-derived-layer"><div className="processing-layer-header"><span className="layer-grip">⠿</span><input type="checkbox" checked readOnly aria-label="Structural Profile enabled" /><span className="layer-number">1</span><strong>Structural Profile</strong><small>Region geometry</small></div></li>
         <li className="selected expanded">
-          <header><button><span>1</span><strong>Edge Detail</strong></button><strong className={`layer-enabled-state ${applied ? "enabled" : "disabled"}`}>{applied ? "ON" : "OFF"}</strong></header>
+          <header className="processing-layer-header"><span className="layer-grip">⠿</span><input type="checkbox" checked={applied} aria-label="Edge Detail enabled" disabled={props.commandBusy || !props.project?.document} onChange={(event) => event.currentTarget.checked ? applyDraft() : disableAppliedLayer()} /><span className="layer-number">2</span><strong>Edge Detail</strong><span className="layer-chevron">⌄</span></header>
           <div className="edge-detail-editor">
-            <section className={`edge-detail-activation ${applied ? "enabled" : "disabled"}`}><div><strong>{!applied ? "Edge Detail is not applied" : dirty ? "Edge Detail has unapplied changes" : artifactCurrent ? "Edge Detail is applied" : "Rendering applied Edge Detail"}</strong><p>{applied ? `The applied layer targets ${targetLabel}. ${dirty ? "Apply Changes to publish the editor values." : artifactCurrent ? "Edge Mask, Height, and Normal contributions match this document revision." : "The last valid atlas remains visible while this revision renders."}` : "Choose the target and settings below, then apply the layer to generate its map contributions."}</p></div>{applied ? <button onClick={disableAppliedLayer} disabled={props.commandBusy}>Disable</button> : null}</section>
-            <label>Target<select value={draft.targetRegion ?? "all"} onChange={(event) => stageDraft({ ...draft, enabled: true, targetRegion: event.currentTarget.value === "all" ? undefined : event.currentTarget.value })}><option value="all">All regions</option>{props.selectedRegionId ? <option value={props.selectedRegionId}>Selected region · {props.project?.document?.topology.regions.find((region) => region.id === props.selectedRegionId)?.displayName ?? props.selectedRegionId}</option> : null}{props.project?.document?.topology.regions.filter((region) => region.id !== props.selectedRegionId).map((region) => <option key={region.id} value={region.id}>{region.displayName} · {region.id}</option>)}</select></label>
             <label>Preset<select value={preset} onChange={(event) => { if (event.currentTarget.value === "Custom") return; stageDraft(edgeDetailIntentFromPreset(event.currentTarget.value as EdgeDetailPresetName, { ...draft, enabled: true })); }}><option>Custom</option>{Object.keys(EDGE_DETAIL_PRESETS).map((name) => <option key={name}>{name}</option>)}</select><small>Preset and control changes remain staged until you apply them.</small></label>
             <div className="processing-primary-controls">{primaryEdgeFields.map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key] as number} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}</div>
             <details><summary>Color response</summary><div className="processing-primary-controls">
-              {([{ key: "hueShiftDegrees", label: "Hue", step: 1, minimum: -180, maximum: 180 }, { key: "saturationMultiplier", label: "Saturation (1 = unchanged)", step: 0.01, minimum: 0, maximum: 2 }, { key: "valueMultiplier", label: "Value (1 = unchanged)", step: 0.01, minimum: 0, maximum: 3 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
+              {([{ key: "hueShiftDegrees", label: "Hue", step: 1, minimum: -180, maximum: 180, slider: true }, { key: "saturationMultiplier", label: "Saturation (1 = unchanged)", step: 0.01, minimum: 0, maximum: 2, slider: true }, { key: "valueMultiplier", label: "Value (1 = unchanged)", step: 0.01, minimum: 0, maximum: 3, slider: true }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
             </div></details>
             <details><summary>Surface response</summary><div className="processing-primary-controls">
-              {([{ key: "roughnessOffset", label: "Roughness offset", step: 0.01, minimum: -1, maximum: 1 }, { key: "normalDetailStrength", label: "Normal detail", step: 0.01, minimum: 0, maximum: 2 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
+              {([{ key: "roughnessOffset", label: "Roughness offset", step: 0.01, minimum: -1, maximum: 1, slider: true }, { key: "normalDetailStrength", label: "Normal detail", step: 0.01, minimum: 0, maximum: 2, slider: true }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
               <label className="metal-intent"><input type="checkbox" checked={draft.exposedMetalEnabled} onChange={(event) => stageDraft({ ...draft, enabled: true, exposedMetalEnabled: event.currentTarget.checked, metallicOffset: event.currentTarget.checked ? draft.metallicOffset : 0 })} /> Exposed metal</label>
+              {draft.exposedMetalEnabled ? <ProcessingNumberField field={{ key: "metallicOffset", label: "Metallic offset", step: 0.01, minimum: 0, maximum: 1, slider: true }} value={draft.metallicOffset} onDraft={(value) => updateDraft({ ...draft, enabled: true, metallicOffset: value })} onCommit={() => undefined} /> : null}
             </div></details>
             <details><summary>Advanced</summary><div className="processing-primary-controls">
-              {([{ key: "edgeSoftness", label: "Edge Softness", step: 0.01, minimum: 0, maximum: 1 }, { key: "breakupScaleM", label: "Breakup Scale", step: 0.1, minimum: 0.01, millimeters: true }, { key: "microDetailAmount", label: "Microdetail Amount", step: 0.01, minimum: 0, maximum: 1 }, { key: "microDetailScaleM", label: "Microdetail Scale", step: 0.1, minimum: 0.01, millimeters: true }, { key: "sourceHeightInfluence", label: "Source Height", step: 0.01, minimum: 0, maximum: 1 }, { key: "sourceLuminanceInfluence", label: "Base Color bump", step: 0.01, minimum: 0, maximum: 1 }, { key: "seed", label: "Seed", step: 1, minimum: 0, maximum: 4294967295 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
+              {([{ key: "edgeSoftness", label: "Edge Softness", step: 0.01, minimum: 0, maximum: 1, slider: true }, { key: "breakupScaleM", label: "Breakup Scale", step: 0.1, minimum: 0.01, maximum: 100, millimeters: true, slider: true }, { key: "microDetailAmount", label: "Microdetail Amount", step: 0.01, minimum: 0, maximum: 1, slider: true }, { key: "microDetailScaleM", label: "Microdetail Scale", step: 0.1, minimum: 0.01, maximum: 25, millimeters: true, slider: true }, { key: "sourceHeightInfluence", label: "Source Height", step: 0.01, minimum: 0, maximum: 1, slider: true }, { key: "sourceLuminanceInfluence", label: "Base Color bump", step: 0.01, minimum: 0, maximum: 1, slider: true }, { key: "seed", label: "Seed", step: 1, minimum: 0, maximum: 4294967295 }] as const).map((field) => <ProcessingNumberField key={field.key} field={field} value={draft[field.key]} onDraft={(value) => updateDraft({ ...draft, enabled: true, [field.key]: value })} onCommit={() => undefined} />)}
             </div></details>
             <div className="edge-detail-apply-row"><button className="primary" onClick={publishDraft} disabled={props.commandBusy || !props.project?.document || (applied && !dirty && artifactCurrent)}>{props.commandBusy ? "Applying…" : !applied ? "Apply Edge Detail" : dirty ? "Apply Changes" : artifactCurrent ? "Applied" : "Render Edge Detail"}</button><span>{dirty ? "Unapplied changes" : applied ? artifactCurrent ? `Applied · revision ${revision}` : "Applied · preview is stale" : "Not applied"}</span></div>
             {props.edgeDetailError ? <p className="typed-state failed" role="alert"><strong>{props.edgeDetailError.code}</strong> · {props.edgeDetailError.message}</p> : null}
           </div>
         </li>
+        <li className="processing-derived-layer"><div className="processing-layer-header"><span className="layer-grip">⠿</span><input type="checkbox" checked={applied && draft.roughnessOffset !== 0} readOnly aria-label="Roughness adjustment generated" /><span className="layer-number">3</span><strong>Roughness Adjust</strong><small>From Edge Detail</small></div></li>
+        <li className="processing-derived-layer"><div className="processing-layer-header"><span className="layer-grip">⠿</span><input type="checkbox" checked={applied} readOnly aria-label="AO and cavity generated" /><span className="layer-number">4</span><strong>AO / Cavity</strong><small>Generated output</small></div></li>
       </ol>
       <div className="undo-row"><button disabled={!props.project?.canUndoDocument} onClick={props.onUndo}>Undo</button><button disabled={!props.project?.canRedoDocument} onClick={props.onRedo}>Redo</button></div>
     </div> : <div className="processing-outputs">

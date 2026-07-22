@@ -1,0 +1,3 @@
+[mcp_servers.hot-trimmer]
+command = "node"
+args = ["scripts/hot-trimmer-mcp.mjs"]

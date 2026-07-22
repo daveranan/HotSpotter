@@ -197,7 +197,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             + source_bias * cmd.edge_width_m * 0.15;
         let distance = max(textureLoad(stage15_sdf, local, 0).x, 0.0);
         let warped = max(0.0, distance + warp);
-        if (warped > cmd.requested_extent_m) {
+        // Structural relief follows the authoritative Region boundary. Wear may
+        // warp farther in or out, but it must never cull that base profile.
+        if (distance > cmd.requested_extent_m && warped > cmd.requested_extent_m) {
             textureStore(height_out, local, vec4<f32>(surface_height));
             continue;
         }
@@ -221,9 +223,32 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         fade = clamp(fade, 0.0, 1.0);
         let combined = clamp(max(core, max(transition * 0.72, fade * 0.30)) * cmd.intensity, 0.0, 1.0);
         let radius = max(cmd.bevel_radius_m, pixel_feather);
-        let x = clamp(warped / radius, 0.0, 1.0);
-        let rounded = sqrt(max(0.0, 1.0 - (1.0 - x) * (1.0 - x)));
-        let edge_height = cmd.height_amplitude_m * (1.0 - rounded) * combined;
+        let structural_x = clamp(distance / radius, 0.0, 1.0);
+        let structural_rounded = sqrt(max(
+            0.0,
+            1.0 - (1.0 - structural_x) * (1.0 - structural_x),
+        ));
+        // A Cycles Bevel node rounds the shading normal by the authored radius
+        // even when the mesh face itself has no displaced Height texture. Model
+        // that virtual quarter-round in the baked Height field, then treat the
+        // authored Height control as additional raised/recessed relief. Without
+        // this radius-sized term a 7 mm bevel paired with a 0.9 mm recess has an
+        // almost-flat slope and cannot resemble the reference geometry.
+        let bevel_direction = select(1.0, -1.0, cmd.height_amplitude_m <= 0.0);
+        let virtual_bevel_amplitude = cmd.height_amplitude_m
+            + bevel_direction * cmd.bevel_radius_m * 0.85;
+        let structural_height = virtual_bevel_amplitude * (1.0 - structural_rounded);
+
+        // Breakup adds bounded secondary relief. It does not multiply the
+        // structural profile, so coverage and intensity cannot erase a bevel.
+        let wear_x = clamp(warped / radius, 0.0, 1.0);
+        let wear_rounded = sqrt(max(0.0, 1.0 - (1.0 - wear_x) * (1.0 - wear_x)));
+        let chipped_height = virtual_bevel_amplitude
+            * (1.0 - wear_rounded)
+            * combined
+            * cmd.breakup_amount
+            * 0.15;
+        let edge_height = structural_height + chipped_height;
         textureStore(core_out, local, vec4<f32>(core));
         textureStore(transition_out, local, vec4<f32>(transition));
         textureStore(fade_out, local, vec4<f32>(fade));

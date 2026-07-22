@@ -12,6 +12,7 @@ MATERIAL_METADATA = {
     "ht_template_snapshot_hash": "templateSnapshotHash",
     "ht_material_revision": "materialRevision",
 }
+SUPPORTED_MAP_ROLES = ("basecolor", "roughness", "metallic", "normal", "height", "ambientocclusion", "edgemask")
 
 
 def _canonical_role(role):
@@ -59,7 +60,7 @@ def create_or_update_material(manifest, bpy):
     for key in sorted(manifest.get("maps", {})):
         record = manifest["maps"][key]
         role = _canonical_role(record["role"])
-        if role not in ("basecolor", "roughness", "metallic", "normal", "height"):
+        if role not in SUPPORTED_MAP_ROLES:
             continue
         image_path = (Path(manifest["_package_path"]) / record["relativePath"]).resolve()
         image = bpy.data.images.load(str(image_path), check_existing=True)
@@ -89,7 +90,7 @@ def create_or_update_material(manifest, bpy):
     for key in sorted(manifest.get("maps", {})):
         record = manifest["maps"][key]
         role = _canonical_role(record["role"])
-        if role not in ("basecolor", "roughness", "metallic", "normal", "height"):
+        if role not in SUPPORTED_MAP_ROLES:
             continue
         image = loaded_images[key]
         image.colorspace_settings.name = "sRGB" if role == "basecolor" else "Non-Color"
@@ -99,13 +100,31 @@ def create_or_update_material(manifest, bpy):
         texture.image = image
         textures[role] = texture
 
-    role_inputs = {"basecolor": "Base Color", "roughness": "Roughness", "metallic": "Metallic"}
+    for role in SUPPORTED_MAP_ROLES:
+        if role not in textures:
+            _remove_named(nodes, (f"HT {role} Texture",))
+
+    role_inputs = {"roughness": "Roughness", "metallic": "Metallic"}
     for role, input_name in role_inputs.items():
         texture = textures.get(role)
         if texture is not None:
             _link(links, texture.outputs["Color"], principled.inputs[input_name])
-        else:
-            _remove_named(nodes, (f"HT {role} Texture",))
+    base_color_texture = textures.get("basecolor")
+    ao_texture = textures.get("ambientocclusion")
+    if base_color_texture is not None and ao_texture is not None:
+        ao_multiply = _node(nodes, "HT AO Multiply", "ShaderNodeMixRGB")
+        ao_multiply.blend_type = "MULTIPLY"
+        ao_multiply.inputs[0].default_value = 1.0
+        _link(links, base_color_texture.outputs["Color"], ao_multiply.inputs[1])
+        _link(links, ao_texture.outputs["Color"], ao_multiply.inputs[2])
+        _link(links, ao_multiply.outputs["Color"], principled.inputs["Base Color"])
+    elif base_color_texture is not None:
+        _remove_named(nodes, ("HT AO Multiply",))
+        _link(links, base_color_texture.outputs["Color"], principled.inputs["Base Color"])
+    else:
+        _remove_named(nodes, ("HT AO Multiply",))
+        for existing in tuple(principled.inputs["Base Color"].links):
+            links.remove(existing)
 
     normal_output = None
     normal_texture = textures.get("normal")
@@ -144,7 +163,6 @@ def create_or_update_material(manifest, bpy):
         _remove_named(nodes, ("HT height Texture", "HT Bump"))
         for existing in tuple(principled.inputs["Normal"].links):
             links.remove(existing)
-    base_color_texture = textures.get("basecolor")
     if base_color_texture is not None:
         for node in nodes:
             node.select = False

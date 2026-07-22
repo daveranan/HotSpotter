@@ -82,9 +82,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var i = 0u; i < header.command_count; i = i + 1u) {
         let cmd = commands[i];
         if (atlas_pixel.x >= cmd.dst_x && atlas_pixel.x < cmd.dst_x + cmd.dst_width && atlas_pixel.y >= cmd.dst_y && atlas_pixel.y < cmd.dst_y + cmd.dst_height) {
+            let raw_fade = clamp(textureLoad(fade_tex, p, 0).r, 0.0, 1.0);
             let core = clamp(textureLoad(core_tex, p, 0).r * cmd.intensity, 0.0, 1.0);
             let transition = clamp(textureLoad(transition_tex, p, 0).r * cmd.intensity, 0.0, 1.0);
-            let fade = clamp(textureLoad(fade_tex, p, 0).r * cmd.intensity, 0.0, 1.0);
+            let fade = clamp(raw_fade * cmd.intensity, 0.0, 1.0);
             let mask = clamp(textureLoad(combined_tex, p, 0).r, 0.0, 1.0);
             if (header.map_kind == 0u) {
                 // Decode once, respond to the three authored zones independently,
@@ -125,6 +126,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             } else if (header.map_kind == 3u) {
                 let roughness = clamp(base.r + mask * cmd.roughness_offset, 0.0, 1.0);
                 result = vec4<f32>(select(roughness, roughness - base.r, header.inspection_mode == 1u));
+            } else if (header.map_kind == 4u) {
+                // A recessed structural profile must publish cavity response even
+                // when procedural wear coverage is zero. Narrow the broad fade
+                // band back toward the authored bevel radius and scale occlusion
+                // by physical slope, with a conservative upper bound.
+                let pixel_feather = max(cmd.meters_per_pixel_x, cmd.meters_per_pixel_y);
+                let radius = max(cmd.bevel_radius_m, pixel_feather);
+                let band_ratio = max(cmd.edge_width_m / radius, 1.0);
+                let cavity = pow(raw_fade, band_ratio);
+                // HotBox obtains deep contact occlusion from individually
+                // extruded face islands. The baked equivalent must account for
+                // the virtual bevel itself, not only the smaller user-authored
+                // Height offset layered on top of it.
+                let virtual_depth = abs(cmd.height_amplitude_m) + cmd.bevel_radius_m * 0.85;
+                let cavity_strength = clamp(virtual_depth / radius * 0.65, 0.0, 0.62);
+                let ao = clamp(base.r * (1.0 - cavity * cavity_strength), 0.0, 1.0);
+                result = vec4<f32>(select(ao, base.r - ao, header.inspection_mode == 1u));
             } else if (header.map_kind == 5u) {
                 if (cmd.exposed_metal_enabled != 0u) {
                     let metallic = clamp(base.r + mask * cmd.metallic_offset, 0.0, 1.0);

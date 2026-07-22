@@ -9,14 +9,16 @@ test("mvp-edge-wear ignores a stale cancellation after newer preview publication
   assert.equal(feedbackRequestIsCurrent(6, 6), true);
 });
 
-test("mvp-edge-wear exposes four editable typed presets with distinct exact intents", () => {
-  const names = ["Soft Worn Edge", "Chipped Paint", "Heavy Erosion", "Clean Bevel"] as const;
+test("mvp-edge-wear exposes five editable typed presets with distinct exact intents", () => {
+  const names = ["Soft Worn Edge", "Chipped Paint", "Heavy Erosion", "Clean Bevel", "HotBox Concrete"] as const;
   assert.deepEqual(Object.keys(EDGE_DETAIL_PRESETS), names);
   const intents = names.map((name) => edgeDetailIntentFromPreset(name, edgeDetail({ targetRegion: "stable-region-uuid" })));
   assert.equal(new Set(intents.map((intent) => JSON.stringify(intent))).size, names.length);
   assert.ok(intents.every((intent) => intent.targetRegion === "stable-region-uuid"));
   assert.equal(intents[3].breakupAmount, 0);
   assert.equal(intents[3].microDetailAmount, 0);
+  assert.equal(intents[4].bevelRadiusM, 0.007);
+  assert.equal(intents[4].edgeWidthM, 0.015);
   assert.ok(intents[0].edgeWidthM <= 0.006, "the default wear band stays narrow");
   assert.ok(intents[0].saturationMultiplier >= 0.9, "the default does not bleach Base Color");
   assert.ok(intents[0].valueMultiplier <= 1.06, "the default does not paint a bright halo");
@@ -104,6 +106,12 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(shader, /source_linear_luminance\(local\) - 0\.5/);
   assert.match(shader, /cmd\.source_height_range_m/);
   assert.match(shader, /surface_height \+ edge_height/);
+  assert.match(shader, /let virtual_bevel_amplitude = cmd\.height_amplitude_m/);
+  assert.match(shader, /bevel_direction \* cmd\.bevel_radius_m \* 0\.85/);
+  assert.match(shader, /let structural_height = virtual_bevel_amplitude/);
+  assert.match(shader, /let chipped_height = virtual_bevel_amplitude/);
+  assert.match(shader, /let edge_height = structural_height \+ chipped_height/);
+  assert.doesNotMatch(shader, /height_amplitude_m \* \(1\.0 - rounded\) \* combined/);
   assert.match(shader, /clamp\(local \+ vec2<i32>\(x, y\), stencil_min, stencil_max\)/);
   assert.match(shader, /transition_micro/);
   assert.match(shader, /cmd\.cap_major_axis == 1u/);
@@ -112,7 +120,7 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(shader, /var fade_out: texture_storage_2d<r32float/);
   assert.match(shader, /var combined_out: texture_storage_2d<r32float/);
   assert.match(shader, /var height_out: texture_storage_2d<r32float/);
-  assert.match(shader, /sqrt\(max\(0\.0, 1\.0 - \(1\.0 - x\)/);
+  assert.match(shader, /let structural_rounded = sqrt\(max\(/);
   assert.doesNotMatch(shader, /normal.*rgb.*height/i);
   assert.match(executor, /GpuAtlasPipelineKind::EdgeDetail/);
   assert.match(executor, /execute_or_load_edge_detail_fields/);
@@ -150,9 +158,14 @@ test("mvp-edge-wear stays on the compiled GPU requested-map path", () => {
   assert.match(composition, /textureLoad\(edge_height_tex/);
   assert.match(composition, /let core = clamp\(textureLoad\(core_tex/);
   assert.match(composition, /let transition = clamp\(textureLoad\(transition_tex/);
-  assert.match(composition, /let fade = clamp\(textureLoad\(fade_tex/);
+  assert.match(composition, /let raw_fade = clamp\(textureLoad\(fade_tex/);
+  assert.match(composition, /let fade = clamp\(raw_fade \* cmd\.intensity/);
   assert.match(composition, /let mask = clamp\(textureLoad\(combined_tex/);
   assert.match(composition, /roughness = clamp\(base\.r \+ mask \* cmd\.roughness_offset/);
+  assert.match(composition, /header\.map_kind == 4u/);
+  assert.match(composition, /let virtual_depth = abs\(cmd\.height_amplitude_m\) \+ cmd\.bevel_radius_m \* 0\.85/);
+  assert.match(composition, /let cavity_strength = clamp\(virtual_depth \/ radius/);
+  assert.match(composition, /base\.r \* \(1\.0 - cavity \* cavity_strength\)/);
   assert.match(composition, /cmd\.exposed_metal_enabled != 0u/);
   assert.match(composition, /else if \(header\.inspection_mode != 0u\)[\s\S]*result = vec4<f32>\(0\.0\)/,
     "disabled exposed-metal inspection must publish zero contribution while preserving the base Metallic route");
@@ -279,12 +292,10 @@ test("mvp-edge-wear Processing switches retained map publications, keeps the pri
   assert.match(shell, /await requestPreview\(undefined, undefined, interactivePreviewProfile, revision, false, true\)/);
 });
 
-test("mvp-edge-wear Processing makes Edge Detail application explicit and truthful", () => {
+test("mvp-edge-wear Processing presents a truthful layer stack with staged Edge Detail controls", () => {
   const workbench = read("apps/desktop/src/feedback-workbench.tsx");
   assert.match(workbench, /persisted = props\.project\?\.document\?\.edgeDetail/);
   assert.match(workbench, /persisted \?\? \{ \.\.\.defaultEdgeWearIntent\(\), enabled: false \}/);
-  assert.match(workbench, /targetRegion = committed\.targetRegion/);
-  assert.match(workbench, /targetLabel = targetRegion \? `\$\{targetRegion\.displayName\} · \$\{targetRegion\.id\}` : "All regions"/);
   assert.match(workbench, /Selected region ·/);
   assert.match(workbench, /onBlur=\{finish\}/);
   assert.match(workbench, /onPointerUp=\{finish\}/);
@@ -293,12 +304,13 @@ test("mvp-edge-wear Processing makes Edge Detail application explicit and truthf
   assert.match(workbench, /Render Edge Detail/);
   assert.match(workbench, /if \(applied && !dirty\)/);
   assert.match(workbench, /if \(!artifactCurrent\) props\.onRender\(\)/);
-  assert.match(workbench, /Edge Detail is not applied/);
-  assert.match(workbench, /Edge Detail has unapplied changes/);
   assert.match(workbench, /sanitizeEdgeDetailIntent\(\{ \.\.\.draft, enabled: true \}\)/);
   assert.doesNotMatch(workbench, /Changes publish live/);
   assert.match(workbench, /edgeDetailIntentFromPreset\(event\.currentTarget\.value as EdgeDetailPresetName, \{ \.\.\.draft, enabled: true \}\)/);
-  assert.doesNotMatch(workbench, /<strong>Structural Profile<\/strong>/);
+  assert.match(workbench, /<strong>Structural Profile<\/strong><small>Region geometry<\/small>/);
+  assert.match(workbench, /<strong>Roughness Adjust<\/strong><small>From Edge Detail<\/small>/);
+  assert.match(workbench, /<strong>AO \/ Cavity<\/strong><small>Generated output<\/small>/);
+  assert.match(workbench, /type="range"/);
   assert.doesNotMatch(workbench, /What feeds these maps\?/);
   for (const control of ["Wear Amount", "Intensity", "Edge Width", "Bevel Radius", "Breakup", "Height"]) assert.match(workbench, new RegExp(`label: "${control}"`));
   assert.match(workbench, /props\.value \* 1000/);
@@ -321,17 +333,25 @@ test("mvp-edge-wear publishes a complete material set, lights it without geometr
     assert.match(shell, new RegExp(`processingPreviewMaterialMaps[\\s\\S]*?"${map}"`));
   }
   assert.match(shell, /const requestedMaps = processingOpen\s*\? processingPreviewMaterialMaps/);
-  assert.match(shell, /<MaterialPreviewCanvas artifact=\{artifact\}/);
+  assert.match(shell, /<MaterialPreviewComparison artifact=\{artifact\}/);
+  assert.match(shell, /comparisonArtifact=\{props\.comparisonArtifact\}/);
+  assert.match(shell, /const quickProfile: InteractivePreviewProfile = "refinement1024"/);
+  assert.match(shell, /previewDraftId\.current !== quickDraftId/);
   assert.doesNotMatch(shell, /role="tab" disabled[^>]*>Material/);
   assert.match(materialPreview, /uniform sampler2D u_base_color/);
   assert.match(materialPreview, /uniform sampler2D u_normal/);
   assert.match(materialPreview, /uniform sampler2D u_height/);
   assert.match(materialPreview, /height_toward_light/);
+  assert.match(materialPreview, /float distribution = alpha2/);
+  assert.match(materialPreview, /float contact = pow\(ao, 1\.45\)/);
   assert.match(materialPreview, /onPointerMove/);
+  assert.match(materialPreview, /Before and after comparison/);
+  assert.match(materialPreview, /clipPath: !afterPainted/);
+  assert.match(materialPreview, /key=\{afterKey\}/);
   assert.match(shell, />Export All Maps</);
-  assert.match(shell, />Refresh All Maps</);
+  assert.match(shell, />Refresh</);
   assert.match(css, /\.processing-inspection-controls button \{[^}]*min-width: max-content;[^}]*max-width: none;[^}]*white-space: nowrap;/);
-  assert.match(shell, /"metallic", "edge_mask"/);
+  assert.match(shell, /"metallic", "ambient_occlusion", "edge_mask"/);
   assert.match(native, /MaterialMapKind::AmbientOcclusion\s*\| MaterialMapKind::EdgeMask => \{/);
   assert.match(native, /"maps\/edge_mask\.png"/);
 });

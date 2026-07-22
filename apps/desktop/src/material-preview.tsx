@@ -40,6 +40,51 @@ export function materialPreviewReady(
     && materialPreviewMapViews.every((view) => !!publicationForView(artifact, view));
 }
 
+function materialArtifactKey(artifact: IntermediateAtlasProjection): string {
+  return materialPreviewMapViews.map((view) => {
+    const publication = publicationForView(artifact, view);
+    return `${publication?.manifest.generation ?? "missing"}:${publication?.manifest.opaqueHandle ?? view}`;
+  }).join("|");
+}
+
+export function MaterialPreviewComparison(props: {
+  artifact: IntermediateAtlasProjection;
+  comparisonArtifact: IntermediateAtlasProjection | null;
+  enabled: boolean;
+  onPaint: (dimensions: { width: number; height: number; generation?: number }) => void;
+}) {
+  const [divider, setDivider] = useState(50);
+  const [light, setLight] = useState<readonly [number, number, number]>([-0.42, 0.48, 0.76]);
+  const [paintedAfterKey, setPaintedAfterKey] = useState<string | null>(null);
+  const before = props.comparisonArtifact
+    && props.comparisonArtifact.topologyHash === props.artifact.topologyHash
+    && materialPreviewReady(props.comparisonArtifact)
+      ? props.comparisonArtifact
+      : null;
+  const afterKey = materialArtifactKey(props.artifact);
+  const beforeKey = before ? materialArtifactKey(before) : null;
+  const afterPainted = paintedAfterKey === afterKey;
+  const comparisonVisible = !!before && props.enabled && afterPainted;
+  return <div
+    className={`material-preview-comparison ${comparisonVisible ? "comparing" : ""}`}
+    onPointerMove={(event) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const x = ((event.clientX - rect.left) / Math.max(rect.width, 1) - 0.5) * 1.7;
+      const y = (0.5 - (event.clientY - rect.top) / Math.max(rect.height, 1)) * 1.7;
+      setLight([x, y, 0.72]);
+    }}
+    onPointerLeave={() => setLight([-0.42, 0.48, 0.76])}
+  >
+    <div key={afterKey} className="material-preview-layer after"><MaterialPreviewCanvas artifact={props.artifact} light={light} onPaint={(dimensions) => { setPaintedAfterKey(afterKey); props.onPaint(dimensions); }} /></div>
+    {before ? <div key={beforeKey} className="material-preview-layer before" style={{ clipPath: !afterPainted ? "inset(0)" : comparisonVisible ? `inset(0 ${100 - divider}% 0 0)` : "inset(0 100% 0 0)" }}><MaterialPreviewCanvas artifact={before} light={light} showStatus={false} onPaint={() => undefined} /></div> : null}
+    {comparisonVisible ? <>
+      <span className="material-compare-label before">Before</span><span className="material-compare-label after">After</span>
+      <div className="material-compare-divider" style={{ left: `${divider}%` }} aria-hidden="true"><i /></div>
+      <input className="material-compare-range" aria-label="Before and after comparison" type="range" min="0" max="100" step="0.1" value={divider} onChange={(event) => setDivider(Number(event.currentTarget.value))} />
+    </> : null}
+  </div>;
+}
+
 export const materialPreviewFragmentShader = `#version 300 es
 precision highp float;
 in vec2 v_uv;
@@ -77,21 +122,32 @@ void main() {
   vec3 view = vec3(0.0, 0.0, 1.0);
   vec3 halfway = normalize(light + view);
   float n_dot_l = max(dot(normal, light), 0.0);
+  float n_dot_v = max(dot(normal, view), 0.001);
+  float n_dot_h = max(dot(normal, halfway), 0.0);
+  float v_dot_h = max(dot(view, halfway), 0.0);
   float wrapped_light = clamp((dot(normal, light) + 0.18) / 1.18, 0.0, 1.0);
-  float specular_power = mix(160.0, 4.0, roughness * roughness);
   vec3 f0 = mix(vec3(0.04), base, metallic);
-  vec3 diffuse = base * (1.0 - metallic) * wrapped_light;
-  vec3 specular = f0 * pow(max(dot(normal, halfway), 0.0), specular_power)
-    * mix(1.0, 0.16, roughness) * n_dot_l;
+  float alpha = max(roughness * roughness, 0.0025);
+  float alpha2 = alpha * alpha;
+  float distribution = alpha2 / max(3.14159265 * pow(n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0, 2.0), 0.0001);
+  float geometry_k = pow(roughness + 1.0, 2.0) / 8.0;
+  float geometry_v = n_dot_v / (n_dot_v * (1.0 - geometry_k) + geometry_k);
+  float geometry_l = n_dot_l / (n_dot_l * (1.0 - geometry_k) + geometry_k);
+  vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
+  vec3 specular = distribution * geometry_v * geometry_l * fresnel
+    / max(4.0 * n_dot_v * max(n_dot_l, 0.001), 0.001);
+  vec3 diffuse = (1.0 - fresnel) * (1.0 - metallic) * base / 3.14159265;
 
   // A short height look-ahead adds restrained cavity shadowing at grazing
   // angles. Normal remains the primary surface response; this only makes a
   // recessed bevel readable under the preview light.
   float height_here = texture(u_height, uv).r;
   float height_toward_light = texture(u_height, uv + light.xy * u_texel * 3.0).r;
-  float cavity = clamp(1.0 + (height_here - height_toward_light) * 2.5, 0.48, 1.0);
-  vec3 ambient = base * (0.075 + 0.16 * ao);
-  vec3 color = ambient + (diffuse + specular) * ao * cavity * 1.15;
+  float cavity = clamp(1.0 + (height_here - height_toward_light) * 10.0, 0.38, 1.0);
+  float contact = pow(ao, 1.45);
+  vec3 ambient = base * (0.055 + 0.18 * contact);
+  vec3 direct = (diffuse * wrapped_light + specular * n_dot_l) * contact;
+  vec3 color = ambient + direct * cavity * 3.1;
   out_color = vec4(linear_to_srgb(color), encoded_base.a);
 }`;
 
@@ -162,6 +218,8 @@ async function loadTextureBytes(publication: GpuTiledPreviewPublication): Promis
 
 export function MaterialPreviewCanvas(props: {
   artifact: IntermediateAtlasProjection;
+  light?: readonly [number, number, number];
+  showStatus?: boolean;
   onPaint: (dimensions: { width: number; height: number; generation?: number }) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -228,7 +286,7 @@ export function MaterialPreviewCanvas(props: {
         gl.uniform3f(lightUniform, light[0], light[1], light[2]);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
       };
-      drawRef.current([-0.42, 0.48, 0.76]);
+      drawRef.current(props.light ?? [-0.42, 0.48, 0.76]);
       setStatus("ready");
       props.onPaint({
         width: props.artifact.width,
@@ -252,6 +310,10 @@ export function MaterialPreviewCanvas(props: {
     };
   }, [generationKey, props.artifact.width, props.artifact.height]);
 
+  useEffect(() => {
+    if (props.light) drawRef.current?.(props.light);
+  }, [props.light]);
+
   return <div className="material-preview-surface">
     <canvas
       ref={canvasRef}
@@ -259,16 +321,16 @@ export function MaterialPreviewCanvas(props: {
       width={props.artifact.width}
       height={props.artifact.height}
       aria-label="Lit material preview"
-      onPointerMove={(event) => {
+      onPointerMove={props.light ? undefined : (event) => {
         const rect = event.currentTarget.getBoundingClientRect();
         const x = ((event.clientX - rect.left) / Math.max(rect.width, 1) - 0.5) * 1.7;
         const y = (0.5 - (event.clientY - rect.top) / Math.max(rect.height, 1)) * 1.7;
         drawRef.current?.([x, y, 0.72]);
       }}
-      onPointerLeave={() => drawRef.current?.([-0.42, 0.48, 0.76])}
+      onPointerLeave={props.light ? undefined : () => drawRef.current?.([-0.42, 0.48, 0.76])}
     />
-    <div className={`material-preview-state ${status}`}>
+    {props.showStatus === false ? null : <div className={`material-preview-state ${status}`}>
       {status === "loading" ? "Loading the complete material map set…" : status === "failed" ? problem : "Real-time material · move the pointer to relight"}
-    </div>
+    </div>}
   </div>;
 }

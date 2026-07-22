@@ -20,9 +20,10 @@ class ManifestAndMatchingTests(unittest.TestCase):
         radial = slots(self.manifest)[3]
         self.assertEqual(rectangular.slot_id, "rect_wide")
         self.assertEqual(rectangular.region_id, "fixture-v1:rect_wide")
+        self.assertEqual(rectangular.normalized_hotspot_rect, {"x": 0.05, "y": 0.75, "width": 0.4, "height": 0.2})
         self.assertEqual(rectangular.fit_axis, "automatic")
         self.assertTrue(rectangular.keep_proportion)
-        self.assertEqual(rectangular.allowed_rotations, (0, 180))
+        self.assertEqual(rectangular.allowed_rotations, (0, 90, 180, 270))
         self.assertTrue(rectangular.mirror_allowed)
         self.assertEqual(rectangular.classification_tags, ("HOTSPOT", "RECTANGULAR"))
         self.assertEqual(rectangular.world_size_meters, (2.0, 1.0))
@@ -64,8 +65,8 @@ class ManifestAndMatchingTests(unittest.TestCase):
     def test_rectangular_matching_is_aspect_first_and_slot_id_stable(self):
         descriptor = IslandDescriptor((0.0, 0.0, 2.0, 1.0), 2.0, 2.0, 2.0, "U", True, 0.4)
         ordered = choose_slot(descriptor, reversed(slots(self.manifest)))
-        self.assertEqual(ordered.slot.slot_id, "rect_wide")
-        self.assertEqual(ordered.rotation, 0)
+        self.assertEqual(ordered.slot.slot_id, "rect_tall")
+        self.assertEqual(ordered.rotation, 90)
         repeated = choose_slot(descriptor, slots(self.manifest))
         self.assertEqual((ordered.slot.slot_id, ordered.rotation), (repeated.slot.slot_id, repeated.rotation))
 
@@ -111,6 +112,16 @@ class ManifestAndMatchingTests(unittest.TestCase):
         horizontal = math.dist(fitted[0], fitted[1]) / math.dist(original[0], original[1])
         vertical = math.dist(fitted[1], fitted[2]) / math.dist(original[1], original[2])
         self.assertAlmostEqual(horizontal, vertical, places=12)
+
+    def test_rectified_quad_can_fill_the_entire_selected_rectangle(self):
+        descriptor = IslandDescriptor((0.0, 0.0, 1.5, 1.0), 1.5, 1.5, 1.5, "U", True, 0.4)
+        match = choose_slot(descriptor, slots(self.manifest), "RECTANGULAR")
+        fitted = transform_uvs(((0.0, 0.0), (1.5, 0.0), (1.5, 1.0), (0.0, 1.0)), match, fill_rect=True)
+        rect = match.slot.normalized_hotspot_rect
+        self.assertEqual(
+            {(round(u, 12), round(v, 12)) for u, v in fitted},
+            {(round(rect["x"], 12), round(rect["y"], 12)), (round(rect["x"] + rect["width"], 12), round(rect["y"], 12)), (round(rect["x"] + rect["width"], 12), round(rect["y"] + rect["height"], 12)), (round(rect["x"], 12), round(rect["y"] + rect["height"], 12))},
+        )
 
     def test_auto_radial_requires_strong_evidence_and_manual_override_wins(self):
         radial = IslandDescriptor((0.0, 0.0, 1.0, 1.0), 1.0, math.pi / 4, math.pi, "U", True, 0.97)

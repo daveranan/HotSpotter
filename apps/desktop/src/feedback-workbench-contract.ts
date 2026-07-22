@@ -49,6 +49,15 @@ export const EDGE_DETAIL_PRESETS = Object.freeze({
     sourceHeightInfluence: 0, sourceLuminanceInfluence: 0, heightAmplitudeM: 0.0003,
     saturationMultiplier: 1, valueMultiplier: 1.04, roughnessOffset: 0.04,
   },
+  "HotBox Concrete": {
+    ...SOFT_WORN_EDGE,
+    wearAmount: 0.5, intensity: 0.86, edgeWidthM: 0.015, bevelRadiusM: 0.007,
+    edgeSoftness: 0.2, breakupAmount: 0.82, breakupScaleM: 0.012,
+    microDetailAmount: 0.35, microDetailScaleM: 0.0015,
+    sourceHeightInfluence: 0.55, sourceLuminanceInfluence: 0.16,
+    heightAmplitudeM: -0.0009, normalDetailStrength: 1.1,
+    saturationMultiplier: 0.96, valueMultiplier: 1.2, roughnessOffset: 0.1,
+  },
 } satisfies Readonly<Record<string, Partial<EdgeDetailIntentV1>>>);
 
 export type EdgeDetailPresetName = keyof typeof EDGE_DETAIL_PRESETS;

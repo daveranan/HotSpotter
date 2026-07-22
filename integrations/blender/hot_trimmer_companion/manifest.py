@@ -75,6 +75,16 @@ def _validated_rect(value, description):
     return rect
 
 
+def _blender_uv_rect(rect):
+    """Project top-left image coordinates into Blender's bottom-left UV space."""
+    return {
+        "x": rect["x"],
+        "y": 1.0 - rect["y"] - rect["height"],
+        "width": rect["width"],
+        "height": rect["height"],
+    }
+
+
 def _validated_slot(record, index):
     description = f"slot[{index}]"
     if not isinstance(record, dict):
@@ -128,11 +138,12 @@ def _validated_slot(record, index):
         orientation = _nonempty_string(orientation, f"{description}.orientation").lower()
         if orientation not in SUPPORTED_ORIENTATIONS:
             raise ValueError(f"{description}.orientation is unsupported: {orientation}")
+    normalized_rect = _validated_rect(_required(record, "normalizedHotspotRect", description), f"{description}.normalizedHotspotRect")
     return Slot(
         slot_id=_nonempty_string(_required(record, "slotId", description), f"{description}.slotId"),
         region_id=_nonempty_string(_required(record, "regionId", description), f"{description}.regionId"),
         role=_nonempty_string(_required(record, "role", description), f"{description}.role").lower(),
-        normalized_hotspot_rect=_validated_rect(_required(record, "normalizedHotspotRect", description), f"{description}.normalizedHotspotRect"),
+        normalized_hotspot_rect=_blender_uv_rect(normalized_rect),
         uv_fit_kind=kind,
         fit_axis=fit_axis,
         keep_proportion=keep_proportion,

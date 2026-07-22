@@ -3255,7 +3255,12 @@ mod source_frame_partition_tests {
             bottom: false,
         };
         let regions = vec![panel.clone(), horizontal.clone(), vertical.clone(), ineligible];
-        let global = EdgeDetailIntentV1::default();
+        let global = EdgeDetailIntentV1 {
+            // The fixture is 1 mm/px and exercises successful compilation;
+            // keep authored microdetail on the authoritative two-pixel floor.
+            micro_detail_scale_m: 0.002,
+            ..EdgeDetailIntentV1::default()
+        };
         let compiled = compile_edge_fixture(&global, &regions).expect("global Edge Detail plan");
         assert_eq!(compiled.commands.len(), 3, "one command per eligible region");
         assert_eq!(compiled.commands[0].region_id, panel.region_id);
@@ -3349,7 +3354,7 @@ mod source_frame_partition_tests {
         assert_eq!(command.edge_width_m, intent.edge_width_m as f32);
         assert_eq!(command.breakup_scale_m, intent.breakup_scale_m as f32);
         assert_eq!(command.micro_detail_scale_m, 0.008);
-        assert_eq!(intent.micro_detail_scale_m, 0.002, "authored intent remains unchanged");
+        assert_eq!(intent.micro_detail_scale_m, 0.001_5, "authored intent remains unchanged");
 
         let mut authoritative_region =
             edge_detail_region(7, TemplateSlotRole::Planar, ManualRegionRole::Panel);

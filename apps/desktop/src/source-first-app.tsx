@@ -60,7 +60,7 @@ import { defaultPartitionRecipe, layoutTemplateOptions, layoutTemplateRecipe, se
 import { authoredGridResolutions, cellDragRect, diagonalCascadePreset, newBlankPreset, rescalePreset, snapshotDocumentPreset, snappedGridPoint, sourceFrameGridBounds } from "./manual-layout-presets";
 import { canInteractWithPatch, compiledMapViewForSourceChannel, sourceChannelForCompiledMapView, sourceSetIdForRegion } from "./workbench-interactions";
 import { FeedbackWorkbench, ProcessingSidebar } from "./feedback-workbench";
-import { MaterialPreviewCanvas, materialPreviewReady } from "./material-preview";
+import { MaterialPreviewComparison, materialPreviewReady } from "./material-preview";
 import {
   feedbackExecutionMatchesRequest,
   edgeDetailInspectionForView,
@@ -153,7 +153,7 @@ function requestedMaterialMapsForExport(project: ProjectProjection | null): read
   if (!channels) return ["base_color"];
   const requested = exportableMaterialMaps.filter((map) => channels[map]?.enabled);
   if (project?.document?.edgeDetail?.enabled) {
-    for (const map of ["base_color", "height", "normal", "roughness", "metallic", "edge_mask"] as const) {
+    for (const map of ["base_color", "height", "normal", "roughness", "metallic", "ambient_occlusion", "edge_mask"] as const) {
       if (!requested.includes(map)) requested.push(map);
     }
   }
@@ -360,6 +360,7 @@ function App() {
   const native = isNativeRuntime();
   const [project, setProject] = useState<ProjectProjection | null>(null);
   const [artifact, setArtifact] = useState<IntermediateAtlasProjection | null>(null);
+  const [previousProcessingArtifact, setPreviousProcessingArtifact] = useState<IntermediateAtlasProjection | null>(null);
   const [preview, setPreview] = useState<PreviewSheetProjection | null>(null);
   const [previewClientTelemetry, setPreviewClientTelemetry] = useState<string[]>([]);
   const [interactivePreviewProfile, setInteractivePreviewProfile] = useState<InteractivePreviewProfile>(() => {
@@ -440,6 +441,7 @@ function App() {
   const stage14InvokeTail = useRef<Promise<void>>(Promise.resolve());
   const previewPublishStartedAt = useRef<number | null>(null);
   const projectRef = useRef<ProjectProjection | null>(null);
+  const artifactRef = useRef<IntermediateAtlasProjection | null>(null);
   const mapViewRef = useRef<CompiledMapView>("baseColor");
   const lastTransientCompletionAt = useRef(0);
   const smoothedTransientFps = useRef(0);
@@ -465,6 +467,8 @@ function App() {
   }, [previewProgress?.requestId, previewProgress?.phase]);
   const workbenchRef = useRef<HTMLElement | null>(null);
   useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => { artifactRef.current = artifact; }, [artifact]);
+  useEffect(() => { setPreviousProcessingArtifact(null); }, [project?.id]);
   useEffect(() => { mapViewRef.current = mapView; }, [mapView]);
 
   useEffect(() => {
@@ -472,6 +476,88 @@ function App() {
     let disposed = false;
     void listen<{ stage: string; fraction: number }>("import-progress", (event) => {
       if (!disposed) setImportProgress(event.payload.fraction >= 1 ? null : event.payload);
+    }).then((unlisten) => { if (disposed) unlisten(); });
+    return () => { disposed = true; };
+  }, [native]);
+
+  // The desktop owns the MCP bridge. Keep its operations on the same IPC
+  // command path as the visible UI so Codex cannot create a second project or
+  // bypass revision/GPU/export guards.
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    void listen<{ requestId: string; name: string; arguments: Record<string, unknown> }>("mcp-request", (event) => {
+      if (disposed) return;
+      const { requestId, name, arguments: args } = event.payload;
+      const respond = (response: unknown) => invoke("mcp_respond", { requestId, response }).catch(() => undefined);
+      const request = { ...protocol };
+      if (name === "render_preview_1024") {
+        void (async () => {
+          const revision = args.revision ?? projectRef.current?.document?.documentRevision;
+          if (typeof revision !== "number") throw new Error("Create a trim-sheet document before requesting a 1024px preview.");
+          const requestedMaps = args.requestedMaps ?? ["base_color", "normal", "height", "roughness", "metallic", "ambient_occlusion", "edge_mask", "region_id"];
+          const artifact = await invokeStage14Serialized<IntermediateAtlasProjection>("preview_through_stage_14", { request: { ...request, revision, profile: "refinement1024", requestedMaps } });
+          const publications = artifact.tileManifests ?? (artifact.tileManifest ? { [artifact.tileManifest.manifest.map]: artifact.tileManifest } : {});
+          const maps: Record<string, unknown> = {};
+          const encode = (bytes: Uint8Array) => {
+            let binary = "";
+            for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+            return btoa(binary);
+          };
+          for (const [map, publication] of Object.entries(publications)) {
+            const manifest = publication.manifest;
+            const bytes = await invoke<Uint8Array>("get_gpu_tiled_preview_payload", { request: { ...request, generation: manifest.generation, opaqueHandle: manifest.opaqueHandle } });
+            maps[map] = { manifest, payloadBase64: encode(bytes) };
+            await invoke("release_gpu_tiled_preview_payload", { request: { ...request, generation: manifest.generation, opaqueHandle: manifest.opaqueHandle } }).catch(() => undefined);
+          }
+          respond({ revision: artifact.documentRevision, width: artifact.width, height: artifact.height, maps, artifact });
+        })().catch((reason) => respond({ isError: true, error: failure(reason) }));
+        return;
+      }
+      let command: string;
+      let commandArgs: Record<string, unknown>;
+      switch (name) {
+        case "inspect_project":
+          command = "current_project_projection"; commandArgs = { request }; break;
+        case "debug_project":
+          command = "stage_15_20_debug_payload";
+          commandArgs = { request: { ...request, schemaVersion: 1, selectedRegionId: args.selectedRegionId ?? null, requestedView: args.requestedView ?? "stage15Height", previewProfile: args.previewProfile ?? "preview2048", comparisonMode: args.comparisonMode ?? "after", selectedOperationId: args.selectedOperationId ?? null, activeTool: args.activeTool ?? "select", previewState: args.previewState ?? "requested", requestIdentity: args.requestIdentity ?? "mcp", pixelDispatchCount: args.pixelDispatchCount ?? 0, executionOutcome: args.executionOutcome ?? "requested", previewError: args.previewError ?? null, lastCommandResult: args.lastCommandResult ?? null, paintSummary: args.paintSummary ?? null, tile: args.tile ?? null, compiledInspection: args.compiledInspection ?? null, workbenchState: args.workbenchState ?? null, boundedTelemetry: args.boundedTelemetry ?? [] } }; break;
+        case "create_region":
+          command = "apply_document_command"; commandArgs = { request: { ...request, command: { type: "draw_source_frame_region", gridRect: args.gridRect } } }; break;
+        case "edit_region": {
+          const allowed = new Set(["split_source_frame_region", "merge_source_frame_regions", "move_source_frame_boundary", "resize_source_frame_region", "set_region_content", "set_region_address_mode", "set_region_behavior", "set_region_projection", "set_region_radial", "set_output_resolution", "set_atlas_padding", "detach_source_cell", "reset_source_cell"]);
+          const regionCommand = args.command;
+          if (!regionCommand || typeof regionCommand !== "object" || !allowed.has((regionCommand as { type?: string }).type ?? "")) throw new Error("Unsupported region edit command.");
+          command = "apply_document_command"; commandArgs = { request: { ...request, command: regionCommand } }; break;
+        }
+        case "list_templates":
+          command = "list_authored_layout_presets"; commandArgs = { request }; break;
+        case "save_template":
+          command = "save_authored_layout_preset"; commandArgs = { request: { ...request, preset: args.preset } }; break;
+        case "apply_template":
+          command = "apply_document_command"; commandArgs = { request: { ...request, command: { type: "apply_authored_layout_preset", preset: args.preset, instanceId: args.instanceId ?? crypto.randomUUID() } } }; break;
+        case "delete_template":
+          command = "delete_authored_layout_preset"; commandArgs = { request: { ...request, presetId: args.presetId } }; break;
+        case "load_texture":
+          command = "import_source"; commandArgs = { request: { ...request, path: args.path, ownership: "owned_copy", channel: args.channel, sourceSetId: args.sourceSetId, assignmentProvenance: "user_assigned", confidenceMilli: 1000, normalConvention: args.normalConvention ?? "not_applicable" } }; break;
+        case "apply_edge_detail":
+          command = "apply_feedback_workbench_command"; commandArgs = { request: { ...request, commandVersion: 1, command: { type: "set_edge_detail", intent: args.intent } } }; break;
+        case "adjust_edge_settings":
+          command = "apply_feedback_workbench_command"; commandArgs = { request: { ...request, commandVersion: 1, command: { type: "set_edge_detail", intent: args.intent } } }; break;
+        case "export_package":
+          command = "export_stage_14_material_maps"; commandArgs = { request: { ...request, revision: args.revision, path: args.path, requestedMaps: args.requestedMaps ?? [] } }; break;
+        default:
+          respond({ isError: true, error: `Unknown Hot Trimmer MCP operation: ${name}` }); return;
+      }
+      void invoke<unknown>(command, commandArgs).then((result) => {
+        const candidate = result as { project?: ProjectProjection; materialSources?: unknown; document?: unknown };
+        const next = candidate.project ?? (candidate.materialSources && candidate.document ? result as ProjectProjection : null);
+        if (next) {
+          projectRef.current = next;
+          setProject(next);
+        }
+        respond(result);
+      }).catch((reason) => respond({ isError: true, error: failure(reason) }));
     }).then((unlisten) => { if (disposed) unlisten(); });
     return () => { disposed = true; };
   }, [native]);
@@ -537,7 +623,7 @@ function App() {
   else if (showSourceWorkspace || hotspotSheetOpen) visibleTracks.push("minmax(0, 1fr)");
   if (showInspector) visibleTracks.push(`${panes.inspector}px`);
   const workbenchColumns = processingOpen
-    ? "minmax(0, 1fr) minmax(360px, 430px)"
+    ? "minmax(0, 1fr) minmax(330px, 360px)"
     : visibleTracks.length ? visibleTracks.join(" 6px ") : "minmax(0, 1fr)";
 
   useEffect(() => {
@@ -1034,8 +1120,17 @@ function App() {
       if (commandValue.type === "set_edge_detail" && previewRegionId) {
         const revision = result.project.document?.documentRevision;
         if (revision !== undefined) {
-          if (processingEdgeCommand) await requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, false, processingRequestedMap);
-          else await requestFeedbackTile(revision, previewRegionId, previewAllRegions, nextFeedbackView);
+          if (processingEdgeCommand) {
+            const quickProfile: InteractivePreviewProfile = "refinement1024";
+            await requestPreview(undefined, undefined, quickProfile, revision, false, false, processingRequestedMap);
+            if (interactivePreviewProfile !== quickProfile) {
+              const quickDraftId = previewDraftId.current;
+              window.setTimeout(() => {
+                if (previewDraftId.current !== quickDraftId || projectRef.current?.document?.documentRevision !== revision) return;
+                void requestPreview(undefined, undefined, interactivePreviewProfile, revision, false, false, processingRequestedMap);
+              }, 220);
+            }
+          } else await requestFeedbackTile(revision, previewRegionId, previewAllRegions, nextFeedbackView);
         }
       }
     } catch (reason) {
@@ -1383,6 +1478,11 @@ function App() {
           mapViewRef.current = requestedMapOverride;
         }
         setPreviewProgress({ requestId: draftId, phase: "received", profile, requestedRevision, requestedMap: requestedMapView, startedAt: previewPublishStartedAt.current, elapsedMs: performance.now() - previewPublishStartedAt.current, dimensions: { width: next.width, height: next.height }, terminalOutcome: "published" });
+        const previousArtifact = artifactRef.current;
+        if (processingOpen && previousArtifact && previousArtifact.documentRevision !== next.documentRevision) {
+          setPreviousProcessingArtifact(previousArtifact);
+        }
+        artifactRef.current = next;
         setArtifact(next);
         setPreview(null);
         setProblem(null);
@@ -2187,6 +2287,7 @@ function App() {
         {(hotspotSheetOpen || processingOpen) ? <SheetWorkbench
           project={project}
           artifact={artifact}
+          comparisonArtifact={processingOpen ? previousProcessingArtifact : null}
           preview={preview}
           preparedPatchPreview={activePatchId ? preparedPatchPreview : null}
           preparedPatchPreviews={preparedPatchPreviews}
@@ -3297,6 +3398,7 @@ function PaneSplitter(props: {
 function SheetWorkbench(props: {
   project: ProjectProjection | null;
   artifact: IntermediateAtlasProjection | null;
+  comparisonArtifact: IntermediateAtlasProjection | null;
   preview: PreviewSheetProjection | null;
   preparedPatchPreview: PreparedPatchPreviewProjection | null;
   preparedPatchPreviews: Readonly<Record<string, PreparedPatchPreviewProjection>>;
@@ -3386,6 +3488,7 @@ function SheetWorkbench(props: {
   const [gridOpacity, setGridOpacity] = useState(10);
   const [textureVisible, setTextureVisible] = useState(true);
   const [processingMaterialView, setProcessingMaterialView] = useState(true);
+  const [processingCompareEnabled, setProcessingCompareEnabled] = useState(true);
   const [regionFillVisible, setRegionFillVisible] = useState(true);
   const [regionBordersVisible, setRegionBordersVisible] = useState(true);
   const [edgeEligibilityVisible, setEdgeEligibilityVisible] = useState(false);
@@ -3399,6 +3502,9 @@ function SheetWorkbench(props: {
   const [resizeDraft, setResizeDraft] = useState<{ pointerId: number; regionId: string; handle: ResizeHandle; origin: LogicalRect; rect: LogicalRect } | null>(null);
   const [drawDraft, setDrawDraft] = useState<{ pointerId: number; startCellX: number; startCellY: number; endCellX: number; endCellY: number } | null>(null);
   useEffect(() => { if (processing) setProcessingMaterialView(true); }, [processing]);
+  useEffect(() => {
+    if (props.comparisonArtifact) setProcessingCompareEnabled(true);
+  }, [props.comparisonArtifact?.documentRevision]);
   useEffect(() => {
     if (processing && props.interactivePreviewProfile === "preview8192") {
       props.setInteractivePreviewProfile("preview4096");
@@ -3794,8 +3900,9 @@ function SheetWorkbench(props: {
       <span className={`build-status ${props.problem ? "error" : props.artifact ? "ready" : ""}`}>{props.buildState}</span>
     </header>
     {processing ? <div className="processing-toolbar">
+      <div className="processing-mode-toggle segmented-control" role="group" aria-label="Processing view mode"><button className={!processingMaterialView ? "active" : ""} aria-pressed={!processingMaterialView} onClick={() => setProcessingMaterialView(false)}>Edit</button><button className={processingMaterialView ? "active" : ""} aria-pressed={processingMaterialView} onClick={() => setProcessingMaterialView(true)}>Preview</button></div>
       <div className="processing-map-tabs" role="tablist" aria-label="Material maps"><button role="tab" aria-selected={processingMaterialView} className={processingMaterialView ? "active" : ""} onClick={() => setProcessingMaterialView(true)} title="Real-time lit preview composed from the current material maps.">Material</button>{([['baseColor','Base Color'],['normal','Normal'],['height','Height'],['roughness','Roughness'],['metallic','Metallic'],['ambientOcclusion','AO'],['edgeMask','Edge Mask']] as const).map(([view, label]) => <button key={view} role="tab" aria-selected={!processingMaterialView && props.processingRequestedMap === view} className={!processingMaterialView && props.processingRequestedMap === view ? "active" : ""} onClick={() => { setProcessingMaterialView(false); props.setMapView(view); }}>{label}</button>)}</div>
-      <div className="processing-inspection-controls"><select aria-label="Before or After" value={props.feedbackDebug?.comparisonMode ?? "after"} disabled><option value="before">Before</option><option value="after">After</option></select><select aria-label="Preview resolution" title="Interactive complete-material previews are capped at 4K; Export All Maps uses the project output resolution." value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as InteractivePreviewProfile)}><option value="refinement1024">1K</option><option value="preview2048">2K</option><option value="preview4096">4K</option></select><button onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle"}>Refresh All Maps</button></div>
+      <div className="processing-inspection-controls"><button className={processingCompareEnabled && !!props.comparisonArtifact ? "active" : ""} aria-pressed={processingCompareEnabled && !!props.comparisonArtifact} disabled={!props.comparisonArtifact || !processingMaterialView} onClick={() => setProcessingCompareEnabled((current) => !current)}>Compare</button><select aria-label="Preview resolution" title="Interactive complete-material previews are capped at 4K; Export All Maps uses the project output resolution." value={props.interactivePreviewProfile} onChange={(event) => props.setInteractivePreviewProfile(event.currentTarget.value as InteractivePreviewProfile)}><option value="refinement1024">1K</option><option value="preview2048">2K</option><option value="preview4096">4K</option></select><button onClick={props.renderFullResolutionPreview} disabled={!props.project?.document || props.activity !== "idle"}>Refresh</button><button onClick={viewport.fit} disabled={!workpieceSize}>Fit</button></div>
     </div> : null}
     <section className="layout-stage">
     {!processing ? <aside className="layout-sidebar" aria-label="Layout controls">
@@ -3939,7 +4046,7 @@ function SheetWorkbench(props: {
           } else if (!(event.target as Element).closest(".region")) props.setSelectedRegionId(null);
         }}
       >
-        {processing && processingMaterialView && artifact ? <MaterialPreviewCanvas artifact={artifact} onPaint={props.onPreviewPaint} /> : textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && displayGpuTiles && artifact ? <GpuTiledPreviewCanvas artifact={artifact} mapView={props.mapView} retainPayload={processing} onPaint={props.onPreviewPaint} onDebugSummary={setGpuPaintSummary} /> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
+        {processing && processingMaterialView && artifact ? <MaterialPreviewComparison artifact={artifact} comparisonArtifact={props.comparisonArtifact} enabled={processingCompareEnabled} onPaint={props.onPreviewPaint} /> : textureVisible && continuousTexture && sourceFrame ? <div className="source-frame-texture"><img src={continuousTexture} alt="Source Frame texture" style={sourceFrameTextureStyle(sourceFrame)} onLoad={() => props.onPreviewPaint({ width: sheet.width, height: sheet.height })} /></div> : textureVisible && displayGpuTiles && artifact ? <GpuTiledPreviewCanvas artifact={artifact} mapView={props.mapView} retainPayload={processing} onPaint={props.onPreviewPaint} onDebugSummary={setGpuPaintSummary} /> : textureVisible && imageUrl ? <img src={imageUrl} alt={`${props.mapView} trim sheet preview`} onLoad={(event) => props.onPreviewPaint({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : null}
         {authoringOverlaysVisible ? pendingPatchRegions.map(({ region, patchPreview }) => <div key={`assigned-${region.regionId}`} className="assigned-patch-preview" style={gridRectOverlayStyle(region.gridRect!, displayedGrid)}><img src={patchPreview.dataUrl} alt={`Immediate assigned patch preview for ${region.displayName}`} /></div>) : null}
         {authoringOverlaysVisible && layoutTool === "draw" && hoverSnap && !drawDraft ? <div className="draw-hover-cell" style={gridRectOverlayStyle({ x: hoverSnap.cellX, y: hoverSnap.cellY, width: 1, height: 1 }, displayedGrid)}><div className="draw-snap-crosshair"><span>cell {hoverSnap.cellX}, {hoverSnap.cellY}</span></div></div> : null}
         {authoringOverlaysVisible && (sheetMatchesDocument || props.candidatePreviewing) && gridVisible ? <><div className="sheet-grid minor" style={{ backgroundSize: `${gridSteps.minorX * 100 / displayedGrid.width}% ${gridSteps.minorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 * .9 }} /><div className="sheet-grid major" style={{ backgroundSize: `${gridSteps.majorX * 100 / displayedGrid.width}% ${gridSteps.majorY * 100 / displayedGrid.height}%`, opacity: gridOpacity / 100 }} /></> : null}

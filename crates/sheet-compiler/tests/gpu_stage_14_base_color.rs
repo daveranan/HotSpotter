@@ -980,14 +980,15 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     assert!(output.telemetry.iter().any(|line| {
         line.contains("requested_map=EdgeMask")
             && line.contains("logical_passes=stage15-sdf,stage15-semantics,edge-detail-masks,publish")
-            && line.contains("executed_gpu_passes=stage15-profile,edge-detail-mvp-v3")
+            && line.contains("executed_gpu_passes=stage15-profile,edge-detail-mvp-v5")
     }));
 
     let authoritative_identity = plan.ordered_regions[0].edge_detail.as_ref().unwrap().cache_identity.0.clone();
     let mut publications = std::collections::BTreeMap::new();
     for map in [
         MaterialMapKind::BaseColor, MaterialMapKind::Height, MaterialMapKind::Normal,
-        MaterialMapKind::Roughness, MaterialMapKind::Metallic,
+        MaterialMapKind::Roughness, MaterialMapKind::AmbientOcclusion,
+        MaterialMapKind::Metallic,
     ] {
         let published = execute_edge_detail_map(&plan, &domain, map);
         assert!(published.telemetry.iter().any(|line| {
@@ -1059,6 +1060,13 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     assert!(roughness.chunks_exact(4).all(|pixel| (0.0..=1.0).contains(&f32::from_le_bytes(pixel.try_into().unwrap()))));
     assert_ne!(output_pixel(roughness_display, 64, 1, 32), output_pixel(roughness_display, 64, 32, 32), "Roughness preview bypassed composition");
 
+    let ao = publications[&MaterialMapKind::AmbientOcclusion].map_tiles[&MaterialMapKind::AmbientOcclusion].pixels();
+    let edge_ao = output_f32(ao, 64, 1, 32);
+    let center_ao = output_f32(ao, 64, 32, 32);
+    assert!(edge_ao < center_ao, "structural cavity did not darken AO: edge={edge_ao}, center={center_ao}");
+    let ao_display = publications[&MaterialMapKind::AmbientOcclusion].display_tiles[&MaterialMapKind::AmbientOcclusion].pixels();
+    assert_ne!(output_pixel(ao_display, 64, 1, 32), output_pixel(ao_display, 64, 32, 32), "AO preview bypassed structural cavity composition");
+
     let mut disabled = plan.clone();
     disabled.ordered_regions[0].edge_detail = None;
     disabled.final_plan_hash = ContentDigest(String::new());
@@ -1076,12 +1084,13 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     assert!(disabled_intent.ordered_regions[0].edge_detail.is_none());
     for map in [
         MaterialMapKind::BaseColor, MaterialMapKind::EdgeMask, MaterialMapKind::Height,
-        MaterialMapKind::Normal, MaterialMapKind::Roughness, MaterialMapKind::Metallic,
+        MaterialMapKind::Normal, MaterialMapKind::Roughness,
+        MaterialMapKind::AmbientOcclusion, MaterialMapKind::Metallic,
     ] {
         let without_intent = execute_edge_detail_map(&disabled, &domain, map);
         let disabled_output = execute_edge_detail_map(&disabled_intent, &domain, map);
         assert_eq!(disabled_output.map_tiles[&map].pixels(), without_intent.map_tiles[&map].pixels(), "disabled Edge Detail changed {map:?}");
-        assert!(disabled_output.telemetry.iter().all(|line| !line.contains("edge-detail-composition-v2") && !line.contains("edge-detail-mvp-v3")), "disabled Edge Detail dispatched work for {map:?}: {:#?}", disabled_output.telemetry);
+        assert!(disabled_output.telemetry.iter().all(|line| !line.contains("edge-detail-composition-v3") && !line.contains("edge-detail-mvp-v5")), "disabled Edge Detail dispatched work for {map:?}: {:#?}", disabled_output.telemetry);
     }
 
     let zero_intensity = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
@@ -1091,6 +1100,13 @@ fn mvp_edge_wear_executes_real_gpu_pixels_for_the_requested_maps() {
     let zero_color = execute_edge_detail_map(&zero_intensity, &domain, MaterialMapKind::BaseColor);
     let disabled_color = execute_edge_detail_map(&disabled, &domain, MaterialMapKind::BaseColor);
     assert_eq!(zero_color.map_tiles[&MaterialMapKind::BaseColor].pixels(), disabled_color.map_tiles[&MaterialMapKind::BaseColor].pixels(), "zero intensity still modified Base Color");
+    let zero_height = execute_edge_detail_map(&zero_intensity, &domain, MaterialMapKind::Height);
+    let disabled_height = execute_edge_detail_map(&disabled, &domain, MaterialMapKind::Height);
+    assert_ne!(
+        output_f32(zero_height.map_tiles[&MaterialMapKind::Height].pixels(), 64, 1, 32),
+        output_f32(disabled_height.map_tiles[&MaterialMapKind::Height].pixels(), 64, 1, 32),
+        "zero wear intensity erased the permanent structural edge",
+    );
 
     let zero_normal_strength = mvp_edge_detail_plan_with_intent(&domain, hot_trimmer_domain::EdgeDetailIntentV1 {
         normal_detail_strength: 0.0, source_height_influence: 0.0, source_luminance_influence: 0.0,

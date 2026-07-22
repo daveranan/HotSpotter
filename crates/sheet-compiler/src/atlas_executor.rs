@@ -1446,7 +1446,7 @@ pub const SOURCE_HEIGHT_RANGE_M: f32 = 0.002;
 
 const GPU_HEADER_BYTES: usize = 88;
 const GPU_COMMAND_BYTES: usize = 176;
-const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v16-native-edge-detail-composition";
+const GPU_SHADER_VERSION: &str = "stage14-material-map-wgsl-v17-virtual-bevel-composition";
 
 fn requested_material_maps(
     plan: &CompiledAtlasPlanV1,
@@ -3640,7 +3640,7 @@ impl AtlasRenderExecutor for GpuAtlasRenderExecutor<'_> {
             .map(|cache| (cache.source_resident_bytes(), cache.source_layer_count()))
             .unwrap_or((0, 0));
         let executed_gpu_passes = if edge_composition.is_some() {
-            "material-publish,edge-detail-composition-v2"
+            "material-publish,edge-detail-composition-v3"
         } else {
             "material-publish"
         };
@@ -4270,11 +4270,11 @@ const PROFILE_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
 ];
 
 const EDGE_DETAIL_FIELD_IDENTITIES: [(MaterialMapKind, &str); 5] = [
-    (MaterialMapKind::BaseColor, "edge-detail-core-r32float-v3"),
-    (MaterialMapKind::Roughness, "edge-detail-transition-r32float-v3"),
-    (MaterialMapKind::AmbientOcclusion, "edge-detail-fade-r32float-v3"),
-    (MaterialMapKind::EdgeMask, "edge-detail-combined-r32float-v3"),
-    (MaterialMapKind::Height, "edge-detail-surface-and-edge-height-r32float-v3"),
+    (MaterialMapKind::BaseColor, "edge-detail-core-r32float-v5"),
+    (MaterialMapKind::Roughness, "edge-detail-transition-r32float-v5"),
+    (MaterialMapKind::AmbientOcclusion, "edge-detail-fade-r32float-v5"),
+    (MaterialMapKind::EdgeMask, "edge-detail-combined-r32float-v5"),
+    (MaterialMapKind::Height, "edge-detail-virtual-bevel-height-r32float-v5"),
 ];
 
 #[derive(Clone, Copy)]
@@ -5705,7 +5705,7 @@ fn execute_edge_detail_gpu_tile(
         .join("|");
     let mut telemetry = vec![
         format!(
-            "executor=gpu; backend={}; plan_hash={}; requested_map=EdgeMask; logical_passes={}; executed_gpu_passes=stage15-profile,edge-detail-mvp-v3,scalar-display-rgba8; shader_identity=edge-detail-mvp-v3; mask_format=R32Float; display_format=Rgba8UnormLinear; height_format=R32Float; final_tile_cache=miss; edge_detail_cache={}; dispatches={}; command_count={}; command_bytes={}; resident_bytes={}; required_halo_px={}; source_cache_hits={}; source_upload_bytes={}; dispatch_ms={}; readback_ms={}; smooth_intermediate_pixels={smooth_values}; render_ms={}",
+            "executor=gpu; backend={}; plan_hash={}; requested_map=EdgeMask; logical_passes={}; executed_gpu_passes=stage15-profile,edge-detail-mvp-v5,scalar-display-rgba8; shader_identity=edge-detail-mvp-v5; mask_format=R32Float; display_format=Rgba8UnormLinear; height_format=R32Float; final_tile_cache=miss; edge_detail_cache={}; dispatches={}; command_count={}; command_bytes={}; resident_bytes={}; required_halo_px={}; source_cache_hits={}; source_upload_bytes={}; dispatch_ms={}; readback_ms={}; smooth_intermediate_pixels={smooth_values}; render_ms={}",
             state.capabilities().backend, plan.final_plan_hash.0,
             logical_passes_for_map(plan, MaterialMapKind::EdgeMask),
             if stats.cache_hit { "CacheHit" } else { "CacheMiss" },
@@ -6074,7 +6074,7 @@ fn execute_r32float_material_tile(
         .checked_out_source_layers_peak
         .max(display_stats.checked_out_source_layers_peak);
     let executed_gpu_passes = if edge_composition_executed {
-        "material-r32float-publish,edge-detail-composition-v2,material-rgba8-display-publish"
+        "material-r32float-publish,edge-detail-composition-v3,material-rgba8-display-publish"
     } else {
         "material-r32float-publish,material-rgba8-display-publish"
     };
@@ -13584,6 +13584,9 @@ mod tests {
         let mut intent = hot_trimmer_domain::EdgeDetailIntentV1::default();
         intent.source_height_influence = 0.0;
         intent.source_luminance_influence = 0.0;
+        // The fixture is exactly 1 mm/px; keep microdetail at the compiler's
+        // authoritative two-pixel physical LOD rather than below it.
+        intent.micro_detail_scale_m = 0.002;
         let inputs = multi.ordered_regions.iter().map(|region| {
             hot_trimmer_effect_compiler::EdgeDetailRegionInput {
                 region_id: region.region_id,
@@ -13624,7 +13627,7 @@ mod tests {
         assert_eq!(global_stats.command_count, 3);
         let combined = read_cached_profile_field(
             &handle, &cache, &multi, MaterialMapKind::EdgeMask,
-            "edge-detail-combined-r32float-v3",
+            "edge-detail-combined-r32float-v5",
         );
         for x in [1, 16, 31, 32, 47, 63, 67, 80, 92] {
             let nonzero = (0..64).any(|y| r32_pixel(&combined, 96, x, y) > 0.0);
@@ -13648,6 +13651,7 @@ mod tests {
         | {
             let region = &plan.ordered_regions[0];
             let mut source_intent = hot_trimmer_domain::EdgeDetailIntentV1::default();
+            source_intent.micro_detail_scale_m = 0.002;
             source_intent.source_height_influence =
                 if route == hot_trimmer_effect_compiler::EdgeDetailSourceModulationRoute::RegisteredHeight {
                     0.65
@@ -13711,7 +13715,7 @@ mod tests {
             ).expect("source-aware Edge Detail execution");
             let bytes = read_cached_profile_field(
                 &handle, &cache, plan, MaterialMapKind::EdgeMask,
-                "edge-detail-combined-r32float-v3",
+                "edge-detail-combined-r32float-v5",
             );
             (bytes, stats)
         };
@@ -13921,14 +13925,14 @@ mod tests {
             &golden_cache,
             &golden_plan,
             MaterialMapKind::EdgeMask,
-            "edge-detail-combined-r32float-v3",
+            "edge-detail-combined-r32float-v5",
         );
         let edge_height_pixels = read_cached_profile_field(
             &handle,
             &golden_cache,
             &golden_plan,
             MaterialMapKind::Height,
-            "edge-detail-surface-and-edge-height-r32float-v3",
+            "edge-detail-virtual-bevel-height-r32float-v5",
         );
         let normal_tile = golden_output.map_tiles
             .get(&MaterialMapKind::Normal).expect("final Normal publication");
