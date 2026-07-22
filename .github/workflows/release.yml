@@ -1,0 +1,77 @@
+name: Publish Windows Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-latest
+  cancel-in-progress: true
+
+jobs:
+  publish-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows executable
+        run: npm run build:native
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-package
+          Copy-Item target/release/hot-trimmer-desktop.exe release-package/Hot-Trimmer.exe
+          Copy-Item README.md, LICENSE release-package/
+          Compress-Archive -Path release-package/* -DestinationPath Hot-Trimmer-Windows-x64.zip
+          Copy-Item target/release/hot-trimmer-desktop.exe Hot-Trimmer-Windows-x64.exe
+          $hashLines = @(
+            (Get-FileHash Hot-Trimmer-Windows-x64.exe -Algorithm SHA256).Hash + "  Hot-Trimmer-Windows-x64.exe"
+            (Get-FileHash Hot-Trimmer-Windows-x64.zip -Algorithm SHA256).Hash + "  Hot-Trimmer-Windows-x64.zip"
+          )
+          Set-Content -Path SHA256SUMS.txt -Value $hashLines
+
+      - name: Publish rolling latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --force latest $env:GITHUB_SHA
+          git push origin refs/tags/latest --force
+
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $notes = "Automated Windows build from commit [$shortSha]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA)."
+          gh release view latest *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit latest --title "Hot Trimmer - Latest Windows Build" --notes $notes --latest
+            gh release upload latest Hot-Trimmer-Windows-x64.exe Hot-Trimmer-Windows-x64.zip SHA256SUMS.txt --clobber
+          } else {
+            gh release create latest Hot-Trimmer-Windows-x64.exe Hot-Trimmer-Windows-x64.zip SHA256SUMS.txt --verify-tag --title "Hot Trimmer - Latest Windows Build" --notes $notes --latest
+          }
